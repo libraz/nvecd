@@ -1,0 +1,132 @@
+# nvecd Configuration Example
+#
+# This is a complete example configuration file with all available options.
+# Copy this file and customize it for your environment.
+#
+# Documentation: See docs/en/configuration.md or docs/ja/configuration.md
+
+# Event Store Configuration
+events:
+  ctx_buffer_size: 50              # Ring buffer size per context (default: 50)
+                                    # - Number of events to keep in history per context
+                                    # - Older events are automatically overwritten
+  decay_interval_sec: 3600          # Decay interval in seconds (default: 3600 = 1 hour)
+                                    # - How often co-occurrence scores decay
+                                    # - 0 = disabled (no decay)
+  decay_alpha: 0.99                 # Decay factor (default: 0.99)
+                                    # - Score multiplier at each decay interval
+                                    # - Value between 0.0 and 1.0
+                                    # - Higher values = slower decay
+
+# Vector Store Configuration
+vectors:
+  default_dimension: 768            # Default vector dimension (default: 768)
+                                    # - Used when vector dimension is not specified
+                                    # - Common dimensions: 768 (BERT), 1536 (OpenAI), 384 (MiniLM)
+  distance_metric: "cosine"         # Distance metric (default: "cosine")
+                                    # Options:
+                                    # - "cosine"  : Cosine similarity (normalized)
+                                    # - "dot"     : Dot product (raw similarity)
+                                    # - "l2"      : Euclidean distance
+
+# Similarity Search Configuration
+similarity:
+  default_top_k: 100                # Default number of results (default: 100)
+                                    # - Used when top_k is not specified
+  max_top_k: 1000                   # Maximum allowed top_k (default: 1000)
+                                    # - Prevents excessive memory usage
+  fusion_alpha: 0.6                 # Weight for vector similarity in fusion mode (default: 0.6)
+                                    # - Alpha + Beta should equal 1.0
+  fusion_beta: 0.4                  # Weight for co-occurrence in fusion mode (default: 0.4)
+                                    # - Higher beta = more event influence
+
+# Snapshot Persistence Configuration
+snapshot:
+  dir: "/var/lib/nvecd/snapshots"   # Snapshot directory (default: /var/lib/nvecd/snapshots)
+                                    # - Created automatically if doesn't exist
+                                    # - Write permissions verified at startup
+  default_filename: "nvecd.snapshot" # Default filename for manual saves (default: nvecd.snapshot)
+  interval_sec: 0                   # Auto-snapshot interval in seconds (default: 0 = disabled)
+                                    # - Set to 7200 for 2-hour intervals
+                                    # - Auto-saved files: auto_YYYYMMDD_HHMMSS.snapshot
+  retain: 3                         # Number of snapshots to retain (default: 3)
+                                    # - Older auto-saved snapshots are cleaned up
+                                    # - Manual snapshots are not affected
+
+# Performance Configuration
+performance:
+  thread_pool_size: 8               # Worker thread pool size (default: 8)
+                                    # - Recommended: number of CPU cores
+  max_connections: 1000             # Maximum concurrent connections (default: 1000)
+                                    # - Prevents resource exhaustion
+                                    # - Set based on system ulimit and memory
+  connection_timeout_sec: 300       # Connection timeout in seconds (default: 300 = 5 minutes)
+                                    # - Idle connections are closed after this time
+
+# API Server Configuration
+api:
+  tcp:
+    bind: "127.0.0.1"               # TCP bind address (default: 127.0.0.1 = localhost only)
+                                    # - "0.0.0.0" to listen on all interfaces (WARNING: security risk)
+    port: 11017                     # TCP port (default: 11017)
+
+  http:
+    enable: false                   # Enable HTTP/JSON API (default: false)
+                                    # - TCP API is always enabled
+                                    # - Set to true for REST API access
+    bind: "127.0.0.1"               # HTTP bind address (default: 127.0.0.1)
+    port: 8080                      # HTTP port (default: 8080)
+    enable_cors: false              # Enable CORS headers (default: false)
+                                    # - Required for browser clients
+    cors_allow_origin: ""           # Allowed origin when CORS is enabled
+                                    # - Example: "https://app.example.com"
+                                    # - "*" allows all origins (not recommended)
+
+  # Rate Limiting (optional, disabled by default)
+  rate_limiting:
+    enable: false                   # Enable rate limiting (default: false)
+                                    # - Uses token bucket algorithm per client IP
+                                    # - Protects against DoS attacks
+    capacity: 100                   # Maximum tokens per client (burst size) (default: 100)
+                                    # - Allows burst of up to N requests
+    refill_rate: 10                 # Tokens added per second per client (default: 10)
+                                    # - Sustained rate limit: N requests/second per IP
+    max_clients: 10000              # Maximum number of tracked clients (default: 10000)
+                                    # - Prevents memory exhaustion
+
+# Network Security Configuration (REQUIRED for production)
+# IMPORTANT: Empty allow_cidrs will DENY all connections by default (fail-closed)
+# You MUST explicitly configure allowed IP ranges
+network:
+  allow_cidrs:                      # Allowed CIDR list applied to TCP/HTTP
+    - "127.0.0.1/32"                # RECOMMENDED: Localhost only (most secure)
+    # - "192.168.1.0/24"            # Example: Local network
+    # - "10.0.0.0/8"                # Example: Private network
+    # - "0.0.0.0/0"                 # WARNING: Allow all (NOT RECOMMENDED for production)
+
+# Logging Configuration
+logging:
+  level: "info"                     # Log level (default: "info")
+                                    # Options: "trace", "debug", "info", "warn", "error"
+  json: true                        # JSON format output (default: true)
+                                    # - Structured logging for better parsing
+  file: ""                          # Log file path (default: "" = stdout)
+                                    # - Empty string: log to stdout (systemd/Docker)
+                                    # - Path: log to file (e.g., "/var/log/nvecd/nvecd.log")
+
+# Query Result Cache Configuration (optional)
+cache:
+  enabled: true                     # Enable query result cache (default: true)
+  max_memory_mb: 32                 # Maximum cache memory in MB (default: 32)
+                                    # - Automatically evicts old entries when full
+  min_query_cost_ms: 10.0           # Minimum query cost to cache in milliseconds (default: 10.0)
+                                    # - Only cache queries that take longer than this
+                                    # - Prevents caching of fast queries
+  ttl_seconds: 3600                 # Cache entry TTL in seconds (default: 3600 = 1 hour)
+                                    # - 0 = no TTL (entries never expire by time)
+
+  # Advanced tuning (optional)
+  compression_enabled: true         # Enable LZ4 compression for cached results (default: true)
+                                    # - Reduces memory usage at small CPU cost
+  eviction_batch_size: 10           # Number of entries to evict at once (default: 10)
+                                    # - When memory is full

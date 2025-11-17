@@ -1,0 +1,80 @@
+# Build directories
+build/
+build-*/
+cmake-build-*/
+dist/
+*.o
+*.a
+*.so
+*.dylib
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+CTestTestfile.cmake
+_deps/
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+*.bak
+.DS_Store
+
+# Claude Code configuration
+.claude/
+CLAUDE.md
+
+# act (GitHub Actions local runner)
+.secrets
+.act/
+
+# Cache
+.cache/
+
+# Generated files
+*.log
+*.out
+core
+core.*
+
+# Test outputs
+Testing/
+*.gcov
+*.gcda
+*.gcno
+
+# Binaries
+nvecd
+mygram-cli
+*.exe
+
+# Dependencies
+third_party/*
+!third_party/CMakeLists.txt
+
+# Snapshots & Data
+/var/
+*.snap
+snapshots/
+
+# SQL files (may contain sensitive data)
+*.sql
+!support/docker/mysql/init/*.sql
+
+# Backup directory
+backup/
+
+# Docker
+.env
+.env.prod
+.env.local
+docker-compose.override.yml
+logs/
+
+# Coverage reports
+coverage/
+*.info

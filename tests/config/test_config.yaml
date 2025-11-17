@@ -1,0 +1,61 @@
+# Test configuration for nvecd unit tests
+
+events:
+  ctx_buffer_size: 100
+  decay_interval_sec: 1800
+  decay_alpha: 0.95
+
+vectors:
+  default_dimension: 384
+  distance_metric: "dot"
+
+similarity:
+  default_top_k: 50
+  max_top_k: 500
+  fusion_alpha: 0.7
+  fusion_beta: 0.3
+
+snapshot:
+  dir: "/tmp/nvecd_test_snapshots"
+  default_filename: "test.snapshot"
+  interval_sec: 600
+  retain: 5
+
+performance:
+  thread_pool_size: 4
+  max_connections: 500
+  connection_timeout_sec: 60
+
+api:
+  tcp:
+    bind: "127.0.0.1"
+    port: 12345
+  http:
+    enable: true
+    bind: "0.0.0.0"
+    port: 9090
+    enable_cors: true
+    cors_allow_origin: "https://example.com"
+  rate_limiting:
+    enable: true
+    capacity: 50
+    refill_rate: 5
+    max_clients: 1000
+
+network:
+  allow_cidrs:
+    - "127.0.0.1/32"
+    - "192.168.1.0/24"
+
+logging:
+  level: "debug"
+  json: false
+  file: "/tmp/nvecd_test.log"
+
+cache:
+  enabled: false
+  max_memory_mb: 16
+  min_query_cost_ms: 5.0
+  ttl_seconds: 1800
+  compression_enabled: false
+  eviction_batch_size: 5
