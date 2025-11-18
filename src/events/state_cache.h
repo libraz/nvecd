@@ -23,12 +23,9 @@ struct StateKey {
   std::string ctx;  ///< Context identifier
   std::string id;   ///< Event ID
 
-  StateKey(std::string ctx_, std::string id_)
-      : ctx(std::move(ctx_)), id(std::move(id_)) {}
+  StateKey(std::string ctx_, std::string id_) : ctx(std::move(ctx_)), id(std::move(id_)) {}
 
-  bool operator==(const StateKey& other) const {
-    return ctx == other.ctx && id == other.id;
-  }
+  bool operator==(const StateKey& other) const { return ctx == other.ctx && id == other.id; }
 };
 
 }  // namespace nvecd::events
@@ -132,10 +129,10 @@ class StateCache {
    * @brief Get cache statistics
    */
   struct Statistics {
-    size_t size;           ///< Current number of entries
-    size_t max_size;       ///< Maximum cache size
-    uint64_t total_hits;   ///< Total duplicate detections
-    uint64_t total_misses; ///< Total new states
+    size_t size;            ///< Current number of entries
+    size_t max_size;        ///< Maximum cache size
+    uint64_t total_hits;    ///< Total duplicate detections
+    uint64_t total_misses;  ///< Total new states
   };
 
   Statistics GetStatistics() const;
@@ -146,7 +143,7 @@ class StateCache {
 
   size_t max_size_;  ///< Maximum cache size
 
-  mutable std::shared_mutex mutex_;  ///< Reader-writer lock
+  mutable std::shared_mutex mutex_;           ///< Reader-writer lock
   std::unordered_map<StateKey, int> states_;  ///< Key -> last_score (or kDeletedScore)
 
   // Statistics (atomic for thread-safe access)

@@ -34,7 +34,7 @@ std::vector<uint8_t> ResultCompressor::CompressSimilarityResults(
 
   for (const auto& result : results) {
     SerializedSimilarityResult ser{};
-    std::strncpy(ser.id, result.id.c_str(), sizeof(ser.id) - 1);
+    std::strncpy(ser.id, result.item_id.c_str(), sizeof(ser.id) - 1);
     ser.id[sizeof(ser.id) - 1] = '\0';  // Ensure null-termination
     ser.score = result.score;
     serialized.push_back(ser);

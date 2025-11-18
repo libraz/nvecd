@@ -33,13 +33,13 @@ namespace {
 constexpr size_t kReceiveBufferSize = 65536;  // Receive buffer size (64KB)
 constexpr size_t kOkPrefixLength = 3;         // "OK " length
 constexpr size_t kErrorPrefixLength = 6;      // "ERROR " length
-constexpr int kMaxWaitReadyRetries = 100;    // Maximum retries for --wait-ready (~5 minutes)
+constexpr int kMaxWaitReadyRetries = 100;     // Maximum retries for --wait-ready (~5 minutes)
 
 #ifdef USE_READLINE
 // Command list for tab completion
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays,cppcoreguidelines-avoid-non-const-global-variables)
-const char* command_list[] = {"EVENT",  "VECSET", "SIM",  "SIMV",  "INFO",  "CONFIG", "CACHE",
-                              "DUMP",   "DEBUG",  "quit", "exit",  "help",  nullptr};
+const char* command_list[] = {"EVENT", "VECSET", "SIM",  "SIMV", "INFO", "CONFIG", "CACHE",
+                              "DUMP",  "DEBUG",  "quit", "exit", "help", nullptr};
 
 /**
  * @brief Command name generator for readline completion

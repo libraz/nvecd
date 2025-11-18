@@ -16,10 +16,10 @@ namespace nvecd::vectors::simd {
  * @brief CPU SIMD feature flags
  */
 enum class CpuFeatures : uint32_t {
-  kScalar = 0,      ///< No SIMD support (fallback)
-  kSSE2 = 1 << 0,   ///< x86 SSE2 (baseline, not used yet)
-  kAVX2 = 1 << 1,   ///< x86_64 AVX2 (256-bit SIMD)
-  kNEON = 1 << 2,   ///< ARM NEON (128-bit SIMD)
+  kScalar = 0,     ///< No SIMD support (fallback)
+  kSSE2 = 1 << 0,  ///< x86 SSE2 (baseline, not used yet)
+  kAVX2 = 1 << 1,  ///< x86_64 AVX2 (256-bit SIMD)
+  kNEON = 1 << 2,  ///< ARM NEON (128-bit SIMD)
 };
 
 /**

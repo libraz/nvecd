@@ -3,11 +3,11 @@
  * @brief Unit tests for EventStore deduplication
  */
 
-#include "events/event_store.h"
-
 #include <gtest/gtest.h>
 
 #include <thread>
+
+#include "events/event_store.h"
 
 namespace nvecd::events {
 
@@ -48,7 +48,7 @@ TEST_F(EventStoreDeduplicationTest, DuplicateEventIgnored) {
   // Verify only one event in context
   auto events = store.GetEvents("user1");
   EXPECT_EQ(events.size(), 1);
-  EXPECT_EQ(events[0].id, "item1");
+  EXPECT_EQ(events[0].item_id, "item1");
   EXPECT_EQ(events[0].score, 95);
 }
 

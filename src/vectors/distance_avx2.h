@@ -33,12 +33,12 @@ namespace nvecd::vectors::simd {
  */
 inline float HorizontalSumAVX2(__m256 v) {
   // v = [a0, a1, a2, a3, a4, a5, a6, a7]
-  __m128 lo = _mm256_castps256_ps128(v);        // [a0, a1, a2, a3]
-  __m128 hi = _mm256_extractf128_ps(v, 1);      // [a4, a5, a6, a7]
-  __m128 sum128 = _mm_add_ps(lo, hi);           // [a0+a4, a1+a5, a2+a6, a3+a7]
-  sum128 = _mm_hadd_ps(sum128, sum128);         // Horizontal add
-  sum128 = _mm_hadd_ps(sum128, sum128);         // Final horizontal add
-  return _mm_cvtss_f32(sum128);                 // Extract scalar
+  __m128 lo = _mm256_castps256_ps128(v);    // [a0, a1, a2, a3]
+  __m128 hi = _mm256_extractf128_ps(v, 1);  // [a4, a5, a6, a7]
+  __m128 sum128 = _mm_add_ps(lo, hi);       // [a0+a4, a1+a5, a2+a6, a3+a7]
+  sum128 = _mm_hadd_ps(sum128, sum128);     // Horizontal add
+  sum128 = _mm_hadd_ps(sum128, sum128);     // Final horizontal add
+  return _mm_cvtss_f32(sum128);             // Extract scalar
 }
 
 /**
@@ -60,7 +60,7 @@ inline float DotProductAVX2(const float* a, const float* b, size_t n) {
   // Process 8 floats at a time
   size_t i = 0;
   for (; i + kVecSize <= n; i += kVecSize) {
-    __m256 a_vec = _mm256_loadu_ps(a + i);      // Load 8 floats (unaligned)
+    __m256 a_vec = _mm256_loadu_ps(a + i);  // Load 8 floats (unaligned)
     __m256 b_vec = _mm256_loadu_ps(b + i);
     __m256 prod = _mm256_mul_ps(a_vec, b_vec);  // Element-wise multiply
     sum_vec = _mm256_add_ps(sum_vec, prod);     // Accumulate

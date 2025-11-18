@@ -32,12 +32,9 @@ struct EventKey {
   std::string id;   ///< Event ID
   int score;        ///< Event score
 
-  EventKey(std::string ctx_, std::string id_, int score_)
-      : ctx(std::move(ctx_)), id(std::move(id_)), score(score_) {}
+  EventKey(std::string ctx_, std::string id_, int score_) : ctx(std::move(ctx_)), id(std::move(id_)), score(score_) {}
 
-  bool operator==(const EventKey& other) const {
-    return ctx == other.ctx && id == other.id && score == other.score;
-  }
+  bool operator==(const EventKey& other) const { return ctx == other.ctx && id == other.id && score == other.score; }
 };
 
 }  // namespace nvecd::events
@@ -124,10 +121,10 @@ class DedupCache {
    * @brief Get cache statistics
    */
   struct Statistics {
-    size_t size;           ///< Current number of entries
-    size_t max_size;       ///< Maximum cache size
-    uint64_t total_hits;   ///< Total number of duplicate detections
-    uint64_t total_misses; ///< Total number of new events
+    size_t size;            ///< Current number of entries
+    size_t max_size;        ///< Maximum cache size
+    uint64_t total_hits;    ///< Total number of duplicate detections
+    uint64_t total_misses;  ///< Total number of new events
   };
 
   Statistics GetStatistics() const;
@@ -143,11 +140,11 @@ class DedupCache {
     LRUIterator lru_iter;
   };
 
-  size_t max_size_;         ///< Maximum cache size
-  uint32_t window_sec_;     ///< Time window in seconds
+  size_t max_size_;      ///< Maximum cache size
+  uint32_t window_sec_;  ///< Time window in seconds
 
-  mutable std::shared_mutex mutex_;  ///< Reader-writer lock
-  LRUList lru_list_;                 ///< LRU list (front = most recent)
+  mutable std::shared_mutex mutex_;                 ///< Reader-writer lock
+  LRUList lru_list_;                                ///< LRU list (front = most recent)
   std::unordered_map<EventKey, CacheEntry> cache_;  ///< Key -> Entry map
 
   // Statistics (atomic for thread-safe const access)

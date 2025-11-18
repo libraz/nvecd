@@ -15,7 +15,10 @@
 #include <stdexcept>
 #include <thread>
 
+#include "cache/similarity_cache.h"
 #include "server/connection_io_handler.h"
+#include "server/http_server.h"
+#include "server/request_dispatcher.h"
 #include "utils/error.h"
 #include "utils/structured_log.h"
 
@@ -24,10 +27,9 @@ namespace nvecd::server {
 namespace {
 constexpr int kShutdownTimeoutMs = 5000;  // Wait up to 5s for connections to close
 constexpr int kShutdownCheckIntervalMs = 100;
-constexpr size_t kMaxQueryLength = 1024 * 1024;  // 1MB max query size
 }  // namespace
 
-NvecdServer::NvecdServer(config::Config config) : config_(std::move(config)) {}
+NvecdServer::NvecdServer(const config::Config& config) : config_(config) {}
 
 NvecdServer::~NvecdServer() {
   if (running_.load()) {
@@ -177,8 +179,8 @@ utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
   spdlog::info("VectorStore initialized (default_dimension={})", config_.vectors.default_dimension);
 
   // Create SimilarityEngine
-  similarity_engine_ = std::make_unique<similarity::SimilarityEngine>(event_store_.get(), co_index_.get(),
-                                                                      vector_store_.get(), config_.similarity);
+  similarity_engine_ =
+      std::make_unique<similarity::SimilarityEngine>(event_store_.get(), co_index_.get(), vector_store_.get(), config_.similarity);
   spdlog::info("SimilarityEngine initialized (fusion: alpha={}, beta={})", config_.similarity.fusion_alpha,
                config_.similarity.fusion_beta);
 
@@ -230,8 +232,8 @@ void NvecdServer::HandleConnection(int client_fd) {
 
     // Create I/O configuration
     IOConfig io_config;
-    io_config.recv_buffer_size = kDefaultRecvBufferSize;
-    io_config.max_query_length = kMaxQueryLength;
+    io_config.recv_buffer_size = 4096;         // 4KB
+    io_config.max_query_length = 1024 * 1024;  // 1MB
     io_config.recv_timeout_sec = config_.perf.connection_timeout_sec;
 
     // Create request processor

@@ -3,11 +3,11 @@
  * @brief Unit tests for ADD/SET/DEL event types
  */
 
-#include "events/event_store.h"
-
 #include <gtest/gtest.h>
 
 #include <thread>
+
+#include "events/event_store.h"
 
 namespace nvecd::events {
 
@@ -34,7 +34,7 @@ TEST_F(EventTypeTest, AddTypeBasic) {
 
   auto events = store.GetEvents("user1");
   ASSERT_EQ(events.size(), 1);
-  EXPECT_EQ(events[0].id, "item1");
+  EXPECT_EQ(events[0].item_id, "item1");
   EXPECT_EQ(events[0].score, 100);
   EXPECT_EQ(events[0].type, EventType::ADD);
 }
@@ -78,7 +78,7 @@ TEST_F(EventTypeTest, SetTypeBasic) {
 
   auto events = store.GetEvents("user1");
   ASSERT_EQ(events.size(), 1);
-  EXPECT_EQ(events[0].id, "like:item1");
+  EXPECT_EQ(events[0].item_id, "like:item1");
   EXPECT_EQ(events[0].score, 100);
   EXPECT_EQ(events[0].type, EventType::SET);
 }
@@ -178,7 +178,7 @@ TEST_F(EventTypeTest, DelTypeBasic) {
 
   auto events = store.GetEvents("user1");
   ASSERT_EQ(events.size(), 1);
-  EXPECT_EQ(events[0].id, "like:item1");
+  EXPECT_EQ(events[0].item_id, "like:item1");
   EXPECT_EQ(events[0].score, 0);  // DEL always stores score=0
   EXPECT_EQ(events[0].type, EventType::DEL);
 }

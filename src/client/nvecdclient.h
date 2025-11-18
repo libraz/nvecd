@@ -28,8 +28,8 @@ namespace nvecd::client {
  * @brief Similarity search result item
  */
 struct SimResultItem {
-  std::string id;    ///< Document/vector ID
-  float score;       ///< Similarity score
+  std::string id;  ///< Document/vector ID
+  float score;     ///< Similarity score
 
   SimResultItem() = default;
   SimResultItem(std::string id_value, float score_value) : id(std::move(id_value)), score(score_value) {}
@@ -53,8 +53,8 @@ struct ServerInfo {
   uint64_t uptime_seconds = 0;
   uint64_t total_requests = 0;
   uint64_t active_connections = 0;
-  uint64_t event_count = 0;         ///< Total events stored
-  uint64_t vector_count = 0;        ///< Total vectors stored
+  uint64_t event_count = 0;            ///< Total events stored
+  uint64_t vector_count = 0;           ///< Total vectors stored
   uint64_t co_occurrence_entries = 0;  ///< Co-occurrence index entries
 };
 
@@ -161,7 +161,7 @@ class NvecdClient {
    * @return Expected<void, Error>
    */
   nvecd::utils::Expected<void, nvecd::utils::Error> Event(const std::string& ctx, const std::string& type,
-                                                           const std::string& id, int score = 0) const;
+                                                          const std::string& id, int score = 0) const;
 
   /**
    * @brief Register vector (VECSET command)
@@ -171,7 +171,7 @@ class NvecdClient {
    * @return Expected<void, Error>
    */
   nvecd::utils::Expected<void, nvecd::utils::Error> Vecset(const std::string& id,
-                                                            const std::vector<float>& vector) const;
+                                                           const std::vector<float>& vector) const;
 
   /**
    * @brief Similarity search by ID (SIM command)

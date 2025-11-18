@@ -6,12 +6,12 @@
  * Reusability: 70% (adapted for nvecd command types)
  */
 
-#include "server/server_types.h"
-
 #include <gtest/gtest.h>
 
 #include <thread>
 #include <vector>
+
+#include "server/server_types.h"
 
 using namespace nvecd::server;
 

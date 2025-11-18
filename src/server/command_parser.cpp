@@ -140,9 +140,8 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request) 
     // EVENT <ctx> SET <id> <score>
     // EVENT <ctx> DEL <id>
     if (tokens.size() < 4) {
-      return utils::MakeUnexpected(
-          utils::MakeError(utils::ErrorCode::kCommandSyntaxError,
-                          "EVENT requires at least 3 arguments: <ctx> <type> <id> [<score>]"));
+      return utils::MakeUnexpected(utils::MakeError(
+          utils::ErrorCode::kCommandSyntaxError, "EVENT requires at least 3 arguments: <ctx> <type> <id> [<score>]"));
     }
 
     cmd.type = CommandType::kEvent;
@@ -153,9 +152,8 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request) 
     if (type_str == "ADD") {
       cmd.event_type = events::EventType::ADD;
       if (tokens.size() != 5) {
-        return utils::MakeUnexpected(
-            utils::MakeError(utils::ErrorCode::kCommandSyntaxError,
-                            "EVENT ADD requires 4 arguments: <ctx> ADD <id> <score>"));
+        return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandSyntaxError,
+                                                      "EVENT ADD requires 4 arguments: <ctx> ADD <id> <score>"));
       }
       cmd.id = tokens[3];
       auto score_result = ParseInt(tokens[4]);
@@ -167,9 +165,8 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request) 
     } else if (type_str == "SET") {
       cmd.event_type = events::EventType::SET;
       if (tokens.size() != 5) {
-        return utils::MakeUnexpected(
-            utils::MakeError(utils::ErrorCode::kCommandSyntaxError,
-                            "EVENT SET requires 4 arguments: <ctx> SET <id> <score>"));
+        return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandSyntaxError,
+                                                      "EVENT SET requires 4 arguments: <ctx> SET <id> <score>"));
       }
       cmd.id = tokens[3];
       auto score_result = ParseInt(tokens[4]);
@@ -182,23 +179,21 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request) 
       cmd.event_type = events::EventType::DEL;
       if (tokens.size() != 4) {
         return utils::MakeUnexpected(
-            utils::MakeError(utils::ErrorCode::kCommandSyntaxError,
-                            "EVENT DEL requires 3 arguments: <ctx> DEL <id>"));
+            utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "EVENT DEL requires 3 arguments: <ctx> DEL <id>"));
       }
       cmd.id = tokens[3];
       cmd.score = 0;  // DEL doesn't use score
 
     } else {
-      return utils::MakeUnexpected(
-          utils::MakeError(utils::ErrorCode::kCommandSyntaxError,
-                          "Invalid EVENT type: " + type_str + " (must be ADD, SET, or DEL)"));
+      return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandSyntaxError,
+                                                    "Invalid EVENT type: " + type_str + " (must be ADD, SET, or DEL)"));
     }
 
   } else if (cmd_name == "VECSET") {
     // VECSET <id> <f1> <f2> ... <fN>
     if (tokens.size() < 3) {
-      return utils::MakeUnexpected(
-          utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "VECSET requires at least 2 arguments: <id> <floats>"));
+      return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandSyntaxError,
+                                                    "VECSET requires at least 2 arguments: <id> <floats>"));
     }
     cmd.type = CommandType::kVecset;
     cmd.id = tokens[1];
@@ -246,8 +241,8 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request) 
   } else if (cmd_name == "SIMV") {
     // SIMV <top_k> <f1> <f2> ... <fN>
     if (tokens.size() < 3) {
-      return utils::MakeUnexpected(
-          utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "SIMV requires at least 2 arguments: <top_k> <floats>"));
+      return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandSyntaxError,
+                                                    "SIMV requires at least 2 arguments: <top_k> <floats>"));
     }
     cmd.type = CommandType::kSimv;
 
@@ -338,7 +333,7 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request) 
     // CACHE STATS|CLEAR|ENABLE|DISABLE
     if (tokens.size() < 2) {
       return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandSyntaxError,
-                                                     "CACHE requires subcommand: STATS|CLEAR|ENABLE|DISABLE"));
+                                                    "CACHE requires subcommand: STATS|CLEAR|ENABLE|DISABLE"));
     }
     std::string subcommand = ToUpper(tokens[1]);
     if (subcommand == "STATS") {

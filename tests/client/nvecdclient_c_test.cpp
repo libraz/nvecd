@@ -33,12 +33,12 @@ class NvecdClientCTest : public ::testing::Test {
     config_ = std::make_unique<config::Config>();
     config_->api.tcp.port = kTestPort;
     config_->api.http.enable = false;
-    config_->perf.thread_pool_size = 2;      // NOLINT
-    config_->events.ctx_buffer_size = 100;          // NOLINT
-    config_->events.decay_interval_sec = 60;        // NOLINT
-    config_->events.decay_alpha = 0.9;              // NOLINT
-    config_->vectors.default_dimension = 3;         // Small dimension for tests
-    config_->network.allow_cidrs = {"127.0.0.1/32"};  // Allow localhost
+    config_->perf.thread_pool_size = 2;                   // NOLINT
+    config_->events.ctx_buffer_size = 100;                // NOLINT
+    config_->events.decay_interval_sec = 60;              // NOLINT
+    config_->events.decay_alpha = 0.9;                    // NOLINT
+    config_->vectors.default_dimension = 3;               // Small dimension for tests
+    config_->network.allow_cidrs = {"127.0.0.1/32"};      // Allow localhost
     config_->snapshot.dir = "/tmp/nvecd_test_snapshots";  // Use temp dir for tests
 
     // Create and start server (server owns stores)
@@ -73,8 +73,8 @@ TEST_F(NvecdClientCTest, CreateAndConnect) {
   NvecdClientConfig_C config = {};
   config.host = "127.0.0.1";
   config.port = port_;
-  config.timeout_ms = 5000;            // NOLINT
-  config.recv_buffer_size = 65536;     // NOLINT
+  config.timeout_ms = 5000;         // NOLINT
+  config.recv_buffer_size = 65536;  // NOLINT
 
   NvecdClient_C* client = nvecdclient_create(&config);
   ASSERT_NE(client, nullptr);

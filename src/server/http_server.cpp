@@ -670,7 +670,7 @@ void HttpServer::HandleSim(const httplib::Request& req, httplib::Response& res) 
     }
 
     std::string item_id = body["id"];
-    int top_k = static_cast<int>(body.value("top_k", handler_context_->full_config->similarity.default_top_k));
+    int top_k = static_cast<int>(body.value("top_k", full_config_->similarity.default_top_k));
     std::string mode = body.value("mode", "fusion");
 
     // Check if similarity engine is initialized
@@ -748,7 +748,7 @@ void HttpServer::HandleSimv(const httplib::Request& req, httplib::Response& res)
     }
 
     std::vector<float> vector = body["vector"].get<std::vector<float>>();
-    int top_k = static_cast<int>(body.value("top_k", handler_context_->full_config->similarity.default_top_k));
+    int top_k = static_cast<int>(body.value("top_k", full_config_->similarity.default_top_k));
 
     // Check if similarity engine is initialized
     if (handler_context_->similarity_engine == nullptr) {

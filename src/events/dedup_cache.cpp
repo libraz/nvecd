@@ -7,11 +7,9 @@
 
 namespace nvecd::events {
 
-DedupCache::DedupCache(size_t max_size, uint32_t window_sec)
-    : max_size_(max_size), window_sec_(window_sec) {}
+DedupCache::DedupCache(size_t max_size, uint32_t window_sec) : max_size_(max_size), window_sec_(window_sec) {}
 
-bool DedupCache::IsDuplicate(const EventKey& key,
-                              uint64_t current_timestamp) const {
+bool DedupCache::IsDuplicate(const EventKey& key, uint64_t current_timestamp) const {
   // Window of 0 means deduplication is disabled
   if (window_sec_ == 0) {
     total_misses_.fetch_add(1, std::memory_order_relaxed);
@@ -28,8 +26,7 @@ bool DedupCache::IsDuplicate(const EventKey& key,
 
   // Check if within time window
   uint64_t prev_timestamp = it->second.timestamp;
-  if (current_timestamp >= prev_timestamp &&
-      (current_timestamp - prev_timestamp) <= window_sec_) {
+  if (current_timestamp >= prev_timestamp && (current_timestamp - prev_timestamp) <= window_sec_) {
     total_hits_.fetch_add(1, std::memory_order_relaxed);
     return true;  // Duplicate within window
   }

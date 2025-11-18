@@ -188,8 +188,7 @@ TEST_F(DedupCacheTest, ThreadSafety) {
   for (int t = 0; t < kNumThreads; ++t) {
     threads.emplace_back([&cache, t]() {
       for (int i = 0; i < kOpsPerThread; ++i) {
-        EventKey key("ctx" + std::to_string(t),
-                     "id" + std::to_string(i % 100), i % 10);
+        EventKey key("ctx" + std::to_string(t), "id" + std::to_string(i % 100), i % 10);
         uint64_t ts = 1000 + (i / 10);
 
         // Mix of reads and writes

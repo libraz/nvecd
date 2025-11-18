@@ -36,12 +36,12 @@ class NvecdClientTest : public ::testing::Test {
     config_ = std::make_unique<config::Config>();
     config_->api.tcp.port = kTestPort;  // Random port
     config_->api.http.enable = false;
-    config_->perf.thread_pool_size = 2;      // NOLINT
-    config_->events.ctx_buffer_size = 100;          // NOLINT
-    config_->events.decay_interval_sec = 60;        // NOLINT
-    config_->events.decay_alpha = 0.9;              // NOLINT
-    config_->vectors.default_dimension = 3;         // Small dimension for tests
-    config_->network.allow_cidrs = {"127.0.0.1/32"};  // Allow localhost
+    config_->perf.thread_pool_size = 2;                   // NOLINT
+    config_->events.ctx_buffer_size = 100;                // NOLINT
+    config_->events.decay_interval_sec = 60;              // NOLINT
+    config_->events.decay_alpha = 0.9;                    // NOLINT
+    config_->vectors.default_dimension = 3;               // Small dimension for tests
+    config_->network.allow_cidrs = {"127.0.0.1/32"};      // Allow localhost
     config_->snapshot.dir = "/tmp/nvecd_test_snapshots";  // Use temp dir for tests
 
     // Create and start server (server owns stores)
@@ -198,7 +198,7 @@ TEST_F(NvecdClientTest, SimNonExistentId) {
   ASSERT_TRUE(client.Connect());
 
   auto result = client.Sim("nonexistent", 10, "vectors");  // NOLINT
-  EXPECT_FALSE(result);  // Should fail for non-existent ID
+  EXPECT_FALSE(result);                                    // Should fail for non-existent ID
 }
 
 //
@@ -219,8 +219,8 @@ TEST_F(NvecdClientTest, SimvSuccess) {
   ASSERT_TRUE(vec1_result) << "Vecset vec1 failed: " << vec1_result.error().message();
 
   // Search by vector
-  std::vector<float> query = {0.9F, 0.1F, 0.0F};  // NOLINT
-  auto result = client.Simv(query, 10, "vectors");           // NOLINT
+  std::vector<float> query = {0.9F, 0.1F, 0.0F};    // NOLINT
+  auto result = client.Simv(query, 10, "vectors");  // NOLINT
   ASSERT_TRUE(result) << "Simv failed: " << result.error().message();
 
   EXPECT_EQ(result->mode, "vectors");

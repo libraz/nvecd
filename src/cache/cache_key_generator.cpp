@@ -30,7 +30,8 @@ CacheKey GenerateSimvCacheKey(const std::vector<float>& vector, int top_k, const
 
 std::string HashVector(const std::vector<float>& vector) {
   // Hash raw bytes of vector using MD5
-  const uint8_t* data = reinterpret_cast<const uint8_t*>(vector.data());  // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+  const uint8_t* data =
+      reinterpret_cast<const uint8_t*>(vector.data());  // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
   size_t size_bytes = vector.size() * sizeof(float);
 
   uint8_t digest[16];

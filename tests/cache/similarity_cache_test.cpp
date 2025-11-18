@@ -43,10 +43,7 @@ TEST(SimilarityCacheTest, SingleQuery) {
 
   auto key = MakeKey("item1", 10);
 
-  std::vector<similarity::SimilarityResult> results = {
-      {"item2", 0.95f},
-      {"item3", 0.90f}
-  };
+  std::vector<similarity::SimilarityResult> results = {{"item2", 0.95f}, {"item3", 0.90f}};
 
   // First lookup - miss
   auto retrieved1 = cache.Lookup(key);
@@ -60,7 +57,7 @@ TEST(SimilarityCacheTest, SingleQuery) {
   auto retrieved2 = cache.Lookup(key);
   ASSERT_TRUE(retrieved2.has_value());
   EXPECT_EQ(retrieved2->size(), 2);
-  EXPECT_EQ((*retrieved2)[0].id, "item2");
+  EXPECT_EQ((*retrieved2)[0].item_id, "item2");
 
   auto stats = cache.GetStatistics();
   EXPECT_EQ(stats.total_queries, 2);  // 1 miss + 1 hit
@@ -77,9 +74,7 @@ TEST(SimilarityCacheTest, HitRate_RepeatedQueries) {
 
   auto key = MakeKey("item1", 10);
 
-  std::vector<similarity::SimilarityResult> results = {
-      {"item2", 0.95f}
-  };
+  std::vector<similarity::SimilarityResult> results = {{"item2", 0.95f}};
 
   // First query - cache miss
   auto result1 = cache.Lookup(key);
@@ -111,9 +106,7 @@ TEST(SimilarityCacheTest, HitRate_MultipleKeys) {
   for (int i = 0; i < 5; ++i) {
     auto key = MakeKey("item" + std::to_string(i), 10);
 
-    std::vector<similarity::SimilarityResult> results = {
-        {"result" + std::to_string(i), 0.95f}
-    };
+    std::vector<similarity::SimilarityResult> results = {{"result" + std::to_string(i), 0.95f}};
 
     // Miss
     auto result = cache.Lookup(key);
@@ -145,9 +138,7 @@ TEST(SimilarityCacheTest, HitRate_WorkloadSimulation) {
   for (int i = 0; i < unique_queries; ++i) {
     auto key = MakeKey("item" + std::to_string(i), 10);
 
-    std::vector<similarity::SimilarityResult> results = {
-        {"result" + std::to_string(i), 0.95f}
-    };
+    std::vector<similarity::SimilarityResult> results = {{"result" + std::to_string(i), 0.95f}};
 
     cache.Insert(key, results, 1.0);
   }
@@ -192,8 +183,8 @@ TEST(SimilarityCacheTest, Eviction_MemoryLimit) {
   }
 
   auto stats = cache.GetStatistics();
-  EXPECT_LT(stats.current_entries, entry_count);        // Some entries should be evicted
-  EXPECT_LE(stats.current_memory_bytes, 5 * 1024);      // Should not exceed limit
+  EXPECT_LT(stats.current_entries, entry_count);    // Some entries should be evicted
+  EXPECT_LE(stats.current_memory_bytes, 5 * 1024);  // Should not exceed limit
   // Either evictions occurred, or some inserts were rejected due to size
   EXPECT_TRUE(stats.evictions > 0 || successful_inserts < entry_count);
 }

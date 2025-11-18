@@ -194,11 +194,11 @@ class SimilarityCache {
    * @brief Cached entry data structure
    */
   struct CachedEntry {
-    std::vector<uint8_t> compressed_data;  ///< Compressed result data
-    size_t original_size = 0;              ///< Original size before compression
-    double query_cost_ms = 0.0;            ///< Original query execution time
+    std::vector<uint8_t> compressed_data;              ///< Compressed result data
+    size_t original_size = 0;                          ///< Original size before compression
+    double query_cost_ms = 0.0;                        ///< Original query execution time
     std::chrono::steady_clock::time_point created_at;  ///< Creation timestamp
-    std::atomic<bool> invalidated{false};  ///< Invalidation flag (lock-free)
+    std::atomic<bool> invalidated{false};              ///< Invalidation flag (lock-free)
 
     CachedEntry() = default;
     CachedEntry(const CachedEntry& other)

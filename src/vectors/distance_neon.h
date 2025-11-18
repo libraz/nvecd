@@ -42,8 +42,8 @@ inline float DotProductNEON(const float* a, const float* b, size_t n) {
   // Process 4 floats at a time
   size_t i = 0;
   for (; i + kVecSize <= n; i += kVecSize) {
-    float32x4_t a_vec = vld1q_f32(a + i);              // Load 4 floats from a
-    float32x4_t b_vec = vld1q_f32(b + i);              // Load 4 floats from b
+    float32x4_t a_vec = vld1q_f32(a + i);        // Load 4 floats from a
+    float32x4_t b_vec = vld1q_f32(b + i);        // Load 4 floats from b
     sum_vec = vmlaq_f32(sum_vec, a_vec, b_vec);  // sum += a * b (fused)
   }
 

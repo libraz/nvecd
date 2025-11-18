@@ -24,8 +24,8 @@ namespace defaults {
 constexpr uint32_t kCtxBufferSize = 50;
 constexpr uint32_t kDecayIntervalSec = 3600;
 constexpr double kDecayAlpha = 0.99;
-constexpr uint32_t kDedupWindowSec = 60;      // 60 seconds deduplication window
-constexpr uint32_t kDedupCacheSize = 10000;   // 10k entries in dedup cache
+constexpr uint32_t kDedupWindowSec = 60;     // 60 seconds deduplication window
+constexpr uint32_t kDedupCacheSize = 10000;  // 10k entries in dedup cache
 
 // Vector store defaults
 constexpr uint32_t kDefaultDimension = 768;

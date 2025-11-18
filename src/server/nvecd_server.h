@@ -16,6 +16,7 @@
 #include "events/co_occurrence_index.h"
 #include "events/event_store.h"
 #include "server/connection_acceptor.h"
+#include "server/http_server.h"
 #include "server/request_dispatcher.h"
 #include "server/server_types.h"
 #include "server/thread_pool.h"
@@ -61,7 +62,7 @@ class NvecdServer {
    * @brief Construct nvecd server
    * @param config Server configuration
    */
-  explicit NvecdServer(config::Config config);
+  explicit NvecdServer(const config::Config& config);
 
   /**
    * @brief Destructor (calls Stop if running)
@@ -154,6 +155,7 @@ class NvecdServer {
   std::unique_ptr<events::CoOccurrenceIndex> co_index_;
   std::unique_ptr<vectors::VectorStore> vector_store_;
   std::unique_ptr<similarity::SimilarityEngine> similarity_engine_;
+  std::unique_ptr<cache::SimilarityCache> cache_;
 
   // Handler context (must be declared before dispatcher_ to ensure proper initialization order)
   HandlerContext handler_ctx_{
@@ -161,8 +163,9 @@ class NvecdServer {
       nullptr,     // co_index
       nullptr,     // vector_store
       nullptr,     // similarity_engine
+      nullptr,     // cache
       stats_,      // stats
-      &config_,    // full_config
+      &config_,    // config
       loading_,    // loading
       read_only_,  // read_only
       ""           // dump_dir - Will be initialized from config in InitializeComponents
@@ -172,6 +175,7 @@ class NvecdServer {
   std::unique_ptr<RequestDispatcher> dispatcher_;
   std::unique_ptr<ThreadPool> thread_pool_;
   std::unique_ptr<ConnectionAcceptor> acceptor_;
+  std::unique_ptr<HttpServer> http_server_;  // HTTP API server (optional)
 };
 
 }  // namespace nvecd::server

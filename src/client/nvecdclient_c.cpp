@@ -48,8 +48,8 @@ NvecdClient_C* nvecdclient_create(const NvecdClientConfig_C* config) {
 
   ClientConfig cpp_config;
   cpp_config.host = (config->host != nullptr) ? config->host : "127.0.0.1";
-  cpp_config.port = config->port != 0 ? config->port : 11017;                              // NOLINT
-  cpp_config.timeout_ms = config->timeout_ms != 0 ? config->timeout_ms : 5000;             // NOLINT
+  cpp_config.port = config->port != 0 ? config->port : 11017;                                      // NOLINT
+  cpp_config.timeout_ms = config->timeout_ms != 0 ? config->timeout_ms : 5000;                     // NOLINT
   cpp_config.recv_buffer_size = config->recv_buffer_size != 0 ? config->recv_buffer_size : 65536;  // NOLINT
 
   client_c->client = std::make_unique<NvecdClient>(cpp_config);
@@ -57,7 +57,9 @@ NvecdClient_C* nvecdclient_create(const NvecdClientConfig_C* config) {
   return client_c;
 }
 
-void nvecdclient_destroy(NvecdClient_C* client) { delete client; }
+void nvecdclient_destroy(NvecdClient_C* client) {
+  delete client;
+}
 
 int nvecdclient_connect(NvecdClient_C* client) {
   if (client == nullptr || client->client == nullptr) {
@@ -383,7 +385,9 @@ void nvecdclient_free_server_info(NvecdServerInfo_C* info) {
   free(info);
 }
 
-void nvecdclient_free_string(char* str) { free(str); }
+void nvecdclient_free_string(char* str) {
+  free(str);
+}
 
 // NOLINTEND(readability-identifier-naming, cppcoreguidelines-owning-memory,
 // cppcoreguidelines-no-malloc, readability-implicit-bool-conversion)

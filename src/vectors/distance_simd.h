@@ -40,9 +40,9 @@ using L2DistanceFunc = float (*)(const float*, const float*, size_t);
  * selected at runtime based on CPU features.
  */
 struct DistanceFunctions {
-  DotProductFunc dot_product;      ///< Optimal dot product implementation
-  L2NormFunc l2_norm;              ///< Optimal L2 norm implementation
-  L2DistanceFunc l2_distance;      ///< Optimal L2 distance implementation
+  DotProductFunc dot_product;       ///< Optimal dot product implementation
+  L2NormFunc l2_norm;               ///< Optimal L2 norm implementation
+  L2DistanceFunc l2_distance;       ///< Optimal L2 distance implementation
   const char* implementation_name;  ///< Name for logging (e.g., "NEON", "AVX2")
 };
 
@@ -69,22 +69,19 @@ inline const DistanceFunctions& GetOptimalImpl() {
 #ifdef __AVX2__
     // AVX2 available at compile-time, check runtime support
     if (cpu.has_avx2) {
-      return DistanceFunctions{DotProductAVX2, L2NormAVX2, L2DistanceAVX2,
-                               "AVX2"};
+      return DistanceFunctions{DotProductAVX2, L2NormAVX2, L2DistanceAVX2, "AVX2"};
     }
 #endif
 
 #ifdef __ARM_NEON
     // NEON available at compile-time, check runtime support
     if (cpu.has_neon) {
-      return DistanceFunctions{DotProductNEON, L2NormNEON, L2DistanceNEON,
-                               "NEON"};
+      return DistanceFunctions{DotProductNEON, L2NormNEON, L2DistanceNEON, "NEON"};
     }
 #endif
 
     // Fallback to scalar implementation
-    return DistanceFunctions{DotProductScalar, L2NormScalar, L2DistanceScalar,
-                             "Scalar"};
+    return DistanceFunctions{DotProductScalar, L2NormScalar, L2DistanceScalar, "Scalar"};
   }();
 
   return impl;

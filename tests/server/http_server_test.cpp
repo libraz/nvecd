@@ -10,18 +10,19 @@
  * - Cache management endpoints
  */
 
+#include "server/http_server.h"
+
 #include <gtest/gtest.h>
 #include <httplib.h>
-#include <nlohmann/json.hpp>
 
 #include <chrono>
+#include <nlohmann/json.hpp>
 #include <thread>
 
 #include "cache/similarity_cache.h"
 #include "config/config.h"
 #include "events/co_occurrence_index.h"
 #include "events/event_store.h"
-#include "server/http_server.h"
 #include "server/server_types.h"
 #include "similarity/similarity_engine.h"
 #include "vectors/vector_store.h"
@@ -47,8 +48,8 @@ class HttpServerTest : public ::testing::Test {
     event_store_ = std::make_unique<events::EventStore>(config_->events);
     co_index_ = std::make_unique<events::CoOccurrenceIndex>();
     vector_store_ = std::make_unique<vectors::VectorStore>(config_->vectors);
-    similarity_engine_ = std::make_unique<similarity::SimilarityEngine>(
-        event_store_.get(), co_index_.get(), vector_store_.get(), config_->similarity);
+    similarity_engine_ = std::make_unique<similarity::SimilarityEngine>(event_store_.get(), co_index_.get(),
+                                                                        vector_store_.get(), config_->similarity);
     cache_ = std::make_unique<cache::SimilarityCache>(10 * 1024 * 1024, 0.1);
 
     // Setup handler context (pointers only, references already set in initializer)

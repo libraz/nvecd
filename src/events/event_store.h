@@ -41,14 +41,14 @@ enum class EventType {
  * @brief Event data structure
  */
 struct Event {
-  std::string id;         ///< Event ID (e.g., item ID)
+  std::string item_id;    ///< Event ID (e.g., item ID)
   int score{0};           ///< Event score/weight
   uint64_t timestamp{0};  ///< Unix timestamp (seconds)
   EventType type;         ///< Event type
 
   Event() = default;
-  Event(std::string id_, int score_, uint64_t timestamp_, EventType type_ = EventType::ADD)
-      : id(std::move(id_)), score(score_), timestamp(timestamp_), type(type_) {}
+  Event(std::string item_id_, int score_, uint64_t timestamp_, EventType type_ = EventType::ADD)
+      : item_id(std::move(item_id_)), score(score_), timestamp(timestamp_), type(type_) {}
 };
 
 /**
@@ -96,14 +96,14 @@ class EventStore {
    * If the context's ring buffer is full, overwrites the oldest event.
    *
    * @param ctx Context identifier (e.g., user ID, session ID)
-   * @param id Event ID (e.g., item ID)
+   * @param item_id Event ID (e.g., item ID)
    * @param score Event score/weight
    * @param type Event type (ADD/SET/DEL)
    * @return Expected<void, Error> Success or error
    *
    * @throws None
    */
-  utils::Expected<void, utils::Error> AddEvent(const std::string& ctx, const std::string& id, int score,
+  utils::Expected<void, utils::Error> AddEvent(const std::string& ctx, const std::string& item_id, int score,
                                                 EventType type = EventType::ADD);
 
   /**
@@ -163,7 +163,7 @@ class EventStore {
   mutable std::shared_mutex mutex_;
   std::unordered_map<std::string, RingBuffer<Event>> ctx_events_;
 
-  std::atomic<uint64_t> total_events_{0};  ///< Total events processed
+  std::atomic<uint64_t> total_events_{0};    ///< Total events processed
   std::atomic<uint64_t> deduped_events_{0};  ///< Total deduplicated events
 
   // Deduplication caches

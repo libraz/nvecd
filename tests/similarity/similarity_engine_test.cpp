@@ -332,8 +332,7 @@ TEST_F(SimilarityEngineTest, FusionParameters_AlphaOnly) {
   SimilarityEngine engine(event_store_.get(), co_index_.get(), vector_store_.get(), config);
 
   // Add both events and vectors
-  std::vector<events::Event> events = {
-      {"item1", 100, 1000}, {"item2", 50, 1001}, {"item3", 25, 1002}};
+  std::vector<events::Event> events = {{"item1", 100, 1000}, {"item2", 50, 1001}, {"item3", 25, 1002}};
   co_index_->UpdateFromEvents("ctx1", events);
 
   ASSERT_TRUE(vector_store_->SetVector("item1", {0.1f, 0.2f, 0.3f}).has_value());
@@ -350,7 +349,7 @@ TEST_F(SimilarityEngineTest, FusionParameters_AlphaOnly) {
 
   // First result should prioritize vector similarity (item3 is most similar)
   if (!vector_results->empty() && !results->empty()) {
-    EXPECT_EQ((*results)[0].id, (*vector_results)[0].id);
+    EXPECT_EQ((*results)[0].item_id, (*vector_results)[0].item_id);
   }
 }
 
@@ -364,8 +363,7 @@ TEST_F(SimilarityEngineTest, FusionParameters_BetaOnly) {
   SimilarityEngine engine(event_store_.get(), co_index_.get(), vector_store_.get(), config);
 
   // Add both events and vectors
-  std::vector<events::Event> events = {
-      {"item1", 100, 1000}, {"item2", 50, 1001}, {"item3", 25, 1002}};
+  std::vector<events::Event> events = {{"item1", 100, 1000}, {"item2", 50, 1001}, {"item3", 25, 1002}};
   co_index_->UpdateFromEvents("ctx1", events);
 
   ASSERT_TRUE(vector_store_->SetVector("item1", {0.1f, 0.2f, 0.3f}).has_value());
@@ -382,7 +380,7 @@ TEST_F(SimilarityEngineTest, FusionParameters_BetaOnly) {
 
   // First result should prioritize event score (item2 has highest event score: 50)
   if (!event_results->empty() && !results->empty()) {
-    EXPECT_EQ((*results)[0].id, (*event_results)[0].id);
+    EXPECT_EQ((*results)[0].item_id, (*event_results)[0].item_id);
   }
 }
 
@@ -430,7 +428,7 @@ TEST_F(SimilarityEngineTest, FusionParameters_AlphaDominant) {
   co_index_->UpdateFromEvents("ctx1", events);
 
   ASSERT_TRUE(vector_store_->SetVector("item1", {0.1f, 0.2f, 0.3f}).has_value());
-  ASSERT_TRUE(vector_store_->SetVector("item_high_event", {0.9f, 0.8f, 0.7f}).has_value());  // Different vector
+  ASSERT_TRUE(vector_store_->SetVector("item_high_event", {0.9f, 0.8f, 0.7f}).has_value());      // Different vector
   ASSERT_TRUE(vector_store_->SetVector("item_high_vector", {0.11f, 0.21f, 0.31f}).has_value());  // Similar vector
 
   auto results = engine.SearchByIdFusion("item1", 10);
@@ -444,19 +442,18 @@ TEST_F(SimilarityEngineTest, FusionParameters_AlphaDominant) {
   size_t high_vector_pos = 0;
 
   for (size_t i = 0; i < results->size(); ++i) {
-    if ((*results)[i].id == "item_high_event") {
+    if ((*results)[i].item_id == "item_high_event") {
       high_event_found = true;
       high_event_pos = i;
     }
-    if ((*results)[i].id == "item_high_vector") {
+    if ((*results)[i].item_id == "item_high_vector") {
       high_vector_found = true;
       high_vector_pos = i;
     }
   }
 
   if (high_event_found && high_vector_found) {
-    EXPECT_LT(high_vector_pos, high_event_pos)
-        << "With alpha=0.8, vector similarity should dominate";
+    EXPECT_LT(high_vector_pos, high_event_pos) << "With alpha=0.8, vector similarity should dominate";
   }
 }
 
@@ -475,7 +472,7 @@ TEST_F(SimilarityEngineTest, FusionParameters_BetaDominant) {
   co_index_->UpdateFromEvents("ctx1", events);
 
   ASSERT_TRUE(vector_store_->SetVector("item1", {0.1f, 0.2f, 0.3f}).has_value());
-  ASSERT_TRUE(vector_store_->SetVector("item_high_event", {0.9f, 0.8f, 0.7f}).has_value());  // Different vector
+  ASSERT_TRUE(vector_store_->SetVector("item_high_event", {0.9f, 0.8f, 0.7f}).has_value());      // Different vector
   ASSERT_TRUE(vector_store_->SetVector("item_high_vector", {0.11f, 0.21f, 0.31f}).has_value());  // Similar vector
 
   auto results = engine.SearchByIdFusion("item1", 10);
@@ -489,19 +486,18 @@ TEST_F(SimilarityEngineTest, FusionParameters_BetaDominant) {
   size_t high_vector_pos = 0;
 
   for (size_t i = 0; i < results->size(); ++i) {
-    if ((*results)[i].id == "item_high_event") {
+    if ((*results)[i].item_id == "item_high_event") {
       high_event_found = true;
       high_event_pos = i;
     }
-    if ((*results)[i].id == "item_high_vector") {
+    if ((*results)[i].item_id == "item_high_vector") {
       high_vector_found = true;
       high_vector_pos = i;
     }
   }
 
   if (high_event_found && high_vector_found) {
-    EXPECT_LT(high_event_pos, high_vector_pos)
-        << "With beta=0.8, event score should dominate";
+    EXPECT_LT(high_event_pos, high_vector_pos) << "With beta=0.8, event score should dominate";
   }
 }
 

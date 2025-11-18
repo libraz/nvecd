@@ -287,8 +287,8 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleDumpSave(con
 
   utils::LogStorageInfo("dump_save", "Attempting to save snapshot to: " + filepath);
 
-  // Check if full_config is available
-  if (ctx_.full_config == nullptr) {
+  // Check if config is available
+  if (ctx_.config == nullptr) {
     std::string error_msg = "Cannot save snapshot: server configuration is not available";
     utils::LogStorageError("dump_save", filepath, error_msg);
     return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kInternalError, error_msg));
@@ -305,7 +305,7 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleDumpSave(con
   FlagGuard read_only_guard(ctx_.read_only);
 
   // Call snapshot_v1 API
-  auto result = storage::snapshot_v1::WriteSnapshotV1(filepath, *ctx_.full_config, *ctx_.event_store, *ctx_.co_index,
+  auto result = storage::snapshot_v1::WriteSnapshotV1(filepath, *ctx_.config, *ctx_.event_store, *ctx_.co_index,
                                                       *ctx_.vector_store);
 
   if (result) {

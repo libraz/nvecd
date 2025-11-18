@@ -73,15 +73,13 @@ TEST_F(DistanceSIMDTest, DotProductCorrectness) {
 #ifdef __AVX2__
     // Test AVX2 implementation
     float avx2_result = DotProductAVX2(vec_a.data(), vec_b.data(), dim);
-    EXPECT_NEAR(scalar_result, avx2_result, tolerance)
-        << "AVX2 DotProduct mismatch at dimension " << dim;
+    EXPECT_NEAR(scalar_result, avx2_result, tolerance) << "AVX2 DotProduct mismatch at dimension " << dim;
 #endif
 
 #ifdef __ARM_NEON
     // Test NEON implementation
     float neon_result = DotProductNEON(vec_a.data(), vec_b.data(), dim);
-    EXPECT_NEAR(scalar_result, neon_result, tolerance)
-        << "NEON DotProduct mismatch at dimension " << dim;
+    EXPECT_NEAR(scalar_result, neon_result, tolerance) << "NEON DotProduct mismatch at dimension " << dim;
 #endif
   }
 }
@@ -101,15 +99,13 @@ TEST_F(DistanceSIMDTest, L2NormCorrectness) {
 #ifdef __AVX2__
     // Test AVX2 implementation
     float avx2_result = L2NormAVX2(vec.data(), dim);
-    EXPECT_NEAR(scalar_result, avx2_result, tolerance)
-        << "AVX2 L2Norm mismatch at dimension " << dim;
+    EXPECT_NEAR(scalar_result, avx2_result, tolerance) << "AVX2 L2Norm mismatch at dimension " << dim;
 #endif
 
 #ifdef __ARM_NEON
     // Test NEON implementation
     float neon_result = L2NormNEON(vec.data(), dim);
-    EXPECT_NEAR(scalar_result, neon_result, tolerance)
-        << "NEON L2Norm mismatch at dimension " << dim;
+    EXPECT_NEAR(scalar_result, neon_result, tolerance) << "NEON L2Norm mismatch at dimension " << dim;
 #endif
   }
 }
@@ -131,15 +127,13 @@ TEST_F(DistanceSIMDTest, L2DistanceCorrectness) {
 #ifdef __AVX2__
     // Test AVX2 implementation
     float avx2_result = L2DistanceAVX2(vec_a.data(), vec_b.data(), dim);
-    EXPECT_NEAR(scalar_result, avx2_result, tolerance)
-        << "AVX2 L2Distance mismatch at dimension " << dim;
+    EXPECT_NEAR(scalar_result, avx2_result, tolerance) << "AVX2 L2Distance mismatch at dimension " << dim;
 #endif
 
 #ifdef __ARM_NEON
     // Test NEON implementation
     float neon_result = L2DistanceNEON(vec_a.data(), vec_b.data(), dim);
-    EXPECT_NEAR(scalar_result, neon_result, tolerance)
-        << "NEON L2Distance mismatch at dimension " << dim;
+    EXPECT_NEAR(scalar_result, neon_result, tolerance) << "NEON L2Distance mismatch at dimension " << dim;
 #endif
   }
 }
@@ -243,10 +237,10 @@ TEST_F(DistanceSIMDTest, PublicAPIUsesOptimalImpl) {
   float cosine = CosineSimilarity(a, b);
 
   // Verify results are reasonable
-  EXPECT_GT(dot, 0.0f);          // Positive dot product
-  EXPECT_GT(norm, 0.0f);         // Positive norm
-  EXPECT_GE(dist, 0.0f);         // Non-negative distance
-  EXPECT_GE(cosine, -1.0f);      // Cosine similarity in [-1, 1]
+  EXPECT_GT(dot, 0.0f);      // Positive dot product
+  EXPECT_GT(norm, 0.0f);     // Positive norm
+  EXPECT_GE(dist, 0.0f);     // Non-negative distance
+  EXPECT_GE(cosine, -1.0f);  // Cosine similarity in [-1, 1]
   EXPECT_LE(cosine, 1.0f);
 }
 

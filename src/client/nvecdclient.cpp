@@ -203,8 +203,7 @@ class NvecdClient::Impl {
   // nvecd-specific commands
   //
 
-  Expected<void, Error> Event(const std::string& ctx, const std::string& type, const std::string& id,
-                               int score) const {
+  Expected<void, Error> Event(const std::string& ctx, const std::string& type, const std::string& id, int score) const {
     if (auto err = ValidateNoControlCharacters(ctx, "context ID")) {
       return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, *err));
     }
@@ -583,14 +582,20 @@ NvecdClient::NvecdClient(NvecdClient&&) noexcept = default;
 
 NvecdClient& NvecdClient::operator=(NvecdClient&&) noexcept = default;
 
-Expected<void, Error> NvecdClient::Connect() { return impl_->Connect(); }
+Expected<void, Error> NvecdClient::Connect() {
+  return impl_->Connect();
+}
 
-void NvecdClient::Disconnect() { impl_->Disconnect(); }
+void NvecdClient::Disconnect() {
+  impl_->Disconnect();
+}
 
-bool NvecdClient::IsConnected() const { return impl_->IsConnected(); }
+bool NvecdClient::IsConnected() const {
+  return impl_->IsConnected();
+}
 
 Expected<void, Error> NvecdClient::Event(const std::string& ctx, const std::string& type, const std::string& id,
-                                          int score) const {
+                                         int score) const {
   return impl_->Event(ctx, type, id, score);
 }
 
@@ -603,27 +608,41 @@ Expected<SimResponse, Error> NvecdClient::Sim(const std::string& id, uint32_t to
 }
 
 Expected<SimResponse, Error> NvecdClient::Simv(const std::vector<float>& vector, uint32_t top_k,
-                                                const std::string& mode) const {
+                                               const std::string& mode) const {
   return impl_->Simv(vector, top_k, mode);
 }
 
-Expected<ServerInfo, Error> NvecdClient::Info() const { return impl_->Info(); }
+Expected<ServerInfo, Error> NvecdClient::Info() const {
+  return impl_->Info();
+}
 
-Expected<std::string, Error> NvecdClient::GetConfig() const { return impl_->GetConfig(); }
+Expected<std::string, Error> NvecdClient::GetConfig() const {
+  return impl_->GetConfig();
+}
 
-Expected<std::string, Error> NvecdClient::Save(const std::string& filepath) const { return impl_->Save(filepath); }
+Expected<std::string, Error> NvecdClient::Save(const std::string& filepath) const {
+  return impl_->Save(filepath);
+}
 
-Expected<std::string, Error> NvecdClient::Load(const std::string& filepath) const { return impl_->Load(filepath); }
+Expected<std::string, Error> NvecdClient::Load(const std::string& filepath) const {
+  return impl_->Load(filepath);
+}
 
-Expected<std::string, Error> NvecdClient::Verify(const std::string& filepath) const { return impl_->Verify(filepath); }
+Expected<std::string, Error> NvecdClient::Verify(const std::string& filepath) const {
+  return impl_->Verify(filepath);
+}
 
 Expected<std::string, Error> NvecdClient::DumpInfo(const std::string& filepath) const {
   return impl_->DumpInfo(filepath);
 }
 
-Expected<void, Error> NvecdClient::EnableDebug() const { return impl_->EnableDebug(); }
+Expected<void, Error> NvecdClient::EnableDebug() const {
+  return impl_->EnableDebug();
+}
 
-Expected<void, Error> NvecdClient::DisableDebug() const { return impl_->DisableDebug(); }
+Expected<void, Error> NvecdClient::DisableDebug() const {
+  return impl_->DisableDebug();
+}
 
 Expected<std::string, Error> NvecdClient::SendCommand(const std::string& command) const {
   return impl_->SendCommand(command);

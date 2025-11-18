@@ -11,11 +11,10 @@
 #include <yaml-cpp/yaml.h>
 
 #include <fstream>
-#include <sstream>
-#include <stdexcept>
-
 #include <nlohmann/json-schema.hpp>
 #include <nlohmann/json.hpp>
+#include <sstream>
+#include <stdexcept>
 
 #include "config/config_schema_embedded.h"
 #include "utils/error.h"

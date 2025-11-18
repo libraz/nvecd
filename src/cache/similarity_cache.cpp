@@ -276,8 +276,7 @@ bool SimilarityCache::EvictForSpace(size_t required_bytes) {
     }
 
     // Calculate entry memory
-    const size_t entry_memory =
-        sizeof(CachedEntry) + iter->second.first.compressed_data.capacity() + sizeof(CacheKey);
+    const size_t entry_memory = sizeof(CachedEntry) + iter->second.first.compressed_data.capacity() + sizeof(CacheKey);
 
     // Remove entry
     lru_list_.pop_back();

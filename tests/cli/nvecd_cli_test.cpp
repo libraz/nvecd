@@ -93,7 +93,8 @@ class NvecdCliTest : public ::testing::Test {
     // CLI binary is in build/bin/, tests run from build/tests/
     // Use printf to send command + quit in interactive mode
     // This ensures the CLI properly processes the command and exits cleanly
-    std::string full_command = "printf '" + command + "\\nquit\\n' | ../bin/nvecd-cli -h 127.0.0.1 -p " + std::to_string(port_) + " 2>&1";
+    std::string full_command =
+        "printf '" + command + "\\nquit\\n' | ../bin/nvecd-cli -h 127.0.0.1 -p " + std::to_string(port_) + " 2>&1";
     return ExecuteCommand(full_command);
   }
 

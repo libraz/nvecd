@@ -82,11 +82,7 @@ std::string AdminHandler::HandleConfigHelp(const std::string& path) {
     return "+OK\n" + result;
 
   } catch (const std::exception& e) {
-    utils::StructuredLog()
-        .Event("server_error")
-        .Field("operation", "config_help")
-        .Field("error", e.what())
-        .Error();
+    utils::StructuredLog().Event("server_error").Field("operation", "config_help").Field("error", e.what()).Error();
     return "-ERR CONFIG HELP failed: " + std::string(e.what()) + "\n";
   }
 }
@@ -105,11 +101,7 @@ std::string AdminHandler::HandleConfigShow(const ServerContext& ctx, const std::
     std::string result = config::FormatConfigForDisplay(*ctx.config, path);
     return "+OK\n" + result;
   } catch (const std::exception& e) {
-    utils::StructuredLog()
-        .Event("server_error")
-        .Field("operation", "config_show")
-        .Field("error", e.what())
-        .Error();
+    utils::StructuredLog().Event("server_error").Field("operation", "config_show").Field("error", e.what()).Error();
     return "-ERR CONFIG SHOW failed: " + std::string(e.what()) + "\n";
   }
 }

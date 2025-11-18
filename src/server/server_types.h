@@ -97,9 +97,7 @@ struct ServerStats {
    * @brief Get uptime in seconds
    * Reference: ../mygram-db/src/server/server_stats.cpp:GetUptimeSeconds
    */
-  uint64_t GetUptimeSeconds() const {
-    return static_cast<uint64_t>(std::time(nullptr)) - start_time;
-  }
+  uint64_t GetUptimeSeconds() const { return static_cast<uint64_t>(std::time(nullptr)) - start_time; }
 
   /**
    * @brief Get queries per second
