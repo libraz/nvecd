@@ -10,7 +10,6 @@ add_executable(snapshot_integration_test
 target_link_libraries(snapshot_integration_test
   nvecd_server      # Includes all dependencies transitively
   nvecd_storage     # Snapshot functionality
-  gtest
   gtest_main
 )
 

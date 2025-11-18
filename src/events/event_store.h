@@ -41,10 +41,10 @@ enum class EventType {
  * @brief Event data structure
  */
 struct Event {
-  std::string id;       ///< Event ID (e.g., item ID)
-  int score;            ///< Event score/weight
-  uint64_t timestamp;   ///< Unix timestamp (seconds)
-  EventType type;       ///< Event type
+  std::string id;         ///< Event ID (e.g., item ID)
+  int score{0};           ///< Event score/weight
+  uint64_t timestamp{0};  ///< Unix timestamp (seconds)
+  EventType type;         ///< Event type
 
   Event() = default;
   Event(std::string id_, int score_, uint64_t timestamp_, EventType type_ = EventType::ADD)
@@ -55,11 +55,11 @@ struct Event {
  * @brief Event store statistics
  */
 struct EventStoreStatistics {
-  size_t active_contexts = 0;     ///< Number of contexts with events
-  uint64_t total_events = 0;      ///< Total events processed (cumulative)
-  uint64_t deduped_events = 0;    ///< Total deduplicated events (ignored)
-  size_t stored_events = 0;       ///< Current number of stored events
-  size_t memory_bytes = 0;        ///< Estimated memory usage in bytes
+  size_t active_contexts = 0;   ///< Number of contexts with events
+  uint64_t total_events = 0;    ///< Total events processed (cumulative)
+  uint64_t deduped_events = 0;  ///< Total deduplicated events (ignored)
+  size_t stored_events = 0;     ///< Current number of stored events
+  size_t memory_bytes = 0;      ///< Estimated memory usage in bytes
 };
 
 /**
@@ -103,9 +103,7 @@ class EventStore {
    *
    * @throws None
    */
-  utils::Expected<void, utils::Error> AddEvent(const std::string& ctx,
-                                                const std::string& id,
-                                                int score,
+  utils::Expected<void, utils::Error> AddEvent(const std::string& ctx, const std::string& id, int score,
                                                 EventType type = EventType::ADD);
 
   /**

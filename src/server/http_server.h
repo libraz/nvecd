@@ -16,10 +16,10 @@
 #endif
 
 #include <httplib.h>
-#include <nlohmann/json.hpp>
 
 #include <atomic>
 #include <memory>
+#include <nlohmann/json.hpp>
 #include <string>
 #include <thread>
 #include <vector>
@@ -37,9 +37,9 @@ namespace nvecd::server {
  */
 struct HttpServerConfig {
   std::string bind = "0.0.0.0";
-  int port = 8081;
-  int read_timeout_sec = 5;
-  int write_timeout_sec = 5;
+  int port = 8081;            // NOLINT(cppcoreguidelines-avoid-magic-numbers,readability-magic-numbers)
+  int read_timeout_sec = 5;   // NOLINT(cppcoreguidelines-avoid-magic-numbers,readability-magic-numbers)
+  int write_timeout_sec = 5;  // NOLINT(cppcoreguidelines-avoid-magic-numbers,readability-magic-numbers)
   bool enable_cors = false;
   std::string cors_allow_origin;
   std::vector<std::string> allow_cidrs;
@@ -54,9 +54,9 @@ struct HttpServerConfig {
  * - POST /sim - Similarity search by ID
  * - POST /simv - Similarity search by vector
  * - GET /info - Server information
- * - GET /health/* - Health check endpoints
+ * - GET /health/{endpoint} - Health check endpoints
  * - GET /config - Configuration summary
- * - POST /dump/* - Snapshot management
+ * - POST /dump/{action} - Snapshot management
  * - POST /debug/on|off - Debug mode
  */
 class HttpServer {
@@ -180,12 +180,12 @@ class HttpServer {
   /**
    * @brief Handle GET /health (legacy endpoint)
    */
-  void HandleHealth(const httplib::Request& req, httplib::Response& res);
+  static void HandleHealth(const httplib::Request& req, httplib::Response& res);
 
   /**
    * @brief Handle GET /health/live (liveness probe)
    */
-  void HandleHealthLive(const httplib::Request& req, httplib::Response& res);
+  static void HandleHealthLive(const httplib::Request& req, httplib::Response& res);
 
   /**
    * @brief Handle GET /health/ready (readiness probe)
@@ -230,12 +230,12 @@ class HttpServer {
   /**
    * @brief Handle POST /debug/on
    */
-  void HandleDebugOn(const httplib::Request& req, httplib::Response& res);
+  static void HandleDebugOn(const httplib::Request& req, httplib::Response& res);
 
   /**
    * @brief Handle POST /debug/off
    */
-  void HandleDebugOff(const httplib::Request& req, httplib::Response& res);
+  static void HandleDebugOff(const httplib::Request& req, httplib::Response& res);
 
   /**
    * @brief Handle GET /cache/stats

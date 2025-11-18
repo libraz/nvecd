@@ -212,9 +212,7 @@ struct TestStruct {
   int id;
   std::string name;
 
-  bool operator==(const TestStruct& other) const {
-    return id == other.id && name == other.name;
-  }
+  bool operator==(const TestStruct& other) const { return id == other.id && name == other.name; }
 };
 
 TEST(RingBufferTest, StructType) {

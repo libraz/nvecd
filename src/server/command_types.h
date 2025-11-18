@@ -27,7 +27,7 @@ namespace nvecd::server {
  * - DUMP: Snapshot management
  * - DEBUG: Debug mode toggle
  */
-enum class CommandType {
+enum class CommandType : std::uint8_t {
   // Core commands
   kEvent,
   kVecset,

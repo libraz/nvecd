@@ -26,7 +26,7 @@ else()
     message(STATUS "Version from git tag: ${PROJECT_VERSION_FROM_GIT}")
   else()
     set(PROJECT_VERSION_FROM_GIT "0.1.0")
-    message(WARNING "No git tag found, using default version: ${PROJECT_VERSION_FROM_GIT}")
+    message(STATUS "No git tag found, using default version: ${PROJECT_VERSION_FROM_GIT}")
   endif()
 
   project(nvecd VERSION ${PROJECT_VERSION_FROM_GIT} LANGUAGES CXX C)

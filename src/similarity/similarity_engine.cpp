@@ -15,28 +15,27 @@
 
 namespace nvecd::similarity {
 
-SimilarityEngine::SimilarityEngine(events::EventStore* event_store,
-                                   events::CoOccurrenceIndex* co_index,
-                                   vectors::VectorStore* vector_store,
-                                   const config::SimilarityConfig& config)
-    : event_store_(event_store),
-      co_index_(co_index),
-      vector_store_(vector_store),
-      config_(config) {}
+namespace {
+constexpr float kNormalizationEpsilon = 1e-6F;  // Epsilon for floating point comparison in score normalization
+}  // namespace
+
+SimilarityEngine::SimilarityEngine(events::EventStore* event_store, events::CoOccurrenceIndex* co_index,
+                                   vectors::VectorStore* vector_store, const config::SimilarityConfig& config)
+    : event_store_(event_store), co_index_(co_index), vector_store_(vector_store), config_(config) {}
 
 // ============================================================================
 // Events-based Search
 // ============================================================================
 
-utils::Expected<std::vector<SimilarityResult>, utils::Error>
-SimilarityEngine::SearchByIdEvents(const std::string& id, int top_k) {
+utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::SearchByIdEvents(
+    const std::string& item_id, int top_k) {
   auto validated_top_k = ValidateTopK(top_k);
   if (!validated_top_k) {
     return utils::MakeUnexpected(validated_top_k.error());
   }
 
   // Get similar items from co-occurrence index
-  auto co_results = co_index_->GetSimilar(id, validated_top_k.value());
+  auto co_results = co_index_->GetSimilar(item_id, validated_top_k.value());
 
   // Convert to SimilarityResult
   std::vector<SimilarityResult> results;
@@ -53,18 +52,17 @@ SimilarityEngine::SearchByIdEvents(const std::string& id, int top_k) {
 // Vectors-based Search
 // ============================================================================
 
-utils::Expected<std::vector<SimilarityResult>, utils::Error>
-SimilarityEngine::SearchByIdVectors(const std::string& id, int top_k) {
+utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::SearchByIdVectors(
+    const std::string& item_id, int top_k) {
   auto validated_top_k = ValidateTopK(top_k);
   if (!validated_top_k) {
     return utils::MakeUnexpected(validated_top_k.error());
   }
 
   // Get query vector
-  auto query_vec = vector_store_->GetVector(id);
+  auto query_vec = vector_store_->GetVector(item_id);
   if (!query_vec) {
-    auto error = utils::MakeError(utils::ErrorCode::kVectorNotFound,
-                                  "Query vector not found: " + id);
+    auto error = utils::MakeError(utils::ErrorCode::kVectorNotFound, "Query vector not found: " + item_id);
     return utils::MakeUnexpected(error);
   }
 
@@ -76,7 +74,7 @@ SimilarityEngine::SearchByIdVectors(const std::string& id, int top_k) {
   results.reserve(all_ids.size());
 
   for (const auto& candidate_id : all_ids) {
-    if (candidate_id == id) {
+    if (candidate_id == item_id) {
       continue;  // Skip self
     }
 
@@ -86,8 +84,7 @@ SimilarityEngine::SearchByIdVectors(const std::string& id, int top_k) {
     }
 
     // Compute similarity (using cosine similarity by default)
-    float score =
-        vectors::CosineSimilarity(query_vec->data, candidate_vec->data);
+    float score = vectors::CosineSimilarity(query_vec->data, candidate_vec->data);
 
     results.emplace_back(candidate_id, score);
   }
@@ -100,25 +97,23 @@ SimilarityEngine::SearchByIdVectors(const std::string& id, int top_k) {
 // Fusion Search
 // ============================================================================
 
-utils::Expected<std::vector<SimilarityResult>, utils::Error>
-SimilarityEngine::SearchByIdFusion(const std::string& id, int top_k) {
+utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::SearchByIdFusion(
+    const std::string& item_id, int top_k) {
   auto validated_top_k = ValidateTopK(top_k);
   if (!validated_top_k) {
     return utils::MakeUnexpected(validated_top_k.error());
   }
 
   // Get results from both sources (request more to ensure good coverage)
-  int fetch_k = std::min(validated_top_k.value() * 3,
-                         static_cast<int>(config_.max_top_k));
+  int fetch_k = std::min(validated_top_k.value() * 3, static_cast<int>(config_.max_top_k));
 
-  auto event_results = SearchByIdEvents(id, fetch_k);
-  auto vector_results = SearchByIdVectors(id, fetch_k);
+  auto event_results = SearchByIdEvents(item_id, fetch_k);
+  auto vector_results = SearchByIdVectors(item_id, fetch_k);
 
   // If both failed, return error
   if (!event_results && !vector_results) {
-    auto error = utils::MakeError(
-        utils::ErrorCode::kSimilaritySearchFailed,
-        "Both event and vector searches failed for ID: " + id);
+    auto error = utils::MakeError(utils::ErrorCode::kSimilaritySearchFailed,
+                                  "Both event and vector searches failed for ID: " + item_id);
     return utils::MakeUnexpected(error);
   }
 
@@ -135,13 +130,13 @@ SimilarityEngine::SearchByIdFusion(const std::string& id, int top_k) {
 
   if (event_results) {
     for (const auto& result : *event_results) {
-      fusion_scores[result.id] += config_.fusion_beta * result.score;
+      fusion_scores[result.item_id] += static_cast<float>(config_.fusion_beta * result.score);
     }
   }
 
   if (vector_results) {
     for (const auto& result : *vector_results) {
-      fusion_scores[result.id] += config_.fusion_alpha * result.score;
+      fusion_scores[result.item_id] += static_cast<float>(config_.fusion_alpha * result.score);
     }
   }
 
@@ -161,28 +156,24 @@ SimilarityEngine::SearchByIdFusion(const std::string& id, int top_k) {
 // Vector Query Search (SIMV)
 // ============================================================================
 
-utils::Expected<std::vector<SimilarityResult>, utils::Error>
-SimilarityEngine::SearchByVector(const std::vector<float>& query_vector,
-                                 int top_k) {
+utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::SearchByVector(
+    const std::vector<float>& query_vector, int top_k) {
   auto validated_top_k = ValidateTopK(top_k);
   if (!validated_top_k) {
     return utils::MakeUnexpected(validated_top_k.error());
   }
 
   if (query_vector.empty()) {
-    auto error = utils::MakeError(utils::ErrorCode::kInvalidArgument,
-                                  "Query vector cannot be empty");
+    auto error = utils::MakeError(utils::ErrorCode::kInvalidArgument, "Query vector cannot be empty");
     return utils::MakeUnexpected(error);
   }
 
   // Validate dimension
   size_t expected_dim = vector_store_->GetDimension();
   if (expected_dim > 0 && query_vector.size() != expected_dim) {
-    auto error = utils::MakeError(
-        utils::ErrorCode::kVectorDimensionMismatch,
-        "Query vector dimension mismatch: expected " +
-            std::to_string(expected_dim) + ", got " +
-            std::to_string(query_vector.size()));
+    auto error = utils::MakeError(utils::ErrorCode::kVectorDimensionMismatch,
+                                  "Query vector dimension mismatch: expected " + std::to_string(expected_dim) +
+                                      ", got " + std::to_string(query_vector.size()));
     return utils::MakeUnexpected(error);
   }
 
@@ -213,26 +204,22 @@ SimilarityEngine::SearchByVector(const std::vector<float>& query_vector,
 // Helper Methods
 // ============================================================================
 
-utils::Expected<int, utils::Error> SimilarityEngine::ValidateTopK(
-    int top_k) const {
+utils::Expected<int, utils::Error> SimilarityEngine::ValidateTopK(int top_k) const {
   if (top_k <= 0) {
-    auto error = utils::MakeError(utils::ErrorCode::kInvalidArgument,
-                                  "top_k must be positive");
+    auto error = utils::MakeError(utils::ErrorCode::kInvalidArgument, "top_k must be positive");
     return utils::MakeUnexpected(error);
   }
 
   if (top_k > static_cast<int>(config_.max_top_k)) {
-    auto error = utils::MakeError(
-        utils::ErrorCode::kInvalidArgument,
-        "top_k exceeds maximum allowed: " + std::to_string(config_.max_top_k));
+    auto error = utils::MakeError(utils::ErrorCode::kInvalidArgument,
+                                  "top_k exceeds maximum allowed: " + std::to_string(config_.max_top_k));
     return utils::MakeUnexpected(error);
   }
 
   return top_k;
 }
 
-void SimilarityEngine::NormalizeScores(
-    std::vector<SimilarityResult>& results) const {
+void SimilarityEngine::NormalizeScores(std::vector<SimilarityResult>& results) {
   if (results.empty()) {
     return;
   }
@@ -248,10 +235,10 @@ void SimilarityEngine::NormalizeScores(
 
   // Normalize to [0, 1]
   float range = max_score - min_score;
-  if (range < 1e-6f) {
+  if (range < kNormalizationEpsilon) {
     // All scores are the same, set to 1.0
     for (auto& result : results) {
-      result.score = 1.0f;
+      result.score = 1.0F;
     }
     return;
   }
@@ -261,8 +248,7 @@ void SimilarityEngine::NormalizeScores(
   }
 }
 
-std::vector<SimilarityResult> SimilarityEngine::MergeAndSelectTopK(
-    std::vector<SimilarityResult> results, int top_k) const {
+std::vector<SimilarityResult> SimilarityEngine::MergeAndSelectTopK(std::vector<SimilarityResult> results, int top_k) {
   // Sort by score descending
   std::sort(results.begin(), results.end());
 

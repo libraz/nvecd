@@ -94,12 +94,12 @@ constexpr uint32_t kWithCRC = 0x00000010;         // Contains CRC checksums (alw
  * This helps identify which part of the snapshot file is corrupted.
  */
 enum class CRCErrorType : std::uint8_t {
-  None = 0,           // No error detected
-  FileCRC = 1,        // File-level CRC mismatch (entire file corrupted)
-  ConfigCRC = 2,      // Config section CRC mismatch
-  StatsCRC = 3,       // Statistics section CRC mismatch
-  StoreStatsCRC = 4,  // Store statistics CRC mismatch (store-specific)
-  EventStoreCRC = 5,  // EventStore data CRC mismatch
+  None = 0,             // No error detected
+  FileCRC = 1,          // File-level CRC mismatch (entire file corrupted)
+  ConfigCRC = 2,        // Config section CRC mismatch
+  StatsCRC = 3,         // Statistics section CRC mismatch
+  StoreStatsCRC = 4,    // Store statistics CRC mismatch (store-specific)
+  EventStoreCRC = 5,    // EventStore data CRC mismatch
   CoOccurrenceCRC = 6,  // CoOccurrenceIndex data CRC mismatch
   VectorStoreCRC = 7,   // VectorStore data CRC mismatch
 };

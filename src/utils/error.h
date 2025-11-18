@@ -66,28 +66,28 @@ enum class ErrorCode : std::uint16_t {
   kEventCoOccurrenceError = 2005,  ///< Co-occurrence index error
 
   // ===== Command Parsing Errors (3000-3999) =====
-  kCommandSyntaxError = 3000,        ///< Command syntax error
-  kCommandInvalidToken = 3001,       ///< Invalid token in command
-  kCommandUnexpectedToken = 3002,    ///< Unexpected token in command
-  kCommandMissingArgument = 3003,    ///< Missing required argument
-  kCommandInvalidArgument = 3004,    ///< Invalid argument value
-  kCommandTooLong = 3005,            ///< Command exceeds maximum length
-  kCommandUnknown = 3006,            ///< Unknown command
-  kCommandInvalidTopK = 3007,        ///< Invalid top_k value
-  kCommandInvalidMode = 3008,        ///< Invalid similarity mode
-  kCommandInvalidVector = 3009,      ///< Invalid vector format
-  kCommandParseError = 3010,         ///< General command parsing error
+  kCommandSyntaxError = 3000,      ///< Command syntax error
+  kCommandInvalidToken = 3001,     ///< Invalid token in command
+  kCommandUnexpectedToken = 3002,  ///< Unexpected token in command
+  kCommandMissingArgument = 3003,  ///< Missing required argument
+  kCommandInvalidArgument = 3004,  ///< Invalid argument value
+  kCommandTooLong = 3005,          ///< Command exceeds maximum length
+  kCommandUnknown = 3006,          ///< Unknown command
+  kCommandInvalidTopK = 3007,      ///< Invalid top_k value
+  kCommandInvalidMode = 3008,      ///< Invalid similarity mode
+  kCommandInvalidVector = 3009,    ///< Invalid vector format
+  kCommandParseError = 3010,       ///< General command parsing error
 
   // ===== Vector/Similarity Errors (4000-4999) =====
-  kVectorDimensionMismatch = 4000,   ///< Vector dimension mismatch
-  kVectorNotFound = 4001,            ///< Vector not found
-  kVectorInvalidDimension = 4002,    ///< Invalid vector dimension
-  kVectorStoreFull = 4003,           ///< Vector store capacity exceeded
-  kVectorStoreError = 4004,          ///< General vector store error
-  kSimilaritySearchFailed = 4010,    ///< Similarity search failed
-  kSimilarityInvalidMode = 4011,     ///< Invalid similarity mode
-  kSimilarityNoResults = 4012,       ///< No similarity results found
-  kSimilarityComputeError = 4013,    ///< Similarity computation error
+  kVectorDimensionMismatch = 4000,  ///< Vector dimension mismatch
+  kVectorNotFound = 4001,           ///< Vector not found
+  kVectorInvalidDimension = 4002,   ///< Invalid vector dimension
+  kVectorStoreFull = 4003,          ///< Vector store capacity exceeded
+  kVectorStoreError = 4004,         ///< General vector store error
+  kSimilaritySearchFailed = 4010,   ///< Similarity search failed
+  kSimilarityInvalidMode = 4011,    ///< Invalid similarity mode
+  kSimilarityNoResults = 4012,      ///< No similarity results found
+  kSimilarityComputeError = 4013,   ///< Similarity computation error
 
   // ===== Storage/Snapshot Errors (5000-5999) =====
   kStorageFileNotFound = 5000,         ///< Snapshot file not found

@@ -27,12 +27,11 @@ namespace nvecd::similarity {
  * @brief Similarity search result
  */
 struct SimilarityResult {
-  std::string id;  ///< Item ID
-  float score;     ///< Similarity score (higher = more similar)
+  std::string item_id;  ///< Item ID
+  float score{0.0F};    ///< Similarity score (higher = more similar)
 
   SimilarityResult() = default;
-  SimilarityResult(std::string id_, float score_)
-      : id(std::move(id_)), score(score_) {}
+  SimilarityResult(std::string item_id_, float score_) : item_id(std::move(item_id_)), score(score_) {}
 
   /**
    * @brief Compare for sorting (descending by score)
@@ -63,7 +62,7 @@ struct SimilarityResult {
  * auto results = engine.SearchByIdFusion("item123", 10);
  * if (results) {
  *   for (const auto& result : *results) {
- *     std::cout << result.id << ": " << result.score << std::endl;
+ *     std::cout << result.item_id << ": " << result.score << std::endl;
  *   }
  * }
  * @endcode
@@ -78,10 +77,8 @@ class SimilarityEngine {
    * @param vector_store Vector store (not owned, must outlive this object)
    * @param config Similarity configuration
    */
-  SimilarityEngine(events::EventStore* event_store,
-                   events::CoOccurrenceIndex* co_index,
-                   vectors::VectorStore* vector_store,
-                   const config::SimilarityConfig& config);
+  SimilarityEngine(events::EventStore* event_store, events::CoOccurrenceIndex* co_index,
+                   vectors::VectorStore* vector_store, const config::SimilarityConfig& config);
 
   /**
    * @brief Search similar items using events (co-occurrence)
@@ -89,12 +86,11 @@ class SimilarityEngine {
    * Uses co-occurrence index to find items that frequently appear
    * in the same contexts as the query item.
    *
-   * @param id Query item ID
+   * @param item_id Query item ID
    * @param top_k Maximum number of results
    * @return Expected<vector<SimilarityResult>, Error> Results or error
    */
-  utils::Expected<std::vector<SimilarityResult>, utils::Error>
-  SearchByIdEvents(const std::string& id, int top_k);
+  utils::Expected<std::vector<SimilarityResult>, utils::Error> SearchByIdEvents(const std::string& item_id, int top_k);
 
   /**
    * @brief Search similar items using vectors (distance)
@@ -102,12 +98,11 @@ class SimilarityEngine {
    * Uses vector store to find items with similar vector representations.
    * Distance metric is configured in VectorsConfig.
    *
-   * @param id Query item ID
+   * @param item_id Query item ID
    * @param top_k Maximum number of results
    * @return Expected<vector<SimilarityResult>, Error> Results or error
    */
-  utils::Expected<std::vector<SimilarityResult>, utils::Error>
-  SearchByIdVectors(const std::string& id, int top_k);
+  utils::Expected<std::vector<SimilarityResult>, utils::Error> SearchByIdVectors(const std::string& item_id, int top_k);
 
   /**
    * @brief Search similar items using fusion (events + vectors)
@@ -115,12 +110,11 @@ class SimilarityEngine {
    * Combines events-based and vectors-based scores using weighted sum:
    * score = alpha * vector_score + beta * event_score
    *
-   * @param id Query item ID
+   * @param item_id Query item ID
    * @param top_k Maximum number of results
    * @return Expected<vector<SimilarityResult>, Error> Results or error
    */
-  utils::Expected<std::vector<SimilarityResult>, utils::Error>
-  SearchByIdFusion(const std::string& id, int top_k);
+  utils::Expected<std::vector<SimilarityResult>, utils::Error> SearchByIdFusion(const std::string& item_id, int top_k);
 
   /**
    * @brief Search similar items using vector query (SIMV)
@@ -132,8 +126,8 @@ class SimilarityEngine {
    * @param top_k Maximum number of results
    * @return Expected<vector<SimilarityResult>, Error> Results or error
    */
-  utils::Expected<std::vector<SimilarityResult>, utils::Error>
-  SearchByVector(const std::vector<float>& query_vector, int top_k);
+  utils::Expected<std::vector<SimilarityResult>, utils::Error> SearchByVector(const std::vector<float>& query_vector,
+                                                                              int top_k);
 
  private:
   /**
@@ -150,7 +144,7 @@ class SimilarityEngine {
    *
    * @param results Results to normalize (modified in-place)
    */
-  void NormalizeScores(std::vector<SimilarityResult>& results) const;
+  static void NormalizeScores(std::vector<SimilarityResult>& results);
 
   /**
    * @brief Merge and sort results from multiple sources
@@ -159,13 +153,12 @@ class SimilarityEngine {
    * @param top_k Maximum number of results to return
    * @return Top-k results sorted by score descending
    */
-  std::vector<SimilarityResult> MergeAndSelectTopK(
-      std::vector<SimilarityResult> results, int top_k) const;
+  static std::vector<SimilarityResult> MergeAndSelectTopK(std::vector<SimilarityResult> results, int top_k);
 
-  [[maybe_unused]] events::EventStore* event_store_;             ///< Event store (not owned, reserved for future use)
-  events::CoOccurrenceIndex* co_index_;         ///< Co-occurrence index (not owned)
-  vectors::VectorStore* vector_store_;          ///< Vector store (not owned)
-  config::SimilarityConfig config_;             ///< Configuration
+  [[maybe_unused]] events::EventStore* event_store_;  ///< Event store (not owned)
+  events::CoOccurrenceIndex* co_index_;               ///< Co-occurrence index (not owned)
+  vectors::VectorStore* vector_store_;                ///< Vector store (not owned)
+  config::SimilarityConfig config_;                   ///< Configuration
 };
 
 }  // namespace nvecd::similarity

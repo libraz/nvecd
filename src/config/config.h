@@ -56,18 +56,18 @@ constexpr int kConnectionTimeoutSec = 300;
  * @brief Event store configuration
  */
 struct EventsConfig {
-  uint32_t ctx_buffer_size = defaults::kCtxBufferSize;  ///< Events per context (ring buffer size)
+  uint32_t ctx_buffer_size = defaults::kCtxBufferSize;        ///< Events per context (ring buffer size)
   uint32_t decay_interval_sec = defaults::kDecayIntervalSec;  ///< Decay interval in seconds
-  double decay_alpha = defaults::kDecayAlpha;  ///< Decay factor (0.0-1.0)
-  uint32_t dedup_window_sec = defaults::kDedupWindowSec;  ///< Deduplication time window in seconds
-  uint32_t dedup_cache_size = defaults::kDedupCacheSize;  ///< Deduplication cache size (LRU)
+  double decay_alpha = defaults::kDecayAlpha;                 ///< Decay factor (0.0-1.0)
+  uint32_t dedup_window_sec = defaults::kDedupWindowSec;      ///< Deduplication time window in seconds
+  uint32_t dedup_cache_size = defaults::kDedupCacheSize;      ///< Deduplication cache size (LRU)
 };
 
 /**
  * @brief Vector store configuration
  */
 struct VectorsConfig {
-  uint32_t default_dimension = defaults::kDefaultDimension;  ///< Default vector dimension
+  uint32_t default_dimension = defaults::kDefaultDimension;        ///< Default vector dimension
   std::string distance_metric = defaults::kDefaultDistanceMetric;  ///< Distance metric: "cosine", "dot", "l2"
 };
 
@@ -76,27 +76,27 @@ struct VectorsConfig {
  */
 struct SimilarityConfig {
   uint32_t default_top_k = defaults::kDefaultTopK;  ///< Default number of results
-  uint32_t max_top_k = defaults::kMaxTopK;  ///< Maximum number of results
-  double fusion_alpha = defaults::kFusionAlpha;  ///< Weight for vector similarity in fusion mode
-  double fusion_beta = defaults::kFusionBeta;  ///< Weight for co-occurrence in fusion mode
+  uint32_t max_top_k = defaults::kMaxTopK;          ///< Maximum number of results
+  double fusion_alpha = defaults::kFusionAlpha;     ///< Weight for vector similarity in fusion mode
+  double fusion_beta = defaults::kFusionBeta;       ///< Weight for co-occurrence in fusion mode
 };
 
 /**
  * @brief Snapshot configuration
  */
 struct SnapshotConfig {
-  std::string dir = "/var/lib/nvecd/snapshots";  ///< Snapshot directory
+  std::string dir = "/var/lib/nvecd/snapshots";                       ///< Snapshot directory
   std::string default_filename = defaults::kSnapshotDefaultFilename;  ///< Default snapshot filename
-  int interval_sec = defaults::kSnapshotIntervalSec;  ///< Auto-snapshot interval (0 = disabled)
-  int retain = 3;  ///< Number of snapshots to retain
+  int interval_sec = defaults::kSnapshotIntervalSec;                  ///< Auto-snapshot interval (0 = disabled)
+  int retain = 3;                                                     ///< Number of snapshots to retain
 };
 
 /**
  * @brief Performance configuration
  */
 struct PerformanceConfig {
-  int thread_pool_size = defaults::kThreadPoolSize;  ///< Worker thread pool size
-  int max_connections = defaults::kMaxConnections;  ///< Maximum concurrent connections
+  int thread_pool_size = defaults::kThreadPoolSize;              ///< Worker thread pool size
+  int max_connections = defaults::kMaxConnections;               ///< Maximum concurrent connections
   int connection_timeout_sec = defaults::kConnectionTimeoutSec;  ///< Connection timeout
 };
 
@@ -145,18 +145,18 @@ struct NetworkConfig {
  */
 struct LoggingConfig {
   std::string level = "info";  ///< Log level: trace, debug, info, warn, error
-  bool json = true;  ///< Use structured JSON logging
-  std::string file;  ///< Log file path (empty = stdout)
+  bool json = true;            ///< Use structured JSON logging
+  std::string file;            ///< Log file path (empty = stdout)
 };
 
 /**
  * @brief Cache configuration
  */
 struct CacheConfig {
-  bool enabled = true;                          ///< Enable/disable cache (default: true)
-  size_t max_memory_bytes = 32 * 1024 * 1024;   ///< Maximum cache memory in bytes (default: 32MB)  // NOLINT
-  double min_query_cost_ms = 10.0;              ///< Minimum query cost to cache (default: 10ms)  // NOLINT
-  int ttl_seconds = 3600;                       ///< Cache entry TTL (default: 1 hour, 0 = no TTL)  // NOLINT
+  bool enabled = true;                         ///< Enable/disable cache (default: true)
+  size_t max_memory_bytes = 32 * 1024 * 1024;  ///< Maximum cache memory in bytes (default: 32MB)  // NOLINT
+  double min_query_cost_ms = 10.0;             ///< Minimum query cost to cache (default: 10ms)  // NOLINT
+  int ttl_seconds = 3600;                      ///< Cache entry TTL (default: 1 hour, 0 = no TTL)  // NOLINT
 
   // Advanced tuning
   bool compression_enabled = true;  ///< Enable LZ4 compression (default: true)

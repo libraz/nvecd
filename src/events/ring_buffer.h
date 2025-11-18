@@ -67,8 +67,8 @@ class RingBuffer {
 
  private:
   std::vector<T> buffer_;  ///< Underlying storage
-  size_t head_;            ///< Index where next element will be written
-  size_t size_;            ///< Current number of elements
+  size_t head_{0};         ///< Index where next element will be written
+  size_t size_{0};         ///< Current number of elements
   size_t capacity_;        ///< Maximum capacity
 };
 
@@ -77,8 +77,7 @@ class RingBuffer {
 // ============================================================================
 
 template <typename T>
-RingBuffer<T>::RingBuffer(size_t capacity)
-    : buffer_(capacity), head_(0), size_(0), capacity_(capacity) {
+RingBuffer<T>::RingBuffer(size_t capacity) : buffer_(capacity), capacity_(capacity) {
   // Reserve capacity but don't initialize elements
 }
 

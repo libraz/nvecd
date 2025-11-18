@@ -165,7 +165,7 @@ Expected<void, Error> DeserializeEventStore(std::istream& input_stream, events::
  * @return Expected<void, Error> Success or error with details
  */
 Expected<void, Error> SerializeCoOccurrenceIndex(std::ostream& output_stream,
-                                                  const events::CoOccurrenceIndex& co_index);
+                                                 const events::CoOccurrenceIndex& co_index);
 
 /**
  * @brief Deserialize CoOccurrenceIndex from input stream
@@ -249,8 +249,7 @@ Expected<void, Error> ReadHeaderV1(std::istream& input_stream, HeaderV1& header)
  * @note CRC32 uses zlib implementation (polynomial: 0xEDB88320)
  */
 Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config::Config& config,
-                                      const events::EventStore& event_store,
-                                      const events::CoOccurrenceIndex& co_index,
+                                      const events::EventStore& event_store, const events::CoOccurrenceIndex& co_index,
                                       const vectors::VectorStore& vector_store,
                                       const SnapshotStatistics* stats = nullptr,
                                       const std::unordered_map<std::string, StoreStatistics>* store_stats = nullptr);
@@ -326,7 +325,7 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
  * @note For full validation, use ReadSnapshotV1() which verifies all sections
  */
 Expected<void, Error> VerifySnapshotIntegrity(const std::string& filepath,
-                                               snapshot_format::IntegrityError& integrity_error);
+                                              snapshot_format::IntegrityError& integrity_error);
 
 /**
  * @brief Calculate CRC32 checksum for data
@@ -351,12 +350,12 @@ uint32_t CalculateCRC32(const std::string& str);
  * the actual data.
  */
 struct SnapshotInfo {
-  uint32_t version = 0;          // Format version (1 for V1)
-  uint32_t store_count = 0;      // Number of stores in snapshot (should be 3)
-  uint32_t flags = 0;            // Feature flags (see snapshot_format::flags_v1)
-  uint64_t file_size = 0;        // Total file size in bytes
-  uint64_t timestamp = 0;        // Unix timestamp when snapshot was created
-  bool has_statistics = false;   // True if snapshot contains statistics sections
+  uint32_t version = 0;         // Format version (1 for V1)
+  uint32_t store_count = 0;     // Number of stores in snapshot (should be 3)
+  uint32_t flags = 0;           // Feature flags (see snapshot_format::flags_v1)
+  uint64_t file_size = 0;       // Total file size in bytes
+  uint64_t timestamp = 0;       // Unix timestamp when snapshot was created
+  bool has_statistics = false;  // True if snapshot contains statistics sections
 };
 
 /**

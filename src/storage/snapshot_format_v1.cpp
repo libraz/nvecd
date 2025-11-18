@@ -43,6 +43,9 @@ using namespace utils;
 
 namespace {
 
+constexpr int kGetAllItemsLimit = 1000000;      // Large limit to get all co-occurrence items
+constexpr int kScoreAmplificationFactor = 100;  // Amplification factor for synthetic event scores
+
 /**
  * @brief Write binary data to stream
  */
@@ -336,8 +339,7 @@ Expected<void, Error> SerializeEventStore(std::ostream& output_stream, const eve
   for (const auto& ctx : contexts) {
     // Write context name
     if (!WriteString(output_stream, ctx)) {
-      return MakeUnexpected(
-          MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write context name: " + ctx));
+      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write context name: " + ctx));
     }
 
     // Get events for this context
@@ -352,7 +354,7 @@ Expected<void, Error> SerializeEventStore(std::ostream& output_stream, const eve
 
     // Write each event
     for (const auto& event : events) {
-      if (!WriteString(output_stream, event.id)) {
+      if (!WriteString(output_stream, event.item_id)) {
         return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write event id"));
       }
       if (!WriteBinary(output_stream, event.score)) {
@@ -394,11 +396,11 @@ Expected<void, Error> DeserializeEventStore(std::istream& input_stream, events::
 
     // Read each event
     for (uint32_t ev_idx = 0; ev_idx < event_count; ++ev_idx) {
-      std::string id;
+      std::string item_id;
       int score = 0;
       uint64_t timestamp = 0;
 
-      if (!ReadString(input_stream, id)) {
+      if (!ReadString(input_stream, item_id)) {
         return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read event id"));
       }
       if (!ReadBinary(input_stream, score)) {
@@ -410,7 +412,7 @@ Expected<void, Error> DeserializeEventStore(std::istream& input_stream, events::
 
       // Add event to store
       // Note: We reconstruct the event with original timestamp, not current time
-      auto result = event_store.AddEvent(ctx, id, score);
+      auto result = event_store.AddEvent(ctx, item_id, score);
       if (!result) {
         return MakeUnexpected(
             MakeError(ErrorCode::kStorageDumpReadError, "Failed to add event: " + result.error().message()));
@@ -426,7 +428,7 @@ Expected<void, Error> DeserializeEventStore(std::istream& input_stream, events::
 // ============================================================================
 
 Expected<void, Error> SerializeCoOccurrenceIndex(std::ostream& output_stream,
-                                                  const events::CoOccurrenceIndex& co_index) {
+                                                 const events::CoOccurrenceIndex& co_index) {
   // Get all items
   std::vector<std::string> items = co_index.GetAllItems();
 
@@ -440,12 +442,11 @@ Expected<void, Error> SerializeCoOccurrenceIndex(std::ostream& output_stream,
   for (const auto& item1 : items) {
     // Write item name
     if (!WriteString(output_stream, item1)) {
-      return MakeUnexpected(
-          MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write item name: " + item1));
+      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write item name: " + item1));
     }
 
     // Get all co-occurring items with their scores
-    std::vector<std::pair<std::string, float>> co_items = co_index.GetSimilar(item1, 1000000);  // Get all
+    std::vector<std::pair<std::string, float>> co_items = co_index.GetSimilar(item1, kGetAllItemsLimit);
 
     // Write co-item count
     auto co_item_count = static_cast<uint32_t>(co_items.size());
@@ -494,8 +495,7 @@ Expected<void, Error> DeserializeCoOccurrenceIndex(std::istream& input_stream, e
     // Read co-item count
     uint32_t co_item_count = 0;
     if (!ReadBinary(input_stream, co_item_count)) {
-      return MakeUnexpected(
-          MakeError(ErrorCode::kStorageDumpReadError, "Failed to read co-item count for: " + item1));
+      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read co-item count for: " + item1));
     }
 
     // Collect co-items and scores
@@ -504,7 +504,7 @@ Expected<void, Error> DeserializeCoOccurrenceIndex(std::istream& input_stream, e
 
     for (uint32_t co_idx = 0; co_idx < co_item_count; ++co_idx) {
       std::string item2;
-      float score = 0.0f;
+      float score = 0.0F;
 
       if (!ReadString(input_stream, item2)) {
         return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read co-item name"));
@@ -523,7 +523,7 @@ Expected<void, Error> DeserializeCoOccurrenceIndex(std::istream& input_stream, e
 
     // Create a synthetic event list including item1
     std::vector<events::Event> synthetic_events;
-    synthetic_events.emplace_back(item1, static_cast<int>(std::sqrt(co_item_count * 100)), 0);
+    synthetic_events.emplace_back(item1, static_cast<int>(std::sqrt(co_item_count * kScoreAmplificationFactor)), 0);
     for (size_t i = 0; i < co_item_ids.size(); ++i) {
       synthetic_events.emplace_back(co_item_ids[i], co_item_scores[i], 0);
     }
@@ -556,18 +556,17 @@ Expected<void, Error> SerializeVectorStore(std::ostream& output_stream, const ve
   }
 
   // Write each vector
-  for (const auto& id : ids) {
+  for (const auto& vector_id : ids) {
     // Write vector ID
-    if (!WriteString(output_stream, id)) {
-      return MakeUnexpected(
-          MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write vector ID: " + id));
+    if (!WriteString(output_stream, vector_id)) {
+      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write vector ID: " + vector_id));
     }
 
     // Get vector
-    auto vec_opt = vector_store.GetVector(id);
+    auto vec_opt = vector_store.GetVector(vector_id);
     if (!vec_opt) {
       return MakeUnexpected(
-          MakeError(ErrorCode::kStorageDumpWriteError, "Vector not found during serialization: " + id));
+          MakeError(ErrorCode::kStorageDumpWriteError, "Vector not found during serialization: " + vector_id));
     }
 
     const auto& vec = vec_opt.value();
@@ -607,8 +606,8 @@ Expected<void, Error> DeserializeVectorStore(std::istream& input_stream, vectors
   // Read each vector
   for (uint32_t vec_idx = 0; vec_idx < vector_count; ++vec_idx) {
     // Read vector ID
-    std::string id;
-    if (!ReadString(input_stream, id)) {
+    std::string vector_id;
+    if (!ReadString(input_stream, vector_id)) {
       return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read vector ID"));
     }
 
@@ -628,7 +627,7 @@ Expected<void, Error> DeserializeVectorStore(std::istream& input_stream, vectors
 
     // Add vector to store
     // Note: We pass normalize=false and manually restore the normalized flag
-    auto result = vector_store.SetVector(id, data, false);
+    auto result = vector_store.SetVector(vector_id, data, false);
     if (!result) {
       return MakeUnexpected(
           MakeError(ErrorCode::kStorageDumpReadError, "Failed to add vector: " + result.error().message()));
@@ -643,8 +642,7 @@ Expected<void, Error> DeserializeVectorStore(std::istream& input_stream, vectors
 // ============================================================================
 
 Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config::Config& config,
-                                      const events::EventStore& event_store,
-                                      const events::CoOccurrenceIndex& co_index,
+                                      const events::EventStore& event_store, const events::CoOccurrenceIndex& co_index,
                                       const vectors::VectorStore& vector_store, const SnapshotStatistics* stats,
                                       const std::unordered_map<std::string, StoreStatistics>* store_stats) {
   // Create temporary file path
@@ -653,9 +651,9 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
   // Open file for binary writing
   std::ofstream output_stream(temp_filepath, std::ios::binary | std::ios::trunc);
   if (!output_stream) {
-    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError,
-                                    "Failed to open file for writing: " + temp_filepath + " (" +
-                                        std::strerror(errno) + ")"));
+    return MakeUnexpected(
+        MakeError(ErrorCode::kStorageDumpWriteError,
+                  "Failed to open file for writing: " + temp_filepath + " (" + std::strerror(errno) + ")"));
   }
 
   try {
@@ -697,7 +695,7 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
       return config_result;
     }
     std::string config_data = config_ss.str();
-    uint32_t config_size = static_cast<uint32_t>(config_data.size());
+    auto config_size = static_cast<uint32_t>(config_data.size());
     uint32_t config_crc = CalculateCRC32(config_data);
     WriteBinary(output_stream, config_size);
     WriteBinary(output_stream, config_crc);
@@ -711,7 +709,7 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
         return stats_result;
       }
       std::string stats_data = stats_ss.str();
-      uint32_t stats_size = static_cast<uint32_t>(stats_data.size());
+      auto stats_size = static_cast<uint32_t>(stats_data.size());
       uint32_t stats_crc = CalculateCRC32(stats_data);
       WriteBinary(output_stream, stats_size);
       WriteBinary(output_stream, stats_crc);
@@ -732,7 +730,7 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
           return store_stats_result;
         }
         std::string store_stats_data = store_stats_ss.str();
-        uint32_t store_stats_size = static_cast<uint32_t>(store_stats_data.size());
+        auto store_stats_size = static_cast<uint32_t>(store_stats_data.size());
         uint32_t store_stats_crc = CalculateCRC32(store_stats_data);
         WriteBinary(output_stream, store_stats_size);
         WriteBinary(output_stream, store_stats_crc);
@@ -748,7 +746,7 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
         return serialize_result;
       }
       std::string store_data = store_data_ss.str();
-      uint32_t store_data_size = static_cast<uint32_t>(store_data.size());
+      auto store_data_size = static_cast<uint32_t>(store_data.size());
       uint32_t store_data_crc = CalculateCRC32(store_data);
       WriteBinary(output_stream, store_data_size);
       WriteBinary(output_stream, store_data_crc);
@@ -765,7 +763,7 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
           return store_stats_result;
         }
         std::string store_stats_data = store_stats_ss.str();
-        uint32_t store_stats_size = static_cast<uint32_t>(store_stats_data.size());
+        auto store_stats_size = static_cast<uint32_t>(store_stats_data.size());
         uint32_t store_stats_crc = CalculateCRC32(store_stats_data);
         WriteBinary(output_stream, store_stats_size);
         WriteBinary(output_stream, store_stats_crc);
@@ -781,7 +779,7 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
         return serialize_result;
       }
       std::string store_data = store_data_ss.str();
-      uint32_t store_data_size = static_cast<uint32_t>(store_data.size());
+      auto store_data_size = static_cast<uint32_t>(store_data.size());
       uint32_t store_data_crc = CalculateCRC32(store_data);
       WriteBinary(output_stream, store_data_size);
       WriteBinary(output_stream, store_data_crc);
@@ -798,7 +796,7 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
           return store_stats_result;
         }
         std::string store_stats_data = store_stats_ss.str();
-        uint32_t store_stats_size = static_cast<uint32_t>(store_stats_data.size());
+        auto store_stats_size = static_cast<uint32_t>(store_stats_data.size());
         uint32_t store_stats_crc = CalculateCRC32(store_stats_data);
         WriteBinary(output_stream, store_stats_size);
         WriteBinary(output_stream, store_stats_crc);
@@ -814,7 +812,7 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
         return serialize_result;
       }
       std::string store_data = store_data_ss.str();
-      uint32_t store_data_size = static_cast<uint32_t>(store_data.size());
+      auto store_data_size = static_cast<uint32_t>(store_data.size());
       uint32_t store_data_crc = CalculateCRC32(store_data);
       WriteBinary(output_stream, store_data_size);
       WriteBinary(output_stream, store_data_crc);
@@ -856,13 +854,12 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
                                      events::EventStore& event_store, events::CoOccurrenceIndex& co_index,
                                      vectors::VectorStore& vector_store, SnapshotStatistics* stats,
                                      std::unordered_map<std::string, StoreStatistics>* store_stats,
-                                     snapshot_format::IntegrityError* /* integrity_error */) {
+                                     [[maybe_unused]] snapshot_format::IntegrityError* integrity_error) {
   // Open file for binary reading
   std::ifstream input_stream(filepath, std::ios::binary);
   if (!input_stream) {
-    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError,
-                                    "Failed to open file for reading: " + filepath + " (" + std::strerror(errno) +
-                                        ")"));
+    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to open file for reading: " + filepath +
+                                                                          " (" + std::strerror(errno) + ")"));
   }
 
   try {
@@ -936,12 +933,12 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
         input_stream.read(store_stats_data.data(), store_stats_size);
         // TODO: Verify CRC32
         std::istringstream store_stats_ss(store_stats_data);
-        StoreStatistics st;
-        auto deserialize_store_stats_result = DeserializeStoreStatistics(store_stats_ss, st);
+        StoreStatistics stats;
+        auto deserialize_store_stats_result = DeserializeStoreStatistics(store_stats_ss, stats);
         if (!deserialize_store_stats_result) {
           return deserialize_store_stats_result;
         }
-        (*store_stats)[store_name] = st;
+        (*store_stats)[store_name] = stats;
       }
 
       // Read store data
@@ -986,7 +983,7 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
 }
 
 Expected<void, Error> VerifySnapshotIntegrity(const std::string& filepath,
-                                               snapshot_format::IntegrityError& integrity_error) {
+                                              snapshot_format::IntegrityError& integrity_error) {
   // Open file for binary reading
   std::ifstream input_stream(filepath, std::ios::binary);
   if (!input_stream) {
@@ -1027,8 +1024,8 @@ Expected<void, Error> VerifySnapshotIntegrity(const std::string& filepath,
     uint64_t actual_file_size = static_cast<uint64_t>(input_stream.tellg());
     if (actual_file_size != header.total_file_size) {
       integrity_error.type = snapshot_format::CRCErrorType::FileCRC;
-      integrity_error.message = "File size mismatch: expected " + std::to_string(header.total_file_size) +
-                                ", got " + std::to_string(actual_file_size);
+      integrity_error.message = "File size mismatch: expected " + std::to_string(header.total_file_size) + ", got " +
+                                std::to_string(actual_file_size);
       return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, integrity_error.message));
     }
 
@@ -1048,9 +1045,8 @@ Expected<void, Error> GetSnapshotInfo(const std::string& filepath, SnapshotInfo&
   // Open file for binary reading
   std::ifstream input_stream(filepath, std::ios::binary);
   if (!input_stream) {
-    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError,
-                                    "Failed to open file for reading: " + filepath + " (" + std::strerror(errno) +
-                                        ")"));
+    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to open file for reading: " + filepath +
+                                                                          " (" + std::strerror(errno) + ")"));
   }
 
   try {

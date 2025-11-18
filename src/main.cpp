@@ -20,6 +20,12 @@ namespace {
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 volatile std::sig_atomic_t g_shutdown_requested = 0;
 
+// Default configuration constants
+constexpr int kDefaultTcpPort = 11017;             // Default nvecd TCP port
+constexpr int kDefaultMaxConnections = 10000;      // Default maximum concurrent connections
+constexpr int kDefaultConnectionTimeoutSec = 300;  // Default connection timeout (5 minutes)
+constexpr int kShutdownPollIntervalMs = 100;       // Main loop poll interval
+
 /**
  * @brief Signal handler for graceful shutdown
  * @param signal Signal number
@@ -42,12 +48,12 @@ nvecd::config::Config CreateDefaultConfig() {
 
   // API configuration
   config.api.tcp.bind = "127.0.0.1";
-  config.api.tcp.port = 11017;
+  config.api.tcp.port = kDefaultTcpPort;
 
   // Performance configuration
   config.perf.thread_pool_size = 0;  // Auto-detect
-  config.perf.max_connections = 10000;
-  config.perf.connection_timeout_sec = 300;
+  config.perf.max_connections = kDefaultMaxConnections;
+  config.perf.connection_timeout_sec = kDefaultConnectionTimeoutSec;
 
   // Events configuration (use defaults from config.h)
   // config.events.ctx_buffer_size = 50;
@@ -203,7 +209,7 @@ int main(int argc, char* argv[]) {
 
   // Main loop: wait for shutdown signal
   while (g_shutdown_requested == 0) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    std::this_thread::sleep_for(std::chrono::milliseconds(kShutdownPollIntervalMs));
   }
 
   spdlog::info("Shutdown signal received");

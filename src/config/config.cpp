@@ -28,6 +28,9 @@ namespace nvecd::config {
 
 namespace {
 
+constexpr size_t kBytesPerMB = 1024 * 1024;  // Bytes in one megabyte
+constexpr int kMaxPortNumber = 65535;        // Maximum TCP/UDP port number
+
 /**
  * @brief Convert YAML node to JSON (recursive)
  * Reference: ../mygram-db/src/config/config.cpp:YamlToJson
@@ -301,7 +304,7 @@ CacheConfig ParseCacheConfig(const YAML::Node& node) {
   }
   if (node["max_memory_mb"]) {
     // Convert MB to bytes
-    config.max_memory_bytes = static_cast<size_t>(node["max_memory_mb"].as<int>()) * 1024 * 1024;
+    config.max_memory_bytes = static_cast<size_t>(node["max_memory_mb"].as<int>()) * kBytesPerMB;
   }
   if (node["min_query_cost_ms"]) {
     config.min_query_cost_ms = node["min_query_cost_ms"].as<double>();
@@ -416,8 +419,8 @@ utils::Expected<Config, utils::Error> LoadConfig(const std::string& path) {
     return config;
 
   } catch (const YAML::BadFile& e) {
-    return utils::MakeUnexpected(
-        utils::MakeError(utils::ErrorCode::kConfigFileNotFound, "Failed to open config file: " + std::string(e.what())));
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kConfigFileNotFound,
+                                                  "Failed to open config file: " + std::string(e.what())));
   } catch (const YAML::Exception& e) {
     return utils::MakeUnexpected(
         utils::MakeError(utils::ErrorCode::kConfigYamlError, "YAML parsing error: " + std::string(e.what())));
@@ -488,16 +491,16 @@ utils::Expected<void, utils::Error> ValidateConfig(const Config& config) {
         utils::MakeError(utils::ErrorCode::kConfigInvalidValue, "performance.max_connections must be greater than 0"));
   }
   if (config.perf.connection_timeout_sec <= 0) {
-    return utils::MakeUnexpected(
-        utils::MakeError(utils::ErrorCode::kConfigInvalidValue, "performance.connection_timeout_sec must be greater than 0"));
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
+                                                  "performance.connection_timeout_sec must be greater than 0"));
   }
 
   // Validate API configuration
-  if (config.api.tcp.port <= 0 || config.api.tcp.port > 65535) {
+  if (config.api.tcp.port <= 0 || config.api.tcp.port > kMaxPortNumber) {
     return utils::MakeUnexpected(
         utils::MakeError(utils::ErrorCode::kConfigInvalidValue, "api.tcp.port must be between 1 and 65535"));
   }
-  if (config.api.http.enable && (config.api.http.port <= 0 || config.api.http.port > 65535)) {
+  if (config.api.http.enable && (config.api.http.port <= 0 || config.api.http.port > kMaxPortNumber)) {
     return utils::MakeUnexpected(
         utils::MakeError(utils::ErrorCode::kConfigInvalidValue, "api.http.port must be between 1 and 65535"));
   }
@@ -507,12 +510,12 @@ utils::Expected<void, utils::Error> ValidateConfig(const Config& config) {
           utils::MakeError(utils::ErrorCode::kConfigInvalidValue, "api.rate_limiting.capacity must be greater than 0"));
     }
     if (config.api.rate_limiting.refill_rate <= 0) {
-      return utils::MakeUnexpected(
-          utils::MakeError(utils::ErrorCode::kConfigInvalidValue, "api.rate_limiting.refill_rate must be greater than 0"));
+      return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
+                                                    "api.rate_limiting.refill_rate must be greater than 0"));
     }
     if (config.api.rate_limiting.max_clients <= 0) {
-      return utils::MakeUnexpected(
-          utils::MakeError(utils::ErrorCode::kConfigInvalidValue, "api.rate_limiting.max_clients must be greater than 0"));
+      return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
+                                                    "api.rate_limiting.max_clients must be greater than 0"));
     }
   }
 
@@ -526,8 +529,8 @@ utils::Expected<void, utils::Error> ValidateConfig(const Config& config) {
 
   // Validate cache configuration
   if (config.cache.max_memory_bytes == 0 && config.cache.enabled) {
-    return utils::MakeUnexpected(
-        utils::MakeError(utils::ErrorCode::kConfigInvalidValue, "cache.max_memory_mb must be greater than 0 when cache is enabled"));
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
+                                                  "cache.max_memory_mb must be greater than 0 when cache is enabled"));
   }
   if (config.cache.ttl_seconds < 0) {
     return utils::MakeUnexpected(

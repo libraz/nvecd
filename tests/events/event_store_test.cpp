@@ -47,7 +47,7 @@ TEST(EventStoreTest, AddSingleEvent) {
 
   auto events = store.GetEvents("user1");
   ASSERT_EQ(events.size(), 1);
-  EXPECT_EQ(events[0].id, "item1");
+  EXPECT_EQ(events[0].item_id, "item1");
   EXPECT_EQ(events[0].score, 10);
   EXPECT_GT(events[0].timestamp, 0);
 }
@@ -65,9 +65,9 @@ TEST(EventStoreTest, AddMultipleEventsToSameContext) {
 
   auto events = store.GetEvents("user1");
   ASSERT_EQ(events.size(), 3);
-  EXPECT_EQ(events[0].id, "item1");
-  EXPECT_EQ(events[1].id, "item2");
-  EXPECT_EQ(events[2].id, "item3");
+  EXPECT_EQ(events[0].item_id, "item1");
+  EXPECT_EQ(events[1].item_id, "item2");
+  EXPECT_EQ(events[2].item_id, "item3");
 }
 
 TEST(EventStoreTest, AddEventsToMultipleContexts) {
@@ -86,11 +86,11 @@ TEST(EventStoreTest, AddEventsToMultipleContexts) {
 
   auto events1 = store.GetEvents("user1");
   ASSERT_EQ(events1.size(), 1);
-  EXPECT_EQ(events1[0].id, "item1");
+  EXPECT_EQ(events1[0].item_id, "item1");
 
   auto events2 = store.GetEvents("user2");
   ASSERT_EQ(events2.size(), 1);
-  EXPECT_EQ(events2[0].id, "item2");
+  EXPECT_EQ(events2[0].item_id, "item2");
 }
 
 // ============================================================================
@@ -111,9 +111,9 @@ TEST(EventStoreTest, RingBufferOverwrite) {
 
   auto events = store.GetEvents("user1");
   ASSERT_EQ(events.size(), 3);
-  EXPECT_EQ(events[0].id, "item2");
-  EXPECT_EQ(events[1].id, "item3");
-  EXPECT_EQ(events[2].id, "item4");
+  EXPECT_EQ(events[0].item_id, "item2");
+  EXPECT_EQ(events[1].item_id, "item3");
+  EXPECT_EQ(events[2].item_id, "item4");
 }
 
 TEST(EventStoreTest, MultipleOverwrites) {
@@ -121,16 +121,15 @@ TEST(EventStoreTest, MultipleOverwrites) {
   EventStore store(config);
 
   for (int i = 1; i <= 10; ++i) {
-    ASSERT_TRUE(store.AddEvent("user1", "item" + std::to_string(i), i * 10)
-                    .has_value());
+    ASSERT_TRUE(store.AddEvent("user1", "item" + std::to_string(i), i * 10).has_value());
   }
 
   EXPECT_EQ(store.GetTotalEventCount(), 10);
 
   auto events = store.GetEvents("user1");
   ASSERT_EQ(events.size(), 2);
-  EXPECT_EQ(events[0].id, "item9");
-  EXPECT_EQ(events[1].id, "item10");
+  EXPECT_EQ(events[0].item_id, "item9");
+  EXPECT_EQ(events[1].item_id, "item10");
 }
 
 // ============================================================================
@@ -266,7 +265,7 @@ TEST(EventStoreTest, ReuseAfterClear) {
 
   auto events = store.GetEvents("user2");
   ASSERT_EQ(events.size(), 1);
-  EXPECT_EQ(events[0].id, "item2");
+  EXPECT_EQ(events[0].item_id, "item2");
 }
 
 // ============================================================================
@@ -285,8 +284,7 @@ TEST(EventStoreTest, ConcurrentWrites) {
     threads.emplace_back([&store, t]() {
       std::string ctx = "user" + std::to_string(t);
       for (int i = 0; i < events_per_thread; ++i) {
-        auto result =
-            store.AddEvent(ctx, "item" + std::to_string(i), i);
+        auto result = store.AddEvent(ctx, "item" + std::to_string(i), i);
         EXPECT_TRUE(result.has_value());
       }
     });
@@ -306,8 +304,7 @@ TEST(EventStoreTest, ConcurrentReadsAndWrites) {
 
   // Add initial data
   for (int i = 0; i < 100; ++i) {
-    ASSERT_TRUE(store.AddEvent("user1", "item" + std::to_string(i), i)
-                    .has_value());
+    ASSERT_TRUE(store.AddEvent("user1", "item" + std::to_string(i), i).has_value());
   }
 
   std::atomic<bool> stop{false};
@@ -363,7 +360,7 @@ TEST(EventStoreTest, VeryLongStrings) {
 
   auto events = store.GetEvents(long_ctx);
   ASSERT_EQ(events.size(), 1);
-  EXPECT_EQ(events[0].id, long_id);
+  EXPECT_EQ(events[0].item_id, long_id);
 }
 
 TEST(EventStoreTest, SpecialCharacters) {
@@ -378,7 +375,7 @@ TEST(EventStoreTest, SpecialCharacters) {
 
   auto events = store.GetEvents(special_ctx);
   ASSERT_EQ(events.size(), 1);
-  EXPECT_EQ(events[0].id, special_id);
+  EXPECT_EQ(events[0].item_id, special_id);
 }
 
 }  // namespace

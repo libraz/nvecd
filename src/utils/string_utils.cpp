@@ -160,7 +160,8 @@ std::string NormalizeTextICU(std::string_view text, bool nfkc, std::string_view 
   UErrorCode status = U_ZERO_ERROR;
 
   // Convert UTF-8 to UnicodeString
-  icu::UnicodeString ustr = icu::UnicodeString::fromUTF8(icu::StringPiece(text.data(), static_cast<int32_t>(text.size())));
+  icu::UnicodeString ustr =
+      icu::UnicodeString::fromUTF8(icu::StringPiece(text.data(), static_cast<int32_t>(text.size())));
 
   // NFKC normalization
   if (nfkc) {
@@ -203,7 +204,8 @@ std::string NormalizeTextICU(std::string_view text, bool nfkc, std::string_view 
 }
 #endif
 
-std::string NormalizeText(std::string_view text, bool /* nfkc */, std::string_view /* width */, bool lower) {
+std::string NormalizeText(std::string_view text, [[maybe_unused]] bool nfkc, [[maybe_unused]] std::string_view width,
+                          bool lower) {
 #ifdef USE_ICU
   return NormalizeTextICU(text, nfkc, width, lower);
 #else
@@ -211,25 +213,25 @@ std::string NormalizeText(std::string_view text, bool /* nfkc */, std::string_vi
   std::string result(text);
 
   if (lower) {
-    std::transform(result.begin(), result.end(), result.begin(), [](unsigned char c) { return std::tolower(c); });
+    std::transform(result.begin(), result.end(), result.begin(), [](unsigned char chr) { return std::tolower(chr); });
   }
 
   return result;
 #endif
 }
 
-std::vector<std::string> GenerateNgrams(std::string_view text, int n) {
+std::vector<std::string> GenerateNgrams(std::string_view text, int ngram_size) {
   std::vector<std::string> ngrams;
 
   // Convert to codepoints for proper character-level n-grams
   std::vector<uint32_t> codepoints = Utf8ToCodepoints(text);
 
-  if (codepoints.empty() || n <= 0) {
+  if (codepoints.empty() || ngram_size <= 0) {
     return ngrams;
   }
 
-  // For n=1 (unigrams), just return each character
-  if (n == 1) {
+  // For ngram_size=1 (unigrams), just return each character
+  if (ngram_size == 1) {
     ngrams.reserve(codepoints.size());
     for (uint32_t codepoint : codepoints) {
       ngrams.push_back(CodepointsToUtf8({codepoint}));
@@ -237,15 +239,15 @@ std::vector<std::string> GenerateNgrams(std::string_view text, int n) {
     return ngrams;
   }
 
-  // For n > 1
-  if (codepoints.size() < static_cast<size_t>(n)) {
+  // For ngram_size > 1
+  if (codepoints.size() < static_cast<size_t>(ngram_size)) {
     return ngrams;
   }
 
-  ngrams.reserve(codepoints.size() - n + 1);
-  for (size_t i = 0; i <= codepoints.size() - n; ++i) {
+  ngrams.reserve(codepoints.size() - ngram_size + 1);
+  for (size_t i = 0; i <= codepoints.size() - ngram_size; ++i) {
     std::vector<uint32_t> ngram_cp(codepoints.begin() + static_cast<std::ptrdiff_t>(i),
-                                   codepoints.begin() + static_cast<std::ptrdiff_t>(i + n));
+                                   codepoints.begin() + static_cast<std::ptrdiff_t>(i + ngram_size));
     ngrams.push_back(CodepointsToUtf8(ngram_cp));
   }
 

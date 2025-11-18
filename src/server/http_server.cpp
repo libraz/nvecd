@@ -15,7 +15,6 @@
 #include <chrono>
 #include <sstream>
 
-#include "cache/similarity_cache.h"
 #include "events/co_occurrence_index.h"
 #include "events/event_store.h"
 #include "server/command_parser.h"
@@ -113,9 +112,8 @@ void HttpServer::SetupRoutes() {
   server_->Get("/info", [this](const httplib::Request& req, httplib::Response& res) { HandleInfo(req, res); });
 
   // Health check endpoints
-  server_->Get("/health", [this](const httplib::Request& req, httplib::Response& res) { HandleHealth(req, res); });
-  server_->Get("/health/live",
-               [this](const httplib::Request& req, httplib::Response& res) { HandleHealthLive(req, res); });
+  server_->Get("/health", [](const httplib::Request& req, httplib::Response& res) { HandleHealth(req, res); });
+  server_->Get("/health/live", [](const httplib::Request& req, httplib::Response& res) { HandleHealthLive(req, res); });
   server_->Get("/health/ready",
                [this](const httplib::Request& req, httplib::Response& res) { HandleHealthReady(req, res); });
   server_->Get("/health/detail",
@@ -123,15 +121,6 @@ void HttpServer::SetupRoutes() {
 
   // Configuration
   server_->Get("/config", [this](const httplib::Request& req, httplib::Response& res) { HandleConfig(req, res); });
-
-  // Metrics
-  server_->Get("/metrics", [this](const httplib::Request& req, httplib::Response& res) { HandleMetrics(req, res); });
-
-  // Cache management
-  server_->Get("/cache/stats",
-               [this](const httplib::Request& req, httplib::Response& res) { HandleCacheStats(req, res); });
-  server_->Post("/cache/clear",
-                [this](const httplib::Request& req, httplib::Response& res) { HandleCacheClear(req, res); });
 
   // Snapshot management
   server_->Post("/dump/save",
@@ -144,9 +133,8 @@ void HttpServer::SetupRoutes() {
                 [this](const httplib::Request& req, httplib::Response& res) { HandleDumpInfo(req, res); });
 
   // Debug mode
-  server_->Post("/debug/on", [this](const httplib::Request& req, httplib::Response& res) { HandleDebugOn(req, res); });
-  server_->Post("/debug/off",
-                [this](const httplib::Request& req, httplib::Response& res) { HandleDebugOff(req, res); });
+  server_->Post("/debug/on", [](const httplib::Request& req, httplib::Response& res) { HandleDebugOn(req, res); });
+  server_->Post("/debug/off", [](const httplib::Request& req, httplib::Response& res) { HandleDebugOff(req, res); });
 }
 
 void HttpServer::SetupAccessControl() {
@@ -233,8 +221,8 @@ nvecd::utils::Expected<void, nvecd::utils::Error> HttpServer::Start() {
       server_thread_->join();
     }
     std::lock_guard<std::mutex> lock(error_mutex);
-    auto error = MakeError(ErrorCode::kNetworkBindFailed,
-                           thread_error.empty() ? "Failed to start HTTP server" : thread_error);
+    auto error =
+        MakeError(ErrorCode::kNetworkBindFailed, thread_error.empty() ? "Failed to start HTTP server" : thread_error);
     return MakeUnexpected(error);
   }
 
@@ -279,8 +267,6 @@ void HttpServer::SendError(httplib::Response& res, int status_code, const std::s
 //
 
 void HttpServer::HandleHealth(const httplib::Request& /*req*/, httplib::Response& res) {
-  ;
-
   json response;
   response["status"] = "ok";
   response["timestamp"] =
@@ -290,8 +276,6 @@ void HttpServer::HandleHealth(const httplib::Request& /*req*/, httplib::Response
 }
 
 void HttpServer::HandleHealthLive(const httplib::Request& /*req*/, httplib::Response& res) {
-  ;
-
   // Liveness probe: Always return 200 OK if the process is running
   // This is used by orchestrators (Kubernetes, Docker) to detect deadlocks
   json response;
@@ -350,7 +334,7 @@ void HttpServer::HandleHealthDetail(const httplib::Request& /*req*/, httplib::Re
   components["server"] = server_comp;
 
   // Event store component
-  if (handler_context_ != nullptr && handler_context_->event_store) {
+  if (handler_context_ != nullptr && handler_context_->event_store != nullptr) {
     json event_comp;
     event_comp["status"] = "ok";
     auto event_stats = handler_context_->event_store->GetStatistics();
@@ -360,7 +344,7 @@ void HttpServer::HandleHealthDetail(const httplib::Request& /*req*/, httplib::Re
   }
 
   // Vector store component
-  if (handler_context_ != nullptr && handler_context_->vector_store) {
+  if (handler_context_ != nullptr && handler_context_->vector_store != nullptr) {
     json vector_comp;
     vector_comp["status"] = "ok";
     auto vector_stats = handler_context_->vector_store->GetStatistics();
@@ -370,7 +354,7 @@ void HttpServer::HandleHealthDetail(const httplib::Request& /*req*/, httplib::Re
   }
 
   // Co-occurrence index component
-  if (handler_context_ != nullptr && handler_context_->co_index) {
+  if (handler_context_ != nullptr && handler_context_->co_index != nullptr) {
     json co_comp;
     co_comp["status"] = "ok";
     auto co_stats = handler_context_->co_index->GetStatistics();
@@ -418,21 +402,21 @@ void HttpServer::HandleInfo(const httplib::Request& /*req*/, httplib::Response& 
 
     // Event store memory
     size_t event_memory = 0;
-    if (handler_context_ != nullptr && handler_context_->event_store) {
+    if (handler_context_ != nullptr && handler_context_->event_store != nullptr) {
       event_memory = handler_context_->event_store->MemoryUsage();
       total_memory += event_memory;
     }
 
     // Vector store memory
     size_t vector_memory = 0;
-    if (handler_context_ != nullptr && handler_context_->vector_store) {
+    if (handler_context_ != nullptr && handler_context_->vector_store != nullptr) {
       vector_memory = handler_context_->vector_store->MemoryUsage();
       total_memory += vector_memory;
     }
 
     // Co-occurrence index memory
     size_t co_memory = 0;
-    if (handler_context_ != nullptr && handler_context_->co_index) {
+    if (handler_context_ != nullptr && handler_context_->co_index != nullptr) {
       co_memory = handler_context_->co_index->MemoryUsage();
       total_memory += co_memory;
     }
@@ -481,7 +465,7 @@ void HttpServer::HandleInfo(const httplib::Request& /*req*/, httplib::Response& 
     // Store statistics
     json stores_obj;
 
-    if (handler_context_ != nullptr && handler_context_->event_store) {
+    if (handler_context_ != nullptr && handler_context_->event_store != nullptr) {
       auto event_stats = handler_context_->event_store->GetStatistics();
       json event_obj;
       event_obj["contexts"] = event_stats.active_contexts;
@@ -489,7 +473,7 @@ void HttpServer::HandleInfo(const httplib::Request& /*req*/, httplib::Response& 
       stores_obj["event_store"] = event_obj;
     }
 
-    if (handler_context_ != nullptr && handler_context_->vector_store) {
+    if (handler_context_ != nullptr && handler_context_->vector_store != nullptr) {
       auto vector_stats = handler_context_->vector_store->GetStatistics();
       json vector_obj;
       vector_obj["vectors"] = vector_stats.vector_count;
@@ -497,7 +481,7 @@ void HttpServer::HandleInfo(const httplib::Request& /*req*/, httplib::Response& 
       stores_obj["vector_store"] = vector_obj;
     }
 
-    if (handler_context_ != nullptr && handler_context_->co_index) {
+    if (handler_context_ != nullptr && handler_context_->co_index != nullptr) {
       auto co_stats = handler_context_->co_index->GetStatistics();
       json co_obj;
       co_obj["tracked_ids"] = co_stats.tracked_ids;
@@ -548,8 +532,7 @@ void HttpServer::HandleConfig(const httplib::Request& /*req*/, httplib::Response
     similarity_obj["fusion_alpha"] = full_config_->similarity.fusion_alpha;
     response["similarity"] = similarity_obj;
 
-    response["notes"] =
-        "Sensitive configuration values are redacted. Use CONFIG SHOW over TCP for full details.";
+    response["notes"] = "Sensitive configuration values are redacted. Use CONFIG SHOW over TCP for full details.";
 
     SendJson(res, kHttpOk, response);
 
@@ -577,44 +560,18 @@ void HttpServer::HandleEvent(const httplib::Request& req, httplib::Response& res
     json body = json::parse(req.body);
 
     // Validate required fields
-    if (!body.contains("ctx") || !body.contains("id") || !body.contains("type")) {
-      SendError(res, kHttpBadRequest, "Missing required fields: ctx, id, type");
+    if (!body.contains("ctx") || !body.contains("id") || !body.contains("score")) {
+      SendError(res, kHttpBadRequest, "Missing required fields: ctx, id, score");
       return;
     }
 
     std::string ctx = body["ctx"];
-    std::string id = body["id"];
-    std::string type_str = body["type"];
-
-    // Parse event type
-    events::EventType event_type;
-    if (type_str == "ADD" || type_str == "add") {
-      event_type = events::EventType::ADD;
-      if (!body.contains("score")) {
-        SendError(res, kHttpBadRequest, "ADD type requires 'score' field");
-        return;
-      }
-    } else if (type_str == "SET" || type_str == "set") {
-      event_type = events::EventType::SET;
-      if (!body.contains("score")) {
-        SendError(res, kHttpBadRequest, "SET type requires 'score' field");
-        return;
-      }
-    } else if (type_str == "DEL" || type_str == "del") {
-      event_type = events::EventType::DEL;
-    } else {
-      SendError(res, kHttpBadRequest, "Invalid type: " + type_str + " (must be ADD, SET, or DEL)");
-      return;
-    }
-
-    int score = 0;
-    if (event_type != events::EventType::DEL) {
-      score = body["score"];
-    }
+    std::string item_id = body["id"];
+    int score = body["score"];
 
     // Add event to event store
-    if (handler_context_->event_store) {
-      auto result = handler_context_->event_store->AddEvent(ctx, id, score, event_type);
+    if (handler_context_->event_store != nullptr) {
+      auto result = handler_context_->event_store->AddEvent(ctx, item_id, score);
       if (!result) {
         SendError(res, kHttpInternalServerError, result.error().message());
         return;
@@ -625,7 +582,7 @@ void HttpServer::HandleEvent(const httplib::Request& req, httplib::Response& res
     }
 
     // Update co-occurrence index
-    if (handler_context_->co_index) {
+    if (handler_context_->co_index != nullptr) {
       auto events = handler_context_->event_store->GetEvents(ctx);
       handler_context_->co_index->UpdateFromEvents(ctx, events);
     }
@@ -663,12 +620,12 @@ void HttpServer::HandleVecset(const httplib::Request& req, httplib::Response& re
       return;
     }
 
-    std::string id = body["id"];
+    std::string vector_id = body["id"];
     std::vector<float> vector = body["vector"].get<std::vector<float>>();
 
     // Add vector to vector store
-    if (handler_context_->vector_store) {
-      auto result = handler_context_->vector_store->SetVector(id, vector);
+    if (handler_context_->vector_store != nullptr) {
+      auto result = handler_context_->vector_store->SetVector(vector_id, vector);
       if (!result) {
         SendError(res, kHttpInternalServerError, result.error().message());
         return;
@@ -712,12 +669,12 @@ void HttpServer::HandleSim(const httplib::Request& req, httplib::Response& res) 
       return;
     }
 
-    std::string id = body["id"];
-    int top_k = body.value("top_k", handler_context_->config->similarity.default_top_k);
+    std::string item_id = body["id"];
+    int top_k = static_cast<int>(body.value("top_k", handler_context_->full_config->similarity.default_top_k));
     std::string mode = body.value("mode", "fusion");
 
     // Check if similarity engine is initialized
-    if (!handler_context_->similarity_engine) {
+    if (handler_context_->similarity_engine == nullptr) {
       SendError(res, kHttpInternalServerError, "Similarity engine not initialized");
       return;
     }
@@ -725,11 +682,11 @@ void HttpServer::HandleSim(const httplib::Request& req, httplib::Response& res) 
     // Call appropriate search method based on mode
     utils::Expected<std::vector<similarity::SimilarityResult>, utils::Error> result;
     if (mode == "events") {
-      result = handler_context_->similarity_engine->SearchByIdEvents(id, top_k);
+      result = handler_context_->similarity_engine->SearchByIdEvents(item_id, top_k);
     } else if (mode == "vectors") {
-      result = handler_context_->similarity_engine->SearchByIdVectors(id, top_k);
+      result = handler_context_->similarity_engine->SearchByIdVectors(item_id, top_k);
     } else if (mode == "fusion") {
-      result = handler_context_->similarity_engine->SearchByIdFusion(id, top_k);
+      result = handler_context_->similarity_engine->SearchByIdFusion(item_id, top_k);
     } else {
       SendError(res, kHttpBadRequest, "Invalid mode. Must be one of: events, vectors, fusion");
       return;
@@ -756,7 +713,7 @@ void HttpServer::HandleSim(const httplib::Request& req, httplib::Response& res) 
     json results_array = json::array();
     for (const auto& sim_result : *result) {
       json item;
-      item["id"] = sim_result.id;
+      item["id"] = sim_result.item_id;
       item["score"] = sim_result.score;
       results_array.push_back(item);
     }
@@ -791,10 +748,10 @@ void HttpServer::HandleSimv(const httplib::Request& req, httplib::Response& res)
     }
 
     std::vector<float> vector = body["vector"].get<std::vector<float>>();
-    int top_k = body.value("top_k", handler_context_->config->similarity.default_top_k);
+    int top_k = static_cast<int>(body.value("top_k", handler_context_->full_config->similarity.default_top_k));
 
     // Check if similarity engine is initialized
-    if (!handler_context_->similarity_engine) {
+    if (handler_context_->similarity_engine == nullptr) {
       SendError(res, kHttpInternalServerError, "Similarity engine not initialized");
       return;
     }
@@ -817,7 +774,7 @@ void HttpServer::HandleSimv(const httplib::Request& req, httplib::Response& res)
     json results_array = json::array();
     for (const auto& sim_result : *result) {
       json item;
-      item["id"] = sim_result.id;
+      item["id"] = sim_result.item_id;
       item["score"] = sim_result.score;
       results_array.push_back(item);
     }
@@ -1010,8 +967,6 @@ void HttpServer::HandleDumpInfo(const httplib::Request& req, httplib::Response& 
 //
 
 void HttpServer::HandleDebugOn(const httplib::Request& /*req*/, httplib::Response& res) {
-  ;
-
   // Note: HTTP is stateless, so we cannot enable per-connection debug mode
   // This endpoint exists for API compatibility, but has limited functionality
   json response;
@@ -1021,196 +976,11 @@ void HttpServer::HandleDebugOn(const httplib::Request& /*req*/, httplib::Respons
 }
 
 void HttpServer::HandleDebugOff(const httplib::Request& /*req*/, httplib::Response& res) {
-  ;
-
   // Note: HTTP is stateless, so we cannot disable per-connection debug mode
   json response;
   response["status"] = "ok";
   response["message"] = "Debug mode disabled (note: HTTP is stateless, use TCP for per-connection debug)";
   SendJson(res, kHttpOk, response);
-}
-
-//
-// Metrics handler (Prometheus-compatible)
-// Reference: ../mygram-db/src/server/http_server.cpp:HandleMetrics()
-// Reusability: 70% (adapted for nvecd metrics)
-//
-
-void HttpServer::HandleMetrics(const httplib::Request& /*req*/, httplib::Response& res) {
-  ;
-
-  try {
-    // Use TCP server's stats if available (includes all protocol stats), otherwise use HTTP-only stats
-    const ServerStats& effective_stats = (tcp_stats_ != nullptr) ? *tcp_stats_ : stats_;
-
-    std::ostringstream metrics;
-
-    // Server uptime
-    metrics << "# HELP nvecd_uptime_seconds Server uptime in seconds\n";
-    metrics << "# TYPE nvecd_uptime_seconds counter\n";
-    metrics << "nvecd_uptime_seconds " << 0 << "\n\n";  // Simple ServerStats doesn't track uptime
-
-    // Total commands
-    metrics << "# HELP nvecd_commands_total Total commands processed\n";
-    metrics << "# TYPE nvecd_commands_total counter\n";
-    metrics << "nvecd_commands_total{command=\"event\"} " << effective_stats.event_commands.load() << "\n";
-    metrics << "nvecd_commands_total{command=\"vecset\"} " << effective_stats.vecset_commands.load() << "\n";
-    metrics << "nvecd_commands_total{command=\"sim\"} " << effective_stats.sim_commands.load() << "\n";
-    metrics << "nvecd_commands_total " << effective_stats.total_commands.load() << "\n\n";
-
-    // Memory usage
-    size_t total_memory = 0;
-    if (handler_context_ != nullptr && handler_context_->event_store) {
-      total_memory += handler_context_->event_store->MemoryUsage();
-    }
-    if (handler_context_ != nullptr && handler_context_->vector_store) {
-      total_memory += handler_context_->vector_store->MemoryUsage();
-    }
-    if (handler_context_ != nullptr && handler_context_->co_index) {
-      total_memory += handler_context_->co_index->MemoryUsage();
-    }
-
-    metrics << "# HELP nvecd_memory_bytes Current memory usage in bytes\n";
-    metrics << "# TYPE nvecd_memory_bytes gauge\n";
-    metrics << "nvecd_memory_bytes " << total_memory << "\n\n";
-
-    // Vector count
-    if (handler_context_ != nullptr && handler_context_->vector_store) {
-      auto vector_stats = handler_context_->vector_store->GetStatistics();
-      metrics << "# HELP nvecd_vectors_total Total vectors stored\n";
-      metrics << "# TYPE nvecd_vectors_total gauge\n";
-      metrics << "nvecd_vectors_total " << vector_stats.vector_count << "\n\n";
-    }
-
-    // Event count
-    if (handler_context_ != nullptr && handler_context_->event_store) {
-      auto event_stats = handler_context_->event_store->GetStatistics();
-      metrics << "# HELP nvecd_events_total Total events stored\n";
-      metrics << "# TYPE nvecd_events_total gauge\n";
-      metrics << "nvecd_events_total " << event_stats.total_events << "\n\n";
-
-      metrics << "# HELP nvecd_contexts_total Total contexts stored\n";
-      metrics << "# TYPE nvecd_contexts_total gauge\n";
-      metrics << "nvecd_contexts_total " << event_stats.active_contexts << "\n\n";
-    }
-
-    // Cache metrics
-    if (handler_context_ != nullptr && handler_context_->cache) {
-      auto cache_stats = handler_context_->cache->GetStatistics();
-
-      metrics << "# HELP nvecd_cache_queries_total Total cache queries\n";
-      metrics << "# TYPE nvecd_cache_queries_total counter\n";
-      metrics << "nvecd_cache_queries_total " << cache_stats.total_queries << "\n\n";
-
-      metrics << "# HELP nvecd_cache_hits_total Total cache hits\n";
-      metrics << "# TYPE nvecd_cache_hits_total counter\n";
-      metrics << "nvecd_cache_hits_total " << cache_stats.cache_hits << "\n\n";
-
-      metrics << "# HELP nvecd_cache_misses_total Total cache misses\n";
-      metrics << "# TYPE nvecd_cache_misses_total counter\n";
-      metrics << "nvecd_cache_misses_total " << cache_stats.cache_misses << "\n\n";
-
-      metrics << "# HELP nvecd_cache_hit_rate Cache hit rate\n";
-      metrics << "# TYPE nvecd_cache_hit_rate gauge\n";
-      metrics << "nvecd_cache_hit_rate " << cache_stats.HitRate() << "\n\n";
-
-      metrics << "# HELP nvecd_cache_entries Current cache entries\n";
-      metrics << "# TYPE nvecd_cache_entries gauge\n";
-      metrics << "nvecd_cache_entries " << cache_stats.current_entries << "\n\n";
-
-      metrics << "# HELP nvecd_cache_memory_bytes Current cache memory usage\n";
-      metrics << "# TYPE nvecd_cache_memory_bytes gauge\n";
-      metrics << "nvecd_cache_memory_bytes " << cache_stats.current_memory_bytes << "\n\n";
-    }
-
-    res.status = kHttpOk;
-    res.set_content(metrics.str(), "text/plain; version=0.0.4; charset=utf-8");
-
-  } catch (const std::exception& e) {
-    SendError(res, kHttpInternalServerError, "Internal error: " + std::string(e.what()));
-  }
-}
-
-//
-// Cache management handlers
-//
-
-void HttpServer::HandleCacheStats(const httplib::Request& /*req*/, httplib::Response& res) {
-  ;
-
-  try {
-    if (handler_context_ == nullptr || handler_context_->cache == nullptr) {
-      SendError(res, kHttpInternalServerError, "Cache not initialized");
-      return;
-    }
-
-    auto stats = handler_context_->cache->GetStatistics();
-
-    json response;
-    response["enabled"] = true;
-    response["total_queries"] = stats.total_queries;
-    response["cache_hits"] = stats.cache_hits;
-    response["cache_misses"] = stats.cache_misses;
-    response["cache_misses_invalidated"] = stats.cache_misses_invalidated;
-    response["cache_misses_not_found"] = stats.cache_misses_not_found;
-    response["hit_rate"] = stats.HitRate();
-    response["current_entries"] = stats.current_entries;
-    response["current_memory_bytes"] = stats.current_memory_bytes;
-    response["current_memory_mb"] = static_cast<double>(stats.current_memory_bytes) / (1024.0 * 1024.0);
-    response["evictions"] = stats.evictions;
-    response["avg_hit_latency_ms"] = stats.AverageCacheHitLatency();
-    response["avg_miss_latency_ms"] = stats.AverageCacheMissLatency();
-    response["time_saved_ms"] = stats.TotalTimeSaved();
-
-    SendJson(res, kHttpOk, response);
-
-  } catch (const std::exception& e) {
-    SendError(res, kHttpInternalServerError, "Internal error: " + std::string(e.what()));
-  }
-}
-
-void HttpServer::HandleCacheClear(const httplib::Request& req, httplib::Response& res) {
-  ;
-
-  try {
-    if (handler_context_ == nullptr || handler_context_->cache == nullptr) {
-      SendError(res, kHttpInternalServerError, "Cache not initialized");
-      return;
-    }
-
-    // Parse optional scope parameter
-    std::string scope = "all";
-    if (!req.body.empty()) {
-      try {
-        json body = json::parse(req.body);
-        scope = body.value("scope", "all");
-      } catch (const json::parse_error&) {
-        // Ignore parse errors, use default scope
-      }
-    }
-
-    // Get stats before clearing
-    auto stats_before = handler_context_->cache->GetStatistics();
-    uint64_t entries_before = stats_before.current_entries;
-
-    // Clear cache (currently only supports clearing all)
-    if (scope == "all") {
-      handler_context_->cache->Clear();
-    } else {
-      SendError(res, kHttpBadRequest, "Invalid scope. Only 'all' is supported currently.");
-      return;
-    }
-
-    json response;
-    response["status"] = "ok";
-    response["scope"] = scope;
-    response["entries_removed"] = entries_before;
-
-    SendJson(res, kHttpOk, response);
-
-  } catch (const std::exception& e) {
-    SendError(res, kHttpInternalServerError, "Internal error: " + std::string(e.what()));
-  }
 }
 
 }  // namespace nvecd::server

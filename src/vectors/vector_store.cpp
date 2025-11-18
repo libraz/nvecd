@@ -11,23 +11,20 @@
 
 namespace nvecd::vectors {
 
-VectorStore::VectorStore(const config::VectorsConfig& config)
-    : config_(config) {}
+VectorStore::VectorStore(config::VectorsConfig config) : config_(std::move(config)) {}
 
-utils::Expected<void, utils::Error> VectorStore::SetVector(
-    const std::string& id, const std::vector<float>& vec, bool normalize) {
+utils::Expected<void, utils::Error> VectorStore::SetVector(const std::string& vector_id, const std::vector<float>& vec,
+                                                           bool normalize) {
   // Validate inputs
-  if (id.empty()) {
-    auto error =
-        utils::MakeError(utils::ErrorCode::kInvalidArgument, "ID cannot be empty");
-    utils::LogVectorStoreError("set_vector", id, vec.size(), error.message());
+  if (vector_id.empty()) {
+    auto error = utils::MakeError(utils::ErrorCode::kInvalidArgument, "ID cannot be empty");
+    utils::LogVectorStoreError("set_vector", vector_id, static_cast<int>(vec.size()), error.message());
     return utils::MakeUnexpected(error);
   }
 
   if (vec.empty()) {
-    auto error = utils::MakeError(utils::ErrorCode::kInvalidArgument,
-                                  "Vector cannot be empty");
-    utils::LogVectorStoreError("set_vector", id, vec.size(), error.message());
+    auto error = utils::MakeError(utils::ErrorCode::kInvalidArgument, "Vector cannot be empty");
+    utils::LogVectorStoreError("set_vector", vector_id, static_cast<int>(vec.size()), error.message());
     return utils::MakeUnexpected(error);
   }
 
@@ -37,10 +34,8 @@ utils::Expected<void, utils::Error> VectorStore::SetVector(
 
   if (normalize) {
     if (!Normalize(data)) {
-      auto error = utils::MakeError(utils::ErrorCode::kInvalidArgument,
-                                    "Cannot normalize zero vector");
-      utils::LogVectorStoreError("set_vector", id, vec.size(),
-                                 error.message());
+      auto error = utils::MakeError(utils::ErrorCode::kInvalidArgument, "Cannot normalize zero vector");
+      utils::LogVectorStoreError("set_vector", vector_id, static_cast<int>(vec.size()), error.message());
       return utils::MakeUnexpected(error);
     }
     is_normalized = true;
@@ -59,46 +54,44 @@ utils::Expected<void, utils::Error> VectorStore::SetVector(
     if (data.size() != dimension_) {
       auto error = utils::MakeError(
           utils::ErrorCode::kVectorDimensionMismatch,
-          "Vector dimension mismatch: expected " + std::to_string(dimension_) +
-              ", got " + std::to_string(data.size()));
-      utils::LogVectorStoreError("set_vector", id, data.size(),
-                                 error.message());
+          "Vector dimension mismatch: expected " + std::to_string(dimension_) + ", got " + std::to_string(data.size()));
+      utils::LogVectorStoreError("set_vector", vector_id, static_cast<int>(data.size()), error.message());
       return utils::MakeUnexpected(error);
     }
 
     // Store vector
-    vectors_[id] = Vector(std::move(data), is_normalized);
+    vectors_[vector_id] = Vector(std::move(data), is_normalized);
   }
 
   return {};
 }
 
-std::optional<Vector> VectorStore::GetVector(const std::string& id) const {
+std::optional<Vector> VectorStore::GetVector(const std::string& vector_id) const {
   std::shared_lock lock(mutex_);
 
-  auto it = vectors_.find(id);
-  if (it == vectors_.end()) {
+  auto iter = vectors_.find(vector_id);
+  if (iter == vectors_.end()) {
     return std::nullopt;
   }
 
-  return it->second;
+  return iter->second;
 }
 
-bool VectorStore::DeleteVector(const std::string& id) {
+bool VectorStore::DeleteVector(const std::string& vector_id) {
   std::unique_lock lock(mutex_);
 
-  auto it = vectors_.find(id);
-  if (it == vectors_.end()) {
+  auto iter = vectors_.find(vector_id);
+  if (iter == vectors_.end()) {
     return false;
   }
 
-  vectors_.erase(it);
+  vectors_.erase(iter);
   return true;
 }
 
-bool VectorStore::HasVector(const std::string& id) const {
+bool VectorStore::HasVector(const std::string& vector_id) const {
   std::shared_lock lock(mutex_);
-  return vectors_.find(id) != vectors_.end();
+  return vectors_.find(vector_id) != vectors_.end();
 }
 
 std::vector<std::string> VectorStore::GetAllIds() const {
@@ -107,8 +100,8 @@ std::vector<std::string> VectorStore::GetAllIds() const {
   std::vector<std::string> ids;
   ids.reserve(vectors_.size());
 
-  for (const auto& [id, _] : vectors_) {
-    ids.push_back(id);
+  for (const auto& [vector_id, _] : vectors_) {
+    ids.push_back(vector_id);
   }
 
   return ids;
@@ -145,9 +138,9 @@ size_t VectorStore::MemoryUsage() const {
   total += sizeof(*this);
 
   // Vectors
-  for (const auto& [id, vector] : vectors_) {
+  for (const auto& [vector_id, vector] : vectors_) {
     // ID string
-    total += sizeof(std::string) + id.capacity();
+    total += sizeof(std::string) + vector_id.capacity();
 
     // Vector data
     total += sizeof(Vector);

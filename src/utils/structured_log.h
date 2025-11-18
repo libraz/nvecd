@@ -238,12 +238,12 @@ inline void LogEventStoreError(const std::string& operation, const std::string& 
 /**
  * @brief Log vector store error in structured format
  */
-inline void LogVectorStoreError(const std::string& operation, const std::string& id, int dimension,
+inline void LogVectorStoreError(const std::string& operation, const std::string& vector_id, int dimension,
                                 const std::string& error_msg) {
   StructuredLog()
       .Event("vector_store_error")
       .Field("operation", operation)
-      .Field("id", id)
+      .Field("vector_id", vector_id)
       .Field("dimension", static_cast<int64_t>(dimension))
       .Field("error", error_msg)
       .Error();
@@ -252,11 +252,11 @@ inline void LogVectorStoreError(const std::string& operation, const std::string&
 /**
  * @brief Log similarity search event in structured format
  */
-inline void LogSimilaritySearch(const std::string& id, int top_k, const std::string& mode, int result_count,
+inline void LogSimilaritySearch(const std::string& item_id, int top_k, const std::string& mode, int result_count,
                                 double latency_us) {
   StructuredLog()
       .Event("similarity_search")
-      .Field("id", id)
+      .Field("item_id", item_id)
       .Field("top_k", static_cast<int64_t>(top_k))
       .Field("mode", mode)
       .Field("result_count", static_cast<int64_t>(result_count))

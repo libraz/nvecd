@@ -62,29 +62,25 @@ class RequestDispatcher {
 
  private:
   // Handler methods
-  utils::Expected<std::string, utils::Error> HandleEvent(const Command& cmd);
-  utils::Expected<std::string, utils::Error> HandleVecset(const Command& cmd);
-  utils::Expected<std::string, utils::Error> HandleSim(const Command& cmd, ConnectionContext& conn_ctx);
-  utils::Expected<std::string, utils::Error> HandleSimv(const Command& cmd, ConnectionContext& conn_ctx);
+  utils::Expected<std::string, utils::Error> HandleEvent(const Command& cmd) const;
+  utils::Expected<std::string, utils::Error> HandleVecset(const Command& cmd) const;
+  utils::Expected<std::string, utils::Error> HandleSim(const Command& cmd, ConnectionContext& conn_ctx) const;
+  utils::Expected<std::string, utils::Error> HandleSimv(const Command& cmd, ConnectionContext& conn_ctx) const;
   utils::Expected<std::string, utils::Error> HandleInfo(const Command& cmd);
-  utils::Expected<std::string, utils::Error> HandleConfigHelp(const Command& cmd);
-  utils::Expected<std::string, utils::Error> HandleConfigShow(const Command& cmd);
-  utils::Expected<std::string, utils::Error> HandleConfigVerify(const Command& cmd);
+  static utils::Expected<std::string, utils::Error> HandleConfigHelp(const Command& cmd);
+  static utils::Expected<std::string, utils::Error> HandleConfigShow(const Command& cmd);
+  static utils::Expected<std::string, utils::Error> HandleConfigVerify(const Command& cmd);
   utils::Expected<std::string, utils::Error> HandleDumpSave(const Command& cmd);
   utils::Expected<std::string, utils::Error> HandleDumpLoad(const Command& cmd);
-  utils::Expected<std::string, utils::Error> HandleDumpVerify(const Command& cmd);
-  utils::Expected<std::string, utils::Error> HandleDumpInfo(const Command& cmd);
-  utils::Expected<std::string, utils::Error> HandleDebugOn(ConnectionContext& conn_ctx);
-  utils::Expected<std::string, utils::Error> HandleDebugOff(ConnectionContext& conn_ctx);
-  utils::Expected<std::string, utils::Error> HandleCacheStats(const Command& cmd);
-  utils::Expected<std::string, utils::Error> HandleCacheClear(const Command& cmd);
-  utils::Expected<std::string, utils::Error> HandleCacheEnable(const Command& cmd);
-  utils::Expected<std::string, utils::Error> HandleCacheDisable(const Command& cmd);
+  utils::Expected<std::string, utils::Error> HandleDumpVerify(const Command& cmd) const;
+  utils::Expected<std::string, utils::Error> HandleDumpInfo(const Command& cmd) const;
+  static utils::Expected<std::string, utils::Error> HandleDebugOn(ConnectionContext& conn_ctx);
+  static utils::Expected<std::string, utils::Error> HandleDebugOff(ConnectionContext& conn_ctx);
 
   // Format response helpers
-  std::string FormatOK(const std::string& msg = "") const;
-  std::string FormatError(const std::string& msg) const;
-  std::string FormatSimResults(const std::vector<std::pair<std::string, float>>& results, int count) const;
+  static std::string FormatOK(const std::string& msg = "");
+  static std::string FormatError(const std::string& msg);
+  static std::string FormatSimResults(const std::vector<std::pair<std::string, float>>& results, int count);
 
   HandlerContext& ctx_;
 };

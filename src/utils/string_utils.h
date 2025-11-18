@@ -44,10 +44,10 @@ std::string NormalizeTextICU(std::string_view text, bool nfkc, std::string_view 
  * @brief Generate n-grams from text
  *
  * @param text Input text (should be normalized)
- * @param n N-gram size (typically 1 for unigrams)
+ * @param ngram_size N-gram size (typically 1 for unigrams)
  * @return Vector of n-gram strings
  */
-std::vector<std::string> GenerateNgrams(std::string_view text, int n = 1);
+std::vector<std::string> GenerateNgrams(std::string_view text, int ngram_size = 1);
 
 /**
  * @brief Generate hybrid n-grams with configurable sizes

@@ -28,8 +28,7 @@ struct Vector {
   bool normalized = false;  ///< Whether vector is L2-normalized
 
   Vector() = default;
-  Vector(std::vector<float> data_, bool normalized_ = false)
-      : data(std::move(data_)), normalized(normalized_) {}
+  Vector(std::vector<float> data_, bool normalized_ = false) : data(std::move(data_)), normalized(normalized_) {}
 
   /**
    * @brief Get vector dimension
@@ -42,9 +41,9 @@ struct Vector {
  * @brief Vector store statistics
  */
 struct VectorStoreStatistics {
-  size_t vector_count = 0;    ///< Number of stored vectors
-  size_t dimension = 0;       ///< Vector dimension
-  size_t memory_bytes = 0;    ///< Estimated memory usage in bytes
+  size_t vector_count = 0;  ///< Number of stored vectors
+  size_t dimension = 0;     ///< Vector dimension
+  size_t memory_bytes = 0;  ///< Estimated memory usage in bytes
 };
 
 /**
@@ -73,7 +72,7 @@ class VectorStore {
    * @brief Construct vector store with configuration
    * @param config Vector store configuration
    */
-  explicit VectorStore(const config::VectorsConfig& config);
+  explicit VectorStore(config::VectorsConfig config);
 
   /**
    * @brief Store a vector with ID
@@ -81,38 +80,37 @@ class VectorStore {
    * If dimension is not yet set (first vector), uses the dimension of this vector.
    * Otherwise, validates that dimension matches existing vectors.
    *
-   * @param id Vector ID (e.g., item ID)
+   * @param vector_id Vector ID (e.g., item ID)
    * @param vec Vector data
    * @param normalize Whether to normalize the vector to unit length
    * @return Expected<void, Error> Success or error
    */
-  utils::Expected<void, utils::Error> SetVector(const std::string& id,
-                                                 const std::vector<float>& vec,
-                                                 bool normalize = false);
+  utils::Expected<void, utils::Error> SetVector(const std::string& vector_id, const std::vector<float>& vec,
+                                                bool normalize = false);
 
   /**
    * @brief Retrieve a vector by ID
    *
-   * @param id Vector ID
+   * @param vector_id Vector ID
    * @return Optional vector (nullopt if not found)
    */
-  std::optional<Vector> GetVector(const std::string& id) const;
+  std::optional<Vector> GetVector(const std::string& vector_id) const;
 
   /**
    * @brief Delete a vector by ID
    *
-   * @param id Vector ID
+   * @param vector_id Vector ID
    * @return True if deleted, false if not found
    */
-  bool DeleteVector(const std::string& id);
+  bool DeleteVector(const std::string& vector_id);
 
   /**
    * @brief Check if a vector exists
    *
-   * @param id Vector ID
+   * @param vector_id Vector ID
    * @return True if vector exists
    */
-  bool HasVector(const std::string& id) const;
+  bool HasVector(const std::string& vector_id) const;
 
   /**
    * @brief Get all vector IDs
@@ -156,9 +154,9 @@ class VectorStore {
  private:
   config::VectorsConfig config_;  ///< Configuration
 
-  mutable std::shared_mutex mutex_;           ///< Reader-writer lock
+  mutable std::shared_mutex mutex_;                  ///< Reader-writer lock
   std::unordered_map<std::string, Vector> vectors_;  ///< ID -> Vector mapping
-  size_t dimension_ = 0;                      ///< Fixed dimension (0 = not set)
+  size_t dimension_ = 0;                             ///< Fixed dimension (0 = not set)
 };
 
 }  // namespace nvecd::vectors

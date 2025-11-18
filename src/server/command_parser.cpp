@@ -18,14 +18,16 @@ namespace nvecd::server {
 
 namespace {
 
+constexpr size_t kUsingPrefixLength = 6;  // Length of "using=" prefix
+
 /**
  * @brief Split string by delimiter
  */
 std::vector<std::string> Split(const std::string& str, char delimiter) {
   std::vector<std::string> tokens;
-  std::stringstream ss(str);
+  std::stringstream stream(str);
   std::string token;
-  while (std::getline(ss, token, delimiter)) {
+  while (std::getline(stream, token, delimiter)) {
     if (!token.empty()) {
       tokens.push_back(token);
     }
@@ -37,8 +39,8 @@ std::vector<std::string> Split(const std::string& str, char delimiter) {
  * @brief Trim whitespace from both ends
  */
 std::string Trim(const std::string& str) {
-  auto start = std::find_if_not(str.begin(), str.end(), [](unsigned char ch) { return std::isspace(ch); });
-  auto end = std::find_if_not(str.rbegin(), str.rend(), [](unsigned char ch) { return std::isspace(ch); }).base();
+  auto start = std::find_if_not(str.begin(), str.end(), [](unsigned char chr) { return std::isspace(chr); });
+  auto end = std::find_if_not(str.rbegin(), str.rend(), [](unsigned char chr) { return std::isspace(chr); }).base();
   return (start < end) ? std::string(start, end) : "";
 }
 
@@ -47,7 +49,7 @@ std::string Trim(const std::string& str) {
  */
 std::string ToUpper(const std::string& str) {
   std::string result = str;
-  std::transform(result.begin(), result.end(), result.begin(), [](unsigned char c) { return std::toupper(c); });
+  std::transform(result.begin(), result.end(), result.begin(), [](unsigned char chr) { return std::toupper(chr); });
   return result;
 }
 
@@ -91,16 +93,15 @@ utils::Expected<float, utils::Error> ParseFloat(const std::string& str) {
 
 utils::Expected<std::vector<float>, utils::Error> ParseVector(const std::string& vec_str, int expected_dim) {
   std::vector<float> vec;
-  std::stringstream ss(vec_str);
-  float value;
+  std::stringstream stream(vec_str);
+  float value = 0.0F;
 
-  while (ss >> value) {
+  while (stream >> value) {
     vec.push_back(value);
   }
 
   if (vec.empty()) {
-    return utils::MakeUnexpected(
-        utils::MakeError(utils::ErrorCode::kCommandInvalidVector, "Empty vector"));
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandInvalidVector, "Empty vector"));
   }
 
   if (expected_dim > 0 && static_cast<int>(vec.size()) != expected_dim) {
@@ -114,23 +115,20 @@ utils::Expected<std::vector<float>, utils::Error> ParseVector(const std::string&
 
 utils::Expected<Command, utils::Error> ParseCommand(const std::string& request) {
   if (request.empty()) {
-    return utils::MakeUnexpected(
-        utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "Empty command"));
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "Empty command"));
   }
 
   // Split by newlines for multi-line commands (VECSET, SIMV)
   auto lines = Split(request, '\n');
   if (lines.empty()) {
-    return utils::MakeUnexpected(
-        utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "Empty command"));
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "Empty command"));
   }
 
   // Parse first line (command and args)
   std::string first_line = Trim(lines[0]);
   auto tokens = Split(first_line, ' ');
   if (tokens.empty()) {
-    return utils::MakeUnexpected(
-        utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "Empty command"));
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "Empty command"));
   }
 
   Command cmd;
@@ -238,7 +236,7 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request) 
     if (tokens.size() >= 4) {
       std::string mode_arg = tokens[3];
       if (mode_arg.rfind("using=", 0) == 0) {
-        cmd.mode = mode_arg.substr(6);  // Skip "using="
+        cmd.mode = mode_arg.substr(kUsingPrefixLength);  // Skip "using=" prefix
       } else {
         return utils::MakeUnexpected(
             utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "Invalid SIM option: " + mode_arg));
@@ -358,8 +356,7 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request) 
 
   } else {
     cmd.type = CommandType::kUnknown;
-    return utils::MakeUnexpected(
-        utils::MakeError(utils::ErrorCode::kCommandUnknown, "Unknown command: " + cmd_name));
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandUnknown, "Unknown command: " + cmd_name));
   }
 
   return cmd;

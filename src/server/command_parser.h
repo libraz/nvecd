@@ -28,18 +28,18 @@ struct Command {
   CommandType type = CommandType::kUnknown;
 
   // EVENT fields
-  std::string ctx;   // Context ID
-  std::string id;    // Item ID (EVENT, SIM, VECSET)
-  int score = 0;     // Event score (EVENT)
+  std::string ctx;                                        // Context ID
+  std::string id;                                         // Item ID (EVENT, SIM, VECSET)
+  int score = 0;                                          // Event score (EVENT)
   events::EventType event_type = events::EventType::ADD;  // Event type (ADD/SET/DEL)
 
   // SIM/SIMV fields
-  int top_k = 100;           // Number of results
+  int top_k = 100;  // NOLINT(cppcoreguidelines-avoid-magic-numbers,readability-magic-numbers) Number of results
   std::string mode = "fusion";  // Similarity mode: events, vectors, fusion
 
   // VECSET/SIMV fields
-  int dimension = 0;              // Vector dimension
-  std::vector<float> vector;      // Vector data
+  int dimension = 0;          // Vector dimension
+  std::vector<float> vector;  // Vector data
 
   // CONFIG/DUMP fields
   std::string path;  // Config path or dump filepath

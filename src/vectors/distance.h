@@ -6,9 +6,6 @@
  * - Dot Product (inner product)
  * - Cosine Similarity (normalized dot product)
  * - L2 Distance (Euclidean distance)
- *
- * Implementation uses SIMD acceleration (AVX2/NEON) when available,
- * with automatic runtime detection and fallback to scalar code.
  */
 
 #pragma once
@@ -16,101 +13,97 @@
 #include <cmath>
 #include <vector>
 
-#include "vectors/distance_simd.h"
-
 namespace nvecd::vectors {
 
 /**
  * @brief Calculate dot product between two vectors
  *
- * Dot product: sum(a[i] * b[i])
+ * Dot product: sum(lhs[i] * rhs[i])
  * Higher values indicate greater similarity.
  *
- * Uses SIMD optimization (AVX2/NEON) when available.
- *
- * @param a First vector
- * @param b Second vector
+ * @param lhs First vector (left-hand side)
+ * @param rhs Second vector (right-hand side)
  * @return Dot product value, or 0.0 if dimensions mismatch
  */
-inline float DotProduct(const std::vector<float>& a,
-                        const std::vector<float>& b) {
-  if (a.size() != b.size() || a.empty()) {
-    return 0.0f;
+inline float DotProduct(const std::vector<float>& lhs, const std::vector<float>& rhs) {
+  if (lhs.size() != rhs.size() || lhs.empty()) {
+    return 0.0F;
   }
 
-  // Dispatch to optimal SIMD implementation
-  const auto& impl = simd::GetOptimalImpl();
-  return impl.dot_product(a.data(), b.data(), a.size());
+  float sum = 0.0F;
+  for (size_t i = 0; i < lhs.size(); ++i) {
+    sum += lhs[i] * rhs[i];
+  }
+  return sum;
 }
 
 /**
  * @brief Calculate L2 norm (magnitude) of a vector
  *
- * L2 norm: sqrt(sum(v[i]^2))
+ * L2 norm: sqrt(sum(vec[i]^2))
  *
- * Uses SIMD optimization (AVX2/NEON) when available.
- *
- * @param v Vector
+ * @param vec Vector
  * @return L2 norm value
  */
-inline float L2Norm(const std::vector<float>& v) {
-  if (v.empty()) {
-    return 0.0f;
+inline float L2Norm(const std::vector<float>& vec) {
+  if (vec.empty()) {
+    return 0.0F;
   }
 
-  // Dispatch to optimal SIMD implementation
-  const auto& impl = simd::GetOptimalImpl();
-  return impl.l2_norm(v.data(), v.size());
+  float sum_sq = 0.0F;
+  for (float val : vec) {
+    sum_sq += val * val;
+  }
+  return std::sqrt(sum_sq);
 }
 
 /**
  * @brief Calculate cosine similarity between two vectors
  *
- * Cosine similarity: dot(a, b) / (||a|| * ||b||)
+ * Cosine similarity: dot(lhs, rhs) / (||lhs|| * ||rhs||)
  * Returns value in [-1, 1], where 1 means identical direction.
  *
- * @param a First vector
- * @param b Second vector
+ * @param lhs First vector (left-hand side)
+ * @param rhs Second vector (right-hand side)
  * @return Cosine similarity, or 0.0 if dimensions mismatch or either vector is zero
  */
-inline float CosineSimilarity(const std::vector<float>& a,
-                              const std::vector<float>& b) {
-  if (a.size() != b.size() || a.empty()) {
-    return 0.0f;
+inline float CosineSimilarity(const std::vector<float>& lhs, const std::vector<float>& rhs) {
+  if (lhs.size() != rhs.size() || lhs.empty()) {
+    return 0.0F;
   }
 
-  float dot = DotProduct(a, b);
-  float norm_a = L2Norm(a);
-  float norm_b = L2Norm(b);
+  float dot = DotProduct(lhs, rhs);
+  float norm_lhs = L2Norm(lhs);
+  float norm_rhs = L2Norm(rhs);
 
-  if (norm_a == 0.0f || norm_b == 0.0f) {
-    return 0.0f;  // Undefined for zero vectors
+  if (norm_lhs == 0.0F || norm_rhs == 0.0F) {
+    return 0.0F;  // Undefined for zero vectors
   }
 
-  return dot / (norm_a * norm_b);
+  return dot / (norm_lhs * norm_rhs);
 }
 
 /**
  * @brief Calculate L2 (Euclidean) distance between two vectors
  *
- * L2 distance: sqrt(sum((a[i] - b[i])^2))
+ * L2 distance: sqrt(sum((lhs[i] - rhs[i])^2))
  * Lower values indicate greater similarity.
  *
- * Uses SIMD optimization (AVX2/NEON) when available.
- *
- * @param a First vector
- * @param b Second vector
+ * @param lhs First vector (left-hand side)
+ * @param rhs Second vector (right-hand side)
  * @return L2 distance, or 0.0 if dimensions mismatch
  */
-inline float L2Distance(const std::vector<float>& a,
-                        const std::vector<float>& b) {
-  if (a.size() != b.size() || a.empty()) {
-    return 0.0f;
+inline float L2Distance(const std::vector<float>& lhs, const std::vector<float>& rhs) {
+  if (lhs.size() != rhs.size() || lhs.empty()) {
+    return 0.0F;
   }
 
-  // Dispatch to optimal SIMD implementation
-  const auto& impl = simd::GetOptimalImpl();
-  return impl.l2_distance(a.data(), b.data(), a.size());
+  float sum_sq = 0.0F;
+  for (size_t i = 0; i < lhs.size(); ++i) {
+    float diff = lhs[i] - rhs[i];
+    sum_sq += diff * diff;
+  }
+  return std::sqrt(sum_sq);
 }
 
 /**
@@ -118,16 +111,16 @@ inline float L2Distance(const std::vector<float>& a,
  *
  * Modifies the input vector in-place.
  *
- * @param v Vector to normalize
+ * @param vec Vector to normalize
  * @return True if normalized, false if vector is zero
  */
-inline bool Normalize(std::vector<float>& v) {
-  float norm = L2Norm(v);
-  if (norm == 0.0f) {
+inline bool Normalize(std::vector<float>& vec) {
+  float norm = L2Norm(vec);
+  if (norm == 0.0F) {
     return false;  // Cannot normalize zero vector
   }
 
-  for (float& val : v) {
+  for (float& val : vec) {
     val /= norm;
   }
   return true;
@@ -136,11 +129,11 @@ inline bool Normalize(std::vector<float>& v) {
 /**
  * @brief Create a normalized copy of a vector
  *
- * @param v Input vector
+ * @param vec Input vector
  * @return Normalized copy, or empty vector if input is zero
  */
-inline std::vector<float> NormalizedCopy(const std::vector<float>& v) {
-  std::vector<float> result = v;
+inline std::vector<float> NormalizedCopy(const std::vector<float>& vec) {
+  std::vector<float> result = vec;
   if (!Normalize(result)) {
     return {};  // Return empty for zero vector
   }

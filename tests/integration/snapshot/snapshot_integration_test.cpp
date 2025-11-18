@@ -49,16 +49,13 @@ class TcpClient {
     server_addr.sin_port = htons(port);
     inet_pton(AF_INET, host.c_str(), &server_addr.sin_addr);
 
-    if (connect(sock_, (struct sockaddr*)&server_addr, sizeof(server_addr)) <
-        0) {
+    if (connect(sock_, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
       close(sock_);
       throw std::runtime_error("Failed to connect");
     }
   }
 
-  ~TcpClient() {
-    Close();
-  }
+  ~TcpClient() { Close(); }
 
   void Close() {
     if (sock_ >= 0) {
@@ -264,8 +261,7 @@ TEST_F(SnapshotIntegrationTest, VerifySnapshot) {
   // Verify snapshot
   std::string verify_response = client.SendCommand("DUMP VERIFY test_verify.dmp");
   EXPECT_TRUE(verify_response.find("OK") == 0);
-  EXPECT_TRUE(verify_response.find("valid") != std::string::npos ||
-              verify_response.find("OK") == 0);
+  EXPECT_TRUE(verify_response.find("valid") != std::string::npos || verify_response.find("OK") == 0);
 }
 
 /**
@@ -398,8 +394,7 @@ TEST_F(SnapshotIntegrationTest, LargeSnapshot) {
   auto start = std::chrono::high_resolution_clock::now();
   std::string save_response = client.SendCommand("DUMP SAVE large_test.dmp");
   auto end = std::chrono::high_resolution_clock::now();
-  auto duration =
-      std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+  auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
 
   EXPECT_TRUE(save_response.find("OK") == 0);
   std::cout << "Large snapshot save took " << duration.count() << "ms\n";

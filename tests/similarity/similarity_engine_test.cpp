@@ -49,15 +49,12 @@ class SimilarityEngineTest : public ::testing::Test {
     vectors_config_ = MakeVectorsConfig();
     similarity_config_ = MakeSimilarityConfig();
 
-    event_store_ =
-        std::make_unique<events::EventStore>(events_config_);
+    event_store_ = std::make_unique<events::EventStore>(events_config_);
     co_index_ = std::make_unique<events::CoOccurrenceIndex>();
-    vector_store_ =
-        std::make_unique<vectors::VectorStore>(vectors_config_);
+    vector_store_ = std::make_unique<vectors::VectorStore>(vectors_config_);
 
-    engine_ = std::make_unique<SimilarityEngine>(
-        event_store_.get(), co_index_.get(), vector_store_.get(),
-        similarity_config_);
+    engine_ = std::make_unique<SimilarityEngine>(event_store_.get(), co_index_.get(), vector_store_.get(),
+                                                 similarity_config_);
   }
 
   config::EventsConfig events_config_;
@@ -82,8 +79,7 @@ TEST_F(SimilarityEngineTest, SearchByIdEvents_Empty) {
 
 TEST_F(SimilarityEngineTest, SearchByIdEvents_WithCoOccurrence) {
   // Add events to create co-occurrences
-  std::vector<events::Event> events = {
-      {"item1", 10, 1000}, {"item2", 20, 1001}, {"item3", 15, 1002}};
+  std::vector<events::Event> events = {{"item1", 10, 1000}, {"item2", 20, 1001}, {"item3", 15, 1002}};
 
   co_index_->UpdateFromEvents("ctx1", events);
 
@@ -142,16 +138,16 @@ TEST_F(SimilarityEngineTest, SearchByIdVectors_WithVectors) {
 
   // item2 should be more similar than item3
   if (results->size() >= 2) {
-    EXPECT_EQ((*results)[0].id, "item2");
+    EXPECT_EQ((*results)[0].item_id, "item2");
   }
 }
 
 TEST_F(SimilarityEngineTest, SearchByIdVectors_SortedByScore) {
   // Add vectors with known similarities
   ASSERT_TRUE(vector_store_->SetVector("item1", {1.0f, 0.0f, 0.0f}).has_value());
-  ASSERT_TRUE(vector_store_->SetVector("item2", {0.9f, 0.1f, 0.0f}).has_value());  // Very similar
-  ASSERT_TRUE(vector_store_->SetVector("item3", {0.0f, 1.0f, 0.0f}).has_value());  // Orthogonal
-  ASSERT_TRUE(vector_store_->SetVector("item4", {-1.0f, 0.0f, 0.0f}).has_value()); // Opposite
+  ASSERT_TRUE(vector_store_->SetVector("item2", {0.9f, 0.1f, 0.0f}).has_value());   // Very similar
+  ASSERT_TRUE(vector_store_->SetVector("item3", {0.0f, 1.0f, 0.0f}).has_value());   // Orthogonal
+  ASSERT_TRUE(vector_store_->SetVector("item4", {-1.0f, 0.0f, 0.0f}).has_value());  // Opposite
 
   auto results = engine_->SearchByIdVectors("item1", 10);
   ASSERT_TRUE(results.has_value());
@@ -163,7 +159,7 @@ TEST_F(SimilarityEngineTest, SearchByIdVectors_SortedByScore) {
   }
 
   // item2 should be most similar
-  EXPECT_EQ((*results)[0].id, "item2");
+  EXPECT_EQ((*results)[0].item_id, "item2");
 }
 
 // ============================================================================
@@ -178,8 +174,7 @@ TEST_F(SimilarityEngineTest, SearchByIdFusion_BothEmpty) {
 
 TEST_F(SimilarityEngineTest, SearchByIdFusion_OnlyEvents) {
   // Add events
-  std::vector<events::Event> events = {
-      {"item1", 10, 1000}, {"item2", 20, 1001}, {"item3", 15, 1002}};
+  std::vector<events::Event> events = {{"item1", 10, 1000}, {"item2", 20, 1001}, {"item3", 15, 1002}};
   co_index_->UpdateFromEvents("ctx1", events);
 
   auto results = engine_->SearchByIdFusion("item1", 10);
@@ -199,8 +194,7 @@ TEST_F(SimilarityEngineTest, SearchByIdFusion_OnlyVectors) {
 
 TEST_F(SimilarityEngineTest, SearchByIdFusion_BothSources) {
   // Add events
-  std::vector<events::Event> events = {
-      {"item1", 10, 1000}, {"item2", 20, 1001}, {"item3", 15, 1002}};
+  std::vector<events::Event> events = {{"item1", 10, 1000}, {"item2", 20, 1001}, {"item3", 15, 1002}};
   co_index_->UpdateFromEvents("ctx1", events);
 
   // Add vectors
@@ -263,9 +257,7 @@ TEST_F(SimilarityEngineTest, SearchByVector_TopK) {
   // Add many vectors
   for (int i = 0; i < 20; ++i) {
     float val = static_cast<float>(i) / 20.0f;
-    ASSERT_TRUE(
-        vector_store_->SetVector("item" + std::to_string(i), {val, val, val})
-            .has_value());
+    ASSERT_TRUE(vector_store_->SetVector("item" + std::to_string(i), {val, val, val}).has_value());
   }
 
   std::vector<float> query = {0.5f, 0.5f, 0.5f};
@@ -302,15 +294,13 @@ TEST_F(SimilarityEngineTest, ScoresAreDescending) {
 
   // Verify descending order
   for (size_t i = 1; i < results->size(); ++i) {
-    EXPECT_GE((*results)[i - 1].score, (*results)[i].score)
-        << "Results not in descending order at index " << i;
+    EXPECT_GE((*results)[i - 1].score, (*results)[i].score) << "Results not in descending order at index " << i;
   }
 }
 
 TEST_F(SimilarityEngineTest, NoDuplicatesInFusion) {
   // Add events and vectors for same items
-  std::vector<events::Event> events = {
-      {"item1", 10, 1000}, {"item2", 20, 1001}, {"item3", 15, 1002}};
+  std::vector<events::Event> events = {{"item1", 10, 1000}, {"item2", 20, 1001}, {"item3", 15, 1002}};
   co_index_->UpdateFromEvents("ctx1", events);
 
   ASSERT_TRUE(vector_store_->SetVector("item1", {0.1f, 0.2f, 0.3f}).has_value());
@@ -323,8 +313,8 @@ TEST_F(SimilarityEngineTest, NoDuplicatesInFusion) {
   // Check for duplicates
   std::unordered_set<std::string> seen_ids;
   for (const auto& result : *results) {
-    EXPECT_EQ(seen_ids.count(result.id), 0) << "Duplicate ID: " << result.id;
-    seen_ids.insert(result.id);
+    EXPECT_EQ(seen_ids.count(result.item_id), 0) << "Duplicate ID: " << result.item_id;
+    seen_ids.insert(result.item_id);
   }
 }
 

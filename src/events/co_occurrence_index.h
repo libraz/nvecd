@@ -22,9 +22,9 @@ namespace nvecd::events {
  * @brief Co-occurrence index statistics
  */
 struct CoOccurrenceIndexStatistics {
-  size_t tracked_ids = 0;       ///< Number of tracked item IDs
-  size_t co_pairs = 0;          ///< Number of co-occurrence pairs
-  size_t memory_bytes = 0;      ///< Estimated memory usage in bytes
+  size_t tracked_ids = 0;   ///< Number of tracked item IDs
+  size_t co_pairs = 0;      ///< Number of co-occurrence pairs
+  size_t memory_bytes = 0;  ///< Estimated memory usage in bytes
 };
 
 /**
@@ -70,8 +70,7 @@ class CoOccurrenceIndex {
    * @param ctx Context identifier (used for logging, not stored)
    * @param events Events from a single context
    */
-  void UpdateFromEvents(const std::string& ctx,
-                        const std::vector<Event>& events);
+  void UpdateFromEvents(const std::string& ctx, const std::vector<Event>& events);
 
   /**
    * @brief Get similar items based on co-occurrence scores
@@ -79,21 +78,20 @@ class CoOccurrenceIndex {
    * Returns the top-k items with highest co-occurrence scores with the
    * given item, sorted by score descending.
    *
-   * @param id Item ID to find similar items for
+   * @param item_id Item ID to find similar items for
    * @param top_k Maximum number of results
    * @return Vector of (item_id, score) pairs, sorted by score descending
    */
-  std::vector<std::pair<std::string, float>> GetSimilar(const std::string& id,
-                                                         int top_k) const;
+  std::vector<std::pair<std::string, float>> GetSimilar(const std::string& item_id, int top_k) const;
 
   /**
    * @brief Get co-occurrence score between two items
    *
-   * @param id1 First item ID
-   * @param id2 Second item ID
+   * @param item_id_1 First item ID
+   * @param item_id_2 Second item ID
    * @return Co-occurrence score (0.0 if no co-occurrence)
    */
-  float GetScore(const std::string& id1, const std::string& id2) const;
+  float GetScore(const std::string& item_id_1, const std::string& item_id_2) const;
 
   /**
    * @brief Apply exponential decay to all scores
@@ -138,8 +136,7 @@ class CoOccurrenceIndex {
   // Co-occurrence matrix: id1 -> (id2 -> score)
   // Stored as symmetric matrix (both id1->id2 and id2->id1)
   mutable std::shared_mutex mutex_;
-  std::unordered_map<std::string, std::unordered_map<std::string, float>>
-      co_scores_;
+  std::unordered_map<std::string, std::unordered_map<std::string, float>> co_scores_;
 };
 
 }  // namespace nvecd::events

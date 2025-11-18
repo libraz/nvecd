@@ -14,8 +14,7 @@ namespace nvecd::events {
 namespace {
 
 // Helper to create events
-std::vector<Event> MakeEvents(
-    const std::vector<std::tuple<std::string, int, uint64_t>>& data) {
+std::vector<Event> MakeEvents(const std::vector<std::tuple<std::string, int, uint64_t>>& data) {
   std::vector<Event> events;
   for (const auto& [id, score, timestamp] : data) {
     events.emplace_back(id, score, timestamp);
@@ -156,8 +155,11 @@ TEST(CoOccurrenceIndexTest, GetSimilarMultiplePairsSorted) {
 TEST(CoOccurrenceIndexTest, GetSimilarTopK) {
   CoOccurrenceIndex index;
   auto events = MakeEvents({
-      {"item1", 10, 1000}, {"item2", 5, 1001},  {"item3", 20, 1002},
-      {"item4", 15, 1003}, {"item5", 25, 1004},
+      {"item1", 10, 1000},
+      {"item2", 5, 1001},
+      {"item3", 20, 1002},
+      {"item4", 15, 1003},
+      {"item5", 25, 1004},
   });
   index.UpdateFromEvents("ctx1", events);
 

@@ -144,18 +144,8 @@ format-check:
 	@echo "Format check passed!"
 
 # Check code with clang-tidy
-lint:
-	@echo "Running clang-tidy..."
-	@echo "Note: Project must be built first (run 'make build')"
-	@if [ ! -d "$(BUILD_DIR)" ]; then \
-		echo "Error: Build directory not found. Run 'make build' first."; \
-		exit 1; \
-	fi
-	@find src -type f -name "*.cpp" ! -path "*/build/*" | while read file; do \
-		echo "Checking $$file..."; \
-		clang-tidy "$$file" -p=$(BUILD_DIR) || exit 1; \
-	done
-	@echo "Lint complete!"
+lint: format build
+	@bash support/dev/run-clang-tidy.sh
 
 # Build and run nvecd
 run: build

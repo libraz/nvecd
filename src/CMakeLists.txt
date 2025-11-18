@@ -187,14 +187,7 @@ add_executable(nvecd
 )
 target_link_libraries(nvecd PRIVATE
   nvecd_server
-  nvecd_storage
   nvecd_config
-  nvecd_events
-  nvecd_vectors
-  nvecd_similarity
-  nvecd_utils
-  spdlog
-  Threads::Threads
 )
 
 # Install executable
