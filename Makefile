@@ -2,7 +2,7 @@
 # Convenience wrapper for CMake build system
 # Reference: ../mygram-db/Makefile
 
-.PHONY: help build test test-full test-sequential test-verbose clean rebuild install uninstall format format-check lint configure run
+.PHONY: help build test test-full test-sequential test-verbose clean rebuild install uninstall format format-check lint lint-diff lint-diff-main configure run
 
 # Build directory
 BUILD_DIR := build
@@ -44,7 +44,9 @@ help:
 	@echo "  make uninstall      - Uninstall binaries and files"
 	@echo "  make format         - Format code with clang-format"
 	@echo "  make format-check   - Check code formatting (CI)"
-	@echo "  make lint           - Check code with clang-tidy"
+	@echo "  make lint           - Check all files with clang-tidy"
+	@echo "  make lint-diff      - Check only changed files with clang-tidy (fast)"
+	@echo "  make lint-diff-main - Check files changed from main branch"
 	@echo "  make configure      - Configure CMake (for changing options)"
 	@echo "  make run            - Build and run nvecd"
 	@echo "  make help           - Show this help message"
@@ -146,6 +148,14 @@ format-check:
 # Check code with clang-tidy
 lint: format build
 	@bash support/dev/run-clang-tidy.sh
+
+# Check only changed files with clang-tidy (fast)
+lint-diff: format build
+	@bash support/dev/run-clang-tidy.sh --diff
+
+# Check files changed from main branch with clang-tidy
+lint-diff-main: format build
+	@bash support/dev/run-clang-tidy.sh --diff main
 
 # Build and run nvecd
 run: build
