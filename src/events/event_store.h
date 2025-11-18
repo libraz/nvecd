@@ -16,11 +16,26 @@
 #include <vector>
 
 #include "config/config.h"
+#include "events/dedup_cache.h"
 #include "events/ring_buffer.h"
+#include "events/state_cache.h"
 #include "utils/error.h"
 #include "utils/expected.h"
 
 namespace nvecd::events {
+
+/**
+ * @brief Event type enumeration
+ *
+ * - ADD: Stream events (clicks, views) - time-window deduplication
+ * - SET: State events (likes, bookmarks) - last-value deduplication
+ * - DEL: Deletion events (unlike, unbookmark) - deletion-flag deduplication
+ */
+enum class EventType {
+  ADD,  ///< Stream event (default)
+  SET,  ///< State event
+  DEL   ///< Deletion event
+};
 
 /**
  * @brief Event data structure
@@ -29,10 +44,11 @@ struct Event {
   std::string id;       ///< Event ID (e.g., item ID)
   int score;            ///< Event score/weight
   uint64_t timestamp;   ///< Unix timestamp (seconds)
+  EventType type;       ///< Event type
 
   Event() = default;
-  Event(std::string id_, int score_, uint64_t timestamp_)
-      : id(std::move(id_)), score(score_), timestamp(timestamp_) {}
+  Event(std::string id_, int score_, uint64_t timestamp_, EventType type_ = EventType::ADD)
+      : id(std::move(id_)), score(score_), timestamp(timestamp_), type(type_) {}
 };
 
 /**
@@ -41,6 +57,7 @@ struct Event {
 struct EventStoreStatistics {
   size_t active_contexts = 0;     ///< Number of contexts with events
   uint64_t total_events = 0;      ///< Total events processed (cumulative)
+  uint64_t deduped_events = 0;    ///< Total deduplicated events (ignored)
   size_t stored_events = 0;       ///< Current number of stored events
   size_t memory_bytes = 0;        ///< Estimated memory usage in bytes
 };
@@ -81,13 +98,15 @@ class EventStore {
    * @param ctx Context identifier (e.g., user ID, session ID)
    * @param id Event ID (e.g., item ID)
    * @param score Event score/weight
+   * @param type Event type (ADD/SET/DEL)
    * @return Expected<void, Error> Success or error
    *
    * @throws None
    */
   utils::Expected<void, utils::Error> AddEvent(const std::string& ctx,
                                                 const std::string& id,
-                                                int score);
+                                                int score,
+                                                EventType type = EventType::ADD);
 
   /**
    * @brief Get all events for a context
@@ -147,6 +166,11 @@ class EventStore {
   std::unordered_map<std::string, RingBuffer<Event>> ctx_events_;
 
   std::atomic<uint64_t> total_events_{0};  ///< Total events processed
+  std::atomic<uint64_t> deduped_events_{0};  ///< Total deduplicated events
+
+  // Deduplication caches
+  std::unique_ptr<DedupCache> dedup_cache_;  ///< For ADD type (time-window)
+  std::unique_ptr<StateCache> state_cache_;  ///< For SET/DEL type (last-value)
 };
 
 }  // namespace nvecd::events

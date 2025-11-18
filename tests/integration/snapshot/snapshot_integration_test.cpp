@@ -139,11 +139,11 @@ class SnapshotIntegrationTest : public ::testing::Test {
    */
   void PopulateTestData(TcpClient& client) {
     // Add events
-    EXPECT_TRUE(client.SendCommand("EVENT ctx1 vec1 100").find("OK") == 0);
-    EXPECT_TRUE(client.SendCommand("EVENT ctx1 vec2 90").find("OK") == 0);
-    EXPECT_TRUE(client.SendCommand("EVENT ctx1 vec3 80").find("OK") == 0);
-    EXPECT_TRUE(client.SendCommand("EVENT ctx2 vec2 95").find("OK") == 0);
-    EXPECT_TRUE(client.SendCommand("EVENT ctx2 vec3 85").find("OK") == 0);
+    EXPECT_TRUE(client.SendCommand("EVENT ctx1 ADD vec1 100").find("OK") == 0);
+    EXPECT_TRUE(client.SendCommand("EVENT ctx1 ADD vec2 90").find("OK") == 0);
+    EXPECT_TRUE(client.SendCommand("EVENT ctx1 ADD vec3 80").find("OK") == 0);
+    EXPECT_TRUE(client.SendCommand("EVENT ctx2 ADD vec2 95").find("OK") == 0);
+    EXPECT_TRUE(client.SendCommand("EVENT ctx2 ADD vec3 85").find("OK") == 0);
 
     // Add vectors (128-dimensional, simple pattern)
     // Format: VECSET <id> <f1> <f2> ... <fN>

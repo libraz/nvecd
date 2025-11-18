@@ -24,6 +24,8 @@ namespace defaults {
 constexpr uint32_t kCtxBufferSize = 50;
 constexpr uint32_t kDecayIntervalSec = 3600;
 constexpr double kDecayAlpha = 0.99;
+constexpr uint32_t kDedupWindowSec = 60;      // 60 seconds deduplication window
+constexpr uint32_t kDedupCacheSize = 10000;   // 10k entries in dedup cache
 
 // Vector store defaults
 constexpr uint32_t kDefaultDimension = 768;
@@ -57,6 +59,8 @@ struct EventsConfig {
   uint32_t ctx_buffer_size = defaults::kCtxBufferSize;  ///< Events per context (ring buffer size)
   uint32_t decay_interval_sec = defaults::kDecayIntervalSec;  ///< Decay interval in seconds
   double decay_alpha = defaults::kDecayAlpha;  ///< Decay factor (0.0-1.0)
+  uint32_t dedup_window_sec = defaults::kDedupWindowSec;  ///< Deduplication time window in seconds
+  uint32_t dedup_cache_size = defaults::kDedupCacheSize;  ///< Deduplication cache size (LRU)
 };
 
 /**

@@ -14,6 +14,12 @@
 
 namespace nvecd::cache {
 
+// Forward declaration from result_compressor.cpp
+// Must match SerializedSimilarityResult size for compression/decompression
+namespace {
+constexpr size_t kSerializedResultSize = 256 + sizeof(float);  // id buffer + score
+}  // namespace
+
 SimilarityCache::SimilarityCache(size_t max_memory_bytes, double min_query_cost_ms)
     : max_memory_bytes_(max_memory_bytes), min_query_cost_ms_(min_query_cost_ms) {}
 
@@ -123,7 +129,8 @@ bool SimilarityCache::Insert(const CacheKey& key, const std::vector<similarity::
   }
 
   // Calculate original size in bytes (for decompression)
-  const size_t original_size = results.size() * sizeof(similarity::SimilarityResult);
+  // Must use serialized size, not sizeof(SimilarityResult) which includes std::string overhead
+  const size_t original_size = results.size() * kSerializedResultSize;
 
   // Calculate entry memory usage
   // Entry overhead + compressed data + key size

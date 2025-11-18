@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 
+#include "events/event_store.h"
 #include "server/command_types.h"
 #include "utils/error.h"
 #include "utils/expected.h"
@@ -30,6 +31,7 @@ struct Command {
   std::string ctx;   // Context ID
   std::string id;    // Item ID (EVENT, SIM, VECSET)
   int score = 0;     // Event score (EVENT)
+  events::EventType event_type = events::EventType::ADD;  // Event type (ADD/SET/DEL)
 
   // SIM/SIMV fields
   int top_k = 100;           // Number of results
@@ -47,7 +49,9 @@ struct Command {
  * @brief Parse a command from request string
  *
  * Parses text-based protocol commands:
- * - EVENT <ctx> <id> <score>
+ * - EVENT <ctx> ADD <id> <score>
+ * - EVENT <ctx> SET <id> <score>
+ * - EVENT <ctx> DEL <id>
  * - VECSET <id> <dim> text\n<floats>
  * - SIM <id> <top_k> [using=mode]
  * - SIMV <dim> <top_k>\n<floats>

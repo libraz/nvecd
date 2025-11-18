@@ -102,7 +102,7 @@ TEST_F(NvecdClientCTest, EventCommand) {
   ASSERT_NE(client, nullptr);
   ASSERT_EQ(nvecdclient_connect(client), 0);
 
-  int result = nvecdclient_event(client, "ctx123", "vec456", 95);  // NOLINT
+  int result = nvecdclient_event(client, "ctx123", "ADD", "vec456", 95);  // NOLINT
   EXPECT_EQ(result, 0) << "Event failed: " << nvecdclient_get_last_error(client);
 
   nvecdclient_destroy(client);

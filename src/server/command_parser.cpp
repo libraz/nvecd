@@ -138,19 +138,63 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request) 
 
   // Parse command type and arguments
   if (cmd_name == "EVENT") {
-    // EVENT <ctx> <id> <score>
-    if (tokens.size() != 4) {
+    // EVENT <ctx> ADD <id> <score>
+    // EVENT <ctx> SET <id> <score>
+    // EVENT <ctx> DEL <id>
+    if (tokens.size() < 4) {
       return utils::MakeUnexpected(
-          utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "EVENT requires 3 arguments: <ctx> <id> <score>"));
+          utils::MakeError(utils::ErrorCode::kCommandSyntaxError,
+                          "EVENT requires at least 3 arguments: <ctx> <type> <id> [<score>]"));
     }
+
     cmd.type = CommandType::kEvent;
     cmd.ctx = tokens[1];
-    cmd.id = tokens[2];
-    auto score_result = ParseInt(tokens[3]);
-    if (!score_result) {
-      return utils::MakeUnexpected(score_result.error());
+
+    // Parse event type
+    std::string type_str = ToUpper(tokens[2]);
+    if (type_str == "ADD") {
+      cmd.event_type = events::EventType::ADD;
+      if (tokens.size() != 5) {
+        return utils::MakeUnexpected(
+            utils::MakeError(utils::ErrorCode::kCommandSyntaxError,
+                            "EVENT ADD requires 4 arguments: <ctx> ADD <id> <score>"));
+      }
+      cmd.id = tokens[3];
+      auto score_result = ParseInt(tokens[4]);
+      if (!score_result) {
+        return utils::MakeUnexpected(score_result.error());
+      }
+      cmd.score = *score_result;
+
+    } else if (type_str == "SET") {
+      cmd.event_type = events::EventType::SET;
+      if (tokens.size() != 5) {
+        return utils::MakeUnexpected(
+            utils::MakeError(utils::ErrorCode::kCommandSyntaxError,
+                            "EVENT SET requires 4 arguments: <ctx> SET <id> <score>"));
+      }
+      cmd.id = tokens[3];
+      auto score_result = ParseInt(tokens[4]);
+      if (!score_result) {
+        return utils::MakeUnexpected(score_result.error());
+      }
+      cmd.score = *score_result;
+
+    } else if (type_str == "DEL") {
+      cmd.event_type = events::EventType::DEL;
+      if (tokens.size() != 4) {
+        return utils::MakeUnexpected(
+            utils::MakeError(utils::ErrorCode::kCommandSyntaxError,
+                            "EVENT DEL requires 3 arguments: <ctx> DEL <id>"));
+      }
+      cmd.id = tokens[3];
+      cmd.score = 0;  // DEL doesn't use score
+
+    } else {
+      return utils::MakeUnexpected(
+          utils::MakeError(utils::ErrorCode::kCommandSyntaxError,
+                          "Invalid EVENT type: " + type_str + " (must be ADD, SET, or DEL)"));
     }
-    cmd.score = *score_result;
 
   } else if (cmd_name == "VECSET") {
     // VECSET <id> <f1> <f2> ... <fN>

@@ -24,34 +24,99 @@ nc localhost 11017
 
 ## EVENT コマンド
 
-コンテキストと ID を関連付けるイベントを記録します。
+コンテキストと ID を関連付けるイベントを記録します。3 種類のイベントタイプをサポート：
+- **ADD**: ストリーム型イベント（クリック、閲覧）- 時間窓ベースの重複排除
+- **SET**: 状態型イベント（いいね、ブックマーク、評価）- 冪等な更新
+- **DEL**: 削除型イベント（いいね解除、ブックマーク削除）- 冪等な削除
 
 ### 構文
 
 ```
-EVENT <ctx> <id> <score>
+EVENT <ctx> ADD <id> <score>
+EVENT <ctx> SET <id> <score>
+EVENT <ctx> DEL <id>
 ```
 
-- `<ctx>`: コンテキスト識別子（文字列）
-- `<id>`: アイテム識別子（文字列）
-- `<score>`: イベントスコア（整数、0-100）
+**パラメータ**:
+- `<ctx>`: コンテキスト識別子（文字列、例: ユーザーID、セッションID）
+- `<type>`: イベントタイプ: `ADD`, `SET`, `DEL`
+- `<id>`: アイテム識別子（文字列、例: アイテムID、アクションID）
+- `<score>`: イベントスコア（整数、0-100）— ADD/SET では必須、DEL では無視
 
 ### 例
 
-```
-EVENT user123 item456 95
+```bash
+# ストリーム型イベント（クリック追跡）
+EVENT user123 ADD view:item456 95
+→ OK
+
+# 状態型イベント（いいね ON）
+EVENT user123 SET like:item456 100
+→ OK
+
+# 状態型イベント（いいね OFF）
+EVENT user123 SET like:item456 0
+→ OK
+
+# 重み付きブックマーク（重要度: 高）
+EVENT user123 SET bookmark:item789 100
+→ OK
+
+# ブックマーク重要度変更（中）
+EVENT user123 SET bookmark:item789 50
+→ OK
+
+# ブックマーク削除
+EVENT user123 DEL bookmark:item789
+→ OK
 ```
 
-### レスポンス
+### イベントタイプの動作
 
-```
-OK
+| タイプ | 用途 | 重複排除 | 例 |
+|--------|------|---------|-----|
+| **ADD** | ストリーム型イベント（クリック、閲覧、再生） | 時間窓ベース（デフォルト: 60秒） | `EVENT user1 ADD view:item1 100` |
+| **SET** | 状態型イベント（いいね、ブックマーク、評価） | 同じ値 = 重複（冪等） | `EVENT user1 SET like:item1 100` |
+| **DEL** | 削除型イベント | 既に削除済み = 重複（冪等） | `EVENT user1 DEL like:item1` |
+
+### 冪等性の保証
+
+```bash
+# SET は同じ値に対して冪等
+EVENT user1 SET like:item1 100
+EVENT user1 SET like:item1 100  # 重複、無視される
+→ OK（両方成功、2回目は重複排除）
+
+# SET は状態遷移を許可
+EVENT user1 SET bookmark:item1 100  # 重要度: 高
+EVENT user1 SET bookmark:item1 50   # 重要度: 中（格納）
+EVENT user1 SET bookmark:item1 50   # 重複（無視）
+→ OK
+
+# DEL は冪等
+EVENT user1 DEL like:item1
+EVENT user1 DEL like:item1  # 既に削除済み、無視される
+→ OK
 ```
 
 ### エラーレスポンス
 
-- `(error) Invalid score: must be 0-100`
-- `(error) Context buffer overflow`
+- `(error) Invalid EVENT type: <type> (must be ADD, SET, or DEL)`
+- `(error) EVENT ADD requires 4 arguments: <ctx> ADD <id> <score>`
+- `(error) EVENT SET requires 4 arguments: <ctx> SET <id> <score>`
+- `(error) EVENT DEL requires 3 arguments: <ctx> DEL <id>`
+- `(error) Invalid score: must be integer`
+- `(error) Context cannot be empty`
+- `(error) ID cannot be empty`
+
+### 注意事項
+
+- イベントはコンテキストごとのリングバッファに格納されます（サイズ: `events.ctx_buffer_size`）
+- 重複排除キャッシュサイズ: `events.dedup_cache_size`（デフォルト: 10,000エントリ）
+- ADD タイプの時間窓: `events.dedup_window_sec`（デフォルト: 60秒）
+- SET/DEL は最後の値を追跡して冪等性を保証（時間窓なし）
+- 同じコンテキスト内の ID 間で共起スコアが自動的に追跡されます
+- スコアは `events.decay_interval_sec` と `events.decay_alpha` に基づいて減衰します
 
 ---
 

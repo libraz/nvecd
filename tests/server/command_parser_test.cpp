@@ -12,12 +12,13 @@ using namespace nvecd::utils;
 
 // EVENT command tests
 TEST(CommandParserTest, ParseEvent_Valid) {
-  auto result = ParseCommand("EVENT user123 item456 95");
+  auto result = ParseCommand("EVENT user123 ADD item456 95");
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->type, CommandType::kEvent);
   EXPECT_EQ(result->ctx, "user123");
   EXPECT_EQ(result->id, "item456");
   EXPECT_EQ(result->score, 95);
+  EXPECT_EQ(result->event_type, nvecd::events::EventType::ADD);
 }
 
 TEST(CommandParserTest, ParseEvent_MissingArgs) {
@@ -27,7 +28,7 @@ TEST(CommandParserTest, ParseEvent_MissingArgs) {
 }
 
 TEST(CommandParserTest, ParseEvent_InvalidScore) {
-  auto result = ParseCommand("EVENT user123 item456 abc");
+  auto result = ParseCommand("EVENT user123 ADD item456 abc");
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code(), ErrorCode::kCommandInvalidArgument);
 }
@@ -229,7 +230,8 @@ TEST(CommandParserTest, ParseCaseInsensitive) {
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->type, CommandType::kInfo);
 
-  result = ParseCommand("Event user123 item456 10");
+  result = ParseCommand("Event user123 add item456 10");
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->type, CommandType::kEvent);
+  EXPECT_EQ(result->event_type, nvecd::events::EventType::ADD);
 }

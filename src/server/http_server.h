@@ -203,6 +203,11 @@ class HttpServer {
   void HandleConfig(const httplib::Request& req, httplib::Response& res);
 
   /**
+   * @brief Handle GET /metrics (Prometheus metrics)
+   */
+  void HandleMetrics(const httplib::Request& req, httplib::Response& res);
+
+  /**
    * @brief Handle POST /dump/save
    */
   void HandleDumpSave(const httplib::Request& req, httplib::Response& res);
@@ -231,6 +236,16 @@ class HttpServer {
    * @brief Handle POST /debug/off
    */
   void HandleDebugOff(const httplib::Request& req, httplib::Response& res);
+
+  /**
+   * @brief Handle GET /cache/stats
+   */
+  void HandleCacheStats(const httplib::Request& req, httplib::Response& res);
+
+  /**
+   * @brief Handle POST /cache/clear
+   */
+  void HandleCacheClear(const httplib::Request& req, httplib::Response& res);
 
   //
   // Utility methods

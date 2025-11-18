@@ -110,6 +110,12 @@ EventsConfig ParseEventsConfig(const YAML::Node& node) {
   if (node["decay_alpha"]) {
     config.decay_alpha = node["decay_alpha"].as<double>();
   }
+  if (node["dedup_window_sec"]) {
+    config.dedup_window_sec = node["dedup_window_sec"].as<uint32_t>();
+  }
+  if (node["dedup_cache_size"]) {
+    config.dedup_cache_size = node["dedup_cache_size"].as<uint32_t>();
+  }
 
   return config;
 }

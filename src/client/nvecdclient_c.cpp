@@ -91,12 +91,12 @@ int nvecdclient_is_connected(const NvecdClient_C* client) {
 // nvecd-specific commands
 //
 
-int nvecdclient_event(NvecdClient_C* client, const char* ctx, const char* id, int score) {
-  if (client == nullptr || client->client == nullptr || ctx == nullptr || id == nullptr) {
+int nvecdclient_event(NvecdClient_C* client, const char* ctx, const char* type, const char* id, int score) {
+  if (client == nullptr || client->client == nullptr || ctx == nullptr || type == nullptr || id == nullptr) {
     return -1;
   }
 
-  auto result = client->client->Event(ctx, id, score);
+  auto result = client->client->Event(ctx, type, id, score);
   if (!result) {
     client->last_error = result.error().to_string();
     return -1;

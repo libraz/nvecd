@@ -177,7 +177,7 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleEvent(const 
     return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kInternalError, "EventStore not initialized"));
   }
 
-  auto result = ctx_.event_store->AddEvent(cmd.ctx, cmd.id, cmd.score);
+  auto result = ctx_.event_store->AddEvent(cmd.ctx, cmd.id, cmd.score, cmd.event_type);
   if (!result) {
     return utils::MakeUnexpected(result.error());
   }

@@ -474,5 +474,147 @@ TEST(VectorStoreTest, MixedPositiveNegative) {
   EXPECT_EQ(retrieved->data, vec);
 }
 
+// ============================================================================
+// High-Dimensional Vectors (Real-world LLM Embeddings)
+// ============================================================================
+
+TEST(VectorStoreTest, HighDimension_OpenAI_1536) {
+  // OpenAI text-embedding-3-small uses 1536 dimensions
+  auto config = MakeConfig();
+  VectorStore store(config);
+
+  std::vector<float> vec(1536);
+  for (size_t i = 0; i < 1536; ++i) {
+    vec[i] = static_cast<float>(i) / 1536.0f;
+  }
+
+  auto result = store.SetVector("openai_embedding", vec);
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+  EXPECT_EQ(store.GetDimension(), 1536);
+
+  auto retrieved = store.GetVector("openai_embedding");
+  ASSERT_TRUE(retrieved.has_value());
+  EXPECT_EQ(retrieved->data.size(), 1536);
+  EXPECT_FLOAT_EQ(retrieved->data[0], 0.0f);
+  EXPECT_FLOAT_EQ(retrieved->data[1535], 1535.0f / 1536.0f);
+}
+
+TEST(VectorStoreTest, HighDimension_Cohere_2048) {
+  // Cohere embed-v3 uses up to 2048 dimensions
+  auto config = MakeConfig();
+  VectorStore store(config);
+
+  std::vector<float> vec(2048, 0.5f);
+  auto result = store.SetVector("cohere_embedding", vec);
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+  EXPECT_EQ(store.GetDimension(), 2048);
+
+  auto retrieved = store.GetVector("cohere_embedding");
+  ASSERT_TRUE(retrieved.has_value());
+  EXPECT_EQ(retrieved->data.size(), 2048);
+}
+
+TEST(VectorStoreTest, HighDimension_Claude_4096) {
+  // Very high dimension (stress test)
+  auto config = MakeConfig();
+  VectorStore store(config);
+
+  std::vector<float> vec(4096);
+  // Create a pattern for verification
+  for (size_t i = 0; i < 4096; ++i) {
+    vec[i] = std::sin(static_cast<float>(i) * 0.01f);
+  }
+
+  auto result = store.SetVector("claude_embedding", vec);
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+  EXPECT_EQ(store.GetDimension(), 4096);
+
+  auto retrieved = store.GetVector("claude_embedding");
+  ASSERT_TRUE(retrieved.has_value());
+  EXPECT_EQ(retrieved->data.size(), 4096);
+
+  // Verify pattern
+  for (size_t i = 0; i < 4096; i += 100) {
+    EXPECT_FLOAT_EQ(retrieved->data[i], std::sin(static_cast<float>(i) * 0.01f));
+  }
+}
+
+TEST(VectorStoreTest, HighDimension_MultipleVectors) {
+  // Test multiple high-dimensional vectors
+  auto config = MakeConfig();
+  VectorStore store(config);
+
+  const size_t dim = 1536;
+  const size_t count = 100;
+
+  // Add 100 vectors of dimension 1536
+  for (size_t i = 0; i < count; ++i) {
+    std::vector<float> vec(dim);
+    for (size_t j = 0; j < dim; ++j) {
+      vec[j] = static_cast<float>(i * dim + j) / static_cast<float>(count * dim);
+    }
+
+    std::string id = "vec_" + std::to_string(i);
+    auto result = store.SetVector(id, vec);
+    ASSERT_TRUE(result.has_value()) << "Failed at vector " << i << ": " << result.error().message();
+  }
+
+  EXPECT_EQ(store.GetVectorCount(), count);
+  EXPECT_EQ(store.GetDimension(), dim);
+
+  // Verify a few vectors
+  auto vec0 = store.GetVector("vec_0");
+  ASSERT_TRUE(vec0.has_value());
+  EXPECT_FLOAT_EQ(vec0->data[0], 0.0f);
+
+  auto vec50 = store.GetVector("vec_50");
+  ASSERT_TRUE(vec50.has_value());
+  EXPECT_EQ(vec50->data.size(), dim);
+}
+
+TEST(VectorStoreTest, HighDimension_DimensionMismatch) {
+  auto config = MakeConfig();
+  VectorStore store(config);
+
+  // First vector: 1536 dimensions
+  std::vector<float> vec1(1536, 0.5f);
+  auto result1 = store.SetVector("vec1", vec1);
+  ASSERT_TRUE(result1.has_value());
+
+  // Second vector: 2048 dimensions (should fail)
+  std::vector<float> vec2(2048, 0.5f);
+  auto result2 = store.SetVector("vec2", vec2);
+  EXPECT_FALSE(result2.has_value());
+  EXPECT_EQ(result2.error().code(), utils::ErrorCode::kVectorDimensionMismatch);
+}
+
+TEST(VectorStoreTest, HighDimension_Normalization) {
+  auto config = MakeConfig();
+  VectorStore store(config);
+
+  // Create a 1536-dim vector with known norm
+  std::vector<float> vec(1536, 1.0f);  // L2 norm = sqrt(1536) ≈ 39.19
+
+  auto result = store.SetVector("unnormalized", vec, false);
+  ASSERT_TRUE(result.has_value());
+  auto retrieved = store.GetVector("unnormalized");
+  ASSERT_TRUE(retrieved.has_value());
+  EXPECT_FLOAT_EQ(retrieved->data[0], 1.0f);
+
+  // With normalization
+  auto result_norm = store.SetVector("normalized", vec, true);
+  ASSERT_TRUE(result_norm.has_value());
+  auto retrieved_norm = store.GetVector("normalized");
+  ASSERT_TRUE(retrieved_norm.has_value());
+
+  // Calculate L2 norm
+  float norm = 0.0f;
+  for (float val : retrieved_norm->data) {
+    norm += val * val;
+  }
+  norm = std::sqrt(norm);
+  EXPECT_NEAR(norm, 1.0f, 1e-5f);  // Should be normalized to 1.0
+}
+
 }  // namespace
 }  // namespace nvecd::vectors

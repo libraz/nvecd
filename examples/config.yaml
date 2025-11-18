@@ -17,6 +17,13 @@ events:
                                     # - Score multiplier at each decay interval
                                     # - Value between 0.0 and 1.0
                                     # - Higher values = slower decay
+  dedup_window_sec: 60              # Deduplication time window in seconds (default: 60)
+                                    # - Duplicate events within this window are ignored
+                                    # - Prevents retry/bug from inflating statistics
+                                    # - 0 = disabled (no deduplication)
+  dedup_cache_size: 10000           # Deduplication cache size (default: 10000)
+                                    # - Maximum number of recent events to track
+                                    # - LRU cache: oldest entries evicted when full
 
 # Vector Store Configuration
 vectors:

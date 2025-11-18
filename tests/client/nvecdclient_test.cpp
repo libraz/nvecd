@@ -111,7 +111,7 @@ TEST_F(NvecdClientTest, EventSuccess) {
   NvecdClient client(config);
   ASSERT_TRUE(client.Connect());
 
-  auto result = client.Event("ctx123", "vec456", 95);  // NOLINT
+  auto result = client.Event("ctx123", "ADD", "vec456", 95);  // NOLINT
   EXPECT_TRUE(result) << "Event failed: " << result.error().message();
 }
 
@@ -123,7 +123,7 @@ TEST_F(NvecdClientTest, EventInvalidScore) {
   NvecdClient client(config);
   ASSERT_TRUE(client.Connect());
 
-  auto result = client.Event("ctx123", "vec456", 150);  // NOLINT - invalid score
+  auto result = client.Event("ctx123", "ADD", "vec456", 150);  // NOLINT - invalid score
   EXPECT_FALSE(result);
 }
 

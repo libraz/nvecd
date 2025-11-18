@@ -328,5 +328,192 @@ TEST_F(SimilarityEngineTest, NoDuplicatesInFusion) {
   }
 }
 
+// ============================================================================
+// Fusion Search Parameter Tests
+// ============================================================================
+
+TEST_F(SimilarityEngineTest, FusionParameters_AlphaOnly) {
+  // Test with alpha=1.0, beta=0.0 (vectors only - alpha weights vectors!)
+  config::SimilarityConfig config;
+  config.default_top_k = 10;
+  config.fusion_alpha = 1.0f;  // alpha weights VECTORS
+  config.fusion_beta = 0.0f;   // beta weights EVENTS
+
+  SimilarityEngine engine(event_store_.get(), co_index_.get(), vector_store_.get(), config);
+
+  // Add both events and vectors
+  std::vector<events::Event> events = {
+      {"item1", 100, 1000}, {"item2", 50, 1001}, {"item3", 25, 1002}};
+  co_index_->UpdateFromEvents("ctx1", events);
+
+  ASSERT_TRUE(vector_store_->SetVector("item1", {0.1f, 0.2f, 0.3f}).has_value());
+  ASSERT_TRUE(vector_store_->SetVector("item2", {0.9f, 0.8f, 0.7f}).has_value());
+  ASSERT_TRUE(vector_store_->SetVector("item3", {0.15f, 0.25f, 0.35f}).has_value());  // Most similar vector
+
+  auto results = engine.SearchByIdFusion("item1", 10);
+  ASSERT_TRUE(results.has_value());
+  EXPECT_GT(results->size(), 0);
+
+  // With alpha=1.0, beta=0.0, results should match vectors-only search
+  auto vector_results = engine.SearchByIdVectors("item1", 10);
+  ASSERT_TRUE(vector_results.has_value());
+
+  // First result should prioritize vector similarity (item3 is most similar)
+  if (!vector_results->empty() && !results->empty()) {
+    EXPECT_EQ((*results)[0].id, (*vector_results)[0].id);
+  }
+}
+
+TEST_F(SimilarityEngineTest, FusionParameters_BetaOnly) {
+  // Test with alpha=0.0, beta=1.0 (events only - beta weights events!)
+  config::SimilarityConfig config;
+  config.default_top_k = 10;
+  config.fusion_alpha = 0.0f;  // alpha weights VECTORS
+  config.fusion_beta = 1.0f;   // beta weights EVENTS
+
+  SimilarityEngine engine(event_store_.get(), co_index_.get(), vector_store_.get(), config);
+
+  // Add both events and vectors
+  std::vector<events::Event> events = {
+      {"item1", 100, 1000}, {"item2", 50, 1001}, {"item3", 25, 1002}};
+  co_index_->UpdateFromEvents("ctx1", events);
+
+  ASSERT_TRUE(vector_store_->SetVector("item1", {0.1f, 0.2f, 0.3f}).has_value());
+  ASSERT_TRUE(vector_store_->SetVector("item2", {0.9f, 0.8f, 0.7f}).has_value());
+  ASSERT_TRUE(vector_store_->SetVector("item3", {0.15f, 0.25f, 0.35f}).has_value());  // Most similar vector
+
+  auto results = engine.SearchByIdFusion("item1", 10);
+  ASSERT_TRUE(results.has_value());
+  EXPECT_GT(results->size(), 0);
+
+  // With alpha=0.0, beta=1.0, results should match events-only search (beta weights events)
+  auto event_results = engine.SearchByIdEvents("item1", 10);
+  ASSERT_TRUE(event_results.has_value());
+
+  // First result should prioritize event score (item2 has highest event score: 50)
+  if (!event_results->empty() && !results->empty()) {
+    EXPECT_EQ((*results)[0].id, (*event_results)[0].id);
+  }
+}
+
+TEST_F(SimilarityEngineTest, FusionParameters_Balanced) {
+  // Test with alpha=0.5, beta=0.5 (balanced fusion)
+  config::SimilarityConfig config;
+  config.default_top_k = 10;
+  config.fusion_alpha = 0.5f;
+  config.fusion_beta = 0.5f;
+
+  SimilarityEngine engine(event_store_.get(), co_index_.get(), vector_store_.get(), config);
+
+  // Add events and vectors
+  std::vector<events::Event> events = {
+      {"item1", 100, 1000}, {"item2", 80, 1001}, {"item3", 50, 1002}, {"item4", 20, 1003}};
+  co_index_->UpdateFromEvents("ctx1", events);
+
+  ASSERT_TRUE(vector_store_->SetVector("item1", {0.1f, 0.2f, 0.3f}).has_value());
+  ASSERT_TRUE(vector_store_->SetVector("item2", {0.5f, 0.6f, 0.7f}).has_value());
+  ASSERT_TRUE(vector_store_->SetVector("item3", {0.15f, 0.25f, 0.35f}).has_value());  // Similar vector
+  ASSERT_TRUE(vector_store_->SetVector("item4", {0.12f, 0.22f, 0.32f}).has_value());  // Very similar vector
+
+  auto results = engine.SearchByIdFusion("item1", 10);
+  ASSERT_TRUE(results.has_value());
+  EXPECT_GT(results->size(), 0);
+
+  // All results should have combined scores
+  for (const auto& result : *results) {
+    EXPECT_GT(result.score, 0.0f);
+  }
+}
+
+TEST_F(SimilarityEngineTest, FusionParameters_AlphaDominant) {
+  // Test with alpha=0.8, beta=0.2 (vectors dominant - alpha weights vectors!)
+  config::SimilarityConfig config;
+  config.default_top_k = 10;
+  config.fusion_alpha = 0.8f;  // alpha weights VECTORS
+  config.fusion_beta = 0.2f;   // beta weights EVENTS
+
+  SimilarityEngine engine(event_store_.get(), co_index_.get(), vector_store_.get(), config);
+
+  // Item with high event score but low vector similarity
+  std::vector<events::Event> events = {
+      {"item1", 10, 1000}, {"item_high_event", 100, 1001}, {"item_high_vector", 5, 1002}};
+  co_index_->UpdateFromEvents("ctx1", events);
+
+  ASSERT_TRUE(vector_store_->SetVector("item1", {0.1f, 0.2f, 0.3f}).has_value());
+  ASSERT_TRUE(vector_store_->SetVector("item_high_event", {0.9f, 0.8f, 0.7f}).has_value());  // Different vector
+  ASSERT_TRUE(vector_store_->SetVector("item_high_vector", {0.11f, 0.21f, 0.31f}).has_value());  // Similar vector
+
+  auto results = engine.SearchByIdFusion("item1", 10);
+  ASSERT_TRUE(results.has_value());
+  ASSERT_GE(results->size(), 2);
+
+  // With alpha=0.8, item_high_vector should rank higher despite poor event score
+  bool high_event_found = false;
+  bool high_vector_found = false;
+  size_t high_event_pos = 0;
+  size_t high_vector_pos = 0;
+
+  for (size_t i = 0; i < results->size(); ++i) {
+    if ((*results)[i].id == "item_high_event") {
+      high_event_found = true;
+      high_event_pos = i;
+    }
+    if ((*results)[i].id == "item_high_vector") {
+      high_vector_found = true;
+      high_vector_pos = i;
+    }
+  }
+
+  if (high_event_found && high_vector_found) {
+    EXPECT_LT(high_vector_pos, high_event_pos)
+        << "With alpha=0.8, vector similarity should dominate";
+  }
+}
+
+TEST_F(SimilarityEngineTest, FusionParameters_BetaDominant) {
+  // Test with alpha=0.2, beta=0.8 (events dominant - beta weights events!)
+  config::SimilarityConfig config;
+  config.default_top_k = 10;
+  config.fusion_alpha = 0.2f;  // alpha weights VECTORS
+  config.fusion_beta = 0.8f;   // beta weights EVENTS
+
+  SimilarityEngine engine(event_store_.get(), co_index_.get(), vector_store_.get(), config);
+
+  // Item with high vector similarity but low event score
+  std::vector<events::Event> events = {
+      {"item1", 10, 1000}, {"item_high_event", 100, 1001}, {"item_high_vector", 5, 1002}};
+  co_index_->UpdateFromEvents("ctx1", events);
+
+  ASSERT_TRUE(vector_store_->SetVector("item1", {0.1f, 0.2f, 0.3f}).has_value());
+  ASSERT_TRUE(vector_store_->SetVector("item_high_event", {0.9f, 0.8f, 0.7f}).has_value());  // Different vector
+  ASSERT_TRUE(vector_store_->SetVector("item_high_vector", {0.11f, 0.21f, 0.31f}).has_value());  // Similar vector
+
+  auto results = engine.SearchByIdFusion("item1", 10);
+  ASSERT_TRUE(results.has_value());
+  ASSERT_GE(results->size(), 2);
+
+  // With beta=0.8, item_high_event should rank higher despite poor vector similarity
+  bool high_event_found = false;
+  bool high_vector_found = false;
+  size_t high_event_pos = 0;
+  size_t high_vector_pos = 0;
+
+  for (size_t i = 0; i < results->size(); ++i) {
+    if ((*results)[i].id == "item_high_event") {
+      high_event_found = true;
+      high_event_pos = i;
+    }
+    if ((*results)[i].id == "item_high_vector") {
+      high_vector_found = true;
+      high_vector_pos = i;
+    }
+  }
+
+  if (high_event_found && high_vector_found) {
+    EXPECT_LT(high_event_pos, high_vector_pos)
+        << "With beta=0.8, event score should dominate";
+  }
+}
+
 }  // namespace
 }  // namespace nvecd::similarity

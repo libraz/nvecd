@@ -26,6 +26,8 @@ events:
   ctx_buffer_size: 50          # Ring buffer size per context
   decay_interval_sec: 3600     # Decay interval (seconds)
   decay_alpha: 0.99            # Decay factor (0.0 - 1.0)
+  dedup_window_sec: 60         # Deduplication time window (seconds)
+  dedup_cache_size: 10000      # Deduplication cache size (LRU)
 ```
 
 | Option | Type | Default | Description |
@@ -33,6 +35,20 @@ events:
 | `ctx_buffer_size` | int | 50 | Number of events to keep per context. Older events are overwritten. |
 | `decay_interval_sec` | int | 3600 | How often co-occurrence scores decay (0 = disabled). |
 | `decay_alpha` | float | 0.99 | Score multiplier at each decay (0.0-1.0, higher = slower decay). |
+| `dedup_window_sec` | int | 60 | Time window for duplicate detection in seconds. Duplicate events (same ctx, id, score) within this window are ignored. Set to 0 to disable deduplication. |
+| `dedup_cache_size` | int | 10000 | Maximum number of recent events tracked for deduplication (LRU cache). Oldest entries are evicted when full. |
+
+**Deduplication Behavior:**
+
+Duplicate events are detected when the same `(ctx, id, score)` tuple is received within `dedup_window_sec`. This prevents:
+- Retry bugs from inflating statistics
+- Network re-transmissions from creating duplicate entries
+- Client-side bugs from affecting co-occurrence data
+
+Statistics tracking:
+- `total_events`: Total EVENT commands received (including duplicates)
+- `deduped_events`: Number of duplicate events ignored
+- `stored_events`: Actual events stored in ring buffers (total_events - deduped_events)
 
 ---
 

@@ -203,19 +203,33 @@ class NvecdClient::Impl {
   // nvecd-specific commands
   //
 
-  Expected<void, Error> Event(const std::string& ctx, const std::string& id, int score) const {
+  Expected<void, Error> Event(const std::string& ctx, const std::string& type, const std::string& id,
+                               int score) const {
     if (auto err = ValidateNoControlCharacters(ctx, "context ID")) {
+      return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, *err));
+    }
+    if (auto err = ValidateNoControlCharacters(type, "event type")) {
       return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, *err));
     }
     if (auto err = ValidateNoControlCharacters(id, "document ID")) {
       return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, *err));
     }
-    if (score < 0 || score > 100) {  // NOLINT(readability-magic-numbers) - Score range
+
+    // Validate type
+    if (type != "ADD" && type != "SET" && type != "DEL") {
+      return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, "Event type must be ADD, SET, or DEL"));
+    }
+
+    // Validate score for ADD/SET
+    if ((type == "ADD" || type == "SET") && (score < 0 || score > 100)) {  // NOLINT(readability-magic-numbers)
       return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, "Score must be between 0 and 100"));
     }
 
     std::ostringstream cmd;
-    cmd << "EVENT " << EscapeString(ctx) << " " << EscapeString(id) << " " << score;
+    cmd << "EVENT " << EscapeString(ctx) << " " << type << " " << EscapeString(id);
+    if (type != "DEL") {
+      cmd << " " << score;
+    }
 
     auto result = SendCommand(cmd.str());
     if (!result) {
@@ -575,8 +589,9 @@ void NvecdClient::Disconnect() { impl_->Disconnect(); }
 
 bool NvecdClient::IsConnected() const { return impl_->IsConnected(); }
 
-Expected<void, Error> NvecdClient::Event(const std::string& ctx, const std::string& id, int score) const {
-  return impl_->Event(ctx, id, score);
+Expected<void, Error> NvecdClient::Event(const std::string& ctx, const std::string& type, const std::string& id,
+                                          int score) const {
+  return impl_->Event(ctx, type, id, score);
 }
 
 Expected<void, Error> NvecdClient::Vecset(const std::string& id, const std::vector<float>& vector) const {

@@ -17,6 +17,7 @@
 #include "events/co_occurrence_index.h"
 #include "events/event_store.h"
 #include "server/connection_acceptor.h"
+#include "server/http_server.h"
 #include "server/request_dispatcher.h"
 #include "server/server_types.h"
 #include "server/thread_pool.h"
@@ -175,6 +176,7 @@ class NvecdServer {
   std::unique_ptr<RequestDispatcher> dispatcher_;
   std::unique_ptr<ThreadPool> thread_pool_;
   std::unique_ptr<ConnectionAcceptor> acceptor_;
+  std::unique_ptr<HttpServer> http_server_;  // HTTP API server (optional)
 };
 
 }  // namespace nvecd::server

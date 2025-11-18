@@ -60,6 +60,26 @@ target_link_libraries(command_parser_test
 )
 gtest_discover_tests(command_parser_test)
 
+add_executable(http_server_test
+  server/http_server_test.cpp
+)
+target_link_libraries(http_server_test
+  nvecd_server
+  nvecd_cache
+  nvecd_similarity
+  nvecd_events
+  nvecd_vectors
+  nvecd_config
+  nvecd_utils
+  gtest
+  gtest_main
+)
+gtest_discover_tests(http_server_test
+  PROPERTIES
+    LABELS "http"
+    RESOURCE_LOCK http_port_18081
+)
+
 # Events tests
 add_executable(ring_buffer_test
   events/ring_buffer_test.cpp
@@ -80,6 +100,39 @@ target_link_libraries(event_store_test
   gtest_main
 )
 gtest_discover_tests(event_store_test)
+
+add_executable(dedup_cache_test
+  events/dedup_cache_test.cpp
+)
+target_link_libraries(dedup_cache_test
+  nvecd_events
+  nvecd_utils
+  gtest
+  gtest_main
+)
+gtest_discover_tests(dedup_cache_test)
+
+add_executable(event_store_dedup_test
+  events/event_store_dedup_test.cpp
+)
+target_link_libraries(event_store_dedup_test
+  nvecd_events
+  nvecd_utils
+  gtest
+  gtest_main
+)
+gtest_discover_tests(event_store_dedup_test)
+
+add_executable(event_type_test
+  events/event_type_test.cpp
+)
+target_link_libraries(event_type_test
+  nvecd_events
+  nvecd_utils
+  gtest
+  gtest_main
+)
+gtest_discover_tests(event_type_test)
 
 add_executable(co_occurrence_index_test
   events/co_occurrence_index_test.cpp
@@ -129,6 +182,19 @@ target_link_libraries(similarity_engine_test
   gtest_main
 )
 gtest_discover_tests(similarity_engine_test)
+
+# Cache tests
+add_executable(similarity_cache_test
+  cache/similarity_cache_test.cpp
+)
+target_link_libraries(similarity_cache_test
+  nvecd_cache
+  nvecd_similarity
+  nvecd_utils
+  gtest
+  gtest_main
+)
+gtest_discover_tests(similarity_cache_test)
 
 # Client library tests
 add_executable(nvecdclient_test

@@ -48,6 +48,8 @@ target_link_libraries(nvecd_server PUBLIC
 add_library(nvecd_events STATIC
   events/event_store.cpp
   events/co_occurrence_index.cpp
+  events/dedup_cache.cpp
+  events/state_cache.cpp
 )
 target_link_libraries(nvecd_events PUBLIC
   nvecd_utils

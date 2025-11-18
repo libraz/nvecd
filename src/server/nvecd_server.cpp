@@ -92,6 +92,30 @@ utils::Expected<void, utils::Error> NvecdServer::Start() {
   spdlog::info("nvecd server started on {}:{}", config_.api.tcp.bind, acceptor_->GetPort());
   spdlog::info("Ready to accept connections");
 
+  // Start HTTP server if enabled
+  if (config_.api.http.enable) {
+    HttpServerConfig http_config;
+    http_config.bind = config_.api.http.bind;
+    http_config.port = config_.api.http.port;
+    http_config.read_timeout_sec = 5;
+    http_config.write_timeout_sec = 5;
+    http_config.enable_cors = config_.api.http.enable_cors;
+    http_config.cors_allow_origin = config_.api.http.cors_allow_origin;
+    http_config.allow_cidrs = config_.network.allow_cidrs;
+
+    http_server_ = std::make_unique<HttpServer>(http_config, &handler_ctx_, &config_, &loading_, &stats_);
+
+    auto http_start_result = http_server_->Start();
+    if (!http_start_result) {
+      spdlog::error("Failed to start HTTP server: {}", http_start_result.error().message());
+      // Don't fail overall startup if HTTP server fails
+      // TCP server is still running
+      http_server_.reset();
+    } else {
+      spdlog::info("HTTP server started on {}:{}", config_.api.http.bind, http_server_->GetPort());
+    }
+  }
+
   return {};
 }
 
@@ -104,6 +128,11 @@ void NvecdServer::Stop() {
 
   running_.store(false);
   shutdown_.store(true);
+
+  // Stop HTTP server
+  if (http_server_) {
+    http_server_->Stop();
+  }
 
   // Stop accepting new connections
   if (acceptor_) {

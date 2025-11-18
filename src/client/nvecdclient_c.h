@@ -119,11 +119,12 @@ int nvecdclient_is_connected(const NvecdClient_C* client);
  *
  * @param client Client handle
  * @param ctx Context ID
+ * @param type Event type ("ADD", "SET", or "DEL")
  * @param id Document/vector ID
- * @param score Event score (0-100)
+ * @param score Event score (0-100) - ignored for DEL type
  * @return 0 on success, -1 on error
  */
-int nvecdclient_event(NvecdClient_C* client, const char* ctx, const char* id, int score);
+int nvecdclient_event(NvecdClient_C* client, const char* ctx, const char* type, const char* id, int score);
 
 /**
  * @brief Register vector (VECSET command)

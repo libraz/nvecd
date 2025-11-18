@@ -155,12 +155,13 @@ class NvecdClient {
    * @brief Register event (EVENT command)
    *
    * @param ctx Context ID
+   * @param type Event type ("ADD", "SET", or "DEL")
    * @param id Document/vector ID
-   * @param score Event score (0-100)
+   * @param score Event score (0-100) - ignored for DEL type
    * @return Expected<void, Error>
    */
-  nvecd::utils::Expected<void, nvecd::utils::Error> Event(const std::string& ctx, const std::string& id,
-                                                           int score) const;
+  nvecd::utils::Expected<void, nvecd::utils::Error> Event(const std::string& ctx, const std::string& type,
+                                                           const std::string& id, int score = 0) const;
 
   /**
    * @brief Register vector (VECSET command)
