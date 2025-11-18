@@ -34,7 +34,7 @@ TEST(CommandParserTest, ParseEvent_InvalidScore) {
 
 // VECSET command tests
 TEST(CommandParserTest, ParseVecset_Valid) {
-  auto result = ParseCommand("VECSET item123 4 text\n0.1 0.2 0.3 0.4");
+  auto result = ParseCommand("VECSET item123 0.1 0.2 0.3 0.4");
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->type, CommandType::kVecset);
   EXPECT_EQ(result->id, "item123");
@@ -47,15 +47,17 @@ TEST(CommandParserTest, ParseVecset_Valid) {
 }
 
 TEST(CommandParserTest, ParseVecset_DimensionMismatch) {
-  auto result = ParseCommand("VECSET item123 4 text\n0.1 0.2");  // Only 2 values
+  // Dimension is now auto-detected, so this test is not applicable
+  // We test with minimum floats requirement instead
+  auto result = ParseCommand("VECSET item123");  // Missing floats
   ASSERT_FALSE(result.has_value());
-  EXPECT_EQ(result.error().code(), ErrorCode::kCommandInvalidVector);
+  EXPECT_EQ(result.error().code(), ErrorCode::kCommandSyntaxError);
 }
 
 TEST(CommandParserTest, ParseVecset_MissingVector) {
-  auto result = ParseCommand("VECSET item123 4 text");  // No second line
+  auto result = ParseCommand("VECSET item123");  // No floats
   ASSERT_FALSE(result.has_value());
-  EXPECT_EQ(result.error().code(), ErrorCode::kCommandInvalidVector);
+  EXPECT_EQ(result.error().code(), ErrorCode::kCommandSyntaxError);
 }
 
 // SIM command tests
@@ -85,7 +87,7 @@ TEST(CommandParserTest, ParseSim_MissingArgs) {
 
 // SIMV command tests
 TEST(CommandParserTest, ParseSimv_Valid) {
-  auto result = ParseCommand("SIMV 3 5\n0.5 0.6 0.7");
+  auto result = ParseCommand("SIMV 5 0.5 0.6 0.7");
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->type, CommandType::kSimv);
   EXPECT_EQ(result->dimension, 3);
@@ -97,9 +99,10 @@ TEST(CommandParserTest, ParseSimv_Valid) {
 }
 
 TEST(CommandParserTest, ParseSimv_DimensionMismatch) {
-  auto result = ParseCommand("SIMV 3 5\n0.5 0.6");  // Only 2 values
+  // Dimension is now auto-detected, test with missing floats instead
+  auto result = ParseCommand("SIMV 5");  // Missing floats
   ASSERT_FALSE(result.has_value());
-  EXPECT_EQ(result.error().code(), ErrorCode::kCommandInvalidVector);
+  EXPECT_EQ(result.error().code(), ErrorCode::kCommandSyntaxError);
 }
 
 // INFO command tests
@@ -161,6 +164,49 @@ TEST(CommandParserTest, ParseDebug_InvalidArg) {
   auto result = ParseCommand("DEBUG INVALID");
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code(), ErrorCode::kCommandSyntaxError);
+}
+
+// CACHE command tests
+TEST(CommandParserTest, ParseCacheStats) {
+  auto result = ParseCommand("CACHE STATS");
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->type, CommandType::kCacheStats);
+}
+
+TEST(CommandParserTest, ParseCacheClear) {
+  auto result = ParseCommand("CACHE CLEAR");
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->type, CommandType::kCacheClear);
+}
+
+TEST(CommandParserTest, ParseCacheEnable) {
+  auto result = ParseCommand("CACHE ENABLE");
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->type, CommandType::kCacheEnable);
+}
+
+TEST(CommandParserTest, ParseCacheDisable) {
+  auto result = ParseCommand("CACHE DISABLE");
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->type, CommandType::kCacheDisable);
+}
+
+TEST(CommandParserTest, ParseCache_MissingSubcommand) {
+  auto result = ParseCommand("CACHE");
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), ErrorCode::kCommandSyntaxError);
+}
+
+TEST(CommandParserTest, ParseCache_InvalidSubcommand) {
+  auto result = ParseCommand("CACHE INVALID");
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), ErrorCode::kCommandSyntaxError);
+}
+
+TEST(CommandParserTest, ParseCache_CaseInsensitive) {
+  auto result = ParseCommand("cache stats");
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->type, CommandType::kCacheStats);
 }
 
 // Unknown command tests

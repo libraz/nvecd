@@ -130,3 +130,22 @@ if(TARGET httplib)
     set_target_properties(httplib PROPERTIES INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${HTTPLIB_IID}")
   endif()
 endif()
+
+# nlohmann_json_schema_validator for config validation
+# Reference: ../mygram-db/third_party/CMakeLists.txt
+FetchContent_Declare(
+  json-schema-validator
+  GIT_REPOSITORY https://github.com/pboettch/json-schema-validator.git
+  GIT_TAG 2.3.0
+)
+set(JSON_VALIDATOR_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(json-schema-validator)
+
+# Mark json-schema-validator includes as system
+if(TARGET nlohmann_json_schema_validator)
+  get_target_property(JSON_VALIDATOR_IID nlohmann_json_schema_validator INTERFACE_INCLUDE_DIRECTORIES)
+  if(JSON_VALIDATOR_IID)
+    set_target_properties(nlohmann_json_schema_validator PROPERTIES INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${JSON_VALIDATOR_IID}")
+  endif()
+endif()

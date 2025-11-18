@@ -162,7 +162,7 @@ class SimilarityEngine {
   std::vector<SimilarityResult> MergeAndSelectTopK(
       std::vector<SimilarityResult> results, int top_k) const;
 
-  events::EventStore* event_store_;             ///< Event store (not owned)
+  [[maybe_unused]] events::EventStore* event_store_;             ///< Event store (not owned, reserved for future use)
   events::CoOccurrenceIndex* co_index_;         ///< Co-occurrence index (not owned)
   vectors::VectorStore* vector_store_;          ///< Vector store (not owned)
   config::SimilarityConfig config_;             ///< Configuration

@@ -69,6 +69,24 @@ utils::Expected<int, utils::Error> ParseInt(const std::string& str) {
   }
 }
 
+/**
+ * @brief Parse float from string
+ */
+utils::Expected<float, utils::Error> ParseFloat(const std::string& str) {
+  try {
+    size_t pos = 0;
+    float value = std::stof(str, &pos);
+    if (pos != str.length()) {
+      return utils::MakeUnexpected(
+          utils::MakeError(utils::ErrorCode::kCommandInvalidArgument, "Invalid float: " + str));
+    }
+    return value;
+  } catch (const std::exception& e) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kCommandInvalidArgument, "Failed to parse float: " + str));
+  }
+}
+
 }  // namespace
 
 utils::Expected<std::vector<float>, utils::Error> ParseVector(const std::string& vec_str, int expected_dim) {
@@ -135,32 +153,27 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request) 
     cmd.score = *score_result;
 
   } else if (cmd_name == "VECSET") {
-    // VECSET <id> <dim> text\n<floats>
+    // VECSET <id> <f1> <f2> ... <fN>
     if (tokens.size() < 3) {
       return utils::MakeUnexpected(
-          utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "VECSET requires at least 2 arguments: <id> <dim>"));
+          utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "VECSET requires at least 2 arguments: <id> <floats>"));
     }
     cmd.type = CommandType::kVecset;
     cmd.id = tokens[1];
 
-    auto dim_result = ParseInt(tokens[2]);
-    if (!dim_result) {
-      return utils::MakeUnexpected(dim_result.error());
-    }
-    cmd.dimension = *dim_result;
-
-    // Check for "text" format indicator (optional, ignored)
-    // Vector data is on the second line
-    if (lines.size() < 2) {
-      return utils::MakeUnexpected(
-          utils::MakeError(utils::ErrorCode::kCommandInvalidVector, "VECSET missing vector data"));
+    // Parse vector from remaining tokens
+    std::vector<float> vec;
+    vec.reserve(tokens.size() - 2);
+    for (size_t i = 2; i < tokens.size(); ++i) {
+      auto val_result = ParseFloat(tokens[i]);
+      if (!val_result) {
+        return utils::MakeUnexpected(val_result.error());
+      }
+      vec.push_back(*val_result);
     }
 
-    auto vec_result = ParseVector(Trim(lines[1]), cmd.dimension);
-    if (!vec_result) {
-      return utils::MakeUnexpected(vec_result.error());
-    }
-    cmd.vector = std::move(*vec_result);
+    cmd.dimension = static_cast<int>(vec.size());
+    cmd.vector = std::move(vec);
 
   } else if (cmd_name == "SIM") {
     // SIM <id> <top_k> [using=mode]
@@ -189,36 +202,32 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request) 
     }
 
   } else if (cmd_name == "SIMV") {
-    // SIMV <dim> <top_k>\n<floats>
+    // SIMV <top_k> <f1> <f2> ... <fN>
     if (tokens.size() < 3) {
       return utils::MakeUnexpected(
-          utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "SIMV requires 2 arguments: <dim> <top_k>"));
+          utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "SIMV requires at least 2 arguments: <top_k> <floats>"));
     }
     cmd.type = CommandType::kSimv;
 
-    auto dim_result = ParseInt(tokens[1]);
-    if (!dim_result) {
-      return utils::MakeUnexpected(dim_result.error());
-    }
-    cmd.dimension = *dim_result;
-
-    auto top_k_result = ParseInt(tokens[2]);
+    auto top_k_result = ParseInt(tokens[1]);
     if (!top_k_result) {
       return utils::MakeUnexpected(top_k_result.error());
     }
     cmd.top_k = *top_k_result;
 
-    // Vector data is on the second line
-    if (lines.size() < 2) {
-      return utils::MakeUnexpected(
-          utils::MakeError(utils::ErrorCode::kCommandInvalidVector, "SIMV missing vector data"));
+    // Parse vector from remaining tokens
+    std::vector<float> vec;
+    vec.reserve(tokens.size() - 2);
+    for (size_t i = 2; i < tokens.size(); ++i) {
+      auto val_result = ParseFloat(tokens[i]);
+      if (!val_result) {
+        return utils::MakeUnexpected(val_result.error());
+      }
+      vec.push_back(*val_result);
     }
 
-    auto vec_result = ParseVector(Trim(lines[1]), cmd.dimension);
-    if (!vec_result) {
-      return utils::MakeUnexpected(vec_result.error());
-    }
-    cmd.vector = std::move(*vec_result);
+    cmd.dimension = static_cast<int>(vec.size());
+    cmd.vector = std::move(vec);
 
   } else if (cmd_name == "INFO") {
     cmd.type = CommandType::kInfo;
@@ -281,6 +290,26 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request) 
     } else {
       return utils::MakeUnexpected(
           utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "DEBUG requires ON or OFF, got: " + arg));
+    }
+
+  } else if (cmd_name == "CACHE") {
+    // CACHE STATS|CLEAR|ENABLE|DISABLE
+    if (tokens.size() < 2) {
+      return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandSyntaxError,
+                                                     "CACHE requires subcommand: STATS|CLEAR|ENABLE|DISABLE"));
+    }
+    std::string subcommand = ToUpper(tokens[1]);
+    if (subcommand == "STATS") {
+      cmd.type = CommandType::kCacheStats;
+    } else if (subcommand == "CLEAR") {
+      cmd.type = CommandType::kCacheClear;
+    } else if (subcommand == "ENABLE") {
+      cmd.type = CommandType::kCacheEnable;
+    } else if (subcommand == "DISABLE") {
+      cmd.type = CommandType::kCacheDisable;
+    } else {
+      return utils::MakeUnexpected(
+          utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "Unknown CACHE subcommand: " + subcommand));
     }
 
   } else {

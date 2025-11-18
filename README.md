@@ -45,6 +45,8 @@ Not recommended for production use.
 - **Vector Similarity Search** - Find similar items using embeddings (optional)
 - **Hybrid Fusion** - Combine user behavior + content similarity
 - **Real-time Updates** - Recommendations adapt as users interact
+- **Smart Caching** - LRU cache with LZ4 compression for fast repeated queries
+- **SIMD Optimization** - AVX2/NEON acceleration for vector operations
 - **Persistent Storage** - Snapshot support (DUMP commands)
 - **Simple Protocol** - Text-based commands over TCP
 
@@ -80,11 +82,21 @@ SIM product123 10 fusion
 # → product456 0.75
 ```
 
-### 3. Test
+### 3. Monitor Cache Performance
+
+```bash
+# Check cache statistics
+echo "CACHE STATS" | nc localhost 11017
+# → hit_rate: 0.8500
+# → current_memory_mb: 12.45
+# → time_saved_ms: 15420.50
+```
+
+### 4. Test
 
 ```bash
 make test
-# → All 173 tests passing ✅
+# → All 218 tests passing ✅
 ```
 
 ## Use Cases
@@ -108,6 +120,7 @@ See [**Use Cases Guide**](docs/en/use-cases.md) for detailed examples.
 - [**Protocol Reference**](docs/en/protocol.md) - All available commands
 - [**Configuration Guide**](docs/en/configuration.md) - Configuration options
 - [**Snapshot Management**](docs/en/snapshot.md) - Persistence and backups
+- [**Performance Tuning**](docs/en/performance.md) - Cache tuning and SIMD optimization
 
 ## Requirements
 

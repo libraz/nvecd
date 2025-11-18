@@ -1,0 +1,473 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://nvecd.dev/schemas/config.json",
+  "title": "nvecd Configuration Schema",
+  "description": "JSON Schema for nvecd configuration validation",
+  "type": "object",
+  "required": ["vectors", "events"],
+  "additionalProperties": false,
+  "properties": {
+    "vectors": {
+      "type": "object",
+      "description": "Vector store configuration",
+      "additionalProperties": false,
+      "properties": {
+        "dimension": {
+          "type": "integer",
+          "description": "Vector dimension (number of features per vector)",
+          "minimum": 1,
+          "maximum": 4096
+        },
+        "default_dimension": {
+          "type": "integer",
+          "description": "Default vector dimension (alias for dimension)",
+          "minimum": 1,
+          "maximum": 4096
+        },
+        "default_top_k": {
+          "type": "integer",
+          "description": "Default number of results to return in similarity searches",
+          "default": 10,
+          "minimum": 1,
+          "maximum": 1000
+        },
+        "normalize": {
+          "type": "boolean",
+          "description": "Automatically normalize vectors to unit length (L2 normalization)",
+          "default": true
+        },
+        "distance_metric": {
+          "type": "string",
+          "description": "Distance metric for similarity search",
+          "default": "cosine",
+          "enum": ["cosine", "dot", "l2"]
+        },
+        "use_simd": {
+          "type": "boolean",
+          "description": "Use SIMD optimizations (AVX2, NEON) for distance calculations",
+          "default": true
+        }
+      }
+    },
+    "events": {
+      "type": "object",
+      "description": "Event store and co-occurrence tracking configuration",
+      "additionalProperties": false,
+      "properties": {
+        "ctx_buffer_size": {
+          "type": "integer",
+          "description": "Number of events to track per context (ring buffer size)",
+          "default": 100,
+          "minimum": 10,
+          "maximum": 10000
+        },
+        "decay_interval_sec": {
+          "type": "integer",
+          "description": "Decay interval in seconds (0 = disabled)",
+          "default": 3600,
+          "minimum": 0,
+          "maximum": 86400
+        },
+        "score_decay_interval_sec": {
+          "type": "integer",
+          "description": "Co-occurrence score decay interval in seconds (alias for decay_interval_sec)",
+          "default": 3600,
+          "minimum": 0,
+          "maximum": 86400
+        },
+        "decay_alpha": {
+          "type": "number",
+          "description": "Decay factor (0.0-1.0)",
+          "default": 0.9,
+          "minimum": 0.0,
+          "maximum": 1.0
+        },
+        "score_decay_rate": {
+          "type": "number",
+          "description": "Co-occurrence score decay rate (alias for decay_alpha)",
+          "default": 0.9,
+          "minimum": 0.1,
+          "maximum": 1.0
+        },
+        "min_score_threshold": {
+          "type": "integer",
+          "description": "Minimum co-occurrence score to keep in index (scores below are pruned)",
+          "default": 1,
+          "minimum": 0,
+          "maximum": 1000
+        }
+      }
+    },
+    "fusion": {
+      "type": "object",
+      "description": "Fusion search configuration (combining vector similarity + co-occurrence)",
+      "additionalProperties": false,
+      "properties": {
+        "enable": {
+          "type": "boolean",
+          "description": "Enable fusion search mode",
+          "default": true
+        },
+        "vector_weight": {
+          "type": "number",
+          "description": "Weight for vector similarity component (0.0 - 1.0)",
+          "default": 0.7,
+          "minimum": 0.0,
+          "maximum": 1.0
+        },
+        "cooccurrence_weight": {
+          "type": "number",
+          "description": "Weight for co-occurrence component (0.0 - 1.0)",
+          "default": 0.3,
+          "minimum": 0.0,
+          "maximum": 1.0
+        },
+        "normalize_scores": {
+          "type": "boolean",
+          "description": "Normalize component scores before fusion",
+          "default": true
+        }
+      }
+    },
+    "similarity": {
+      "type": "object",
+      "description": "Similarity search configuration",
+      "additionalProperties": false,
+      "properties": {
+        "default_top_k": {
+          "type": "integer",
+          "description": "Default number of results to return in similarity searches",
+          "default": 10,
+          "minimum": 1,
+          "maximum": 1000
+        },
+        "max_top_k": {
+          "type": "integer",
+          "description": "Maximum number of results allowed in similarity searches",
+          "default": 100,
+          "minimum": 1,
+          "maximum": 10000
+        },
+        "fusion_alpha": {
+          "type": "number",
+          "description": "Weight for vector similarity component in fusion mode (0.0 - 1.0)",
+          "default": 0.7,
+          "minimum": 0.0,
+          "maximum": 1.0
+        },
+        "fusion_beta": {
+          "type": "number",
+          "description": "Weight for co-occurrence component in fusion mode (0.0 - 1.0)",
+          "default": 0.3,
+          "minimum": 0.0,
+          "maximum": 1.0
+        }
+      }
+    },
+    "snapshot": {
+      "type": "object",
+      "description": "Snapshot persistence configuration (alias for dump)",
+      "additionalProperties": false,
+      "properties": {
+        "dir": {
+          "type": "string",
+          "description": "Snapshot directory path",
+          "default": "/var/lib/nvecd/snapshots"
+        },
+        "default_filename": {
+          "type": "string",
+          "description": "Default filename for manual snapshot save",
+          "default": "nvecd.snapshot"
+        },
+        "interval_sec": {
+          "type": "integer",
+          "description": "Snapshot interval in seconds (0 = disabled)",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 86400
+        },
+        "retain": {
+          "type": "integer",
+          "description": "Number of snapshots to retain",
+          "default": 3,
+          "minimum": 1,
+          "maximum": 100
+        },
+        "compression": {
+          "type": "string",
+          "description": "Snapshot compression method",
+          "default": "none",
+          "enum": ["none", "lz4", "zstd"]
+        }
+      }
+    },
+    "performance": {
+      "type": "object",
+      "description": "Performance and threading configuration",
+      "additionalProperties": false,
+      "properties": {
+        "thread_pool_size": {
+          "type": "integer",
+          "description": "Worker thread pool size",
+          "default": 4,
+          "minimum": 1,
+          "maximum": 128
+        },
+        "max_connections": {
+          "type": "integer",
+          "description": "Maximum concurrent connections",
+          "default": 1000,
+          "minimum": 1,
+          "maximum": 100000
+        },
+        "connection_timeout_sec": {
+          "type": "integer",
+          "description": "Connection timeout in seconds",
+          "default": 30,
+          "minimum": 1,
+          "maximum": 3600
+        }
+      }
+    },
+    "dump": {
+      "type": "object",
+      "description": "Snapshot persistence configuration",
+      "additionalProperties": false,
+      "properties": {
+        "dir": {
+          "type": "string",
+          "description": "Dump directory path",
+          "default": "/var/lib/nvecd/dumps"
+        },
+        "default_filename": {
+          "type": "string",
+          "description": "Default filename for manual DUMP SAVE",
+          "default": "nvecd.dmp"
+        },
+        "interval_sec": {
+          "type": "integer",
+          "description": "Snapshot interval in seconds (0 = disabled)",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 86400
+        },
+        "retain": {
+          "type": "integer",
+          "description": "Number of snapshots to retain",
+          "default": 3,
+          "minimum": 1,
+          "maximum": 100
+        },
+        "compression": {
+          "type": "string",
+          "description": "Snapshot compression method",
+          "default": "none",
+          "enum": ["none", "lz4", "zstd"]
+        }
+      }
+    },
+    "api": {
+      "type": "object",
+      "description": "API server configuration",
+      "additionalProperties": false,
+      "properties": {
+        "tcp": {
+          "type": "object",
+          "description": "TCP server configuration",
+          "additionalProperties": false,
+          "properties": {
+            "bind": {
+              "type": "string",
+              "description": "TCP bind address",
+              "default": "127.0.0.1"
+            },
+            "port": {
+              "type": "integer",
+              "description": "TCP port",
+              "default": 11017,
+              "minimum": 1,
+              "maximum": 65535
+            }
+          }
+        },
+        "http": {
+          "type": "object",
+          "description": "HTTP server configuration",
+          "additionalProperties": false,
+          "properties": {
+            "enable": {
+              "type": "boolean",
+              "description": "Enable HTTP server",
+              "default": false
+            },
+            "bind": {
+              "type": "string",
+              "description": "HTTP bind address",
+              "default": "127.0.0.1"
+            },
+            "port": {
+              "type": "integer",
+              "description": "HTTP port",
+              "default": 8080,
+              "minimum": 1,
+              "maximum": 65535
+            },
+            "enable_cors": {
+              "type": "boolean",
+              "description": "Enable CORS headers",
+              "default": false
+            },
+            "cors_allow_origin": {
+              "type": "string",
+              "description": "Value for Access-Control-Allow-Origin header when CORS is enabled",
+              "default": ""
+            }
+          }
+        },
+        "rate_limiting": {
+          "type": "object",
+          "description": "Rate limiting configuration (token bucket algorithm)",
+          "additionalProperties": false,
+          "properties": {
+            "enable": {
+              "type": "boolean",
+              "description": "Enable rate limiting",
+              "default": false
+            },
+            "capacity": {
+              "type": "integer",
+              "description": "Maximum number of tokens per client (burst size)",
+              "default": 100,
+              "minimum": 1,
+              "maximum": 10000
+            },
+            "refill_rate": {
+              "type": "integer",
+              "description": "Tokens added per second per client",
+              "default": 10,
+              "minimum": 1,
+              "maximum": 1000
+            },
+            "max_clients": {
+              "type": "integer",
+              "description": "Maximum number of tracked clients (for memory management)",
+              "default": 10000,
+              "minimum": 10,
+              "maximum": 100000
+            }
+          }
+        }
+      }
+    },
+    "network": {
+      "type": "object",
+      "description": "Network security configuration",
+      "additionalProperties": false,
+      "properties": {
+        "allow_cidrs": {
+          "type": "array",
+          "description": "Allow CIDR list (empty = allow all)",
+          "items": {
+            "type": "string",
+            "pattern": "^([0-9]{1,3}\\.){3}[0-9]{1,3}/[0-9]{1,2}$"
+          }
+        }
+      }
+    },
+    "logging": {
+      "type": "object",
+      "description": "Logging configuration",
+      "additionalProperties": false,
+      "properties": {
+        "level": {
+          "type": "string",
+          "description": "Log level",
+          "default": "info",
+          "enum": ["debug", "info", "warn", "error"]
+        },
+        "json": {
+          "type": "boolean",
+          "description": "JSON format output",
+          "default": true
+        },
+        "file": {
+          "type": "string",
+          "description": "Log file path (empty string = stdout, path = file output)",
+          "default": ""
+        }
+      }
+    },
+    "memory": {
+      "type": "object",
+      "description": "Memory management configuration",
+      "additionalProperties": false,
+      "properties": {
+        "hard_limit_mb": {
+          "type": "integer",
+          "description": "Hard memory limit in MB (0 = no limit)",
+          "default": 0,
+          "minimum": 0
+        },
+        "vector_store_mb": {
+          "type": "integer",
+          "description": "Estimated memory for vector storage in MB (0 = auto)",
+          "default": 0,
+          "minimum": 0
+        },
+        "event_store_mb": {
+          "type": "integer",
+          "description": "Estimated memory for event storage in MB (0 = auto)",
+          "default": 0,
+          "minimum": 0
+        }
+      }
+    },
+    "cache": {
+      "type": "object",
+      "description": "Query cache configuration",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable/disable cache",
+          "default": true
+        },
+        "max_memory_mb": {
+          "type": "integer",
+          "description": "Maximum cache memory in MB",
+          "default": 32,
+          "minimum": 1
+        },
+        "min_query_cost_ms": {
+          "type": "number",
+          "description": "Minimum query cost to cache (ms)",
+          "default": 10.0,
+          "minimum": 0.0
+        },
+        "ttl_seconds": {
+          "type": "integer",
+          "description": "Cache entry TTL (seconds, 0 = no TTL)",
+          "default": 3600,
+          "minimum": 0
+        },
+        "invalidation_strategy": {
+          "type": "string",
+          "description": "Invalidation strategy",
+          "default": "id",
+          "enum": ["id", "all"]
+        },
+        "compression_enabled": {
+          "type": "boolean",
+          "description": "Enable LZ4 compression",
+          "default": true
+        },
+        "eviction_batch_size": {
+          "type": "integer",
+          "description": "Number of entries to evict at once",
+          "default": 10,
+          "minimum": 1
+        }
+      }
+    }
+  }
+}

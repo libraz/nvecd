@@ -856,7 +856,7 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
                                      events::EventStore& event_store, events::CoOccurrenceIndex& co_index,
                                      vectors::VectorStore& vector_store, SnapshotStatistics* stats,
                                      std::unordered_map<std::string, StoreStatistics>* store_stats,
-                                     snapshot_format::IntegrityError* integrity_error) {
+                                     snapshot_format::IntegrityError* /* integrity_error */) {
   // Open file for binary reading
   std::ifstream input_stream(filepath, std::ios::binary);
   if (!input_stream) {

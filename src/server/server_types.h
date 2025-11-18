@@ -30,6 +30,10 @@ class VectorStore;
 namespace similarity {
 class SimilarityEngine;
 }  // namespace similarity
+
+namespace cache {
+class SimilarityCache;
+}  // namespace cache
 }  // namespace nvecd
 
 namespace nvecd::server {
@@ -63,16 +67,69 @@ struct ConnectionContext {
 };
 
 /**
- * @brief Simple server statistics (for TCP server)
+ * @brief Thread-safe server statistics tracker
+ *
+ * Reference: ../mygram-db/src/server/server_stats.h
+ * Reusability: 90% (adapted for nvecd command types)
+ *
+ * Uses std::atomic for thread-safe counter updates without locks.
  */
 struct ServerStats {
+  // Server start time (Unix timestamp)
+  uint64_t start_time = static_cast<uint64_t>(std::time(nullptr));
+
+  // Connection statistics
   std::atomic<uint64_t> total_connections{0};
   std::atomic<uint64_t> active_connections{0};
+
+  // Command statistics
   std::atomic<uint64_t> total_commands{0};
   std::atomic<uint64_t> failed_commands{0};
   std::atomic<uint64_t> event_commands{0};
   std::atomic<uint64_t> sim_commands{0};
   std::atomic<uint64_t> vecset_commands{0};
+  std::atomic<uint64_t> info_commands{0};
+  std::atomic<uint64_t> config_commands{0};
+  std::atomic<uint64_t> dump_commands{0};
+  std::atomic<uint64_t> cache_commands{0};
+
+  /**
+   * @brief Get uptime in seconds
+   * Reference: ../mygram-db/src/server/server_stats.cpp:GetUptimeSeconds
+   */
+  uint64_t GetUptimeSeconds() const {
+    return static_cast<uint64_t>(std::time(nullptr)) - start_time;
+  }
+
+  /**
+   * @brief Get queries per second
+   */
+  double GetQueriesPerSecond() const {
+    uint64_t uptime = GetUptimeSeconds();
+    if (uptime == 0) {
+      return 0.0;
+    }
+    return static_cast<double>(total_commands.load()) / static_cast<double>(uptime);
+  }
+};
+
+/**
+ * @brief Server context for admin commands (INFO, CONFIG SHOW)
+ */
+struct ServerContext {
+  const config::Config* config = nullptr;
+  uint64_t uptime_seconds = 0;
+  uint64_t connections_total = 0;
+  uint64_t connections_current = 0;
+  uint64_t vectors_total = 0;
+  uint32_t vector_dimension = 0;
+  uint64_t contexts_total = 0;
+  uint64_t events_total = 0;
+  bool cache_enabled = false;
+  uint64_t cache_hits = 0;
+  uint64_t cache_misses = 0;
+  uint64_t queries_total = 0;
+  double queries_per_second = 0.0;
 };
 
 /**
@@ -91,9 +148,10 @@ struct HandlerContext {
   events::CoOccurrenceIndex* co_index = nullptr;
   vectors::VectorStore* vector_store = nullptr;
   similarity::SimilarityEngine* similarity_engine = nullptr;
+  cache::SimilarityCache* cache = nullptr;
 
   ServerStats& stats;
-  const config::Config* full_config;
+  const config::Config* config = nullptr;
   std::atomic<bool>& loading;
   std::atomic<bool>& read_only;
 

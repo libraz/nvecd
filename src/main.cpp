@@ -14,6 +14,7 @@
 
 #include "config/config.h"
 #include "server/nvecd_server.h"
+#include "vectors/distance_simd.h"
 
 namespace {
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
@@ -144,6 +145,7 @@ int main(int argc, char* argv[]) {
 
   spdlog::info("nvecd server starting...");
   spdlog::info("Version: 0.1.0");
+  spdlog::info("Vector SIMD: {}", nvecd::vectors::simd::GetImplementationName());
 
   // Load configuration
   nvecd::config::Config config;

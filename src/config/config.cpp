@@ -14,12 +14,68 @@
 #include <sstream>
 #include <stdexcept>
 
+#include <nlohmann/json-schema.hpp>
+#include <nlohmann/json.hpp>
+
+#include "config/config_schema_embedded.h"
 #include "utils/error.h"
 #include "utils/structured_log.h"
+
+using nlohmann::json;
+using nlohmann::json_schema::json_validator;
 
 namespace nvecd::config {
 
 namespace {
+
+/**
+ * @brief Convert YAML node to JSON (recursive)
+ * Reference: ../mygram-db/src/config/config.cpp:YamlToJson
+ *
+ * @param yaml_node YAML node to convert
+ * @return nlohmann::json JSON representation
+ */
+nlohmann::json YamlToJson(const YAML::Node& yaml_node) {
+  if (yaml_node.IsNull()) {
+    return nlohmann::json();
+  }
+
+  if (yaml_node.IsScalar()) {
+    // Try different types
+    try {
+      return yaml_node.as<int64_t>();
+    } catch (...) {
+      try {
+        return yaml_node.as<double>();
+      } catch (...) {
+        try {
+          return yaml_node.as<bool>();
+        } catch (...) {
+          return yaml_node.as<std::string>();
+        }
+      }
+    }
+  }
+
+  if (yaml_node.IsSequence()) {
+    nlohmann::json json_array = nlohmann::json::array();
+    for (const auto& item : yaml_node) {
+      json_array.push_back(YamlToJson(item));
+    }
+    return json_array;
+  }
+
+  if (yaml_node.IsMap()) {
+    nlohmann::json json_object;
+    for (const auto& pair : yaml_node) {
+      std::string key = pair.first.as<std::string>();
+      json_object[key] = YamlToJson(pair.second);
+    }
+    return json_object;
+  }
+
+  return nlohmann::json();
+}
 
 /**
  * @brief Convert YAML node to JSON-like value for parsing
@@ -257,12 +313,62 @@ CacheConfig ParseCacheConfig(const YAML::Node& node) {
   return config;
 }
 
+/**
+ * @brief Validate configuration against JSON Schema
+ * Reference: ../mygram-db/src/config/config.cpp:ValidateConfigJson
+ *
+ * @param config_json JSON representation of configuration
+ * @return Expected<void, Error> with success or validation error
+ */
+utils::Expected<void, utils::Error> ValidateConfigSchema(const nlohmann::json& config_json) {
+  try {
+    // Parse embedded schema
+    json schema_json = json::parse(kConfigSchemaJson);
+
+    // Create validator
+    json_validator validator;
+    validator.set_root_schema(schema_json);
+
+    // Validate
+    try {
+      validator.validate(config_json);
+      utils::StructuredLog().Event("config_validation").Field("status", "passed").Info();
+    } catch (const std::exception& e) {
+      std::stringstream err_msg;
+      err_msg << "Configuration validation failed:\n";
+      err_msg << "  " << e.what() << "\n\n";
+      err_msg << "  Common configuration issues:\n";
+      err_msg << "    - Missing required fields (vectors, events, etc.)\n";
+      err_msg << "    - Invalid data types (string instead of number, etc.)\n";
+      err_msg << "    - Invalid enum values (check allowed values)\n";
+      err_msg << "    - Out of range values (check min/max constraints)\n\n";
+      err_msg << "  Please check your configuration against the schema.\n";
+      err_msg << "  Use 'CONFIG HELP <path>' to see configuration options.";
+      return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kConfigValidationError, err_msg.str()));
+    }
+  } catch (const json::parse_error& e) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kConfigParseError, std::string("JSON parse error: ") + e.what()));
+  }
+
+  return {};
+}
+
 }  // namespace
 
 utils::Expected<Config, utils::Error> LoadConfig(const std::string& path) {
   try {
     // Load YAML file
     YAML::Node root = YAML::LoadFile(path);
+
+    // Convert to JSON for schema validation
+    nlohmann::json config_json = YamlToJson(root);
+
+    // Validate against JSON Schema
+    auto validation_result = ValidateConfigSchema(config_json);
+    if (!validation_result) {
+      return utils::MakeUnexpected(validation_result.error());
+    }
 
     Config config;
 
@@ -295,10 +401,10 @@ utils::Expected<Config, utils::Error> LoadConfig(const std::string& path) {
       config.cache = ParseCacheConfig(root["cache"]);
     }
 
-    // Validate configuration
-    auto validation_result = ValidateConfig(config);
-    if (!validation_result) {
-      return utils::MakeUnexpected(validation_result.error());
+    // Validate configuration (semantic validation)
+    auto semantic_validation = ValidateConfig(config);
+    if (!semantic_validation) {
+      return utils::MakeUnexpected(semantic_validation.error());
     }
 
     return config;

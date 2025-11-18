@@ -152,11 +152,22 @@ utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
   spdlog::info("SimilarityEngine initialized (fusion: alpha={}, beta={})", config_.similarity.fusion_alpha,
                config_.similarity.fusion_beta);
 
+  // Create SimilarityCache (if enabled)
+  if (config_.cache.enabled) {
+    cache_ = std::make_unique<cache::SimilarityCache>(config_.cache.max_memory_bytes, config_.cache.min_query_cost_ms);
+    spdlog::info("SimilarityCache initialized (max_memory={}MB, min_cost={}ms)",
+                 config_.cache.max_memory_bytes / (1024 * 1024), config_.cache.min_query_cost_ms);
+  } else {
+    cache_ = nullptr;
+    spdlog::info("SimilarityCache disabled");
+  }
+
   // Update HandlerContext with initialized components
   handler_ctx_.event_store = event_store_.get();
   handler_ctx_.co_index = co_index_.get();
   handler_ctx_.vector_store = vector_store_.get();
   handler_ctx_.similarity_engine = similarity_engine_.get();
+  handler_ctx_.cache = cache_.get();
   handler_ctx_.dump_dir = config_.snapshot.dir;
 
   // Create snapshot directory if it doesn't exist

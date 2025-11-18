@@ -45,6 +45,10 @@ enum class CommandType {
   kDumpInfo,
   kDebugOn,
   kDebugOff,
+  kCacheStats,
+  kCacheClear,
+  kCacheEnable,
+  kCacheDisable,
 
   // Special
   kUnknown
@@ -83,6 +87,14 @@ inline const char* CommandTypeToString(CommandType type) {
       return "DEBUG_ON";
     case CommandType::kDebugOff:
       return "DEBUG_OFF";
+    case CommandType::kCacheStats:
+      return "CACHE_STATS";
+    case CommandType::kCacheClear:
+      return "CACHE_CLEAR";
+    case CommandType::kCacheEnable:
+      return "CACHE_ENABLE";
+    case CommandType::kCacheDisable:
+      return "CACHE_DISABLE";
     case CommandType::kUnknown:
       return "UNKNOWN";
   }

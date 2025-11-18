@@ -104,6 +104,18 @@ target_link_libraries(vector_store_test
 )
 gtest_discover_tests(vector_store_test)
 
+# SIMD correctness tests
+add_executable(distance_simd_test
+  vectors/distance_simd_test.cpp
+)
+target_link_libraries(distance_simd_test
+  nvecd_vectors
+  nvecd_utils
+  gtest
+  gtest_main
+)
+gtest_discover_tests(distance_simd_test)
+
 # Similarity tests
 add_executable(similarity_engine_test
   similarity/similarity_engine_test.cpp
@@ -117,6 +129,47 @@ target_link_libraries(similarity_engine_test
   gtest_main
 )
 gtest_discover_tests(similarity_engine_test)
+
+# Client library tests
+add_executable(nvecdclient_test
+  client/nvecdclient_test.cpp
+)
+target_link_libraries(nvecdclient_test
+  nvecdclient
+  nvecd_server
+  nvecd_config
+  nvecd_similarity
+  nvecd_events
+  nvecd_vectors
+  nvecd_utils
+  gtest
+  gtest_main
+)
+gtest_discover_tests(nvecdclient_test
+  PROPERTIES LABELS "client"
+)
+
+add_executable(nvecdclient_c_test
+  client/nvecdclient_c_test.cpp
+)
+target_link_libraries(nvecdclient_c_test
+  nvecdclient
+  nvecd_server
+  nvecd_config
+  nvecd_similarity
+  nvecd_events
+  nvecd_vectors
+  nvecd_utils
+  gtest
+  gtest_main
+)
+gtest_discover_tests(nvecdclient_c_test
+  PROPERTIES LABELS "client"
+)
+
+# Note: CLI tests removed - nvecd-cli should be tested manually
+# Interactive REPL testing is difficult to automate reliably
+# Manual testing procedure documented in docs/en/libnvecdclient.md
 
 # Integration tests
 add_subdirectory(integration)

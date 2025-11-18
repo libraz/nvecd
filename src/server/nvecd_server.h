@@ -12,6 +12,7 @@
 #include <memory>
 #include <string>
 
+#include "cache/similarity_cache.h"
 #include "config/config.h"
 #include "events/co_occurrence_index.h"
 #include "events/event_store.h"
@@ -154,6 +155,7 @@ class NvecdServer {
   std::unique_ptr<events::CoOccurrenceIndex> co_index_;
   std::unique_ptr<vectors::VectorStore> vector_store_;
   std::unique_ptr<similarity::SimilarityEngine> similarity_engine_;
+  std::unique_ptr<cache::SimilarityCache> cache_;
 
   // Handler context (must be declared before dispatcher_ to ensure proper initialization order)
   HandlerContext handler_ctx_{
@@ -161,8 +163,9 @@ class NvecdServer {
       .co_index = nullptr,
       .vector_store = nullptr,
       .similarity_engine = nullptr,
+      .cache = nullptr,
       .stats = stats_,
-      .full_config = &config_,
+      .config = &config_,
       .loading = loading_,
       .read_only = read_only_,
       .dump_dir = "",  // Will be initialized from config in InitializeComponents

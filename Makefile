@@ -70,7 +70,7 @@ help:
 # Configure CMake
 configure:
 	@mkdir -p $(BUILD_DIR)
-	cd $(BUILD_DIR) && cmake -DCMAKE_INSTALL_PREFIX=$(PREFIX) $(CMAKE_OPTIONS) ..
+	cd $(BUILD_DIR) && cmake -DCMAKE_INSTALL_PREFIX=$(PREFIX) -DBUILD_TESTS=ON $(CMAKE_OPTIONS) ..
 
 # Build the project
 build: configure

@@ -146,7 +146,7 @@ class SnapshotIntegrationTest : public ::testing::Test {
     EXPECT_TRUE(client.SendCommand("EVENT ctx2 vec3 85").find("OK") == 0);
 
     // Add vectors (128-dimensional, simple pattern)
-    // Format: VECSET <id> <dim> text\n<floats>
+    // Format: VECSET <id> <f1> <f2> ... <fN>
     std::string vec1_data;
     std::string vec2_data;
     std::string vec3_data;
@@ -156,9 +156,9 @@ class SnapshotIntegrationTest : public ::testing::Test {
       vec3_data += (i > 0 ? " " : "") + std::to_string(3.0f);
     }
 
-    EXPECT_TRUE(client.SendCommand("VECSET vec1 128 text\n" + vec1_data).find("OK") == 0);
-    EXPECT_TRUE(client.SendCommand("VECSET vec2 128 text\n" + vec2_data).find("OK") == 0);
-    EXPECT_TRUE(client.SendCommand("VECSET vec3 128 text\n" + vec3_data).find("OK") == 0);
+    EXPECT_TRUE(client.SendCommand("VECSET vec1 " + vec1_data).find("OK") == 0);
+    EXPECT_TRUE(client.SendCommand("VECSET vec2 " + vec2_data).find("OK") == 0);
+    EXPECT_TRUE(client.SendCommand("VECSET vec3 " + vec3_data).find("OK") == 0);
   }
 
   /**
@@ -391,7 +391,7 @@ TEST_F(SnapshotIntegrationTest, LargeSnapshot) {
     for (int j = 0; j < 128; ++j) {
       vec_data += (j > 0 ? " " : "") + std::to_string(static_cast<float>(i % 10));
     }
-    client.SendCommand("VECSET " + vec_id + " 128 text\n" + vec_data);
+    client.SendCommand("VECSET " + vec_id + " " + vec_data);
   }
 
   // Save (should handle large data)

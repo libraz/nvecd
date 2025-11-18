@@ -6,12 +6,17 @@
  * - Dot Product (inner product)
  * - Cosine Similarity (normalized dot product)
  * - L2 Distance (Euclidean distance)
+ *
+ * Implementation uses SIMD acceleration (AVX2/NEON) when available,
+ * with automatic runtime detection and fallback to scalar code.
  */
 
 #pragma once
 
 #include <cmath>
 #include <vector>
+
+#include "vectors/distance_simd.h"
 
 namespace nvecd::vectors {
 
@@ -20,6 +25,8 @@ namespace nvecd::vectors {
  *
  * Dot product: sum(a[i] * b[i])
  * Higher values indicate greater similarity.
+ *
+ * Uses SIMD optimization (AVX2/NEON) when available.
  *
  * @param a First vector
  * @param b Second vector
@@ -31,17 +38,17 @@ inline float DotProduct(const std::vector<float>& a,
     return 0.0f;
   }
 
-  float sum = 0.0f;
-  for (size_t i = 0; i < a.size(); ++i) {
-    sum += a[i] * b[i];
-  }
-  return sum;
+  // Dispatch to optimal SIMD implementation
+  const auto& impl = simd::GetOptimalImpl();
+  return impl.dot_product(a.data(), b.data(), a.size());
 }
 
 /**
  * @brief Calculate L2 norm (magnitude) of a vector
  *
  * L2 norm: sqrt(sum(v[i]^2))
+ *
+ * Uses SIMD optimization (AVX2/NEON) when available.
  *
  * @param v Vector
  * @return L2 norm value
@@ -51,11 +58,9 @@ inline float L2Norm(const std::vector<float>& v) {
     return 0.0f;
   }
 
-  float sum_sq = 0.0f;
-  for (float val : v) {
-    sum_sq += val * val;
-  }
-  return std::sqrt(sum_sq);
+  // Dispatch to optimal SIMD implementation
+  const auto& impl = simd::GetOptimalImpl();
+  return impl.l2_norm(v.data(), v.size());
 }
 
 /**
@@ -91,6 +96,8 @@ inline float CosineSimilarity(const std::vector<float>& a,
  * L2 distance: sqrt(sum((a[i] - b[i])^2))
  * Lower values indicate greater similarity.
  *
+ * Uses SIMD optimization (AVX2/NEON) when available.
+ *
  * @param a First vector
  * @param b Second vector
  * @return L2 distance, or 0.0 if dimensions mismatch
@@ -101,12 +108,9 @@ inline float L2Distance(const std::vector<float>& a,
     return 0.0f;
   }
 
-  float sum_sq = 0.0f;
-  for (size_t i = 0; i < a.size(); ++i) {
-    float diff = a[i] - b[i];
-    sum_sq += diff * diff;
-  }
-  return std::sqrt(sum_sq);
+  // Dispatch to optimal SIMD implementation
+  const auto& impl = simd::GetOptimalImpl();
+  return impl.l2_distance(a.data(), b.data(), a.size());
 }
 
 /**

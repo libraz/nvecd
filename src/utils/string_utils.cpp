@@ -203,7 +203,7 @@ std::string NormalizeTextICU(std::string_view text, bool nfkc, std::string_view 
 }
 #endif
 
-std::string NormalizeText(std::string_view text, bool nfkc, std::string_view width, bool lower) {
+std::string NormalizeText(std::string_view text, bool /* nfkc */, std::string_view /* width */, bool lower) {
 #ifdef USE_ICU
   return NormalizeTextICU(text, nfkc, width, lower);
 #else

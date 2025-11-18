@@ -45,6 +45,8 @@ client.on('data', (data) => {
 - **ベクトル類似検索** - 埋め込みを使用した類似アイテム検索（オプション）
 - **ハイブリッドフュージョン** - ユーザー行動 + コンテンツ類似度を組み合わせ
 - **リアルタイム更新** - ユーザーのインタラクションに応じてレコメンドが適応
+- **スマートキャッシング** - LRU キャッシュと LZ4 圧縮で高速な繰り返しクエリ
+- **SIMD 最適化** - AVX2/NEON によるベクトル演算の高速化
 - **永続ストレージ** - スナップショット対応（DUMP コマンド）
 - **シンプルなプロトコル** - TCP 経由のテキストベースコマンド
 
@@ -80,11 +82,21 @@ SIM product123 10 fusion
 # → product456 0.75
 ```
 
-### 3. テスト
+### 3. キャッシュパフォーマンスを監視
+
+```bash
+# キャッシュ統計を確認
+echo "CACHE STATS" | nc localhost 11017
+# → hit_rate: 0.8500
+# → current_memory_mb: 12.45
+# → time_saved_ms: 15420.50
+```
+
+### 4. テスト
 
 ```bash
 make test
-# → All 173 tests passing ✅
+# → All 218 tests passing ✅
 ```
 
 ## ユースケース
@@ -108,6 +120,7 @@ make test
 - [**プロトコルリファレンス**](docs/ja/protocol.md) - 利用可能な全コマンド
 - [**設定ガイド**](docs/ja/configuration.md) - 設定オプション
 - [**スナップショット管理**](docs/ja/snapshot.md) - 永続化とバックアップ
+- [**パフォーマンスチューニング**](docs/ja/performance.md) - キャッシュチューニングと SIMD 最適化
 
 ## 要件
 

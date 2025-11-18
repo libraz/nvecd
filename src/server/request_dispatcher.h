@@ -76,6 +76,10 @@ class RequestDispatcher {
   utils::Expected<std::string, utils::Error> HandleDumpInfo(const Command& cmd);
   utils::Expected<std::string, utils::Error> HandleDebugOn(ConnectionContext& conn_ctx);
   utils::Expected<std::string, utils::Error> HandleDebugOff(ConnectionContext& conn_ctx);
+  utils::Expected<std::string, utils::Error> HandleCacheStats(const Command& cmd);
+  utils::Expected<std::string, utils::Error> HandleCacheClear(const Command& cmd);
+  utils::Expected<std::string, utils::Error> HandleCacheEnable(const Command& cmd);
+  utils::Expected<std::string, utils::Error> HandleCacheDisable(const Command& cmd);
 
   // Format response helpers
   std::string FormatOK(const std::string& msg = "") const;
