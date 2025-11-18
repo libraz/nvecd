@@ -80,6 +80,26 @@ gtest_discover_tests(http_server_test
     RESOURCE_LOCK http_port_18081
 )
 
+add_executable(thread_pool_test
+  server/thread_pool_test.cpp
+)
+target_link_libraries(thread_pool_test
+  nvecd_server
+  gtest
+  gtest_main
+)
+gtest_discover_tests(thread_pool_test)
+
+add_executable(server_stats_test
+  server/server_stats_test.cpp
+)
+target_link_libraries(server_stats_test
+  nvecd_server
+  gtest
+  gtest_main
+)
+gtest_discover_tests(server_stats_test)
+
 # Events tests
 add_executable(ring_buffer_test
   events/ring_buffer_test.cpp
