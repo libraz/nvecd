@@ -37,13 +37,15 @@ namespace nvecd::vectors::simd {
 inline float DotProductNEON(const float* a, const float* b, size_t n) {
   constexpr size_t kVecSize = 4;  // 128 bits / 32 bits per float
 
-  float32x4_t sum_vec = vdupq_n_f32(0.0f);  // Initialize accumulator to zero
+  float32x4_t sum_vec = vdupq_n_f32(0.0F);  // Initialize accumulator to zero
 
   // Process 4 floats at a time
-  size_t i = 0;
-  for (; i + kVecSize <= n; i += kVecSize) {
-    float32x4_t a_vec = vld1q_f32(a + i);        // Load 4 floats from a
-    float32x4_t b_vec = vld1q_f32(b + i);        // Load 4 floats from b
+  size_t vec_idx = 0;
+  for (; vec_idx + kVecSize <= n; vec_idx += kVecSize) {
+    float32x4_t a_vec =
+        vld1q_f32(a + vec_idx);  // Load 4 floats from a  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+    float32x4_t b_vec =
+        vld1q_f32(b + vec_idx);  // Load 4 floats from b  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
     sum_vec = vmlaq_f32(sum_vec, a_vec, b_vec);  // sum += a * b (fused)
   }
 
@@ -59,8 +61,8 @@ inline float DotProductNEON(const float* a, const float* b, size_t n) {
 #endif
 
   // Handle remainder (scalar)
-  for (; i < n; ++i) {
-    sum += a[i] * b[i];
+  for (; vec_idx < n; ++vec_idx) {
+    sum += a[vec_idx] * b[vec_idx];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
   }
 
   return sum;
@@ -75,16 +77,16 @@ inline float DotProductNEON(const float* a, const float* b, size_t n) {
  * @param n Vector dimension
  * @return L2 norm (magnitude)
  */
-inline float L2NormNEON(const float* v, size_t n) {
+inline float L2NormNEON(const float* vec_data, size_t n) {
   constexpr size_t kVecSize = 4;
 
-  float32x4_t sum_vec = vdupq_n_f32(0.0f);
+  float32x4_t sum_vec = vdupq_n_f32(0.0F);
 
   // Process 4 floats at a time
-  size_t i = 0;
-  for (; i + kVecSize <= n; i += kVecSize) {
-    float32x4_t v_vec = vld1q_f32(v + i);
-    sum_vec = vmlaq_f32(sum_vec, v_vec, v_vec);  // sum += v * v
+  size_t vec_idx = 0;
+  for (; vec_idx + kVecSize <= n; vec_idx += kVecSize) {
+    float32x4_t v_vec = vld1q_f32(vec_data + vec_idx);  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+    sum_vec = vmlaq_f32(sum_vec, v_vec, v_vec);         // sum += v * v
   }
 
   // Horizontal sum
@@ -98,8 +100,8 @@ inline float L2NormNEON(const float* v, size_t n) {
 #endif
 
   // Remainder
-  for (; i < n; ++i) {
-    sum_sq += v[i] * v[i];
+  for (; vec_idx < n; ++vec_idx) {
+    sum_sq += vec_data[vec_idx] * vec_data[vec_idx];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
   }
 
   return std::sqrt(sum_sq);
@@ -118,13 +120,13 @@ inline float L2NormNEON(const float* v, size_t n) {
 inline float L2DistanceNEON(const float* a, const float* b, size_t n) {
   constexpr size_t kVecSize = 4;
 
-  float32x4_t sum_vec = vdupq_n_f32(0.0f);
+  float32x4_t sum_vec = vdupq_n_f32(0.0F);
 
   // Process 4 floats at a time
-  size_t i = 0;
-  for (; i + kVecSize <= n; i += kVecSize) {
-    float32x4_t a_vec = vld1q_f32(a + i);
-    float32x4_t b_vec = vld1q_f32(b + i);
+  size_t vec_idx = 0;
+  for (; vec_idx + kVecSize <= n; vec_idx += kVecSize) {
+    float32x4_t a_vec = vld1q_f32(a + vec_idx);  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+    float32x4_t b_vec = vld1q_f32(b + vec_idx);  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
     float32x4_t diff = vsubq_f32(a_vec, b_vec);  // a - b
     sum_vec = vmlaq_f32(sum_vec, diff, diff);    // sum += diff * diff
   }
@@ -140,8 +142,8 @@ inline float L2DistanceNEON(const float* a, const float* b, size_t n) {
 #endif
 
   // Remainder
-  for (; i < n; ++i) {
-    float diff = a[i] - b[i];
+  for (; vec_idx < n; ++vec_idx) {
+    float diff = a[vec_idx] - b[vec_idx];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
     sum_sq += diff * diff;
   }
 

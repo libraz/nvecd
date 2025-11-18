@@ -62,7 +62,7 @@ class NvecdServer {
    * @brief Construct nvecd server
    * @param config Server configuration
    */
-  explicit NvecdServer(const config::Config& config);
+  explicit NvecdServer(config::Config config);
 
   /**
    * @brief Destructor (calls Stop if running)

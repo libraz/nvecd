@@ -39,7 +39,7 @@ constexpr int kMaxPortNumber = 65535;        // Maximum TCP/UDP port number
  */
 nlohmann::json YamlToJson(const YAML::Node& yaml_node) {
   if (yaml_node.IsNull()) {
-    return nlohmann::json();
+    return {};
   }
 
   if (yaml_node.IsScalar()) {
@@ -70,13 +70,13 @@ nlohmann::json YamlToJson(const YAML::Node& yaml_node) {
   if (yaml_node.IsMap()) {
     nlohmann::json json_object;
     for (const auto& pair : yaml_node) {
-      std::string key = pair.first.as<std::string>();
+      auto key = pair.first.as<std::string>();
       json_object[key] = YamlToJson(pair.second);
     }
     return json_object;
   }
 
-  return nlohmann::json();
+  return {};
 }
 
 /**

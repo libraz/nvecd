@@ -35,9 +35,9 @@ namespace std {
 template <>
 struct hash<nvecd::events::StateKey> {
   size_t operator()(const nvecd::events::StateKey& key) const {
-    size_t h1 = std::hash<std::string>{}(key.ctx);
-    size_t h2 = std::hash<std::string>{}(key.id);
-    return h1 ^ (h2 << 1);
+    size_t ctx_hash = std::hash<std::string>{}(key.ctx);
+    size_t id_hash = std::hash<std::string>{}(key.id);
+    return ctx_hash ^ (id_hash << 1);
   }
 };
 }  // namespace std

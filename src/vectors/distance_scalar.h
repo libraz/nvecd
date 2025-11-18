@@ -26,9 +26,9 @@ namespace nvecd::vectors::simd {
  * @return Dot product sum
  */
 inline float DotProductScalar(const float* a, const float* b, size_t n) {
-  float sum = 0.0f;
+  float sum = 0.0F;
   for (size_t i = 0; i < n; ++i) {
-    sum += a[i] * b[i];
+    sum += a[i] * b[i];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
   }
   return sum;
 }
@@ -43,9 +43,9 @@ inline float DotProductScalar(const float* a, const float* b, size_t n) {
  * @return L2 norm (magnitude)
  */
 inline float L2NormScalar(const float* v, size_t n) {
-  float sum_sq = 0.0f;
+  float sum_sq = 0.0F;
   for (size_t i = 0; i < n; ++i) {
-    sum_sq += v[i] * v[i];
+    sum_sq += v[i] * v[i];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
   }
   return std::sqrt(sum_sq);
 }
@@ -61,9 +61,9 @@ inline float L2NormScalar(const float* v, size_t n) {
  * @return L2 (Euclidean) distance
  */
 inline float L2DistanceScalar(const float* a, const float* b, size_t n) {
-  float sum_sq = 0.0f;
+  float sum_sq = 0.0F;
   for (size_t i = 0; i < n; ++i) {
-    float diff = a[i] - b[i];
+    float diff = a[i] - b[i];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
     sum_sq += diff * diff;
   }
   return std::sqrt(sum_sq);

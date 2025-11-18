@@ -15,8 +15,7 @@ namespace nvecd::events {
 EventStore::EventStore(const config::EventsConfig& config) : config_(config) {
   // Initialize deduplication cache for ADD type (time-window based)
   if (config_.dedup_window_sec > 0 && config_.dedup_cache_size > 0) {
-    dedup_cache_ = std::make_unique<DedupCache>(config_.dedup_cache_size,
-                                                 config_.dedup_window_sec);
+    dedup_cache_ = std::make_unique<DedupCache>(config_.dedup_cache_size, config_.dedup_window_sec);
   }
 
   // Initialize state cache for SET/DEL type (last-value based)
@@ -25,28 +24,24 @@ EventStore::EventStore(const config::EventsConfig& config) : config_(config) {
   }
 }
 
-utils::Expected<void, utils::Error> EventStore::AddEvent(
-    const std::string& ctx, const std::string& id, int score, EventType type) {
+utils::Expected<void, utils::Error> EventStore::AddEvent(const std::string& ctx, const std::string& id, int score,
+                                                         EventType type) {
   // Validate inputs
   if (ctx.empty()) {
-    auto error = utils::MakeError(utils::ErrorCode::kInvalidArgument,
-                                  "Context cannot be empty");
+    auto error = utils::MakeError(utils::ErrorCode::kInvalidArgument, "Context cannot be empty");
     utils::LogEventStoreError("add_event", ctx, error.message());
     return utils::MakeUnexpected(error);
   }
 
   if (id.empty()) {
-    auto error =
-        utils::MakeError(utils::ErrorCode::kInvalidArgument, "ID cannot be empty");
+    auto error = utils::MakeError(utils::ErrorCode::kInvalidArgument, "ID cannot be empty");
     utils::LogEventStoreError("add_event", ctx, error.message());
     return utils::MakeUnexpected(error);
   }
 
   // Get current timestamp
   auto now = std::chrono::system_clock::now();
-  auto timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-                       now.time_since_epoch())
-                       .count();
+  auto timestamp = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
   uint64_t ts = static_cast<uint64_t>(timestamp);
 
   // Increment total event count (includes duplicates)
@@ -103,8 +98,7 @@ utils::Expected<void, utils::Error> EventStore::AddEvent(
     // Create ring buffer for context if it doesn't exist
     auto it = ctx_events_.find(ctx);
     if (it == ctx_events_.end()) {
-      auto [new_it, inserted] = ctx_events_.emplace(
-          ctx, RingBuffer<Event>(config_.ctx_buffer_size));
+      auto [new_it, inserted] = ctx_events_.emplace(ctx, RingBuffer<Event>(config_.ctx_buffer_size));
       it = new_it;
     }
 

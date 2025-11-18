@@ -28,8 +28,8 @@ namespace nvecd::client {
  * @brief Similarity search result item
  */
 struct SimResultItem {
-  std::string id;  ///< Document/vector ID
-  float score;     ///< Similarity score
+  std::string id;     ///< Document/vector ID
+  float score{0.0F};  ///< Similarity score
 
   SimResultItem() = default;
   SimResultItem(std::string id_value, float score_value) : id(std::move(id_value)), score(score_value) {}

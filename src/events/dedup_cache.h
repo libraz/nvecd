@@ -45,10 +45,10 @@ template <>
 struct hash<nvecd::events::EventKey> {
   size_t operator()(const nvecd::events::EventKey& key) const {
     // Combine hashes using FNV-1a-like algorithm
-    size_t h1 = std::hash<std::string>{}(key.ctx);
-    size_t h2 = std::hash<std::string>{}(key.id);
-    size_t h3 = std::hash<int>{}(key.score);
-    return h1 ^ (h2 << 1) ^ (h3 << 2);
+    size_t ctx_hash = std::hash<std::string>{}(key.ctx);
+    size_t id_hash = std::hash<std::string>{}(key.id);
+    size_t score_hash = std::hash<int>{}(key.score);
+    return ctx_hash ^ (id_hash << 1) ^ (score_hash << 2);
   }
 };
 }  // namespace std
@@ -136,7 +136,7 @@ class DedupCache {
 
   // Cache entry: timestamp + iterator to LRU list
   struct CacheEntry {
-    uint64_t timestamp;
+    uint64_t timestamp{0};
     LRUIterator lru_iter;
   };
 

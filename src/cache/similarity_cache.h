@@ -201,6 +201,7 @@ class SimilarityCache {
     std::atomic<bool> invalidated{false};              ///< Invalidation flag (lock-free)
 
     CachedEntry() = default;
+    ~CachedEntry() = default;
     CachedEntry(const CachedEntry& other)
         : compressed_data(other.compressed_data),
           original_size(other.original_size),
@@ -210,6 +211,22 @@ class SimilarityCache {
     CachedEntry& operator=(const CachedEntry& other) {
       if (this != &other) {
         compressed_data = other.compressed_data;
+        original_size = other.original_size;
+        query_cost_ms = other.query_cost_ms;
+        created_at = other.created_at;
+        invalidated.store(other.invalidated.load());
+      }
+      return *this;
+    }
+    CachedEntry(CachedEntry&& other) noexcept
+        : compressed_data(std::move(other.compressed_data)),
+          original_size(other.original_size),
+          query_cost_ms(other.query_cost_ms),
+          created_at(other.created_at),
+          invalidated(other.invalidated.load()) {}
+    CachedEntry& operator=(CachedEntry&& other) noexcept {
+      if (this != &other) {
+        compressed_data = std::move(other.compressed_data);
         original_size = other.original_size;
         query_cost_ms = other.query_cost_ms;
         created_at = other.created_at;

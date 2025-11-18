@@ -27,9 +27,11 @@ namespace nvecd::server {
 namespace {
 constexpr int kShutdownTimeoutMs = 5000;  // Wait up to 5s for connections to close
 constexpr int kShutdownCheckIntervalMs = 100;
+constexpr int kDefaultTimeoutSec = 5;              // Default HTTP read/write timeout
+constexpr size_t kBytesPerMegabyte = 1024 * 1024;  // Bytes in a megabyte
 }  // namespace
 
-NvecdServer::NvecdServer(const config::Config& config) : config_(config) {}
+NvecdServer::NvecdServer(config::Config config) : config_(std::move(config)) {}
 
 NvecdServer::~NvecdServer() {
   if (running_.load()) {
@@ -100,8 +102,8 @@ utils::Expected<void, utils::Error> NvecdServer::Start() {
     HttpServerConfig http_config;
     http_config.bind = config_.api.http.bind;
     http_config.port = config_.api.http.port;
-    http_config.read_timeout_sec = 5;
-    http_config.write_timeout_sec = 5;
+    http_config.read_timeout_sec = kDefaultTimeoutSec;
+    http_config.write_timeout_sec = kDefaultTimeoutSec;
     http_config.enable_cors = config_.api.http.enable_cors;
     http_config.cors_allow_origin = config_.api.http.cors_allow_origin;
     http_config.allow_cidrs = config_.network.allow_cidrs;
@@ -179,8 +181,8 @@ utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
   spdlog::info("VectorStore initialized (default_dimension={})", config_.vectors.default_dimension);
 
   // Create SimilarityEngine
-  similarity_engine_ =
-      std::make_unique<similarity::SimilarityEngine>(event_store_.get(), co_index_.get(), vector_store_.get(), config_.similarity);
+  similarity_engine_ = std::make_unique<similarity::SimilarityEngine>(event_store_.get(), co_index_.get(),
+                                                                      vector_store_.get(), config_.similarity);
   spdlog::info("SimilarityEngine initialized (fusion: alpha={}, beta={})", config_.similarity.fusion_alpha,
                config_.similarity.fusion_beta);
 
@@ -188,7 +190,7 @@ utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
   if (config_.cache.enabled) {
     cache_ = std::make_unique<cache::SimilarityCache>(config_.cache.max_memory_bytes, config_.cache.min_query_cost_ms);
     spdlog::info("SimilarityCache initialized (max_memory={}MB, min_cost={}ms)",
-                 config_.cache.max_memory_bytes / (1024 * 1024), config_.cache.min_query_cost_ms);
+                 config_.cache.max_memory_bytes / kBytesPerMegabyte, config_.cache.min_query_cost_ms);
   } else {
     cache_ = nullptr;
     spdlog::info("SimilarityCache disabled");
@@ -232,8 +234,8 @@ void NvecdServer::HandleConnection(int client_fd) {
 
     // Create I/O configuration
     IOConfig io_config;
-    io_config.recv_buffer_size = 4096;         // 4KB
-    io_config.max_query_length = 1024 * 1024;  // 1MB
+    io_config.recv_buffer_size = kDefaultIORecvBufferSize;
+    io_config.max_query_length = kDefaultMaxQueryLength;
     io_config.recv_timeout_sec = config_.perf.connection_timeout_sec;
 
     // Create request processor

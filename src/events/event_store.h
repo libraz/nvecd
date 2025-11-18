@@ -31,7 +31,7 @@ namespace nvecd::events {
  * - SET: State events (likes, bookmarks) - last-value deduplication
  * - DEL: Deletion events (unlike, unbookmark) - deletion-flag deduplication
  */
-enum class EventType {
+enum class EventType : std::uint8_t {
   ADD,  ///< Stream event (default)
   SET,  ///< State event
   DEL   ///< Deletion event
@@ -41,10 +41,10 @@ enum class EventType {
  * @brief Event data structure
  */
 struct Event {
-  std::string item_id;    ///< Event ID (e.g., item ID)
-  int score{0};           ///< Event score/weight
-  uint64_t timestamp{0};  ///< Unix timestamp (seconds)
-  EventType type;         ///< Event type
+  std::string item_id;             ///< Event ID (e.g., item ID)
+  int score{0};                    ///< Event score/weight
+  uint64_t timestamp{0};           ///< Unix timestamp (seconds)
+  EventType type{EventType::ADD};  ///< Event type
 
   Event() = default;
   Event(std::string item_id_, int score_, uint64_t timestamp_, EventType type_ = EventType::ADD)
@@ -104,7 +104,7 @@ class EventStore {
    * @throws None
    */
   utils::Expected<void, utils::Error> AddEvent(const std::string& ctx, const std::string& item_id, int score,
-                                                EventType type = EventType::ADD);
+                                               EventType type = EventType::ADD);
 
   /**
    * @brief Get all events for a context
