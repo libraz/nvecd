@@ -50,6 +50,11 @@ enum class CommandType : std::uint8_t {
   kCacheEnable,
   kCacheDisable,
 
+  // Variable commands (SET/SHOW VARIABLES)
+  kSet,
+  kGet,
+  kShowVariables,
+
   // Special
   kUnknown
 };
@@ -95,6 +100,12 @@ inline const char* CommandTypeToString(CommandType type) {
       return "CACHE_ENABLE";
     case CommandType::kCacheDisable:
       return "CACHE_DISABLE";
+    case CommandType::kSet:
+      return "SET";
+    case CommandType::kGet:
+      return "GET";
+    case CommandType::kShowVariables:
+      return "SHOW_VARIABLES";
     case CommandType::kUnknown:
       return "UNKNOWN";
   }

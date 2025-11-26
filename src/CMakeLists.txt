@@ -26,6 +26,7 @@ add_library(nvecd_server STATIC
   server/handlers/admin_handler.cpp
   server/handlers/info_handler.cpp
   server/handlers/debug_handler.cpp
+  server/handlers/variable_handler.cpp
   server/request_dispatcher.cpp
   server/http_server.cpp
   server/nvecd_server.cpp
@@ -123,6 +124,7 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
 add_library(nvecd_config STATIC
   config/config.cpp
   config/config_help.cpp
+  config/runtime_variable_manager.cpp
   ${CMAKE_CURRENT_BINARY_DIR}/config/config_schema_embedded.h  # Add as source to track changes
 )
 
@@ -139,6 +141,9 @@ target_link_libraries(nvecd_config PUBLIC
   spdlog
 )
 
+# Note: nvecd_cache is added after nvecd_cache is defined (below)
+# This enables RuntimeVariableManager to access SimilarityCache
+
 # Cache library
 add_library(nvecd_cache STATIC
   cache/cache_key.cpp
@@ -153,6 +158,10 @@ target_link_libraries(nvecd_cache PUBLIC
   lz4
   Threads::Threads
 )
+
+# Add nvecd_cache to nvecd_config now that it's defined
+# (for RuntimeVariableManager to access SimilarityCache)
+target_link_libraries(nvecd_config PUBLIC nvecd_cache)
 
 # Storage library
 add_library(nvecd_storage STATIC

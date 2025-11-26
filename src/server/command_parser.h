@@ -43,6 +43,11 @@ struct Command {
 
   // CONFIG/DUMP fields
   std::string path;  // Config path or dump filepath
+
+  // SET/GET/SHOW VARIABLES fields
+  std::string variable_name;   // Variable name (e.g., "logging.level")
+  std::string variable_value;  // Variable value for SET
+  std::string pattern;         // Pattern for SHOW VARIABLES LIKE
 };
 
 /**

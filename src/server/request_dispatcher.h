@@ -77,6 +77,11 @@ class RequestDispatcher {
   static utils::Expected<std::string, utils::Error> HandleDebugOn(ConnectionContext& conn_ctx);
   static utils::Expected<std::string, utils::Error> HandleDebugOff(ConnectionContext& conn_ctx);
 
+  // Variable command handlers
+  utils::Expected<std::string, utils::Error> HandleSet(const Command& cmd);
+  utils::Expected<std::string, utils::Error> HandleGet(const Command& cmd);
+  utils::Expected<std::string, utils::Error> HandleShowVariables(const Command& cmd);
+
   // Format response helpers
   static std::string FormatOK(const std::string& msg = "");
   static std::string FormatError(const std::string& msg);

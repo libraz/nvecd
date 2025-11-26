@@ -34,6 +34,10 @@ class SimilarityEngine;
 namespace cache {
 class SimilarityCache;
 }  // namespace cache
+
+namespace config {
+class RuntimeVariableManager;
+}  // namespace config
 }  // namespace nvecd
 
 namespace nvecd::server {
@@ -147,6 +151,9 @@ struct HandlerContext {
   vectors::VectorStore* vector_store = nullptr;
   similarity::SimilarityEngine* similarity_engine = nullptr;
   cache::SimilarityCache* cache = nullptr;
+
+  // Runtime configuration
+  config::RuntimeVariableManager* variable_manager = nullptr;
 
   ServerStats& stats;
   const config::Config* config = nullptr;

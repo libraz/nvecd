@@ -16,6 +16,7 @@
 #include "events/event_store.h"
 #include "server/handlers/debug_handler.h"
 #include "server/handlers/info_handler.h"
+#include "server/handlers/variable_handler.h"
 #include "server/request_dispatcher.h"
 #include "similarity/similarity_engine.h"
 #include "storage/snapshot_format_v1.h"
@@ -127,6 +128,30 @@ std::string RequestDispatcher::Dispatch(const std::string& request, ConnectionCo
 
     case CommandType::kDebugOff:
       result = HandleDebugOff(conn_ctx);
+      break;
+
+    case CommandType::kSet:
+      ctx_.stats.config_commands++;
+      result = HandleSet(*cmd);
+      break;
+
+    case CommandType::kGet:
+      ctx_.stats.config_commands++;
+      result = HandleGet(*cmd);
+      break;
+
+    case CommandType::kShowVariables:
+      ctx_.stats.config_commands++;
+      result = HandleShowVariables(*cmd);
+      break;
+
+    case CommandType::kCacheStats:
+    case CommandType::kCacheClear:
+    case CommandType::kCacheEnable:
+    case CommandType::kCacheDisable:
+      ctx_.stats.cache_commands++;
+      result = utils::MakeUnexpected(
+          utils::MakeError(utils::ErrorCode::kCommandUnknown, "CACHE subcommand not yet implemented"));
       break;
 
     case CommandType::kUnknown:
@@ -505,6 +530,22 @@ std::string RequestDispatcher::FormatSimResults(const std::vector<std::pair<std:
     oss << id << " " << score << "\r\n";
   }
   return oss.str();
+}
+
+//
+// Variable command handlers
+//
+
+utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSet(const Command& cmd) {
+  return VariableHandler::HandleSet(ctx_.variable_manager, cmd.variable_name, cmd.variable_value);
+}
+
+utils::Expected<std::string, utils::Error> RequestDispatcher::HandleGet(const Command& cmd) {
+  return VariableHandler::HandleGet(ctx_.variable_manager, cmd.variable_name);
+}
+
+utils::Expected<std::string, utils::Error> RequestDispatcher::HandleShowVariables(const Command& cmd) {
+  return VariableHandler::HandleShowVariables(ctx_.variable_manager, cmd.pattern);
 }
 
 }  // namespace nvecd::server

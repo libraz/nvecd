@@ -13,6 +13,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include <atomic>
 #include <iomanip>
 #include <sstream>
 #include <string>
@@ -21,21 +22,58 @@
 namespace nvecd::utils {
 
 /**
- * @brief Structured log builder for JSON-formatted logs
+ * @brief Log output format
+ */
+enum class LogFormat : std::uint8_t {
+  JSON,  // {"event":"name","field":"value"}
+  TEXT   // event=name field=value
+};
+
+/**
+ * @brief Structured log builder for JSON or text-formatted logs
  *
  * Example usage:
  * @code
  * StructuredLog()
- *   .Event("binlog_error")
- *   .Field("type", "connection_lost")
- *   .Field("gtid", current_gtid)
+ *   .Event("event_store_error")
+ *   .Field("type", "ctx_overflow")
+ *   .Field("ctx", ctx_id)
  *   .Field("retry_count", retry_count)
  *   .Error();
+ * @endcode
+ *
+ * Format can be changed globally via SetFormat():
+ * @code
+ * StructuredLog::SetFormat(LogFormat::TEXT);  // Switch to text format
  * @endcode
  */
 class StructuredLog {
  public:
   StructuredLog() = default;
+
+  /**
+   * @brief Set global log format (JSON or TEXT)
+   * Thread-safe: Uses atomic store with relaxed memory order
+   */
+  static void SetFormat(LogFormat format) { format_.store(format, std::memory_order_relaxed); }
+
+  /**
+   * @brief Get current log format
+   * Thread-safe: Uses atomic load with relaxed memory order
+   */
+  static LogFormat GetFormat() { return format_.load(std::memory_order_relaxed); }
+
+  /**
+   * @brief Parse format string to LogFormat enum
+   * @param format_str Format string ("json" or "text")
+   * @return LogFormat enum value (defaults to JSON for unknown values)
+   */
+  static LogFormat ParseFormat(const std::string& format_str) {
+    if (format_str == "text") {
+      return LogFormat::TEXT;
+    }
+    return LogFormat::JSON;  // Default to JSON
+  }
 
   /**
    * @brief Set event type
@@ -49,7 +87,8 @@ class StructuredLog {
    * @brief Add string field (const char*)
    */
   StructuredLog& Field(const std::string& key, const char* value) {
-    fields_.push_back(MakeField(key, Escape(std::string(value))));
+    fields_.push_back(MakeJSONField(key, Escape(std::string(value))));
+    fields_text_.push_back(MakeTextField(key, std::string(value)));
     return *this;
   }
 
@@ -57,7 +96,17 @@ class StructuredLog {
    * @brief Add string field (std::string)
    */
   StructuredLog& Field(const std::string& key, const std::string& value) {
-    fields_.push_back(MakeField(key, Escape(value)));
+    fields_.push_back(MakeJSONField(key, Escape(value)));
+    fields_text_.push_back(MakeTextField(key, value));
+    return *this;
+  }
+
+  /**
+   * @brief Add string field (std::string_view)
+   */
+  StructuredLog& Field(const std::string& key, std::string_view value) {
+    fields_.push_back(MakeJSONField(key, Escape(std::string(value))));
+    fields_text_.push_back(MakeTextField(key, std::string(value)));
     return *this;
   }
 
@@ -65,7 +114,9 @@ class StructuredLog {
    * @brief Add integer field
    */
   StructuredLog& Field(const std::string& key, int64_t value) {
-    fields_.push_back(MakeField(key, std::to_string(value)));
+    std::string val_str = std::to_string(value);
+    fields_.push_back(MakeJSONField(key, val_str, true));  // Quoted for JSON
+    fields_text_.push_back(key + "=" + val_str);
     return *this;
   }
 
@@ -73,7 +124,9 @@ class StructuredLog {
    * @brief Add unsigned integer field
    */
   StructuredLog& Field(const std::string& key, uint64_t value) {
-    fields_.push_back(MakeField(key, std::to_string(value)));
+    std::string val_str = std::to_string(value);
+    fields_.push_back(MakeJSONField(key, val_str, true));  // Quoted for JSON
+    fields_text_.push_back(key + "=" + val_str);
     return *this;
   }
 
@@ -83,7 +136,9 @@ class StructuredLog {
   StructuredLog& Field(const std::string& key, double value) {
     std::ostringstream oss;
     oss << value;
-    fields_.push_back(MakeField(key, oss.str()));
+    std::string val_str = oss.str();
+    fields_.push_back(MakeJSONField(key, val_str, true));  // Quoted for JSON
+    fields_text_.push_back(key + "=" + val_str);
     return *this;
   }
 
@@ -91,7 +146,9 @@ class StructuredLog {
    * @brief Add boolean field
    */
   StructuredLog& Field(const std::string& key, bool value) {
-    fields_.push_back(MakeField(key, value ? "true" : "false", false));  // No quotes for booleans
+    std::string val_str = value ? "true" : "false";
+    fields_.push_back(MakeJSONField(key, val_str, false));  // No quotes for booleans in JSON
+    fields_text_.push_back(key + "=" + val_str);
     return *this;
   }
 
@@ -119,6 +176,11 @@ class StructuredLog {
   void Info() { spdlog::info("{}", Build()); }
 
   /**
+   * @brief Log as debug level
+   */
+  void Debug() { spdlog::debug("{}", Build()); }
+
+  /**
    * @brief Log as critical level
    */
   void Critical() { spdlog::critical("{}", Build()); }
@@ -126,12 +188,25 @@ class StructuredLog {
  private:
   std::string event_;
   std::string message_;
-  std::vector<std::string> fields_;
+  std::vector<std::string> fields_;                               // JSON format fields
+  std::vector<std::string> fields_text_;                          // Text format fields
+  static inline std::atomic<LogFormat> format_{LogFormat::JSON};  // Default to JSON (thread-safe)
+
+  /**
+   * @brief Build log string in selected format
+   * Thread-safe: Reads format atomically
+   */
+  std::string Build() const {
+    if (format_.load(std::memory_order_relaxed) == LogFormat::TEXT) {
+      return BuildText();
+    }
+    return BuildJSON();
+  }
 
   /**
    * @brief Build JSON string
    */
-  std::string Build() const {
+  std::string BuildJSON() const {
     std::ostringstream json;
     json << "{";
 
@@ -166,9 +241,44 @@ class StructuredLog {
   }
 
   /**
+   * @brief Build text string (key=value format)
+   */
+  std::string BuildText() const {
+    std::ostringstream text;
+
+    bool first = true;
+
+    // Add event type
+    if (!event_.empty()) {
+      text << "event=" << EscapeText(event_);
+      first = false;
+    }
+
+    // Add message if present
+    if (!message_.empty()) {
+      if (!first) {
+        text << " ";
+      }
+      text << "message=\"" << EscapeText(message_) << "\"";
+      first = false;
+    }
+
+    // Add custom fields
+    for (const auto& field : fields_text_) {
+      if (!first) {
+        text << " ";
+      }
+      text << field;
+      first = false;
+    }
+
+    return text.str();
+  }
+
+  /**
    * @brief Create a JSON field
    */
-  static std::string MakeField(const std::string& key, const std::string& value, bool quoted = true) {
+  static std::string MakeJSONField(const std::string& key, const std::string& value, bool quoted = true) {
     std::ostringstream oss;
     oss << "\"" << key << "\":";
     if (quoted) {
@@ -177,6 +287,39 @@ class StructuredLog {
       oss << value;
     }
     return oss.str();
+  }
+
+  /**
+   * @brief Create a text field (key=value or key="value")
+   */
+  static std::string MakeTextField(const std::string& key, const std::string& value) {
+    // Quote string values that contain spaces or special characters
+    if (value.find(' ') != std::string::npos || value.find('"') != std::string::npos ||
+        value.find('\n') != std::string::npos) {
+      return key + "=\"" + EscapeText(value) + "\"";
+    }
+    return key + "=" + value;
+  }
+
+  /**
+   * @brief Escape text for text format (escape quotes and backslashes)
+   */
+  static std::string EscapeText(const std::string& str) {
+    std::ostringstream escaped;
+    for (char chr : str) {
+      if (chr == '"' || chr == '\\') {
+        escaped << '\\' << chr;
+      } else if (chr == '\n') {
+        escaped << "\\n";
+      } else if (chr == '\r') {
+        escaped << "\\r";
+      } else if (chr == '\t') {
+        escaped << "\\t";
+      } else {
+        escaped << chr;
+      }
+    }
+    return escaped.str();
   }
 
   /**

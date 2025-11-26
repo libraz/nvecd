@@ -112,8 +112,9 @@ class SimilarityCache {
    * @brief Constructor
    * @param max_memory_bytes Maximum memory usage in bytes
    * @param min_query_cost_ms Minimum query cost to cache (ms)
+   * @param ttl_seconds TTL for cache entries (0 = no expiration)
    */
-  explicit SimilarityCache(size_t max_memory_bytes, double min_query_cost_ms);
+  explicit SimilarityCache(size_t max_memory_bytes, double min_query_cost_ms, int ttl_seconds = 0);
 
   /**
    * @brief Destructor
@@ -166,6 +167,30 @@ class SimilarityCache {
    * @param predicate Function returning true for keys to erase
    */
   void ClearIf(std::function<bool(const CacheKey&)> predicate);
+
+  /**
+   * @brief Set TTL for cache entries (runtime configuration)
+   * @param ttl_seconds TTL in seconds (0 = no expiration)
+   */
+  void SetTtl(int ttl_seconds) { ttl_seconds_.store(ttl_seconds, std::memory_order_relaxed); }
+
+  /**
+   * @brief Get current TTL setting
+   * @return TTL in seconds (0 = no expiration)
+   */
+  [[nodiscard]] int GetTtl() const { return ttl_seconds_.load(std::memory_order_relaxed); }
+
+  /**
+   * @brief Set minimum query cost threshold (runtime configuration)
+   * @param min_query_cost_ms Minimum query cost in ms
+   */
+  void SetMinQueryCost(double min_query_cost_ms) { min_query_cost_ms_ = min_query_cost_ms; }
+
+  /**
+   * @brief Get current minimum query cost threshold
+   * @return Minimum query cost in ms
+   */
+  [[nodiscard]] double GetMinQueryCost() const { return min_query_cost_ms_; }
 
   /**
    * @brief Get cache statistics snapshot (thread-safe)
@@ -245,6 +270,7 @@ class SimilarityCache {
   // Configuration
   size_t max_memory_bytes_;
   double min_query_cost_ms_;
+  std::atomic<int> ttl_seconds_{0};  ///< TTL in seconds (0 = no expiration)
 
   // Memory tracking
   size_t total_memory_bytes_ = 0;

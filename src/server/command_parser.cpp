@@ -349,6 +349,51 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request) 
           utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "Unknown CACHE subcommand: " + subcommand));
     }
 
+  } else if (cmd_name == "SET") {
+    // SET <variable_name> <value>
+    if (tokens.size() < 3) {
+      return utils::MakeUnexpected(
+          utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "SET requires 2 arguments: <variable_name> <value>"));
+    }
+    cmd.type = CommandType::kSet;
+    cmd.variable_name = tokens[1];
+    // Join remaining tokens as value (in case value contains spaces)
+    std::string value;
+    for (size_t i = 2; i < tokens.size(); ++i) {
+      if (i > 2) {
+        value += " ";
+      }
+      value += tokens[i];
+    }
+    cmd.variable_value = value;
+
+  } else if (cmd_name == "GET") {
+    // GET <variable_name>
+    if (tokens.size() < 2) {
+      return utils::MakeUnexpected(
+          utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "GET requires 1 argument: <variable_name>"));
+    }
+    cmd.type = CommandType::kGet;
+    cmd.variable_name = tokens[1];
+
+  } else if (cmd_name == "SHOW") {
+    // SHOW VARIABLES [LIKE <pattern>]
+    if (tokens.size() < 2) {
+      return utils::MakeUnexpected(
+          utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "SHOW requires subcommand: VARIABLES"));
+    }
+    std::string subcmd = ToUpper(tokens[1]);
+    if (subcmd == "VARIABLES") {
+      cmd.type = CommandType::kShowVariables;
+      // Parse optional LIKE pattern
+      if (tokens.size() >= 4 && ToUpper(tokens[2]) == "LIKE") {
+        cmd.pattern = tokens[3];
+      }
+    } else {
+      return utils::MakeUnexpected(
+          utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "Unknown SHOW subcommand: " + subcmd));
+    }
+
   } else {
     cmd.type = CommandType::kUnknown;
     return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandUnknown, "Unknown command: " + cmd_name));

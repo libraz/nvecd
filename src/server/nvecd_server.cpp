@@ -188,13 +188,46 @@ utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
 
   // Create SimilarityCache (if enabled)
   if (config_.cache.enabled) {
-    cache_ = std::make_unique<cache::SimilarityCache>(config_.cache.max_memory_bytes, config_.cache.min_query_cost_ms);
-    spdlog::info("SimilarityCache initialized (max_memory={}MB, min_cost={}ms)",
-                 config_.cache.max_memory_bytes / kBytesPerMegabyte, config_.cache.min_query_cost_ms);
+    cache_ = std::make_unique<cache::SimilarityCache>(config_.cache.max_memory_bytes, config_.cache.min_query_cost_ms,
+                                                      config_.cache.ttl_seconds);
+    spdlog::info("SimilarityCache initialized (max_memory={}MB, min_cost={}ms, ttl={}s)",
+                 config_.cache.max_memory_bytes / kBytesPerMegabyte, config_.cache.min_query_cost_ms,
+                 config_.cache.ttl_seconds);
   } else {
     cache_ = nullptr;
     spdlog::info("SimilarityCache disabled");
   }
+
+  // Create RuntimeVariableManager
+  auto variable_mgr_result = config::RuntimeVariableManager::Create(config_);
+  if (!variable_mgr_result) {
+    spdlog::error("Failed to create RuntimeVariableManager: {}", variable_mgr_result.error().message());
+    return utils::MakeUnexpected(variable_mgr_result.error());
+  }
+  variable_manager_ = std::move(*variable_mgr_result);
+
+  // Register cache toggle callback
+  variable_manager_->SetCacheToggleCallback([this](bool enabled) -> utils::Expected<void, utils::Error> {
+    if (enabled && !cache_) {
+      // Create cache if it doesn't exist
+      cache_ = std::make_unique<cache::SimilarityCache>(config_.cache.max_memory_bytes, config_.cache.min_query_cost_ms,
+                                                        config_.cache.ttl_seconds);
+      handler_ctx_.cache = cache_.get();
+      spdlog::info("Cache enabled at runtime");
+    } else if (!enabled && cache_) {
+      // Disable cache (set pointer to null but keep cache for later re-enable)
+      handler_ctx_.cache = nullptr;
+      spdlog::info("Cache disabled at runtime");
+    }
+    return {};
+  });
+
+  // Set SimilarityCache pointer if cache is enabled
+  if (cache_) {
+    variable_manager_->SetSimilarityCache(cache_.get());
+  }
+
+  spdlog::info("RuntimeVariableManager initialized");
 
   // Update HandlerContext with initialized components
   handler_ctx_.event_store = event_store_.get();
@@ -202,6 +235,7 @@ utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
   handler_ctx_.vector_store = vector_store_.get();
   handler_ctx_.similarity_engine = similarity_engine_.get();
   handler_ctx_.cache = cache_.get();
+  handler_ctx_.variable_manager = variable_manager_.get();
   handler_ctx_.dump_dir = config_.snapshot.dir;
 
   // Create snapshot directory if it doesn't exist
