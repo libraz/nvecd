@@ -118,6 +118,12 @@ std::vector<std::string> CoOccurrenceIndex::GetAllItems() const {
   return items;
 }
 
+void CoOccurrenceIndex::SetScore(const std::string& item1, const std::string& item2, float score) {
+  std::unique_lock lock(mutex_);
+  co_scores_[item1][item2] = score;
+  co_scores_[item2][item1] = score;
+}
+
 void CoOccurrenceIndex::Clear() {
   std::unique_lock lock(mutex_);
   co_scores_.clear();

@@ -116,6 +116,19 @@ class CoOccurrenceIndex {
   std::vector<std::string> GetAllItems() const;
 
   /**
+   * @brief Directly set co-occurrence score between two items
+   *
+   * Sets the score in both directions (symmetric). This bypasses
+   * UpdateFromEvents() and writes directly to the internal matrix.
+   * Primarily used for snapshot deserialization to preserve exact scores.
+   *
+   * @param item1 First item ID
+   * @param item2 Second item ID
+   * @param score Co-occurrence score to set
+   */
+  void SetScore(const std::string& item1, const std::string& item2, float score);
+
+  /**
    * @brief Clear all co-occurrence data
    */
   void Clear();

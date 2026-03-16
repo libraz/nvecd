@@ -373,6 +373,46 @@ TEST(CoOccurrenceIndexTest, LargeNumberOfEvents) {
 }
 
 // ============================================================================
+// SetScore Tests
+// ============================================================================
+
+TEST(CoOccurrenceIndexTest, SetScoreBasic) {
+  CoOccurrenceIndex index;
+  index.SetScore("item1", "item2", 150.0f);
+
+  EXPECT_FLOAT_EQ(index.GetScore("item1", "item2"), 150.0f);
+  EXPECT_FLOAT_EQ(index.GetScore("item2", "item1"), 150.0f);
+  EXPECT_EQ(index.GetItemCount(), 2);
+}
+
+TEST(CoOccurrenceIndexTest, SetScoreOverwritesExisting) {
+  CoOccurrenceIndex index;
+  auto events = MakeEvents({{"item1", 10, 1000}, {"item2", 20, 1001}});
+  index.UpdateFromEvents("ctx1", events);
+
+  // Original score: 10 * 20 = 200
+  EXPECT_FLOAT_EQ(index.GetScore("item1", "item2"), 200.0f);
+
+  // Overwrite with exact value
+  index.SetScore("item1", "item2", 150.0f);
+  EXPECT_FLOAT_EQ(index.GetScore("item1", "item2"), 150.0f);
+  EXPECT_FLOAT_EQ(index.GetScore("item2", "item1"), 150.0f);
+}
+
+TEST(CoOccurrenceIndexTest, SetScorePreservesNonIntegerValues) {
+  CoOccurrenceIndex index;
+
+  // These values would lose precision with the old sqrt approximation
+  index.SetScore("item1", "item2", 150.0f);
+  index.SetScore("item1", "item3", 37.5f);
+  index.SetScore("item2", "item3", 999.99f);
+
+  EXPECT_FLOAT_EQ(index.GetScore("item1", "item2"), 150.0f);
+  EXPECT_FLOAT_EQ(index.GetScore("item1", "item3"), 37.5f);
+  EXPECT_FLOAT_EQ(index.GetScore("item2", "item3"), 999.99f);
+}
+
+// ============================================================================
 // Concurrency Tests
 // ============================================================================
 

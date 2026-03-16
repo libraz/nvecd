@@ -43,8 +43,16 @@ using namespace utils;
 
 namespace {
 
-constexpr int kGetAllItemsLimit = 1000000;      // Large limit to get all co-occurrence items
-constexpr int kScoreAmplificationFactor = 100;  // Amplification factor for synthetic event scores
+constexpr int kGetAllItemsLimit = 1000000;  // Large limit to get all co-occurrence items
+
+constexpr uint32_t kMaxConfigSize = 16 * 1024 * 1024;       // 16MB max for config section
+constexpr uint32_t kMaxStatsSize = 16 * 1024 * 1024;        // 16MB max for statistics section
+constexpr uint32_t kMaxStoreDataSize = 512 * 1024 * 1024;   // 512MB max for store data
+constexpr uint32_t kMaxStoreStatsSize = 16 * 1024 * 1024;   // 16MB max for store statistics
+
+/// @brief Absolute file offset of the file_crc32 field in the V1 header.
+/// kFixedHeaderSize (8) + header_size(4) + flags(4) + snapshot_timestamp(8) + total_file_size(8) = 32
+constexpr size_t kFileCRC32Offset = snapshot_format::kFixedHeaderSize + 24;
 
 /**
  * @brief Write binary data to stream
@@ -479,12 +487,7 @@ Expected<void, Error> DeserializeCoOccurrenceIndex(std::istream& input_stream, e
     return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read item count"));
   }
 
-  // Temporary storage for co-occurrence matrix
-  // We need to reconstruct events and call UpdateFromEvents
-  // But since we only have pairwise scores, we'll directly reconstruct the matrix
-  // by creating synthetic events
-
-  // Read each item's co-occurrence scores
+  // Read each item's co-occurrence scores and set them directly
   for (uint32_t item_idx = 0; item_idx < item_count; ++item_idx) {
     // Read item name
     std::string item1;
@@ -498,10 +501,6 @@ Expected<void, Error> DeserializeCoOccurrenceIndex(std::istream& input_stream, e
       return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read co-item count for: " + item1));
     }
 
-    // Collect co-items and scores
-    std::vector<std::string> co_item_ids;
-    std::vector<int> co_item_scores;
-
     for (uint32_t co_idx = 0; co_idx < co_item_count; ++co_idx) {
       std::string item2;
       float score = 0.0F;
@@ -513,23 +512,9 @@ Expected<void, Error> DeserializeCoOccurrenceIndex(std::istream& input_stream, e
         return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read co-occurrence score"));
       }
 
-      // Create synthetic events to reconstruct the co-occurrence
-      // score = event1.score * event2.score
-      // We approximate by using sqrt(score) for both events
-      int approx_score = static_cast<int>(std::sqrt(score));
-      co_item_ids.push_back(item2);
-      co_item_scores.push_back(approx_score);
+      // Set the score directly to preserve exact values from the snapshot
+      co_index.SetScore(item1, item2, score);
     }
-
-    // Create a synthetic event list including item1
-    std::vector<events::Event> synthetic_events;
-    synthetic_events.emplace_back(item1, static_cast<int>(std::sqrt(co_item_count * kScoreAmplificationFactor)), 0);
-    for (size_t i = 0; i < co_item_ids.size(); ++i) {
-      synthetic_events.emplace_back(co_item_ids[i], co_item_scores[i], 0);
-    }
-
-    // Update co-occurrence index with synthetic events
-    co_index.UpdateFromEvents("snapshot_restore_" + std::to_string(item_idx), synthetic_events);
   }
 
   return {};
@@ -822,19 +807,62 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
     // Calculate total file size
     header.total_file_size = static_cast<uint64_t>(output_stream.tellp());
 
-    // Calculate file CRC32 (TODO: implement full file CRC32 calculation)
-    // For now, we set it to 0 (will be implemented in future)
+    // Write header with correct total_file_size (file_crc32 still 0 as placeholder)
     header.file_crc32 = 0;
-
-    // Seek back to header position and rewrite with correct values
     output_stream.seekp(snapshot_format::kFixedHeaderSize, std::ios::beg);
     auto rewrite_header_result = WriteHeaderV1(output_stream, header);
     if (!rewrite_header_result) {
       return rewrite_header_result;
     }
 
-    // Close file
+    // Close file to flush all data
     output_stream.close();
+
+    // Compute file-level CRC32: read entire file, zero the file_crc32 field, compute CRC
+    {
+      std::ifstream crc_input(temp_filepath, std::ios::binary);
+      if (!crc_input) {
+        return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError,
+                                        "Failed to reopen temp file for CRC32 computation: " + temp_filepath));
+      }
+      std::string file_contents((std::istreambuf_iterator<char>(crc_input)), std::istreambuf_iterator<char>());
+      crc_input.close();
+
+      // Zero out the file_crc32 field for CRC computation (it was 0 when written)
+      // The field is already 0 in the buffer, so we can compute directly
+      header.file_crc32 = CalculateCRC32(file_contents);
+
+      // Write the computed CRC32 at the file_crc32 position
+      std::ofstream crc_output(temp_filepath, std::ios::binary | std::ios::in | std::ios::out);
+      if (!crc_output) {
+        return MakeUnexpected(
+            MakeError(ErrorCode::kStorageDumpWriteError, "Failed to reopen temp file for CRC32 write: " + temp_filepath));
+      }
+      crc_output.seekp(static_cast<std::streamoff>(kFileCRC32Offset), std::ios::beg);
+      WriteBinary(crc_output, header.file_crc32);
+      crc_output.close();
+    }
+
+#ifndef _WIN32
+    // fsync the temp file to ensure data is persisted before rename
+    {
+      // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg): POSIX open() requires varargs
+      int fd = open(temp_filepath.c_str(), O_RDONLY);
+      if (fd >= 0) {
+        fsync(fd);
+        close(fd);
+      }
+
+      // fsync the parent directory to ensure the directory entry is persisted
+      std::filesystem::path parent_dir = std::filesystem::path(temp_filepath).parent_path();
+      // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg): POSIX open() requires varargs
+      int dir_fd = open(parent_dir.c_str(), O_RDONLY);
+      if (dir_fd >= 0) {
+        fsync(dir_fd);
+        close(dir_fd);
+      }
+    }
+#endif
 
     // Atomic rename
     std::filesystem::rename(temp_filepath, filepath);
@@ -854,7 +882,7 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
                                      events::EventStore& event_store, events::CoOccurrenceIndex& co_index,
                                      vectors::VectorStore& vector_store, SnapshotStatistics* stats,
                                      std::unordered_map<std::string, StoreStatistics>* store_stats,
-                                     [[maybe_unused]] snapshot_format::IntegrityError* integrity_error) {
+                                     snapshot_format::IntegrityError* integrity_error) {
   // Open file for binary reading
   std::ifstream input_stream(filepath, std::ios::binary);
   if (!input_stream) {
@@ -889,9 +917,25 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
     uint32_t config_crc = 0;
     ReadBinary(input_stream, config_size);
     ReadBinary(input_stream, config_crc);
+    if (config_size > kMaxConfigSize) {
+      return MakeUnexpected(
+          MakeError(ErrorCode::kStorageDumpReadError, "Config size exceeds maximum: " + std::to_string(config_size)));
+    }
     std::string config_data(config_size, '\0');
     input_stream.read(config_data.data(), config_size);
-    // TODO: Verify CRC32
+    {
+      uint32_t actual_crc = CalculateCRC32(config_data);
+      if (actual_crc != config_crc) {
+        if (integrity_error != nullptr) {
+          integrity_error->type = snapshot_format::CRCErrorType::ConfigCRC;
+          integrity_error->message = "CRC32 mismatch in config section: expected " + std::to_string(config_crc) +
+                                     ", got " + std::to_string(actual_crc);
+        }
+        return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError,
+                                        "CRC32 mismatch in config section: expected " + std::to_string(config_crc) +
+                                            ", got " + std::to_string(actual_crc)));
+      }
+    }
     std::istringstream config_ss(config_data);
     auto deserialize_config_result = DeserializeConfig(config_ss, config);
     if (!deserialize_config_result) {
@@ -904,9 +948,25 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
       uint32_t stats_crc = 0;
       ReadBinary(input_stream, stats_size);
       ReadBinary(input_stream, stats_crc);
+      if (stats_size > kMaxStatsSize) {
+        return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError,
+                                        "Statistics size exceeds maximum: " + std::to_string(stats_size)));
+      }
       std::string stats_data(stats_size, '\0');
       input_stream.read(stats_data.data(), stats_size);
-      // TODO: Verify CRC32
+      {
+        uint32_t actual_crc = CalculateCRC32(stats_data);
+        if (actual_crc != stats_crc) {
+          if (integrity_error != nullptr) {
+            integrity_error->type = snapshot_format::CRCErrorType::StatsCRC;
+            integrity_error->message = "CRC32 mismatch in statistics section: expected " + std::to_string(stats_crc) +
+                                       ", got " + std::to_string(actual_crc);
+          }
+          return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError,
+                                          "CRC32 mismatch in statistics section: expected " +
+                                              std::to_string(stats_crc) + ", got " + std::to_string(actual_crc)));
+        }
+      }
       std::istringstream stats_ss(stats_data);
       auto deserialize_stats_result = DeserializeStatistics(stats_ss, *stats);
       if (!deserialize_stats_result) {
@@ -929,9 +989,27 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
       if (store_stats_size > 0 && store_stats != nullptr) {
         uint32_t store_stats_crc = 0;
         ReadBinary(input_stream, store_stats_crc);
+        if (store_stats_size > kMaxStoreStatsSize) {
+          return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError,
+                                          "Store statistics size exceeds maximum: " + std::to_string(store_stats_size)));
+        }
         std::string store_stats_data(store_stats_size, '\0');
         input_stream.read(store_stats_data.data(), store_stats_size);
-        // TODO: Verify CRC32
+        {
+          uint32_t actual_crc = CalculateCRC32(store_stats_data);
+          if (actual_crc != store_stats_crc) {
+            if (integrity_error != nullptr) {
+              integrity_error->type = snapshot_format::CRCErrorType::StoreStatsCRC;
+              integrity_error->store_name = store_name;
+              integrity_error->message = "CRC32 mismatch in store statistics for '" + store_name + "': expected " +
+                                         std::to_string(store_stats_crc) + ", got " + std::to_string(actual_crc);
+            }
+            return MakeUnexpected(
+                MakeError(ErrorCode::kStorageDumpReadError, "CRC32 mismatch in store statistics for '" + store_name +
+                                                               "': expected " + std::to_string(store_stats_crc) +
+                                                               ", got " + std::to_string(actual_crc)));
+          }
+        }
         std::istringstream store_stats_ss(store_stats_data);
         StoreStatistics stats;
         auto deserialize_store_stats_result = DeserializeStoreStatistics(store_stats_ss, stats);
@@ -946,9 +1024,36 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
       uint32_t store_data_crc = 0;
       ReadBinary(input_stream, store_data_size);
       ReadBinary(input_stream, store_data_crc);
+      if (store_data_size > kMaxStoreDataSize) {
+        return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError,
+                                        "Store data size exceeds maximum: " + std::to_string(store_data_size)));
+      }
       std::string store_data(store_data_size, '\0');
       input_stream.read(store_data.data(), store_data_size);
-      // TODO: Verify CRC32
+      {
+        uint32_t actual_crc = CalculateCRC32(store_data);
+        if (actual_crc != store_data_crc) {
+          // Determine store-specific CRC error type
+          auto crc_error_type = snapshot_format::CRCErrorType::FileCRC;
+          if (store_name == "events") {
+            crc_error_type = snapshot_format::CRCErrorType::EventStoreCRC;
+          } else if (store_name == "co_occurrence") {
+            crc_error_type = snapshot_format::CRCErrorType::CoOccurrenceCRC;
+          } else if (store_name == "vectors") {
+            crc_error_type = snapshot_format::CRCErrorType::VectorStoreCRC;
+          }
+          if (integrity_error != nullptr) {
+            integrity_error->type = crc_error_type;
+            integrity_error->store_name = store_name;
+            integrity_error->message = "CRC32 mismatch in store data for '" + store_name + "': expected " +
+                                       std::to_string(store_data_crc) + ", got " + std::to_string(actual_crc);
+          }
+          return MakeUnexpected(
+              MakeError(ErrorCode::kStorageDumpReadError, "CRC32 mismatch in store data for '" + store_name +
+                                                             "': expected " + std::to_string(store_data_crc) + ", got " +
+                                                             std::to_string(actual_crc)));
+        }
+      }
 
       std::istringstream store_data_ss(store_data);
 
@@ -1029,7 +1134,24 @@ Expected<void, Error> VerifySnapshotIntegrity(const std::string& filepath,
       return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, integrity_error.message));
     }
 
-    // TODO: Verify file CRC32 (full file checksum)
+    // Verify file CRC32
+    if (header.file_crc32 != 0) {
+      input_stream.seekg(0, std::ios::beg);
+      std::string file_contents((std::istreambuf_iterator<char>(input_stream)), std::istreambuf_iterator<char>());
+
+      // Zero out the file_crc32 field for CRC computation
+      if (file_contents.size() >= kFileCRC32Offset + sizeof(uint32_t)) {
+        std::memset(&file_contents[kFileCRC32Offset], 0, sizeof(uint32_t));
+      }
+
+      uint32_t computed_crc = CalculateCRC32(file_contents);
+      if (computed_crc != header.file_crc32) {
+        integrity_error.type = snapshot_format::CRCErrorType::FileCRC;
+        integrity_error.message = "File CRC32 mismatch: expected " + std::to_string(header.file_crc32) + ", got " +
+                                  std::to_string(computed_crc);
+        return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, integrity_error.message));
+      }
+    }
 
     LogStorageInfo("snapshot_verify", "Snapshot integrity verified: " + filepath);
     return {};

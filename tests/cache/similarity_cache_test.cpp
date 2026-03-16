@@ -36,6 +36,8 @@ TEST(SimilarityCacheTest, ConstructEmpty) {
   EXPECT_EQ(stats.cache_misses, 0);
   EXPECT_EQ(stats.current_entries, 0);
   EXPECT_EQ(stats.current_memory_bytes, 0);
+  EXPECT_EQ(stats.ttl_expirations, 0);
+  EXPECT_EQ(stats.decompression_failures, 0);
 }
 
 TEST(SimilarityCacheTest, SingleQuery) {
@@ -285,6 +287,65 @@ TEST(SimilarityCacheTest, Invalidate_ClearAll) {
     auto result = cache.Lookup(key);
     EXPECT_FALSE(result.has_value());
   }
+}
+
+// ============================================================================
+// TTL Expiration Tests
+// ============================================================================
+
+TEST(SimilarityCacheTest, TtlExpiration_RemovesExpiredEntry) {
+  // TTL of 1 second
+  SimilarityCache cache(1024 * 1024, 0.0, 1);
+
+  auto key = MakeKey("item1", 10);
+  std::vector<similarity::SimilarityResult> results = {{"item2", 0.95f}};
+
+  // Insert entry
+  bool inserted = cache.Insert(key, results, 1.0);
+  EXPECT_TRUE(inserted);
+
+  // Verify entry exists
+  auto stats_before = cache.GetStatistics();
+  EXPECT_EQ(stats_before.current_entries, 1);
+
+  // Wait for TTL to expire
+  std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+
+  // Lookup should return nullopt (expired)
+  auto result = cache.Lookup(key);
+  EXPECT_FALSE(result.has_value());
+
+  // Entry should have been removed from cache
+  auto stats_after = cache.GetStatistics();
+  EXPECT_EQ(stats_after.current_entries, 0);
+  EXPECT_EQ(stats_after.ttl_expirations, 1);
+}
+
+TEST(SimilarityCacheTest, TtlExpiration_StatsTracked) {
+  SimilarityCache cache(1024 * 1024, 0.0, 1);
+
+  // Insert multiple entries
+  for (int i = 0; i < 3; ++i) {
+    auto key = MakeKey("item" + std::to_string(i), 10);
+    std::vector<similarity::SimilarityResult> results = {{"result" + std::to_string(i), 0.95f}};
+    cache.Insert(key, results, 1.0);
+  }
+
+  EXPECT_EQ(cache.GetStatistics().current_entries, 3);
+
+  // Wait for TTL to expire
+  std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+
+  // Lookup all expired entries
+  for (int i = 0; i < 3; ++i) {
+    auto key = MakeKey("item" + std::to_string(i), 10);
+    auto result = cache.Lookup(key);
+    EXPECT_FALSE(result.has_value());
+  }
+
+  auto stats = cache.GetStatistics();
+  EXPECT_EQ(stats.current_entries, 0);
+  EXPECT_EQ(stats.ttl_expirations, 3);
 }
 
 // ============================================================================

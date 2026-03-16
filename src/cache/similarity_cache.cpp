@@ -73,6 +73,20 @@ std::optional<std::vector<similarity::SimilarityResult>> SimilarityCache::Lookup
       // Entry has expired - treat as miss
       stats_.cache_misses++;
       stats_.cache_misses_not_found++;
+      stats_.ttl_expirations++;
+
+      // Save created_at for verification after lock upgrade
+      auto expired_created_at = iter->second.first.created_at;
+
+      // Release shared lock, acquire unique lock to erase expired entry
+      lock.unlock();
+      {
+        std::unique_lock write_lock(mutex_);
+        auto recheck_iter = cache_map_.find(key);
+        if (recheck_iter != cache_map_.end() && recheck_iter->second.first.created_at == expired_created_at) {
+          EraseLocked(key);
+        }
+      }
 
       // Record miss latency
       auto end_time = std::chrono::high_resolution_clock::now();
@@ -91,12 +105,24 @@ std::optional<std::vector<similarity::SimilarityResult>> SimilarityCache::Lookup
 
   // Decompress result and copy query_cost_ms before releasing lock
   const auto& entry = iter->second.first;
+  auto entry_created_at = entry.created_at;
   std::vector<similarity::SimilarityResult> result;
   try {
     result = ResultCompressor::DecompressSimilarityResults(entry.compressed_data, entry.original_size);
   } catch (const std::exception& e) {
     // Decompression failed, treat as miss
     stats_.cache_misses++;
+    stats_.decompression_failures++;
+
+    // Release shared lock, acquire unique lock to erase corrupted entry
+    lock.unlock();
+    {
+      std::unique_lock write_lock(mutex_);
+      auto recheck_iter = cache_map_.find(key);
+      if (recheck_iter != cache_map_.end() && recheck_iter->second.first.created_at == entry_created_at) {
+        EraseLocked(key);
+      }
+    }
 
     // Record miss latency
     auto end_time = std::chrono::high_resolution_clock::now();
@@ -109,9 +135,8 @@ std::optional<std::vector<similarity::SimilarityResult>> SimilarityCache::Lookup
     return std::nullopt;
   }
 
-  // Copy query_cost_ms and created_at before releasing lock to avoid use-after-free
+  // Copy query_cost_ms before releasing lock to avoid use-after-free
   const double query_cost_ms = entry.query_cost_ms;
-  const auto created_at = entry.created_at;
 
   // Update access time (need to upgrade to unique lock)
   lock.unlock();
@@ -119,7 +144,7 @@ std::optional<std::vector<similarity::SimilarityResult>> SimilarityCache::Lookup
 
   // Re-check existence and verify it's the same entry (not a new entry with same key)
   iter = cache_map_.find(key);
-  if (iter != cache_map_.end() && iter->second.first.created_at == created_at) {
+  if (iter != cache_map_.end() && iter->second.first.created_at == entry_created_at) {
     Touch(key);
 
     // Record hit latency and saved time
@@ -217,7 +242,10 @@ bool SimilarityCache::MarkInvalidated(const CacheKey& key) {
 
 bool SimilarityCache::Erase(const CacheKey& key) {
   std::unique_lock lock(mutex_);
+  return EraseLocked(key);
+}
 
+bool SimilarityCache::EraseLocked(const CacheKey& key) {
   auto iter = cache_map_.find(key);
   if (iter == cache_map_.end()) {
     return false;

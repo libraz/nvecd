@@ -44,6 +44,8 @@ struct CacheStatisticsSnapshot {
   uint64_t current_entries = 0;
   uint64_t current_memory_bytes = 0;
   uint64_t evictions = 0;
+  uint64_t ttl_expirations = 0;
+  uint64_t decompression_failures = 0;
 
   // Timing statistics
   double total_cache_hit_time_ms = 0.0;
@@ -92,6 +94,8 @@ struct CacheStatistics {
   std::atomic<uint64_t> current_entries{0};
   std::atomic<uint64_t> current_memory_bytes{0};
   std::atomic<uint64_t> evictions{0};
+  std::atomic<uint64_t> ttl_expirations{0};
+  std::atomic<uint64_t> decompression_failures{0};
 
   // Timing statistics (protected by mutex)
   mutable std::mutex timing_mutex_;
@@ -205,6 +209,8 @@ class SimilarityCache {
     snapshot.current_entries = stats_.current_entries.load();
     snapshot.current_memory_bytes = stats_.current_memory_bytes.load();
     snapshot.evictions = stats_.evictions.load();
+    snapshot.ttl_expirations = stats_.ttl_expirations.load();
+    snapshot.decompression_failures = stats_.decompression_failures.load();
     {
       std::lock_guard<std::mutex> lock(stats_.timing_mutex_);
       snapshot.total_cache_hit_time_ms = stats_.total_cache_hit_time_ms;
@@ -280,6 +286,13 @@ class SimilarityCache {
 
   // Statistics
   CacheStatistics stats_;
+
+  /**
+   * @brief Erase a cache entry (caller must hold unique_lock on mutex_)
+   * @param key Cache key to erase
+   * @return true if entry was found and erased
+   */
+  bool EraseLocked(const CacheKey& key);
 
   /**
    * @brief Evict entries to make room for new entry
