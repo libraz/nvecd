@@ -1,58 +1,22 @@
 # Nvecd
 
-**イベントベース共起追跡機能を備えたインメモリベクトル検索エンジン**
-
+[![CI](https://github.com/libraz/nvecd/actions/workflows/ci.yml/badge.svg)](https://github.com/libraz/nvecd/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/libraz/nvecd/branch/main/graph/badge.svg)](https://codecov.io/gh/libraz/nvecd)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![C++17](https://img.shields.io/badge/C%2B%2B-17-blue?logo=c%2B%2B)](https://en.cppreference.com/w/cpp/17)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-lightgrey)](https://github.com/libraz/nvecd)
 
-## Nvecd とは？
+**イベントベース共起追跡とフュージョン検索を備えたインメモリベクトル検索エンジン**
 
-Nvecd は、ユーザー行動から学習するレコメンドエンジンです。ユーザーの行動を追跡するだけで、パターンに基づいた即座のレコメンドを取得できます。
+## なぜ Nvecd？
 
-### シンプルな例：「この商品を買った人はこんな商品も買っています」
+レコメンドエンジンは複雑です — ML パイプライン、モデル学習、インフラ構築が必要です。多くのチームが本当に必要としているのは「X を買った人は Y も買っています」だけです。
 
-```javascript
-const net = require('net');
-
-// nvecd に接続
-const client = net.createConnection({ port: 11017 }, () => {
-  // ユーザーの購入を追跡
-  client.write('EVENT user_alice item1 100\n');
-  client.write('EVENT user_alice item2 100\n');
-  client.write('EVENT user_bob item1 100\n');
-  client.write('EVENT user_bob item3 100\n');
-
-  // レコメンドを取得: 「item1 を買った人はこれも買っています...」
-  client.write('SIM item1 10 fusion\n');
-});
-
-client.on('data', (data) => {
-  console.log(data.toString());
-  // → item3 0.85
-  // → item2 0.72
-});
-```
-
-**これだけです！** ML モデルも複雑なセットアップも不要。ユーザーの行動を追跡してレコメンドを取得するだけです。
-
-## ⚠️ アルファ開発中
-
-このプロジェクトは現在**アルファ開発中**です。
-本番環境での使用は推奨されません。
-
-## 主な機能
-
-- **行動ベースレコメンド** - ユーザーアクションを追跡し、即座にレコメンドを取得
-- **ベクトル類似検索** - 埋め込みを使用した類似アイテム検索（オプション）
-- **ハイブリッドフュージョン** - ユーザー行動 + コンテンツ類似度を組み合わせ
-- **リアルタイム更新** - ユーザーのインタラクションに応じてレコメンドが適応
-- **スマートキャッシング** - LRU キャッシュと LZ4 圧縮で高速な繰り返しクエリ
-- **SIMD 最適化** - AVX2/NEON によるベクトル演算の高速化
-- **永続ストレージ** - スナップショット対応（DUMP コマンド）
-- **シンプルなプロトコル** - TCP 経由のテキストベースコマンド
+**Nvecd** は、ユーザー行動追跡とベクトル類似検索を組み合わせたインメモリエンジンで、ML セットアップなしで即座にレコメンドを提供します。
 
 ## クイックスタート
 
-### 1. ビルド & 実行
+### ビルド & 実行
 
 ```bash
 # ビルド
@@ -64,63 +28,102 @@ cmake --build build --parallel
 # → Listening on 127.0.0.1:11017
 ```
 
-### 2. 試してみる
+### 基本的な使い方
 
 ```bash
-# 接続
-nc localhost 11017
+# ユーザーの購入を追跡
+nvecd-cli -p 11017 EVENT user_alice ADD product123 100
+nvecd-cli -p 11017 EVENT user_alice ADD product456 80
+nvecd-cli -p 11017 EVENT user_bob ADD product123 100
+nvecd-cli -p 11017 EVENT user_bob ADD product789 95
 
-# ユーザーインタラクションを追跡
-EVENT user1 product123 100
-EVENT user1 product456 80
-EVENT user2 product123 100
-EVENT user2 product789 95
+# レコメンドを取得: 「product123 を買った人はこれも買っています...」
+nvecd-cli -p 11017 SIM product123 10 using=events
+# (2 results, showing 2)
+# 1) product789 (score: 0.92)
+# 2) product456 (score: 0.75)
 
-# レコメンドを取得
-SIM product123 10 fusion
-# → product789 0.92
-# → product456 0.75
+# アイテムベクトルを登録（オプション、コンテンツベース類似検索用）
+nvecd-cli -p 11017 VECSET product123 0.1 0.2 0.3 0.4
+nvecd-cli -p 11017 VECSET product456 0.15 0.18 0.32 0.41
+
+# ハイブリッド検索: 行動 + コンテンツ類似度
+nvecd-cli -p 11017 SIM product123 10 using=fusion
+
+# クエリベクトルで検索
+nvecd-cli -p 11017 SIMV 10 0.5 0.3 0.2 0.1
 ```
 
-### 3. キャッシュパフォーマンスを監視
+### インタラクティブモード
 
 ```bash
-# キャッシュ統計を確認
-echo "CACHE STATS" | nc localhost 11017
-# → hit_rate: 0.8500
-# → current_memory_mb: 12.45
-# → time_saved_ms: 15420.50
+nvecd-cli -p 11017
+# nvecd> EVENT user1 ADD item1 100
+# OK
+# nvecd> SIM item1 10 using=fusion
+# (3 results, showing 3)
+# 1) item3 (score: 0.85)
+# 2) item2 (score: 0.72)
+# 3) item4 (score: 0.61)
+# nvecd> help
 ```
 
-### 4. テスト
+### キャッシュパフォーマンスの監視
+
+```bash
+nvecd-cli -p 11017 CACHE STATS
+# hit_rate: 0.8500
+# current_memory_mb: 12.45
+# time_saved_ms: 15420.50
+```
+
+### テスト
 
 ```bash
 make test
-# → All 218 tests passing ✅
 ```
 
-## ユースケース
+## ベータ開発中
 
-- 🛒 **E コマース** - 商品レコメンド
-- 📰 **ニュース/コンテンツ** - 記事レコメンド
-- 🎵 **音楽/動画** - パーソナライズドプレイリスト
-- 📱 **ソーシャルメディア** - コンテンツフィード（TikTok スタイル）
-- 🔍 **検索** - 埋め込みを使ったセマンティック検索
+このプロジェクトは現在**ベータ開発中**です。
+本番環境での使用は推奨されません。
 
-詳細な例は [**ユースケースガイド**](docs/ja/use-cases.md) を参照してください。
+## 主な機能
+
+- **行動ベースレコメンド** - ユーザーアクションを追跡し、即座にレコメンドを取得
+- **ベクトル類似検索** - 埋め込みを使用した類似アイテム検索
+- **ハイブリッドフュージョン** - ユーザー行動 + コンテンツ類似度を組み合わせ
+- **リアルタイム更新** - ユーザーのインタラクションに応じてレコメンドが適応
+- **スマートキャッシング** - LRU キャッシュと LZ4 圧縮で高速な繰り返しクエリ
+- **SIMD 最適化** - AVX2/NEON によるベクトル演算の高速化
+- **永続ストレージ** - スナップショット対応（DUMP コマンド）
+- **シンプルなプロトコル** - TCP 経由のテキストベースコマンド（Redis/Memcached スタイル）
+- **CLI ツール** - タブ補完とインタラクティブモードを備えた `nvecd-cli`
+
+## Nvecd が適しているケース
+
+**適している:**
+- レコメンドシステム（「この商品を買った人はこんな商品も買っています」）
+- 埋め込みによるコンテンツベース類似検索
+- 行動 + コンテンツを組み合わせたハイブリッドレコメンド
+- ML パイプラインなしのリアルタイムパーソナライゼーション
+- シンプルなデプロイ要件
+
+**推奨されない:**
+- データセットが RAM に収まらない場合
+- ノード間の分散検索が必要な場合
+- 複雑な ML モデルサービング
 
 ## ドキュメント
 
-### はじめに
-- [**インストールガイド**](docs/ja/installation.md) - ビルドとインストール手順
-- [**クイックスタートガイド**](docs/ja/development.md) - 5分で始める
-- [**ユースケース集**](docs/ja/use-cases.md) - 実世界の例とコード
-
-### リファレンス
 - [**プロトコルリファレンス**](docs/ja/protocol.md) - 利用可能な全コマンド
 - [**設定ガイド**](docs/ja/configuration.md) - 設定オプション
+- [**ユースケース集**](docs/ja/use-cases.md) - 実世界の例
 - [**スナップショット管理**](docs/ja/snapshot.md) - 永続化とバックアップ
 - [**パフォーマンスチューニング**](docs/ja/performance.md) - キャッシュチューニングと SIMD 最適化
+- [**インストールガイド**](docs/ja/installation.md) - ビルドとインストール手順
+- [**開発ガイド**](docs/ja/development.md) - 貢献ガイドライン
+- [**クライアントライブラリ**](docs/ja/libnvecdclient.md) - C/C++ クライアントライブラリ
 
 ## 要件
 
@@ -144,7 +147,7 @@ make test
 
 ## ライセンス
 
-MIT License
+[MIT License](LICENSE)
 
 ## 貢献
 

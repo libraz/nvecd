@@ -328,9 +328,9 @@ Connect using `nc` (netcat):
 nc localhost 11017
 
 # Try commands
-EVENT user1 item1 100
+EVENT user1 ADD item1 100
 VECSET item1 3 0.1 0.5 0.8
-SIM item1 10 fusion
+SIM item1 10 using=fusion
 
 # Expected responses
 OK

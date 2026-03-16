@@ -78,6 +78,11 @@ backup/
 docker-compose.override.yml
 logs/
 
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
 # Coverage reports
 coverage/
 *.info

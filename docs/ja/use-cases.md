@@ -78,7 +78,7 @@ class SimpleRecommender {
     };
 
     const score = scores[interactionType] || 50;
-    const command = `EVENT user_${userId} ${itemId} ${score}`;
+    const command = `EVENT user_${userId} ADD ${itemId} ${score}`;
 
     const response = await this.sendCommand(command);
     return response === 'OK';
@@ -86,7 +86,7 @@ class SimpleRecommender {
 
   // アイテムの推薦を取得
   async getRecommendations(itemId, limit = 10) {
-    const command = `SIM ${itemId} ${limit} fusion`;
+    const command = `SIM ${itemId} ${limit} using=fusion`;
     const response = await this.sendCommand(command);
 
     // レスポンスをパース
@@ -245,9 +245,9 @@ graph TB
     B -->|VECSET| C[nvecd ベクトルストア]
 
     D[ユーザーアクション] -->|閲覧/カート/購入| E[エンゲージメントイベント]
-    E -->|EVENT user_X product_Y score| C
+    E -->|EVENT user_X ADD product_Y score| C
 
-    F[ユーザーリクエスト] -->|SIM product_Y 20 fusion| C
+    F[ユーザーリクエスト] -->|SIM product_Y 20 using=fusion| C
     C -->|パーソナライズド結果| G[推薦結果]
     G --> H[ユーザー]
 ```
@@ -269,21 +269,21 @@ VECSET product_11111 768 0.345 0.678 0.912 ...
 
 # 2. ユーザーインタラクションを追跡
 # ユーザー alice が商品を閲覧
-EVENT user_alice product_12345 60
+EVENT user_alice ADD product_12345 60
 
 # ユーザー alice がカートに追加（高いエンゲージメント）
-EVENT user_alice product_12345 85
+EVENT user_alice ADD product_12345 85
 
 # ユーザー alice が購入（最高のエンゲージメント）
-EVENT user_alice product_12345 100
+EVENT user_alice ADD product_12345 100
 
 # ユーザー bob も同じ商品を購入
-EVENT user_bob product_12345 100
-EVENT user_bob product_67890 95
+EVENT user_bob ADD product_12345 100
+EVENT user_bob ADD product_67890 95
 
 # 3. ユーザー alice への推薦を取得
 # 購入した商品に基づいて
-SIM product_12345 20 fusion
+SIM product_12345 20 using=fusion
 # 返却: 特徴が類似し、かつ似たユーザーが購入した商品
 ```
 
@@ -335,11 +335,11 @@ vectors:
 ```mermaid
 graph LR
     A[ユーザーが動画視聴] --> B[エンゲージメント追跡]
-    B --> C[EVENT user_X video_Y score]
+    B --> C[EVENT user_X ADD video_Y score]
     C --> D[nvecd サーバー]
     D --> E[共起インデックス更新]
 
-    F[次の動画を取得] --> G[SIM video_Y 20 fusion]
+    F[次の動画を取得] --> G[SIM video_Y 20 using=fusion]
     G --> D
     D --> H[パーソナライズドフィード返却]
     H --> I[ユーザー]
@@ -364,26 +364,26 @@ VECSET video_ghi789 512 0.77 0.88 0.99 ...
 
 # 2. リアルタイムユーザーエンゲージメントを追跡
 # ユーザーが動画の10%を視聴（低エンゲージメント）
-EVENT user_alice video_abc123 10
+EVENT user_alice ADD video_abc123 10
 
 # ユーザーが動画の50%を視聴（中エンゲージメント）
-EVENT user_alice video_abc123 50
+EVENT user_alice ADD video_abc123 50
 
 # ユーザーが100%視聴 + いいね（高エンゲージメント）
-EVENT user_alice video_abc123 100
+EVENT user_alice ADD video_abc123 100
 
 # ユーザーが動画をシェア（非常に高いエンゲージメント）
-EVENT user_alice video_abc123 100
-EVENT user_alice video_abc123 95  # 2回目のイベントで強化
+EVENT user_alice ADD video_abc123 100
+EVENT user_alice ADD video_abc123 95  # 2回目のイベントで強化
 
 # 3. トレンドパターンを追跡（時間ごとのコンテキスト）
-EVENT trending_2025011812 video_abc123 100
-EVENT trending_2025011812 video_def456 95
-EVENT trending_2025011812 video_ghi789 90
+EVENT trending_2025011812 ADD video_abc123 100
+EVENT trending_2025011812 ADD video_def456 95
+EVENT trending_2025011812 ADD video_ghi789 90
 
 # 4. ユーザー向けのパーソナライズドフィードを生成
 # ユーザーが最後に視聴した動画に基づいて次の動画を取得
-SIM video_abc123 20 fusion
+SIM video_abc123 20 using=fusion
 
 # 5. トレンド動画でブースト
 # 時間ごとのコンテキストからトレンド動画を取得
@@ -400,7 +400,7 @@ def generate_feed(user_id, last_video_id, feed_size=20):
     sock.connect(('localhost', 11017))
 
     # パーソナライズド推薦を取得
-    sock.sendall(f'SIM {last_video_id} {feed_size} fusion\n'.encode())
+    sock.sendall(f'SIM {last_video_id} {feed_size} using=fusion\n'.encode())
     response = sock.recv(4096).decode()
 
     # 結果をパース
@@ -429,19 +429,19 @@ def track_engagement(user_id, video_id, watch_percentage, liked=False, shared=Fa
     # インタラクションによるブースト
     if liked:
         score = 100
-        sock.sendall(f'EVENT user_{user_id} {video_id} {score}\n'.encode())
+        sock.sendall(f'EVENT user_{user_id} ADD {video_id} {score}\n'.encode())
         sock.recv(1024)
 
     if shared:
         score = 100
         # シェアは2回イベント（非常に高いシグナル）
-        sock.sendall(f'EVENT user_{user_id} {video_id} {score}\n'.encode())
+        sock.sendall(f'EVENT user_{user_id} ADD {video_id} {score}\n'.encode())
         sock.recv(1024)
-        sock.sendall(f'EVENT user_{user_id} {video_id} 95\n'.encode())
+        sock.sendall(f'EVENT user_{user_id} ADD {video_id} 95\n'.encode())
         sock.recv(1024)
 
     # 視聴率を追跡
-    sock.sendall(f'EVENT user_{user_id} {video_id} {watch_percentage}\n'.encode())
+    sock.sendall(f'EVENT user_{user_id} ADD {video_id} {watch_percentage}\n'.encode())
     sock.recv(1024)
 
     sock.close()
@@ -513,23 +513,23 @@ VECSET article_sports_002 384 0.4 0.5 0.6 ...
 
 # 2. 読書行動を追跡
 # ユーザーが記事をクリック（低シグナル）
-EVENT user_bob article_tech_001 40
+EVENT user_bob ADD article_tech_001 40
 
 # ユーザーが記事の50%を読む
-EVENT user_bob article_tech_001 70
+EVENT user_bob ADD article_tech_001 70
 
 # ユーザーが記事の100%を読む
-EVENT user_bob article_tech_001 100
+EVENT user_bob ADD article_tech_001 100
 
 # ユーザーが記事をシェア（非常に高いシグナル）
-EVENT user_bob article_tech_001 100
+EVENT user_bob ADD article_tech_001 100
 
 # 3. カテゴリトレンドを追跡
-EVENT category_tech article_tech_001 95
-EVENT category_sports article_sports_002 88
+EVENT category_tech ADD article_tech_001 95
+EVENT category_sports ADD article_sports_002 88
 
 # 4. 推薦を取得
-SIM article_tech_001 10 fusion
+SIM article_tech_001 10 using=fusion
 ```
 
 ### 設定
@@ -584,20 +584,20 @@ VECSET song_rock_002 128 0.6 0.4 0.2 ...
 
 # 2. リスニング行動を追跡
 # ユーザーが完全に再生
-EVENT user_charlie song_pop_001 100
+EVENT user_charlie ADD song_pop_001 100
 
 # ユーザーがすぐにスキップ（<30秒）
-EVENT user_charlie song_rock_002 10
+EVENT user_charlie ADD song_rock_002 10
 
 # ユーザーがリピート（非常に高いシグナル）
-EVENT user_charlie song_pop_001 100
-EVENT user_charlie song_pop_001 100
+EVENT user_charlie ADD song_pop_001 100
+EVENT user_charlie ADD song_pop_001 100
 
 # ユーザーがプレイリストに追加
-EVENT user_charlie song_pop_001 95
+EVENT user_charlie ADD song_pop_001 95
 
 # 3. 次の楽曲推薦を取得
-SIM song_pop_001 20 fusion
+SIM song_pop_001 20 using=fusion
 ```
 
 ### 設定
@@ -648,7 +648,7 @@ VECSET doc_javascript_guide 768 0.3 0.4 ...
 # 2. クエリベクトルで検索
 # ユーザー検索: "how to sort arrays in python"
 # クエリをベクトルにエンコード: [0.15, 0.25, ...]
-SIMV 768 0.15 0.25 0.35 ... 10 cosine
+SIMV 10 0.15 0.25 0.35 0.45 0.55 0.65
 
 # 意味的に類似したドキュメントを返す
 ```

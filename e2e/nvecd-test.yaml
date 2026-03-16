@@ -1,0 +1,40 @@
+# Test configuration for nvecd E2E tests
+api:
+  tcp:
+    bind: "127.0.0.1"
+    port: 11117
+  http:
+    enable: true
+    bind: "127.0.0.1"
+    port: 18180
+
+events:
+  ctx_buffer_size: 100
+  decay_interval_sec: 300
+  decay_alpha: 0.95
+
+vectors:
+  default_dimension: 3
+  distance_metric: "cosine"
+
+similarity:
+  default_top_k: 10
+  max_top_k: 100
+  fusion_alpha: 0.5
+  fusion_beta: 0.5
+
+cache:
+  max_memory_mb: 10
+  min_query_cost_ms: 0.0
+  ttl_seconds: 0
+
+snapshot:
+  dir: "/tmp/nvecd-e2e-dumps"
+
+network:
+  allow_cidrs:
+    - "127.0.0.1/32"
+
+performance:
+  thread_pool_size: 4
+  max_connections: 100

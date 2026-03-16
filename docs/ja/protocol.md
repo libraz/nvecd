@@ -487,7 +487,7 @@ DEBUG OFF
 
 **デバッグ出力例**（DEBUG ON 時）:
 ```
-SIM item456 10 fusion
+SIM item456 10 using=fusion
 → OK RESULTS 3
 item789 0.9245
 item101 0.8932

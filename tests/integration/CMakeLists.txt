@@ -6,3 +6,6 @@
 
 # Snapshot Integration Tests
 add_subdirectory(snapshot)
+
+# End-to-End Server Integration Tests
+add_subdirectory(server)

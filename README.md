@@ -1,58 +1,22 @@
 # Nvecd
 
-**In-memory vector search engine with event-based co-occurrence tracking**
-
+[![CI](https://github.com/libraz/nvecd/actions/workflows/ci.yml/badge.svg)](https://github.com/libraz/nvecd/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/libraz/nvecd/branch/main/graph/badge.svg)](https://codecov.io/gh/libraz/nvecd)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![C++17](https://img.shields.io/badge/C%2B%2B-17-blue?logo=c%2B%2B)](https://en.cppreference.com/w/cpp/17)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-lightgrey)](https://github.com/libraz/nvecd)
 
-## What is Nvecd?
+**In-memory vector search engine with event-based co-occurrence tracking and fusion search.**
 
-Nvecd is a recommendation engine that learns from user behavior. Track what users do, and get instant recommendations based on patterns.
+## Why Nvecd?
 
-### Simple Example: "Customers who bought this also bought..."
+Recommendation engines are complex — they require ML pipelines, model training, and infrastructure. Most teams just need "users who did X also did Y."
 
-```javascript
-const net = require('net');
-
-// Connect to nvecd
-const client = net.createConnection({ port: 11017 }, () => {
-  // Track user purchases
-  client.write('EVENT user_alice item1 100\n');
-  client.write('EVENT user_alice item2 100\n');
-  client.write('EVENT user_bob item1 100\n');
-  client.write('EVENT user_bob item3 100\n');
-
-  // Get recommendations: "People who bought item1 also bought..."
-  client.write('SIM item1 10 fusion\n');
-});
-
-client.on('data', (data) => {
-  console.log(data.toString());
-  // → item3 0.85
-  // → item2 0.72
-});
-```
-
-**That's it!** No ML models, no complex setup. Just track what users do and get recommendations.
-
-## ⚠️ Alpha Development Status
-
-This project is currently in **alpha development**.
-Not recommended for production use.
-
-## Key Features
-
-- **Behavior-Based Recommendations** - Track user actions, get instant recommendations
-- **Vector Similarity Search** - Find similar items using embeddings (optional)
-- **Hybrid Fusion** - Combine user behavior + content similarity
-- **Real-time Updates** - Recommendations adapt as users interact
-- **Smart Caching** - LRU cache with LZ4 compression for fast repeated queries
-- **SIMD Optimization** - AVX2/NEON acceleration for vector operations
-- **Persistent Storage** - Snapshot support (DUMP commands)
-- **Simple Protocol** - Text-based commands over TCP
+**Nvecd** solves this with an in-memory engine that combines user behavior tracking with vector similarity, delivering instant recommendations with zero ML setup.
 
 ## Quick Start
 
-### 1. Build & Run
+### Build & Run
 
 ```bash
 # Build
@@ -64,63 +28,102 @@ cmake --build build --parallel
 # → Listening on 127.0.0.1:11017
 ```
 
-### 2. Try It Out
+### Basic Usage
 
 ```bash
-# Connect
-nc localhost 11017
+# Track user purchases
+nvecd-cli -p 11017 EVENT user_alice ADD product123 100
+nvecd-cli -p 11017 EVENT user_alice ADD product456 80
+nvecd-cli -p 11017 EVENT user_bob ADD product123 100
+nvecd-cli -p 11017 EVENT user_bob ADD product789 95
 
-# Track user interactions
-EVENT user1 product123 100
-EVENT user1 product456 80
-EVENT user2 product123 100
-EVENT user2 product789 95
+# Get recommendations: "People who bought product123 also bought..."
+nvecd-cli -p 11017 SIM product123 10 using=events
+# (2 results, showing 2)
+# 1) product789 (score: 0.92)
+# 2) product456 (score: 0.75)
 
-# Get recommendations
-SIM product123 10 fusion
-# → product789 0.92
-# → product456 0.75
+# Register item vectors (optional, for content-based similarity)
+nvecd-cli -p 11017 VECSET product123 0.1 0.2 0.3 0.4
+nvecd-cli -p 11017 VECSET product456 0.15 0.18 0.32 0.41
+
+# Hybrid search: behavior + content similarity
+nvecd-cli -p 11017 SIM product123 10 using=fusion
+
+# Search by query vector
+nvecd-cli -p 11017 SIMV 10 0.5 0.3 0.2 0.1
 ```
 
-### 3. Monitor Cache Performance
+### Interactive Mode
 
 ```bash
-# Check cache statistics
-echo "CACHE STATS" | nc localhost 11017
-# → hit_rate: 0.8500
-# → current_memory_mb: 12.45
-# → time_saved_ms: 15420.50
+nvecd-cli -p 11017
+# nvecd> EVENT user1 ADD item1 100
+# OK
+# nvecd> SIM item1 10 using=fusion
+# (3 results, showing 3)
+# 1) item3 (score: 0.85)
+# 2) item2 (score: 0.72)
+# 3) item4 (score: 0.61)
+# nvecd> help
 ```
 
-### 4. Test
+### Monitor Cache Performance
+
+```bash
+nvecd-cli -p 11017 CACHE STATS
+# hit_rate: 0.8500
+# current_memory_mb: 12.45
+# time_saved_ms: 15420.50
+```
+
+### Test
 
 ```bash
 make test
-# → All 218 tests passing ✅
 ```
 
-## Use Cases
+## Beta Development Status
 
-- 🛒 **E-commerce** - Product recommendations
-- 📰 **News/Content** - Article recommendations
-- 🎵 **Music/Video** - Personalized playlists
-- 📱 **Social Media** - Content feeds (TikTok-style)
-- 🔍 **Search** - Semantic search with embeddings
+This project is currently in **beta development**.
+Not recommended for production use.
 
-See [**Use Cases Guide**](docs/en/use-cases.md) for detailed examples.
+## Features
+
+- **Behavior-Based Recommendations** - Track user actions, get instant recommendations
+- **Vector Similarity Search** - Find similar items using embeddings
+- **Hybrid Fusion** - Combine user behavior + content similarity
+- **Real-time Updates** - Recommendations adapt as users interact
+- **Smart Caching** - LRU cache with LZ4 compression for fast repeated queries
+- **SIMD Optimization** - AVX2/NEON acceleration for vector operations
+- **Persistent Storage** - Snapshot support (DUMP commands)
+- **Simple Protocol** - Text-based commands over TCP (Redis/Memcached style)
+- **CLI Tool** - `nvecd-cli` with tab completion and interactive mode
+
+## When to Use Nvecd
+
+**Good fit:**
+- Recommendation systems ("customers who bought X also bought Y")
+- Content-based similarity search with embeddings
+- Hybrid recommendations combining behavior + content
+- Real-time personalization without ML pipeline
+- Simple deployment requirements
+
+**Not recommended:**
+- Dataset doesn't fit in RAM
+- Need distributed search across nodes
+- Complex ML model serving
 
 ## Documentation
 
-### Getting Started
-- [**Installation Guide**](docs/en/installation.md) - Build and install instructions
-- [**Quick Start Guide**](docs/en/development.md) - Get started in 5 minutes
-- [**Use Cases**](docs/en/use-cases.md) - Real-world examples with code
-
-### Reference
 - [**Protocol Reference**](docs/en/protocol.md) - All available commands
 - [**Configuration Guide**](docs/en/configuration.md) - Configuration options
+- [**Use Cases**](docs/en/use-cases.md) - Real-world examples
 - [**Snapshot Management**](docs/en/snapshot.md) - Persistence and backups
 - [**Performance Tuning**](docs/en/performance.md) - Cache tuning and SIMD optimization
+- [**Installation Guide**](docs/en/installation.md) - Build and install instructions
+- [**Development Guide**](docs/en/development.md) - Contributing guidelines
+- [**Client Library**](docs/en/libnvecdclient.md) - C/C++ client library
 
 ## Requirements
 
@@ -144,7 +147,7 @@ make test
 
 ## License
 
-MIT License
+[MIT License](LICENSE)
 
 ## Contributing
 

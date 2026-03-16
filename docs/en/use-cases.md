@@ -78,7 +78,7 @@ class SimpleRecommender {
     };
 
     const score = scores[interactionType] || 50;
-    const command = `EVENT user_${userId} ${itemId} ${score}`;
+    const command = `EVENT user_${userId} ADD ${itemId} ${score}`;
 
     const response = await this.sendCommand(command);
     return response === 'OK';
@@ -86,7 +86,7 @@ class SimpleRecommender {
 
   // Get recommendations for an item
   async getRecommendations(itemId, limit = 10) {
-    const command = `SIM ${itemId} ${limit} fusion`;
+    const command = `SIM ${itemId} ${limit} using=fusion`;
     const response = await this.sendCommand(command);
 
     // Parse response
@@ -247,7 +247,7 @@ graph TB
     D[User Actions] -->|view/cart/purchase| E[Engagement Events]
     E -->|EVENT user_X product_Y score| C
 
-    F[User Request] -->|SIM product_Y 20 fusion| C
+    F[User Request] -->|SIM product_Y 20 using=fusion| C
     C -->|Personalized Results| G[Recommendations]
     G --> H[User]
 ```
@@ -269,21 +269,21 @@ VECSET product_11111 768 0.345 0.678 0.912 ...
 
 # 2. Track user interactions
 # User alice views product
-EVENT user_alice product_12345 60
+EVENT user_alice ADD product_12345 60
 
 # User alice adds to cart (higher engagement)
-EVENT user_alice product_12345 85
+EVENT user_alice ADD product_12345 85
 
 # User alice purchases (highest engagement)
-EVENT user_alice product_12345 100
+EVENT user_alice ADD product_12345 100
 
 # User bob purchases same product
-EVENT user_bob product_12345 100
-EVENT user_bob product_67890 95
+EVENT user_bob ADD product_12345 100
+EVENT user_bob ADD product_67890 95
 
 # 3. Get recommendations for user alice
 # Based on product she purchased
-SIM product_12345 20 fusion
+SIM product_12345 20 using=fusion
 # Returns: Products similar in features AND purchased by similar users
 ```
 
@@ -339,7 +339,7 @@ graph LR
     C --> D[nvecd Server]
     D --> E[Update Co-occurrence Index]
 
-    F[Get Next Video] --> G[SIM video_Y 20 fusion]
+    F[Get Next Video] --> G[SIM video_Y 20 using=fusion]
     G --> D
     D --> H[Return Personalized Feed]
     H --> I[User]
@@ -364,26 +364,26 @@ VECSET video_ghi789 512 0.77 0.88 0.99 ...
 
 # 2. Track real-time user engagement
 # User watches 10% of video (low engagement)
-EVENT user_alice video_abc123 10
+EVENT user_alice ADD video_abc123 10
 
 # User watches 50% of video (medium engagement)
-EVENT user_alice video_abc123 50
+EVENT user_alice ADD video_abc123 50
 
 # User watches 100% + likes (high engagement)
-EVENT user_alice video_abc123 100
+EVENT user_alice ADD video_abc123 100
 
 # User shares video (very high engagement)
-EVENT user_alice video_abc123 100
-EVENT user_alice video_abc123 95  # Reinforce with second event
+EVENT user_alice ADD video_abc123 100
+EVENT user_alice ADD video_abc123 95  # Reinforce with second event
 
 # 3. Track trending patterns (hourly context)
-EVENT trending_2025011812 video_abc123 100
-EVENT trending_2025011812 video_def456 95
-EVENT trending_2025011812 video_ghi789 90
+EVENT trending_2025011812 ADD video_abc123 100
+EVENT trending_2025011812 ADD video_def456 95
+EVENT trending_2025011812 ADD video_ghi789 90
 
 # 4. Generate personalized feed for user
 # Get next video based on user's last watched video
-SIM video_abc123 20 fusion
+SIM video_abc123 20 using=fusion
 
 # 5. Boost with trending videos
 # Get trending videos from hourly context
@@ -400,7 +400,7 @@ def generate_feed(user_id, last_video_id, feed_size=20):
     sock.connect(('localhost', 11017))
 
     # Get personalized recommendations
-    sock.sendall(f'SIM {last_video_id} {feed_size} fusion\n'.encode())
+    sock.sendall(f'SIM {last_video_id} {feed_size} using=fusion\n'.encode())
     response = sock.recv(4096).decode()
 
     # Parse results
@@ -429,19 +429,19 @@ def track_engagement(user_id, video_id, watch_percentage, liked=False, shared=Fa
     # Boost for interactions
     if liked:
         score = 100
-        sock.sendall(f'EVENT user_{user_id} {video_id} {score}\n'.encode())
+        sock.sendall(f'EVENT user_{user_id} ADD {video_id} {score}\n'.encode())
         sock.recv(1024)
 
     if shared:
         score = 100
         # Double event for sharing (very high signal)
-        sock.sendall(f'EVENT user_{user_id} {video_id} {score}\n'.encode())
+        sock.sendall(f'EVENT user_{user_id} ADD {video_id} {score}\n'.encode())
         sock.recv(1024)
-        sock.sendall(f'EVENT user_{user_id} {video_id} 95\n'.encode())
+        sock.sendall(f'EVENT user_{user_id} ADD {video_id} 95\n'.encode())
         sock.recv(1024)
 
     # Track watch percentage
-    sock.sendall(f'EVENT user_{user_id} {video_id} {watch_percentage}\n'.encode())
+    sock.sendall(f'EVENT user_{user_id} ADD {video_id} {watch_percentage}\n'.encode())
     sock.recv(1024)
 
     sock.close()
@@ -513,23 +513,23 @@ VECSET article_sports_002 384 0.4 0.5 0.6 ...
 
 # 2. Track reading behavior
 # User clicks article (low signal)
-EVENT user_bob article_tech_001 40
+EVENT user_bob ADD article_tech_001 40
 
 # User reads 50% of article
-EVENT user_bob article_tech_001 70
+EVENT user_bob ADD article_tech_001 70
 
 # User reads 100% of article
-EVENT user_bob article_tech_001 100
+EVENT user_bob ADD article_tech_001 100
 
 # User shares article (very high signal)
-EVENT user_bob article_tech_001 100
+EVENT user_bob ADD article_tech_001 100
 
 # 3. Track category trends
-EVENT category_tech article_tech_001 95
-EVENT category_sports article_sports_002 88
+EVENT category_tech ADD article_tech_001 95
+EVENT category_sports ADD article_sports_002 88
 
 # 4. Get recommendations
-SIM article_tech_001 10 fusion
+SIM article_tech_001 10 using=fusion
 ```
 
 ### Configuration
@@ -584,20 +584,20 @@ VECSET song_rock_002 128 0.6 0.4 0.2 ...
 
 # 2. Track listening behavior
 # User plays full song
-EVENT user_charlie song_pop_001 100
+EVENT user_charlie ADD song_pop_001 100
 
 # User skips song quickly (<30s)
-EVENT user_charlie song_rock_002 10
+EVENT user_charlie ADD song_rock_002 10
 
 # User repeats song (very high signal)
-EVENT user_charlie song_pop_001 100
-EVENT user_charlie song_pop_001 100
+EVENT user_charlie ADD song_pop_001 100
+EVENT user_charlie ADD song_pop_001 100
 
 # User adds to playlist
-EVENT user_charlie song_pop_001 95
+EVENT user_charlie ADD song_pop_001 95
 
 # 3. Get next song recommendation
-SIM song_pop_001 20 fusion
+SIM song_pop_001 20 using=fusion
 ```
 
 ### Configuration
@@ -648,7 +648,7 @@ VECSET doc_javascript_guide 768 0.3 0.4 ...
 # 2. Search with query vector
 # User searches: "how to sort arrays in python"
 # Query encoded to vector: [0.15, 0.25, ...]
-SIMV 768 0.15 0.25 0.35 ... 10 cosine
+SIMV 10 0.15 0.25 0.35 0.45 0.55 0.65
 
 # Returns semantically similar documents
 ```

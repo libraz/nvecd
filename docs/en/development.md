@@ -37,19 +37,19 @@ VECSET item3 3 0.1 0.6 0.7
 
 ```bash
 # Record event: user "user123" interacted with "item1" with score 95
-EVENT user123 item1 95
+EVENT user123 ADD item1 95
 # Response: OK
 
-EVENT user123 item2 80
-EVENT user456 item1 90
-EVENT user456 item3 85
+EVENT user123 ADD item2 80
+EVENT user456 ADD item1 90
+EVENT user456 ADD item3 85
 ```
 
 ### 5. Search for Similar Items
 
 ```bash
 # Find similar items to "item1" using fusion mode
-SIM item1 10 fusion
+SIM item1 10 using=fusion
 # Response:
 # OK RESULTS 2
 # item2 0.8523
@@ -70,12 +70,12 @@ VECSET article123 768 0.123 0.456 ... (768 dimensions)
 VECSET article456 768 0.789 0.234 ...
 
 # 2. Track user engagement
-EVENT user_alice article123 95  # Alice highly engaged with article123
-EVENT user_alice article456 80
-EVENT user_bob article123 90
+EVENT user_alice ADD article123 95  # Alice highly engaged with article123
+EVENT user_alice ADD article456 80
+EVENT user_bob ADD article123 90
 
 # 3. Find similar articles (fusion mode combines vectors + engagement)
-SIM article123 10 fusion
+SIM article123 10 using=fusion
 # Returns articles similar in content AND popular with similar users
 ```
 
@@ -89,7 +89,7 @@ VECSET doc1 384 0.1 0.2 ...
 VECSET doc2 384 0.3 0.4 ...
 
 # Search with query vector (from user's search)
-SIMV 384 0.15 0.25 ... 10 cosine
+SIMV 10 0.15 0.25 0.35 0.45 0.55
 # Returns documents semantically similar to the query
 ```
 
@@ -99,10 +99,10 @@ Recommend based on user behavior patterns.
 
 ```bash
 # Track user interactions
-EVENT user1 movie123 95
-EVENT user1 movie456 80
-EVENT user2 movie123 90
-EVENT user2 movie789 85
+EVENT user1 ADD movie123 95
+EVENT user1 ADD movie456 80
+EVENT user2 ADD movie123 90
+EVENT user2 ADD movie789 85
 
 # Register movie vectors (metadata embeddings)
 VECSET movie123 128 ...
@@ -110,7 +110,7 @@ VECSET movie456 128 ...
 VECSET movie789 128 ...
 
 # Find movies similar to movie123 (fusion mode)
-SIM movie123 10 fusion
+SIM movie123 10 using=fusion
 # Recommends movies liked by users with similar taste
 ```
 
@@ -123,8 +123,8 @@ SIM movie123 10 fusion
 Raw dot product between vectors. Use when vectors are already normalized or when magnitude matters.
 
 ```bash
-SIM item1 10 dot
-SIMV 768 0.1 0.2 ... 10 dot
+SIM item1 10 using=dot
+SIMV 10 0.1 0.2 0.3 0.4 0.5
 ```
 
 ### Cosine Similarity (`cosine`)
@@ -132,8 +132,8 @@ SIMV 768 0.1 0.2 ... 10 dot
 Normalized similarity (range: -1.0 to 1.0). Use for general semantic similarity regardless of vector magnitude.
 
 ```bash
-SIM item1 10 cosine
-SIMV 768 0.1 0.2 ... 10 cosine
+SIM item1 10 using=cosine
+SIMV 10 0.1 0.2 0.3 0.4 0.5
 ```
 
 ### Fusion Search (`fusion`) - Recommended
@@ -141,7 +141,7 @@ SIMV 768 0.1 0.2 ... 10 cosine
 Combines vector similarity + co-occurrence from events. Use for hybrid recommendation systems.
 
 ```bash
-SIM item1 10 fusion
+SIM item1 10 using=fusion
 # Note: Only available for SIM, not SIMV
 ```
 
@@ -219,7 +219,7 @@ client.connect()
 client.vecset('item1', [0.1, 0.5, 0.8])
 
 # Record event
-client.event('user123', 'item1', 95)
+client.event('user123', 'add', 'item1', 95)
 
 # Search
 results = client.sim('item1', top_k=10, mode='fusion')
@@ -242,7 +242,7 @@ await client.connect();
 await client.vecset('item1', [0.1, 0.5, 0.8]);
 
 // Record event
-await client.event('user123', 'item1', 95);
+await client.event('user123', 'add', 'item1', 95);
 
 // Search
 const results = await client.sim('item1', { topK: 10, mode: 'fusion' });
@@ -265,12 +265,12 @@ response = sock.recv(1024).decode().strip()
 print(response)  # "OK"
 
 # Record event
-sock.sendall(b'EVENT user123 item1 95\n')
+sock.sendall(b'EVENT user123 ADD item1 95\n')
 response = sock.recv(1024).decode().strip()
 print(response)  # "OK"
 
 # Search
-sock.sendall(b'SIM item1 10 fusion\n')
+sock.sendall(b'SIM item1 10 using=fusion\n')
 response = sock.recv(4096).decode().strip()
 print(response)  # "OK RESULTS 2\nitem2 0.8523\nitem3 0.7891"
 

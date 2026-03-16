@@ -37,19 +37,19 @@ VECSET item3 3 0.1 0.6 0.7
 
 ```bash
 # イベント記録: ユーザー "user123" が "item1" とスコア 95 で対話
-EVENT user123 item1 95
+EVENT user123 ADD item1 95
 # レスポンス: OK
 
-EVENT user123 item2 80
-EVENT user456 item1 90
-EVENT user456 item3 85
+EVENT user123 ADD item2 80
+EVENT user456 ADD item1 90
+EVENT user456 ADD item3 85
 ```
 
 ### 5. 類似アイテムを検索
 
 ```bash
 # "item1" に類似するアイテムをフュージョンモードで検索
-SIM item1 10 fusion
+SIM item1 10 using=fusion
 # レスポンス:
 # OK RESULTS 2
 # item2 0.8523
@@ -70,12 +70,12 @@ VECSET article123 768 0.123 0.456 ... (768次元)
 VECSET article456 768 0.789 0.234 ...
 
 # 2. ユーザーエンゲージメントを追跡
-EVENT user_alice article123 95  # Alice が article123 に高いエンゲージメント
-EVENT user_alice article456 80
-EVENT user_bob article123 90
+EVENT user_alice ADD article123 95  # Alice が article123 に高いエンゲージメント
+EVENT user_alice ADD article456 80
+EVENT user_bob ADD article123 90
 
 # 3. 類似記事を検索（フュージョンモードはベクトル + エンゲージメントを組み合わせ）
-SIM article123 10 fusion
+SIM article123 10 using=fusion
 # コンテンツが類似し、かつ似たユーザーに人気の記事を返す
 ```
 
@@ -89,7 +89,7 @@ VECSET doc1 384 0.1 0.2 ...
 VECSET doc2 384 0.3 0.4 ...
 
 # クエリベクトルで検索（ユーザーの検索から）
-SIMV 384 0.15 0.25 ... 10 cosine
+SIMV 10 0.15 0.25 0.35 0.45 0.55 0.65
 # クエリと意味的に類似したドキュメントを返す
 ```
 
@@ -99,10 +99,10 @@ SIMV 384 0.15 0.25 ... 10 cosine
 
 ```bash
 # ユーザーインタラクションを追跡
-EVENT user1 movie123 95
-EVENT user1 movie456 80
-EVENT user2 movie123 90
-EVENT user2 movie789 85
+EVENT user1 ADD movie123 95
+EVENT user1 ADD movie456 80
+EVENT user2 ADD movie123 90
+EVENT user2 ADD movie789 85
 
 # 映画ベクトルを登録（メタデータ埋め込み）
 VECSET movie123 128 ...
@@ -110,7 +110,7 @@ VECSET movie456 128 ...
 VECSET movie789 128 ...
 
 # movie123 に類似する映画を検索（フュージョンモード）
-SIM movie123 10 fusion
+SIM movie123 10 using=fusion
 # 似た嗜好のユーザーが好んだ映画を推薦
 ```
 
@@ -123,8 +123,8 @@ SIM movie123 10 fusion
 ベクトル間の生の内積です。ベクトルがすでに正規化されている場合や、大きさが重要な場合に使用します。
 
 ```bash
-SIM item1 10 dot
-SIMV 768 0.1 0.2 ... 10 dot
+SIM item1 10 using=dot
+SIMV 10 0.1 0.2 0.3 0.4 0.5 0.6
 ```
 
 ### コサイン類似度 (`cosine`)
@@ -132,8 +132,8 @@ SIMV 768 0.1 0.2 ... 10 dot
 正規化された類似度（範囲: -1.0 ～ 1.0）。ベクトルの大きさに関係なく、一般的な意味的類似性に使用します。
 
 ```bash
-SIM item1 10 cosine
-SIMV 768 0.1 0.2 ... 10 cosine
+SIM item1 10 using=cosine
+SIMV 10 0.1 0.2 0.3 0.4 0.5 0.6
 ```
 
 ### フュージョン検索 (`fusion`) - 推奨
@@ -141,7 +141,7 @@ SIMV 768 0.1 0.2 ... 10 cosine
 ベクトル類似度 + イベントからの共起を組み合わせます。ハイブリッド推薦システムに使用します。
 
 ```bash
-SIM item1 10 fusion
+SIM item1 10 using=fusion
 # 注意: SIM でのみ利用可能、SIMV では不可
 ```
 
@@ -265,12 +265,12 @@ response = sock.recv(1024).decode().strip()
 print(response)  # "OK"
 
 # イベントを記録
-sock.sendall(b'EVENT user123 item1 95\n')
+sock.sendall(b'EVENT user123 ADD item1 95\n')
 response = sock.recv(1024).decode().strip()
 print(response)  # "OK"
 
 # 検索
-sock.sendall(b'SIM item1 10 fusion\n')
+sock.sendall(b'SIM item1 10 using=fusion\n')
 response = sock.recv(4096).decode().strip()
 print(response)  # "OK RESULTS 2\nitem2 0.8523\nitem3 0.7891"
 

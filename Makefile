@@ -2,7 +2,7 @@
 # Convenience wrapper for CMake build system
 # Reference: ../mygram-db/Makefile
 
-.PHONY: help build test test-full test-sequential test-verbose clean rebuild install uninstall format format-check lint lint-diff lint-diff-main configure run
+.PHONY: help build test test-full test-sequential test-verbose clean rebuild install uninstall format format-check lint lint-diff lint-diff-main configure run e2e-test e2e-test-smoke e2e-test-commands
 
 # Build directory
 BUILD_DIR := build
@@ -171,3 +171,19 @@ run: build
 quick-test: build
 	@echo "Running quick test..."
 	cd $(BUILD_DIR) && ctest --output-on-failure --parallel $(NPROC) -R "EventStore|VectorStore"
+
+# E2E Tests (Python)
+e2e-test: build
+	@echo "Running E2E tests..."
+	cd e2e && python -m pytest tests/ -v --tb=short
+	@echo "E2E tests complete!"
+
+e2e-test-smoke: build
+	@echo "Running E2E smoke tests..."
+	cd e2e && python -m pytest tests/smoke/ -v
+	@echo "Smoke tests complete!"
+
+e2e-test-commands: build
+	@echo "Running E2E command tests..."
+	cd e2e && python -m pytest tests/commands/ -v
+	@echo "Command tests complete!"

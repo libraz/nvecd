@@ -39,9 +39,7 @@ void SignalHandler(int signal) {
 }
 
 /**
- * @brief Create default configuration
- *
- * TODO: Replace with config file parsing (config/config.cpp)
+ * @brief Create default configuration for when no config file is specified
  */
 nvecd::config::Config CreateDefaultConfig() {
   nvecd::config::Config config;

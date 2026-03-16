@@ -487,7 +487,7 @@ DEBUG OFF
 
 **Debug output example** (when DEBUG ON):
 ```
-SIM item456 10 fusion
+SIM item456 10 using=fusion
 → OK RESULTS 3
 item789 0.9245
 item101 0.8932

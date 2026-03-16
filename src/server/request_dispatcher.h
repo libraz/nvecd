@@ -67,9 +67,9 @@ class RequestDispatcher {
   utils::Expected<std::string, utils::Error> HandleSim(const Command& cmd, ConnectionContext& conn_ctx) const;
   utils::Expected<std::string, utils::Error> HandleSimv(const Command& cmd, ConnectionContext& conn_ctx) const;
   utils::Expected<std::string, utils::Error> HandleInfo(const Command& cmd);
-  static utils::Expected<std::string, utils::Error> HandleConfigHelp(const Command& cmd);
-  static utils::Expected<std::string, utils::Error> HandleConfigShow(const Command& cmd);
-  static utils::Expected<std::string, utils::Error> HandleConfigVerify(const Command& cmd);
+  utils::Expected<std::string, utils::Error> HandleConfigHelp(const Command& cmd);
+  utils::Expected<std::string, utils::Error> HandleConfigShow(const Command& cmd);
+  utils::Expected<std::string, utils::Error> HandleConfigVerify(const Command& cmd);
   utils::Expected<std::string, utils::Error> HandleDumpSave(const Command& cmd);
   utils::Expected<std::string, utils::Error> HandleDumpLoad(const Command& cmd);
   utils::Expected<std::string, utils::Error> HandleDumpVerify(const Command& cmd) const;

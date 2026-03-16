@@ -25,6 +25,10 @@ SimilarityCache::SimilarityCache(size_t max_memory_bytes, double min_query_cost_
     : max_memory_bytes_(max_memory_bytes), min_query_cost_ms_(min_query_cost_ms), ttl_seconds_(ttl_seconds) {}
 
 std::optional<std::vector<similarity::SimilarityResult>> SimilarityCache::Lookup(const CacheKey& key) {
+  if (!enabled_.load(std::memory_order_relaxed)) {
+    return std::nullopt;
+  }
+
   // Start timing
   auto start_time = std::chrono::high_resolution_clock::now();
 
@@ -163,6 +167,10 @@ std::optional<std::vector<similarity::SimilarityResult>> SimilarityCache::Lookup
 
 bool SimilarityCache::Insert(const CacheKey& key, const std::vector<similarity::SimilarityResult>& results,
                              double query_cost_ms) {
+  if (!enabled_.load(std::memory_order_relaxed)) {
+    return false;
+  }
+
   // Check if query cost meets threshold
   if (query_cost_ms < min_query_cost_ms_.load(std::memory_order_relaxed)) {
     return false;

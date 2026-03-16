@@ -27,6 +27,7 @@ add_library(nvecd_server STATIC
   server/handlers/info_handler.cpp
   server/handlers/debug_handler.cpp
   server/handlers/variable_handler.cpp
+  server/handlers/cache_handler.cpp
   server/request_dispatcher.cpp
   server/http_server.cpp
   server/nvecd_server.cpp

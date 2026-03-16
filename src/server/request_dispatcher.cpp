@@ -14,6 +14,9 @@
 // Include concrete types before request_dispatcher.h to resolve forward declarations
 #include "events/co_occurrence_index.h"
 #include "events/event_store.h"
+#include "cache/similarity_cache.h"
+#include "server/handlers/admin_handler.h"
+#include "server/handlers/cache_handler.h"
 #include "server/handlers/debug_handler.h"
 #include "server/handlers/info_handler.h"
 #include "server/handlers/variable_handler.h"
@@ -95,14 +98,17 @@ std::string RequestDispatcher::Dispatch(const std::string& request, ConnectionCo
       break;
 
     case CommandType::kConfigHelp:
+      ctx_.stats.config_commands++;
       result = HandleConfigHelp(*cmd);
       break;
 
     case CommandType::kConfigShow:
+      ctx_.stats.config_commands++;
       result = HandleConfigShow(*cmd);
       break;
 
     case CommandType::kConfigVerify:
+      ctx_.stats.config_commands++;
       result = HandleConfigVerify(*cmd);
       break;
 
@@ -146,12 +152,23 @@ std::string RequestDispatcher::Dispatch(const std::string& request, ConnectionCo
       break;
 
     case CommandType::kCacheStats:
+      ctx_.stats.cache_commands++;
+      result = handlers::HandleCacheStats(ctx_);
+      break;
+
     case CommandType::kCacheClear:
+      ctx_.stats.cache_commands++;
+      result = handlers::HandleCacheClear(ctx_);
+      break;
+
     case CommandType::kCacheEnable:
+      ctx_.stats.cache_commands++;
+      result = handlers::HandleCacheEnable(ctx_);
+      break;
+
     case CommandType::kCacheDisable:
       ctx_.stats.cache_commands++;
-      result = utils::MakeUnexpected(
-          utils::MakeError(utils::ErrorCode::kCommandUnknown, "CACHE subcommand not yet implemented"));
+      result = handlers::HandleCacheDisable(ctx_);
       break;
 
     case CommandType::kUnknown:
@@ -259,21 +276,35 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleInfo(const C
 }
 
 utils::Expected<std::string, utils::Error> RequestDispatcher::HandleConfigHelp(const Command& cmd) {
-  (void)cmd;  // Unused parameter
-  // TODO: Implement CONFIG HELP
-  return FormatOK("CONFIG HELP not yet implemented");
+  return AdminHandler::HandleConfigHelp(cmd.path);
 }
 
 utils::Expected<std::string, utils::Error> RequestDispatcher::HandleConfigShow(const Command& cmd) {
-  (void)cmd;  // Unused parameter
-  // TODO: Implement CONFIG SHOW
-  return FormatOK("CONFIG SHOW not yet implemented");
+  // Build ServerContext from HandlerContext members
+  ServerContext server_ctx;
+  server_ctx.config = ctx_.config;
+  server_ctx.uptime_seconds = ctx_.stats.GetUptimeSeconds();
+  server_ctx.connections_total = ctx_.stats.total_connections.load();
+  server_ctx.connections_current = ctx_.stats.active_connections.load();
+  server_ctx.vectors_total = ctx_.vector_store != nullptr ? ctx_.vector_store->GetVectorCount() : 0;
+  server_ctx.vector_dimension =
+      ctx_.vector_store != nullptr ? static_cast<uint32_t>(ctx_.vector_store->GetDimension()) : 0;
+  server_ctx.contexts_total = ctx_.event_store != nullptr ? ctx_.event_store->GetContextCount() : 0;
+  server_ctx.events_total = ctx_.event_store != nullptr ? ctx_.event_store->GetTotalEventCount() : 0;
+  server_ctx.cache_enabled = (ctx_.cache != nullptr);
+  if (ctx_.cache != nullptr) {
+    auto cache_stats = ctx_.cache->GetStatistics();
+    server_ctx.cache_hits = cache_stats.cache_hits;
+    server_ctx.cache_misses = cache_stats.cache_misses;
+  }
+  server_ctx.queries_total = ctx_.stats.total_commands.load();
+  server_ctx.queries_per_second = ctx_.stats.GetQueriesPerSecond();
+
+  return AdminHandler::HandleConfigShow(server_ctx, cmd.path);
 }
 
 utils::Expected<std::string, utils::Error> RequestDispatcher::HandleConfigVerify(const Command& cmd) {
-  (void)cmd;  // Unused parameter
-  // TODO: Implement CONFIG VERIFY
-  return FormatOK("Configuration is valid (not yet fully implemented)");
+  return AdminHandler::HandleConfigVerify(cmd.path);
 }
 
 utils::Expected<std::string, utils::Error> RequestDispatcher::HandleDumpSave(const Command& cmd) {
