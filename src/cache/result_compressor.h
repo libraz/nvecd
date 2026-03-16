@@ -14,6 +14,8 @@
 #include <vector>
 
 #include "similarity/similarity_engine.h"
+#include "utils/error.h"
+#include "utils/expected.h"
 
 namespace nvecd::cache {
 
@@ -31,20 +33,19 @@ class ResultCompressor {
   /**
    * @brief Compress vector of similarity results
    * @param results Vector of similarity results to compress
-   * @return Compressed data
-   * @throws std::runtime_error if compression fails
+   * @return Compressed data or error
    */
-  static std::vector<uint8_t> CompressSimilarityResults(const std::vector<similarity::SimilarityResult>& results);
+  static utils::Expected<std::vector<uint8_t>, utils::Error> CompressSimilarityResults(
+      const std::vector<similarity::SimilarityResult>& results);
 
   /**
    * @brief Decompress to vector of similarity results
    * @param compressed Compressed data
    * @param original_size Original uncompressed size in bytes
-   * @return Decompressed vector of similarity results
-   * @throws std::runtime_error if decompression fails or size mismatch
+   * @return Decompressed vector of similarity results or error
    */
-  static std::vector<similarity::SimilarityResult> DecompressSimilarityResults(const std::vector<uint8_t>& compressed,
-                                                                               size_t original_size);
+  static utils::Expected<std::vector<similarity::SimilarityResult>, utils::Error> DecompressSimilarityResults(
+      const std::vector<uint8_t>& compressed, size_t original_size);
 };
 
 }  // namespace nvecd::cache

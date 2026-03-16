@@ -15,6 +15,28 @@
 #include "cache/cache_key.h"
 
 namespace nvecd::cache {
+
+/**
+ * @brief Test helper to access SimilarityCache internals
+ */
+class SimilarityCacheTestHelper {
+ public:
+  /// Corrupt the compressed_data of a cache entry to trigger decompression failure
+  static bool CorruptEntry(SimilarityCache& cache, const CacheKey& key) {
+    std::unique_lock lock(cache.mutex_);
+    auto iter = cache.cache_map_.find(key);
+    if (iter == cache.cache_map_.end()) {
+      return false;
+    }
+    auto& data = iter->second.first.compressed_data;
+    // Overwrite with invalid data
+    for (auto& byte : data) {
+      byte = 0xFF;
+    }
+    return true;
+  }
+};
+
 namespace {
 
 // Helper to create a simple cache key
@@ -380,6 +402,48 @@ TEST(SimilarityCacheTest, MinQueryCost_OnlySlowQueries) {
 }
 
 // ============================================================================
+// Decompression Failure Tests
+// ============================================================================
+
+TEST(SimilarityCacheTest, DecompressionFailure_ErasesCorruptedEntry) {
+  SimilarityCache cache(1024 * 1024, 0.0);
+
+  auto key = MakeKey("item1", 10);
+  std::vector<similarity::SimilarityResult> results = {{"item2", 0.95f}, {"item3", 0.90f}};
+
+  // First lookup - miss
+  auto result1 = cache.Lookup(key);
+  EXPECT_FALSE(result1.has_value());
+
+  // Insert and verify normal lookup works
+  bool inserted = cache.Insert(key, results, 1.5);
+  EXPECT_TRUE(inserted);
+
+  auto result2 = cache.Lookup(key);
+  ASSERT_TRUE(result2.has_value());
+  EXPECT_EQ(result2->size(), 2);
+
+  // Corrupt the entry's compressed data
+  bool corrupted = SimilarityCacheTestHelper::CorruptEntry(cache, key);
+  EXPECT_TRUE(corrupted);
+
+  // Lookup should fail gracefully (decompression failure)
+  auto result3 = cache.Lookup(key);
+  EXPECT_FALSE(result3.has_value());
+
+  auto stats = cache.GetStatistics();
+  EXPECT_EQ(stats.decompression_failures, 1);
+  // Issue 1 fix: cache_hits should be 1 (only the successful lookup)
+  EXPECT_EQ(stats.cache_hits, 1);
+  // Issue 2 fix: cache_misses == initial miss + decompression failure
+  EXPECT_EQ(stats.cache_misses, 2);
+  // Issue 2 fix: cache_misses_not_found == initial miss + decompression failure
+  EXPECT_EQ(stats.cache_misses_not_found, 2);
+  // Corrupted entry should have been erased
+  EXPECT_EQ(stats.current_entries, 0);
+}
+
+// ============================================================================
 // Concurrent Access Tests
 // ============================================================================
 
@@ -416,6 +480,265 @@ TEST(SimilarityCacheTest, ConcurrentReadsAndWrites) {
   // Should complete without crash
   auto stats = cache.GetStatistics();
   EXPECT_GT(stats.total_queries, 0);
+}
+
+// ============================================================================
+// Phase 1: Concurrent SetMinQueryCost + Insert (data race fix verification)
+// ============================================================================
+
+TEST(SimilarityCacheTest, ConcurrentSetMinQueryCostAndInsert) {
+  SimilarityCache cache(10 * 1024 * 1024, 0.0);
+
+  std::atomic<bool> stop{false};
+  std::vector<similarity::SimilarityResult> results = {{"result", 0.95f}};
+
+  // 1 thread: SetMinQueryCost() loop with varying values
+  std::thread config_writer([&cache, &stop]() {
+    double val = 0.0;
+    while (!stop.load(std::memory_order_relaxed)) {
+      cache.SetMinQueryCost(val);
+      val += 0.1;
+      if (val > 10.0)
+        val = 0.0;
+      std::this_thread::yield();
+    }
+  });
+
+  // 4 threads: Insert() concurrently with varying query costs
+  std::vector<std::thread> inserters;
+  for (int t = 0; t < 4; ++t) {
+    inserters.emplace_back([&cache, &results, &stop, t]() {
+      int i = 0;
+      while (!stop.load(std::memory_order_relaxed)) {
+        auto key = MakeKey("t" + std::to_string(t) + "_item" + std::to_string(i), 10);
+        double cost = static_cast<double>(i % 20) * 0.5;
+        cache.Insert(key, results, cost);
+        ++i;
+        std::this_thread::yield();
+      }
+    });
+  }
+
+  // Run for 100ms
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  stop.store(true, std::memory_order_relaxed);
+
+  config_writer.join();
+  for (auto& t : inserters) {
+    t.join();
+  }
+
+  // Should complete without crash or TSAN violations
+  auto stats = cache.GetStatistics();
+  EXPECT_GE(stats.current_entries, 0);
+}
+
+// ============================================================================
+// Phase 2: Stats consistency tests
+// ============================================================================
+
+TEST(SimilarityCacheTest, ClearIfStatsConsistency) {
+  SimilarityCache cache(1024 * 1024, 0.0);
+
+  std::vector<similarity::SimilarityResult> results = {{"result", 0.95f}};
+
+  // Insert 10 entries
+  for (int i = 0; i < 10; ++i) {
+    auto key = MakeKey("item" + std::to_string(i), 10);
+    cache.Insert(key, results, 1.0);
+  }
+
+  auto stats_before = cache.GetStatistics();
+  EXPECT_EQ(stats_before.current_entries, 10);
+
+  // ClearIf: remove entries with even hash_high values (roughly half)
+  cache.ClearIf([](const CacheKey& key) { return (key.hash_high % 2) == 0; });
+
+  auto stats_after = cache.GetStatistics();
+  // Entries should be fewer
+  EXPECT_LT(stats_after.current_entries, stats_before.current_entries);
+  // Memory should be consistent
+  EXPECT_LT(stats_after.current_memory_bytes, stats_before.current_memory_bytes);
+
+  // Verify that looking up remaining entries works
+  uint64_t found_count = 0;
+  for (int i = 0; i < 10; ++i) {
+    auto key = MakeKey("item" + std::to_string(i), 10);
+    auto result = cache.Lookup(key);
+    if (result.has_value()) {
+      ++found_count;
+    }
+  }
+  EXPECT_EQ(found_count, stats_after.current_entries);
+}
+
+TEST(SimilarityCacheTest, EvictForSpaceStatsConsistency) {
+  // Small cache: 2KB
+  SimilarityCache cache(2048, 0.0);
+
+  std::vector<similarity::SimilarityResult> results = {{"result_id", 0.95f}};
+
+  int successful_inserts = 0;
+  for (int i = 0; i < 50; ++i) {
+    auto key = MakeKey("item" + std::to_string(i), 10);
+    if (cache.Insert(key, results, 1.0)) {
+      successful_inserts++;
+    }
+  }
+
+  auto stats = cache.GetStatistics();
+  // Memory should not exceed limit
+  EXPECT_LE(stats.current_memory_bytes, 2048);
+  // Should have evictions if we inserted more than fits
+  if (successful_inserts > static_cast<int>(stats.current_entries)) {
+    EXPECT_GT(stats.evictions, 0);
+  }
+  // current_entries + evictions should account for all successful inserts
+  EXPECT_EQ(stats.current_entries + stats.evictions, static_cast<uint64_t>(successful_inserts));
+}
+
+// ============================================================================
+// Phase 3: Edge case concurrent tests
+// ============================================================================
+
+TEST(SimilarityCacheTest, ConcurrentMarkInvalidatedAndLookup) {
+  SimilarityCache cache(10 * 1024 * 1024, 0.0);
+
+  std::vector<similarity::SimilarityResult> results = {{"result", 0.95f}};
+
+  // Pre-populate cache
+  for (int i = 0; i < 100; ++i) {
+    auto key = MakeKey("item" + std::to_string(i), 10);
+    cache.Insert(key, results, 1.0);
+  }
+
+  std::atomic<bool> stop{false};
+
+  // 2 threads: MarkInvalidated() on random keys
+  std::vector<std::thread> invalidators;
+  for (int t = 0; t < 2; ++t) {
+    invalidators.emplace_back([&cache, &stop]() {
+      int i = 0;
+      while (!stop.load(std::memory_order_relaxed)) {
+        auto key = MakeKey("item" + std::to_string(i % 100), 10);
+        cache.MarkInvalidated(key);
+        ++i;
+        std::this_thread::yield();
+      }
+    });
+  }
+
+  // 4 threads: Lookup() concurrently
+  std::vector<std::thread> readers;
+  for (int t = 0; t < 4; ++t) {
+    readers.emplace_back([&cache, &stop]() {
+      int i = 0;
+      while (!stop.load(std::memory_order_relaxed)) {
+        auto key = MakeKey("item" + std::to_string(i % 100), 10);
+        auto result = cache.Lookup(key);
+        (void)result;
+        ++i;
+        std::this_thread::yield();
+      }
+    });
+  }
+
+  // Run for 100ms
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  stop.store(true, std::memory_order_relaxed);
+
+  for (auto& t : invalidators) {
+    t.join();
+  }
+  for (auto& t : readers) {
+    t.join();
+  }
+
+  // Should complete without crash
+  auto stats = cache.GetStatistics();
+  EXPECT_GE(stats.cache_misses_invalidated, 0);
+}
+
+TEST(SimilarityCacheTest, EvictForSpaceFailsGracefully) {
+  // Extremely small cache: 1 byte — nothing can fit
+  SimilarityCache cache(1, 0.0);
+
+  std::vector<similarity::SimilarityResult> results = {{"result_with_data", 0.95f}};
+
+  // Insert should fail gracefully (entry too large for cache)
+  auto key = MakeKey("item1", 10);
+  bool inserted = cache.Insert(key, results, 1.0);
+  EXPECT_FALSE(inserted);
+
+  auto stats = cache.GetStatistics();
+  EXPECT_EQ(stats.current_entries, 0);
+  EXPECT_EQ(stats.current_memory_bytes, 0);
+}
+
+TEST(SimilarityCacheTest, PurgeExpired_RemovesAllExpired) {
+  // TTL of 1 second
+  SimilarityCache cache(1024 * 1024, 0.0, 1);
+
+  std::vector<similarity::SimilarityResult> results = {{"result", 0.95f}};
+
+  // Insert multiple entries
+  for (int i = 0; i < 5; ++i) {
+    auto key = MakeKey("item" + std::to_string(i), 10);
+    cache.Insert(key, results, 1.0);
+  }
+
+  EXPECT_EQ(cache.GetStatistics().current_entries, 5);
+
+  // Wait for TTL to expire
+  std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+
+  // PurgeExpired should remove all entries
+  size_t purged = cache.PurgeExpired();
+  EXPECT_EQ(purged, 5);
+  EXPECT_EQ(cache.GetStatistics().current_entries, 0);
+}
+
+TEST(SimilarityCacheTest, PurgeExpired_NoTTL) {
+  // No TTL
+  SimilarityCache cache(1024 * 1024, 0.0, 0);
+
+  std::vector<similarity::SimilarityResult> results = {{"result", 0.95f}};
+  auto key = MakeKey("item1", 10);
+  cache.Insert(key, results, 1.0);
+
+  // PurgeExpired should return 0 when no TTL configured
+  size_t purged = cache.PurgeExpired();
+  EXPECT_EQ(purged, 0);
+  EXPECT_EQ(cache.GetStatistics().current_entries, 1);
+}
+
+TEST(SimilarityCacheTest, PurgeExpired_MixedFreshAndExpired) {
+  // TTL of 1 second
+  SimilarityCache cache(1024 * 1024, 0.0, 1);
+
+  std::vector<similarity::SimilarityResult> results = {{"result", 0.95f}};
+
+  // Insert entries that will expire
+  for (int i = 0; i < 3; ++i) {
+    auto key = MakeKey("old_item" + std::to_string(i), 10);
+    cache.Insert(key, results, 1.0);
+  }
+
+  // Wait for TTL
+  std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+
+  // Insert fresh entries
+  for (int i = 0; i < 2; ++i) {
+    auto key = MakeKey("fresh_item" + std::to_string(i), 10);
+    cache.Insert(key, results, 1.0);
+  }
+
+  EXPECT_EQ(cache.GetStatistics().current_entries, 5);
+
+  // PurgeExpired should only remove old entries
+  size_t purged = cache.PurgeExpired();
+  EXPECT_EQ(purged, 3);
+  EXPECT_EQ(cache.GetStatistics().current_entries, 2);
 }
 
 }  // namespace

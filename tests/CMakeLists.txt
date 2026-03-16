@@ -154,6 +154,15 @@ target_link_libraries(co_occurrence_index_test
 )
 gtest_discover_tests(co_occurrence_index_test)
 
+add_executable(state_cache_test
+  events/state_cache_test.cpp
+)
+target_link_libraries(state_cache_test
+  nvecd_events
+  gtest_main
+)
+gtest_discover_tests(state_cache_test)
+
 # Vectors tests
 add_executable(vector_store_test
   vectors/vector_store_test.cpp
@@ -187,6 +196,18 @@ target_link_libraries(similarity_engine_test
 gtest_discover_tests(similarity_engine_test)
 
 # Cache tests
+add_executable(result_compressor_test
+  cache/result_compressor_test.cpp
+)
+target_link_libraries(result_compressor_test
+  nvecd_cache
+  nvecd_similarity
+  nvecd_utils
+  gtest
+  gtest_main
+)
+gtest_discover_tests(result_compressor_test)
+
 add_executable(similarity_cache_test
   cache/similarity_cache_test.cpp
 )

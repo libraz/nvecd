@@ -489,5 +489,23 @@ TEST(CoOccurrenceIndexTest, ConcurrentReadsAndWrites) {
   EXPECT_GT(index.GetItemCount(), 0);
 }
 
+TEST(CoOccurrenceIndexTest, ApplyDecay_RemovesNearZeroEntries) {
+  CoOccurrenceIndex index;
+  auto events = MakeEvents({{"item1", 1, 1000}, {"item2", 1, 1001}});
+  index.UpdateFromEvents("ctx1", events);
+
+  // Score: 1 * 1 = 1.0
+  EXPECT_FLOAT_EQ(index.GetScore("item1", "item2"), 1.0f);
+
+  // Apply aggressive decay many times to push score below threshold
+  for (int i = 0; i < 100; ++i) {
+    index.ApplyDecay(0.5);
+  }
+
+  // Score should be effectively zero and entries should be cleaned up
+  EXPECT_EQ(index.GetItemCount(), 0);
+  EXPECT_FLOAT_EQ(index.GetScore("item1", "item2"), 0.0f);
+}
+
 }  // namespace
 }  // namespace nvecd::events

@@ -1,36 +1,64 @@
 # プロトコルリファレンス
 
-Nvecd はシンプルなテキストベースのプロトコルを TCP 経由で使用します（memcached/Redis と同様）。
+Nvecd はシンプルなテキストベースのプロトコルを TCP 経由で使用します（Redis/Memcached と同様）。MygramDB 互換の管理コマンドも備えています。
+
+**プロトコル形式**: テキストベース、行区切り、UTF-8 エンコーディング
 
 ## 接続
 
-TCP 経由で Nvecd に接続：
+TCP 経由で nvecd に接続：
 
 ```bash
+# netcat を使用
+nc localhost 11017
+
+# telnet を使用
 telnet localhost 11017
 ```
 
-または `nc` を使用：
+---
 
-```bash
-nc localhost 11017
+## プロトコル形式
+
+- **トランスポート**: テキストベースの行プロトコル（UTF-8）
+- **リクエスト**: `COMMAND args...\r\n`（`\r\n` と `\n` の両方を受け付けます）
+- **レスポンス**: `OK data...\r\n` または `ERROR message\r\n`
+- **最大リクエストサイズ**: 16MB（設定変更可能）
+
+### レスポンス形式
+
+**成功**:
 ```
+OK [data]\r\n
+```
+または Redis スタイル: `+OK [data]\r\n`
 
-## コマンドフォーマット
-
-コマンドはテキストベースで、1 行に 1 コマンドです。レスポンスは改行で終了します。
+**エラー**:
+```
+ERROR <message>\r\n
+```
+または Redis スタイル: `-ERR <message>\r\n` または `(error) <message>\r\n`
 
 ---
 
-## EVENT コマンド
+## コマンドカテゴリ
+
+- **コアコマンド**: EVENT, VECSET, SIM, SIMV（nvecd 固有）
+- **管理コマンド**: INFO, CONFIG, DUMP, DEBUG（MygramDB 互換）
+- **キャッシュコマンド**: CACHE（クエリ結果キャッシュ管理）
+
+---
+
+## コアコマンド
+
+### EVENT — 共起イベントの取り込み
 
 コンテキストと ID を関連付けるイベントを記録します。3 種類のイベントタイプをサポート：
 - **ADD**: ストリーム型イベント（クリック、閲覧）- 時間窓ベースの重複排除
 - **SET**: 状態型イベント（いいね、ブックマーク、評価）- 冪等な更新
 - **DEL**: 削除型イベント（いいね解除、ブックマーク削除）- 冪等な削除
 
-### 構文
-
+**構文**:
 ```
 EVENT <ctx> ADD <id> <score>
 EVENT <ctx> SET <id> <score>
@@ -43,7 +71,7 @@ EVENT <ctx> DEL <id>
 - `<id>`: アイテム識別子（文字列、例: アイテムID、アクションID）
 - `<score>`: イベントスコア（整数、0-100）— ADD/SET では必須、DEL では無視
 
-### 例
+**例**:
 
 ```bash
 # ストリーム型イベント（クリック追跡）
@@ -71,7 +99,7 @@ EVENT user123 DEL bookmark:item789
 → OK
 ```
 
-### イベントタイプの動作
+**イベントタイプの動作**:
 
 | タイプ | 用途 | 重複排除 | 例 |
 |--------|------|---------|-----|
@@ -79,7 +107,7 @@ EVENT user123 DEL bookmark:item789
 | **SET** | 状態型イベント（いいね、ブックマーク、評価） | 同じ値 = 重複（冪等） | `EVENT user1 SET like:item1 100` |
 | **DEL** | 削除型イベント | 既に削除済み = 重複（冪等） | `EVENT user1 DEL like:item1` |
 
-### 冪等性の保証
+**冪等性の保証**:
 
 ```bash
 # SET は同じ値に対して冪等
@@ -99,8 +127,7 @@ EVENT user1 DEL like:item1  # 既に削除済み、無視される
 → OK
 ```
 
-### エラーレスポンス
-
+**エラーレスポンス**:
 - `(error) Invalid EVENT type: <type> (must be ADD, SET, or DEL)`
 - `(error) EVENT ADD requires 4 arguments: <ctx> ADD <id> <score>`
 - `(error) EVENT SET requires 4 arguments: <ctx> SET <id> <score>`
@@ -109,10 +136,9 @@ EVENT user1 DEL like:item1  # 既に削除済み、無視される
 - `(error) Context cannot be empty`
 - `(error) ID cannot be empty`
 
-### 注意事項
-
+**注意事項**:
 - イベントはコンテキストごとのリングバッファに格納されます（サイズ: `events.ctx_buffer_size`）
-- 重複排除キャッシュサイズ: `events.dedup_cache_size`（デフォルト: 10,000エントリ）
+- 重複排除キャッシュサイズ: `events.dedup_cache_size`（デフォルト: 10,000 エントリ）
 - ADD タイプの時間窓: `events.dedup_window_sec`（デフォルト: 60秒）
 - SET/DEL は最後の値を追跡して冪等性を保証（時間窓なし）
 - 同じコンテキスト内の ID 間で共起スコアが自動的に追跡されます
@@ -120,61 +146,61 @@ EVENT user1 DEL like:item1  # 既に削除済み、無視される
 
 ---
 
-## VECSET コマンド
+### VECSET — ベクトルの登録
 
 アイテムのベクトルを登録または更新します。
 
-### 構文
-
+**構文**:
 ```
-VECSET <id> <dimension> <v1> <v2> ... <vN>
+VECSET <id> <f1> <f2> ... <fN>
 ```
 
+**パラメータ**:
 - `<id>`: アイテム識別子（文字列）
-- `<dimension>`: ベクトル次元数（整数）
-- `<v1> <v2> ... <vN>`: ベクトル成分（浮動小数点数）
+- `<f1> <f2> ... <fN>`: ベクトル成分（浮動小数点数）
 
-### 例
-
+**例**:
 ```
-VECSET item456 3 0.1 0.5 0.8
-```
-
-### レスポンス
-
-```
-OK
+VECSET item456 0.1 0.5 0.8
+→ OK
 ```
 
-### エラーレスポンス
+**768 次元ベクトルの例**:
+```
+VECSET item789 0.11 0.98 -0.22 0.44 ... (768 個の値)
+→ OK
+```
 
+**エラーレスポンス**:
 - `(error) Dimension mismatch: expected 768, got 512`
 - `(error) Invalid vector format`
+- `(error) Invalid argument count`
+
+**注意事項**:
+- 次元数は値の数から自動検出されます
+- すべてのベクトルは同じ次元数である必要があります（デフォルト: 768、`vectors.default_dimension` で設定変更可能）
+- ベクトルは `vectors.distance_metric` の設定に基づいて自動的に正規化されます
 
 ---
 
-## SIM コマンド
+### SIM — ID による類似度検索
 
 既存アイテムのベクトルと共起データに基づいて類似アイテムを検索します。
 
-### 構文
-
+**構文**:
 ```
-SIM <id> <top_k> <mode>
+SIM <id> <top_k> [using=events|vectors|fusion]
 ```
 
+**パラメータ**:
 - `<id>`: アイテム識別子（文字列）
-- `<top_k>`: 返す結果数（整数）
-- `<mode>`: 類似度モード（`dot`, `cosine`, または `fusion`）
+- `<top_k>`: 返す結果数（整数、最大: `similarity.max_top_k`）
+- `using=`（省略可能）: 検索モード
+  - `events`: 共起ベース（イベントデータのみ）
+  - `vectors`: ベクトル距離ベース（ベクトルデータのみ）
+  - `fusion`（デフォルト）: 共起 x ベクトルのハイブリッド
 
-### 例
-
-```
-SIM item456 10 fusion
-```
-
-### レスポンス
-
+**レスポンス形式**:
 ```
 OK RESULTS <count>
 <id1> <score1>
@@ -182,44 +208,58 @@ OK RESULTS <count>
 ...
 ```
 
-例：
+**例（fusion モード）**:
 ```
-OK RESULTS 3
+SIM item456 10 using=fusion
+→ OK RESULTS 3
 item789 0.9245
 item101 0.8932
 item202 0.8567
 ```
 
-### エラーレスポンス
+**例（events のみ）**:
+```
+SIM item456 10 using=events
+→ OK RESULTS 2
+item101 0.95
+item789 0.87
+```
 
+**例（vectors のみ）**:
+```
+SIM item456 10 using=vectors
+→ OK RESULTS 3
+item789 0.9245
+item202 0.8932
+item555 0.8567
+```
+
+**エラーレスポンス**:
 - `(error) Item not found: item456`
-- `(error) Invalid mode: must be dot, cosine, or fusion`
+- `(error) Invalid mode: must be events, vectors, or fusion`
+- `(error) Invalid top_k: must be > 0 and <= 1000`
+
+**注意事項**:
+- fusion モードはベクトル類似度（重み: `similarity.fusion_alpha`）と共起スコア（重み: `similarity.fusion_beta`）を組み合わせます
+- クエリコストが `cache.min_query_cost_ms` を超えた場合、結果がキャッシュされます（キャッシュが有効な場合）
+- キャッシュは VECSET（vectors モード向け）または EVENT（fusion モード向け）で無効化されます
 
 ---
 
-## SIMV コマンド
+### SIMV — ベクトルによる類似度検索
 
 クエリベクトルに基づいて類似アイテムを検索します。
 
-### 構文
-
+**構文**:
 ```
-SIMV <dimension> <v1> <v2> ... <vN> <top_k> <mode>
+SIMV <top_k> <f1> <f2> ... <fN>
 ```
 
-- `<dimension>`: ベクトル次元数（整数）
-- `<v1> <v2> ... <vN>`: クエリベクトル成分（浮動小数点数）
+**パラメータ**:
 - `<top_k>`: 返す結果数（整数）
-- `<mode>`: 類似度モード（`dot` または `cosine`）
+- `<f1> <f2> ... <fN>`: クエリベクトル成分（浮動小数点数）
 
-### 例
-
-```
-SIMV 3 0.1 0.5 0.8 10 cosine
-```
-
-### レスポンス
-
+**レスポンス形式**:
 ```
 OK RESULTS <count>
 <id1> <score1>
@@ -227,27 +267,38 @@ OK RESULTS <count>
 ...
 ```
 
-### エラーレスポンス
+**例**:
+```
+SIMV 5 0.1 0.9 -0.2 0.5
+→ OK RESULTS 2
+item789 0.98
+item101 0.82
+```
 
-- `(error) Dimension mismatch`
-- `(error) Invalid mode: must be dot or cosine (fusion not supported for SIMV)`
+**エラーレスポンス**:
+- `(error) Dimension mismatch: expected 768, got 512`
+- `(error) Invalid vector format`
+- `(error) Invalid top_k`
+
+**注意事項**:
+- 次元数は値の数から自動検出されます
+- ベクトル類似度のみが使用されます（クエリベクトルでは fusion モードは非対応）
+- クエリコストが `cache.min_query_cost_ms` を超えた場合、結果がキャッシュされます
 
 ---
 
-## INFO コマンド
+## 管理コマンド（MygramDB 互換）
 
-サーバー情報と統計を取得します（Redis スタイル形式）。
+### INFO — サーバー統計
 
-### 構文
+包括的なサーバー情報と統計を取得します（Redis スタイル形式）。
 
+**構文**:
 ```
 INFO
 ```
 
-### レスポンス
-
-Redis スタイルのキーバリュー形式でサーバー情報を返します：
-
+**レスポンス**:
 ```
 OK INFO
 
@@ -256,200 +307,383 @@ version: 0.1.0
 uptime_seconds: 3600
 
 # Stats
-total_commands_processed: 10000
+total_commands_processed: 100000
 total_connections_received: 150
 
-# Commandstats
-cmd_event: 5000
-cmd_vecset: 2000
-cmd_sim: 2500
-cmd_simv: 500
-
 # Memory
-event_store_contexts: 100
-event_store_events: 5000
-vector_store_vectors: 2000
-co_occurrence_pairs: 1500
+used_memory_bytes: 536870912
+used_memory_human: 512.00 MB
+memory_health: HEALTHY
+
+# Data
+id_count: 12345
+ctx_count: 6789
+vector_count: 12000
+event_count: 987654
+
+# Commandstats
+cmd_event: 50000
+cmd_vecset: 20000
+cmd_sim: 25000
+cmd_simv: 5000
 ```
+
+**Memory Health**:
+- `HEALTHY`: システムメモリの空き容量が 20% 以上
+- `WARNING`: 空き容量が 10-20%
+- `CRITICAL`: 空き容量が 10% 未満
 
 ---
 
-## CONFIG コマンド
+### CONFIG — 設定管理
 
-設定管理コマンドです。
-
-### CONFIG HELP
-
-利用可能な設定コマンドを表示します。
-
+**コマンド**:
 ```
-CONFIG HELP
-```
-
-### CONFIG SHOW
-
-現在の設定を表示します。
-
-```
-CONFIG SHOW
-```
-
-レスポンス：
-```
-OK CONFIG
-server.host: 127.0.0.1
-server.port: 11017
-server.thread_pool_size: 4
-event_store.ctx_buffer_size: 100
-event_store.decay_factor: 0.95
-vector_store.default_dimension: 768
-...
-```
-
-### CONFIG VERIFY
-
-設定ファイルの構文を検証します。
-
-```
+CONFIG HELP [path]
+CONFIG SHOW [path]
 CONFIG VERIFY
 ```
 
-レスポンス：
+#### CONFIG HELP
+
+設定ドキュメントを表示します。
+
+**例**:
 ```
-OK Configuration is valid
+CONFIG HELP events
+→ +OK
+events:
+  ctx_buffer_size: Ring buffer size per context (default: 50)
+  decay_interval_sec: Decay interval in seconds (default: 3600)
+  decay_alpha: Decay factor 0.0-1.0 (default: 0.99)
+```
+
+#### CONFIG SHOW
+
+現在の設定を表示します（パスワードはマスクされます）。
+
+**例**:
+```
+CONFIG SHOW events.ctx_buffer_size
+→ +OK
+events:
+  ctx_buffer_size: 50
+```
+
+#### CONFIG VERIFY
+
+設定ファイルを検証します（サーバー起動前にも使用可能）。
+
+**レスポンス**:
+```
++OK Configuration is valid
 ```
 
 ---
 
-## DUMP コマンド
+### DUMP — スナップショット管理
 
-スナップショット永続化コマンドです。
-
-### DUMP SAVE
-
-スナップショットをディスクに保存します。
-
+**コマンド**:
 ```
-DUMP SAVE [filepath]
+DUMP SAVE [<filepath>]
+DUMP LOAD [<filepath>]
+DUMP VERIFY [<filepath>]
+DUMP INFO [<filepath>]
 ```
 
-`filepath` を省略すると、タイムスタンプ付きのファイル名が自動生成されます。
+単一バイナリの `.dmp` 形式、MygramDB 互換。
 
-レスポンス：
+#### DUMP SAVE
+
+完全なスナップショットをディスクに保存します。
+
+**例**:
 ```
-OK Snapshot saved: /path/to/dump_20250118_120000.nvec
-```
-
-### DUMP LOAD
-
-スナップショットをディスクから読み込みます。
-
-```
-DUMP LOAD <filepath>
+DUMP SAVE /data/nvecd.dmp
+→ +OK Snapshot saved: /data/nvecd.dmp (512.3 MB) in 2.35s
 ```
 
-レスポンス：
+**ファイルパスを省略した場合（自動生成名）**:
 ```
-OK Snapshot loaded: 5000 events, 2000 vectors
-```
-
-### DUMP VERIFY
-
-スナップショットの整合性を検証します。
-
-```
-DUMP VERIFY <filepath>
+DUMP SAVE
+→ +OK Snapshot saved: /var/lib/nvecd/snapshots/auto_20251118_143000.dmp (512.3 MB) in 2.35s
 ```
 
-レスポンス：
+#### DUMP LOAD
+
+スナップショットをディスクから読み込みます（読み込み中はサーバーが読み取り専用になります）。
+
+**例**:
 ```
-OK Snapshot is valid (CRC32: 0x12345678)
+DUMP LOAD /data/nvecd.dmp
+→ +OK Snapshot loaded: /data/nvecd.dmp (5000 events, 2000 vectors) in 1.23s
 ```
 
-### DUMP INFO
+**エラーレスポンス**:
+- `(error) File not found: /data/nvecd.dmp`
+- `(error) CRC mismatch: file may be corrupted`
+- `(error) Unsupported snapshot version`
 
-スナップショットのメタデータを表示します。
+#### DUMP VERIFY
 
+スナップショットの整合性を読み込みなしで検証します。
+
+**例**:
 ```
-DUMP INFO <filepath>
+DUMP VERIFY /data/nvecd.dmp
+→ +OK Snapshot is valid (CRC32: 0x12345678)
 ```
 
-レスポンス：
+#### DUMP INFO
+
+スナップショットのメタデータ（バージョン、サイズ、CRC32、レコード数）を表示します。
+
+**例**:
 ```
-OK INFO
+DUMP INFO /data/nvecd.dmp
+→ +OK INFO
 version: 1
+flags: 0
+timestamp: 2025-11-18T14:30:00Z
 event_store_count: 5000
-vector_store_count: 2000
 co_occurrence_count: 1500
-file_size: 1048576
-created_at: 2025-01-18T12:00:00
+vector_store_count: 2000
+file_size_bytes: 536870912
+file_size_human: 512.00 MB
+crc32: 0x12345678
 ```
 
 ---
 
-## DEBUG コマンド
+### DEBUG — デバッグモード
 
-現在の接続のデバッグ出力を有効化・無効化します。
+接続ごとのデバッグモードです。SIM コマンドの詳細な実行情報を表示します。
 
-### DEBUG ON
-
-デバッグログを有効化します。
-
+**コマンド**:
 ```
 DEBUG ON
-```
-
-レスポンス：
-```
-OK Debug mode enabled
-```
-
-### DEBUG OFF
-
-デバッグログを無効化します。
-
-```
 DEBUG OFF
 ```
 
-レスポンス：
+#### DEBUG ON
+
+この接続のデバッグログを有効化します。
+
+**例**:
 ```
-OK Debug mode disabled
+DEBUG ON
+→ OK Debug mode enabled
+```
+
+#### DEBUG OFF
+
+この接続のデバッグログを無効化します。
+
+**例**:
+```
+DEBUG OFF
+→ OK Debug mode disabled
+```
+
+**デバッグ出力例**（DEBUG ON 時）:
+```
+SIM item456 10 fusion
+→ OK RESULTS 3
+item789 0.9245
+item101 0.8932
+item202 0.8567
+
+# DEBUG
+query_time_us: 850
+event_search_time_us: 320
+vector_search_time_us: 410
+fusion_time_us: 120
+mode: fusion
+event_candidates: 15
+vector_candidates: 12
+```
+
+---
+
+## キャッシュコマンド
+
+### CACHE — キャッシュ管理
+
+クエリ結果キャッシュの管理コマンドです。
+
+**コマンド**:
+```
+CACHE STATS
+CACHE CLEAR
+CACHE ENABLE
+CACHE DISABLE
+```
+
+#### CACHE STATS
+
+詳細なキャッシュ統計を返します。
+
+**レスポンス**:
+```
+OK CACHE_STATS
+total_queries: 1250
+cache_hits: 985
+cache_misses: 265
+cache_misses_invalidated: 45
+cache_misses_not_found: 220
+hit_rate: 0.7880
+current_entries: 342
+current_memory_bytes: 12845632
+current_memory_mb: 12.25
+evictions: 15
+avg_hit_latency_ms: 0.125
+avg_miss_latency_ms: 2.450
+time_saved_ms: 2418.75
+```
+
+**統計フィールド**:
+- `total_queries`: キャッシュルックアップの総数
+- `cache_hits`: キャッシュヒット数
+- `cache_misses`: ミスの合計（invalidated + not found）
+- `cache_misses_invalidated`: 無効化（VECSET/EVENT）によるミス
+- `cache_misses_not_found`: キーがキャッシュにない、TTL 期限切れ、またはデコンプレッション失敗によるミス
+- `hit_rate`: キャッシュヒット率（0.0 ~ 1.0）
+- `current_entries`: キャッシュされたエントリ数
+- `current_memory_mb`: 現在のキャッシュメモリ使用量
+- `evictions`: LRU エビクション数
+- `avg_hit_latency_ms`: ヒット時の平均キャッシュルックアップレイテンシ
+- `avg_miss_latency_ms`: ミス時の平均キャッシュルックアップレイテンシ
+- `time_saved_ms`: キャッシュヒットにより節約されたクエリ時間の合計
+
+#### CACHE CLEAR
+
+すべてのキャッシュエントリをクリアします。
+
+**レスポンス**:
+```
+OK CACHE CLEARED
+```
+
+#### CACHE ENABLE
+
+キャッシュを有効化します（既に初期化済みの場合は no-op）。
+
+**レスポンス**:
+```
+OK CACHE ENABLED
+```
+
+**エラー**（起動時にキャッシュが初期化されていない場合）:
+```
+-ERR Cache was not initialized at startup
+```
+
+**注意**: キャッシュは起動時に config.yaml で有効化されている必要があります。ランタイムでの有効化は、設定で `cache.enabled=true` が設定されている場合のみ可能です。
+
+#### CACHE DISABLE
+
+ランタイムでのキャッシュ無効化は**サポートされていません**。
+
+**レスポンス**:
+```
+-ERR Runtime cache disable not supported. Set cache.enabled=false in config and restart.
+```
+
+**キャッシュの動作**:
+- SIM/SIMV のクエリ結果は `query_cost_ms >= min_query_cost_ms` の場合にキャッシュされます
+- キャッシュエントリは VECSET（SIM クエリ向け）および EVENT（fusion クエリ向け）で無効化されます
+- `current_memory_bytes >= max_memory_bytes` に達すると LRU エビクションが発生します
+- メモリ使用量を削減するため、結果は LZ4 で圧縮されます
+
+**設定**（`config.yaml`）:
+```yaml
+cache:
+  enabled: true               # キャッシュの有効化/無効化
+  max_memory_mb: 32           # キャッシュの最大メモリ
+  min_query_cost_ms: 10.0     # キャッシュする最小クエリコスト
+  ttl_seconds: 3600           # キャッシュエントリの TTL（0 = TTL なし）
+  compression_enabled: true   # LZ4 圧縮の有効化
 ```
 
 ---
 
 ## エラーレスポンス
 
-すべてのエラーは以下の形式に従います：
+すべてのエラーは一貫した形式に従います：
 
 ```
 (error) <error_message>
 ```
 
-例：
+または Redis スタイル：
+
+```
+-ERR <error_message>
+```
+
+**一般的なエラー例**:
 - `(error) Unknown command: FOO`
 - `(error) Invalid argument count`
 - `(error) Item not found: item123`
 - `(error) Dimension mismatch: expected 768, got 512`
+- `(error) Invalid score: must be 0-100`
+- `(error) File not found: /data/dump.dmp`
+- `(error) CRC mismatch: file may be corrupted`
 
 ---
 
 ## 類似度モード
 
-### `dot` - 内積
+### `events` - イベントベース（共起）
 
-ベクトル間の生の内積です。値が大きいほど類似度が高いことを示します。
+イベントデータの共起スコアのみを使用します。コンテンツ特徴量なしの協調フィルタリングに最適です。
 
-### `cosine` - コサイン類似度
+**ユースケース**: 「このアイテムに対してインタラクションしたユーザーは、こちらにもインタラクションしています...」
 
-正規化された内積（範囲：-1.0 ～ 1.0）。ベクトル間の角度を測定します。
+### `vectors` - ベクトルベース
+
+ベクトル類似度（内積またはコサイン）のみを使用します。コンテンツベースの推薦に最適です。
+
+**ユースケース**: 「類似したコンテンツ/特徴量を持つアイテム...」
 
 ### `fusion` - フュージョン検索（SIM のみ）
 
-ベクトル類似度とイベントデータからの共起スコアを組み合わせます。ハイブリッド推薦システムに最適です。
+ベクトル類似度（重み: `similarity.fusion_alpha`）と共起スコア（重み: `similarity.fusion_beta`）を組み合わせます。
+
+**ユースケース**: コンテンツ類似度 + ユーザー行動を組み合わせたハイブリッド推薦。
+
+**計算式**:
+```
+fusion_score = (alpha x vector_similarity) + (beta x co_occurrence_score)
+ここで alpha + beta = 1.0
+```
 
 **注意**: `fusion` モードは `SIM` コマンドでのみ利用可能です（`SIMV` では不可）。
+
+---
+
+## ベストプラクティス
+
+### パフォーマンスのヒント
+
+1. **適切な top_k を使用する**: 値が小さいほど高速です
+2. **キャッシュを有効化する**: 繰り返しクエリには `cache.enabled=true` を設定してください
+3. **fusion の重みを調整する**: ユースケースに応じて `fusion_alpha` と `fusion_beta` を調整してください
+4. **コールドアイテムには events モードを使用する**: ベクトルのないアイテムでもイベント経由で推薦可能です
+5. **キャッシュヒット率を監視する**: `CACHE STATS` でパフォーマンスを確認してください
+
+### データ管理
+
+1. **定期的なスナップショット**: バックアップには `DUMP SAVE` を使用してください
+2. **スナップショットの検証**: 読み込み前に `DUMP VERIFY` を使用してください
+3. **メモリの監視**: `INFO` でメモリ使用量を追跡してください
+4. **減衰の設定**: データの鮮度要件に応じて `decay_interval_sec` を調整してください
+
+### デバッグ
+
+1. **DEBUG モードを有効化する**: `DEBUG ON` でクエリ実行の詳細を確認できます
+2. **INFO の統計を確認する**: コマンド数とパフォーマンスを監視してください
+3. **小さなデータセットでテストする**: スケールアップ前に動作を検証してください
 
 ---
 
@@ -457,3 +691,5 @@ OK Debug mode disabled
 
 - 設定オプションについては [設定ガイド](configuration.md) を参照
 - 永続化の詳細については [スナップショット管理](snapshot.md) を参照
+- プログラムからのアクセスについては [クライアントライブラリガイド](libnvecdclient.md) を参照
+- 最適化のヒントについては [パフォーマンスガイド](performance.md) を参照

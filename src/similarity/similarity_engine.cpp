@@ -15,13 +15,27 @@
 
 namespace nvecd::similarity {
 
-namespace {
-constexpr float kNormalizationEpsilon = 1e-6F;  // Epsilon for floating point comparison in score normalization
-}  // namespace
-
 SimilarityEngine::SimilarityEngine(events::EventStore* event_store, events::CoOccurrenceIndex* co_index,
-                                   vectors::VectorStore* vector_store, const config::SimilarityConfig& config)
-    : event_store_(event_store), co_index_(co_index), vector_store_(vector_store), config_(config) {}
+                                   vectors::VectorStore* vector_store, const config::SimilarityConfig& config,
+                                   const config::VectorsConfig& vectors_config)
+    : event_store_(event_store),
+      co_index_(co_index),
+      vector_store_(vector_store),
+      config_(config),
+      distance_func_(SelectDistanceFunction(vectors_config.distance_metric)) {}
+
+SimilarityEngine::DistanceFunc SimilarityEngine::SelectDistanceFunction(const std::string& metric) {
+  if (metric == "dot") {
+    return vectors::DotProduct;
+  }
+  if (metric == "l2") {
+    return [](const std::vector<float>& lhs, const std::vector<float>& rhs) -> float {
+      return 1.0F / (1.0F + vectors::L2Distance(lhs, rhs));
+    };
+  }
+  // Default: cosine
+  return vectors::CosineSimilarity;
+}
 
 // ============================================================================
 // Events-based Search
@@ -83,8 +97,8 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
       continue;  // Skip if vector not found
     }
 
-    // Compute similarity (using cosine similarity by default)
-    float score = vectors::CosineSimilarity(query_vec->data, candidate_vec->data);
+    // Compute similarity using configured distance function
+    float score = distance_func_(query_vec->data, candidate_vec->data);
 
     results.emplace_back(candidate_id, score);
   }
@@ -190,8 +204,8 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
       continue;  // Skip if vector not found
     }
 
-    // Compute similarity (using cosine similarity by default)
-    float score = vectors::CosineSimilarity(query_vector, candidate_vec->data);
+    // Compute similarity using configured distance function
+    float score = distance_func_(query_vector, candidate_vec->data);
 
     results.emplace_back(candidate_id, score);
   }
@@ -220,7 +234,11 @@ utils::Expected<int, utils::Error> SimilarityEngine::ValidateTopK(int top_k) con
 }
 
 void SimilarityEngine::NormalizeScores(std::vector<SimilarityResult>& results) {
-  if (results.empty()) {
+  if (results.size() <= 1) {
+    // Single result or empty: set to 0.5 to avoid undue weight in fusion
+    for (auto& result : results) {
+      result.score = 0.5F;
+    }
     return;
   }
 
@@ -235,10 +253,11 @@ void SimilarityEngine::NormalizeScores(std::vector<SimilarityResult>& results) {
 
   // Normalize to [0, 1]
   float range = max_score - min_score;
-  if (range < kNormalizationEpsilon) {
-    // All scores are the same, set to 1.0
+  constexpr float kMinRange = 1e-4F;
+  if (range < kMinRange) {
+    // All scores are effectively the same, set to 0.5
     for (auto& result : results) {
-      result.score = 1.0F;
+      result.score = 0.5F;
     }
     return;
   }
@@ -249,13 +268,15 @@ void SimilarityEngine::NormalizeScores(std::vector<SimilarityResult>& results) {
 }
 
 std::vector<SimilarityResult> SimilarityEngine::MergeAndSelectTopK(std::vector<SimilarityResult> results, int top_k) {
-  // Sort by score descending
-  std::sort(results.begin(), results.end());
-
-  // Select top-k
-  if (results.size() > static_cast<size_t>(top_k)) {
-    results.resize(static_cast<size_t>(top_k));
+  if (results.size() <= static_cast<size_t>(top_k)) {
+    // Sort all if fewer results than requested
+    std::sort(results.begin(), results.end());
+    return results;
   }
+
+  // Partial sort for top-k (more efficient than full sort)
+  std::partial_sort(results.begin(), results.begin() + top_k, results.end());
+  results.resize(static_cast<size_t>(top_k));
 
   return results;
 }

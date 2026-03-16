@@ -173,6 +173,16 @@ class SimilarityCache {
   void ClearIf(std::function<bool(const CacheKey&)> predicate);
 
   /**
+   * @brief Purge all TTL-expired entries
+   *
+   * Scans all entries and removes those that have exceeded the TTL.
+   * Can be called periodically from a background thread.
+   *
+   * @return Number of entries purged
+   */
+  size_t PurgeExpired();
+
+  /**
    * @brief Set TTL for cache entries (runtime configuration)
    * @param ttl_seconds TTL in seconds (0 = no expiration)
    */
@@ -188,13 +198,15 @@ class SimilarityCache {
    * @brief Set minimum query cost threshold (runtime configuration)
    * @param min_query_cost_ms Minimum query cost in ms
    */
-  void SetMinQueryCost(double min_query_cost_ms) { min_query_cost_ms_ = min_query_cost_ms; }
+  void SetMinQueryCost(double min_query_cost_ms) {
+    min_query_cost_ms_.store(min_query_cost_ms, std::memory_order_relaxed);
+  }
 
   /**
    * @brief Get current minimum query cost threshold
    * @return Minimum query cost in ms
    */
-  [[nodiscard]] double GetMinQueryCost() const { return min_query_cost_ms_; }
+  [[nodiscard]] double GetMinQueryCost() const { return min_query_cost_ms_.load(std::memory_order_relaxed); }
 
   /**
    * @brief Get cache statistics snapshot (thread-safe)
@@ -219,6 +231,8 @@ class SimilarityCache {
     }
     return snapshot;
   }
+
+  friend class SimilarityCacheTestHelper;  // Test-only access to internals
 
  private:
   /**
@@ -275,7 +289,7 @@ class SimilarityCache {
 
   // Configuration
   size_t max_memory_bytes_;
-  double min_query_cost_ms_;
+  std::atomic<double> min_query_cost_ms_;
   std::atomic<int> ttl_seconds_{0};  ///< TTL in seconds (0 = no expiration)
 
   // Memory tracking

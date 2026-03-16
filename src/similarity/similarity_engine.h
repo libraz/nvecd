@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -19,6 +20,7 @@
 #include "events/event_store.h"
 #include "utils/error.h"
 #include "utils/expected.h"
+#include "vectors/distance.h"
 #include "vectors/vector_store.h"
 
 namespace nvecd::similarity {
@@ -78,7 +80,8 @@ class SimilarityEngine {
    * @param config Similarity configuration
    */
   SimilarityEngine(events::EventStore* event_store, events::CoOccurrenceIndex* co_index,
-                   vectors::VectorStore* vector_store, const config::SimilarityConfig& config);
+                   vectors::VectorStore* vector_store, const config::SimilarityConfig& config,
+                   const config::VectorsConfig& vectors_config = config::VectorsConfig{});
 
   /**
    * @brief Search similar items using events (co-occurrence)
@@ -155,10 +158,21 @@ class SimilarityEngine {
    */
   static std::vector<SimilarityResult> MergeAndSelectTopK(std::vector<SimilarityResult> results, int top_k);
 
+  /// @brief Distance function type for similarity computation
+  using DistanceFunc = std::function<float(const std::vector<float>&, const std::vector<float>&)>;
+
+  /**
+   * @brief Select distance function based on metric name
+   * @param metric Distance metric name ("cosine", "dot", "l2")
+   * @return Distance function
+   */
+  static DistanceFunc SelectDistanceFunction(const std::string& metric);
+
   [[maybe_unused]] events::EventStore* event_store_;  ///< Event store (not owned)
   events::CoOccurrenceIndex* co_index_;               ///< Co-occurrence index (not owned)
   vectors::VectorStore* vector_store_;                ///< Vector store (not owned)
   config::SimilarityConfig config_;                   ///< Configuration
+  DistanceFunc distance_func_;                        ///< Distance function for similarity
 };
 
 }  // namespace nvecd::similarity

@@ -546,7 +546,7 @@ time_saved_ms: 2418.75
 - `cache_hits`: Number of cache hits
 - `cache_misses`: Total misses (invalidated + not found)
 - `cache_misses_invalidated`: Misses due to invalidation (VECSET/EVENT)
-- `cache_misses_not_found`: Misses due to key not in cache
+- `cache_misses_not_found`: Misses due to key not in cache, TTL expiration, or decompression failure
 - `hit_rate`: Cache hit rate (0.0 to 1.0)
 - `current_entries`: Number of cached entries
 - `current_memory_mb`: Current cache memory usage

@@ -93,9 +93,24 @@ void CoOccurrenceIndex::ApplyDecay(double alpha) {
 
   std::unique_lock lock(mutex_);
 
-  for (auto& [item_id_1, scores_map] : co_scores_) {
-    for (auto& [item_id_2, score] : scores_map) {
-      score *= static_cast<float>(alpha);
+  constexpr float kDecayThreshold = 1e-6F;
+
+  for (auto outer_it = co_scores_.begin(); outer_it != co_scores_.end();) {
+    auto& scores_map = outer_it->second;
+    for (auto inner_it = scores_map.begin(); inner_it != scores_map.end();) {
+      inner_it->second *= static_cast<float>(alpha);
+      if (inner_it->second < kDecayThreshold) {
+        inner_it = scores_map.erase(inner_it);
+      } else {
+        ++inner_it;
+      }
+    }
+
+    // Remove outer entry if no neighbors remain
+    if (scores_map.empty()) {
+      outer_it = co_scores_.erase(outer_it);
+    } else {
+      ++outer_it;
     }
   }
 }

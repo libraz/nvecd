@@ -28,6 +28,9 @@ _deps/
 .claude/
 CLAUDE.md
 
+# Serena
+.serena/
+
 # act (GitHub Actions local runner)
 .secrets
 .act/

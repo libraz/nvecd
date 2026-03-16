@@ -48,8 +48,8 @@ class HttpServerTest : public ::testing::Test {
     event_store_ = std::make_unique<events::EventStore>(config_->events);
     co_index_ = std::make_unique<events::CoOccurrenceIndex>();
     vector_store_ = std::make_unique<vectors::VectorStore>(config_->vectors);
-    similarity_engine_ = std::make_unique<similarity::SimilarityEngine>(event_store_.get(), co_index_.get(),
-                                                                        vector_store_.get(), config_->similarity);
+    similarity_engine_ = std::make_unique<similarity::SimilarityEngine>(
+        event_store_.get(), co_index_.get(), vector_store_.get(), config_->similarity, config_->vectors);
     cache_ = std::make_unique<cache::SimilarityCache>(10 * 1024 * 1024, 0.1);
 
     // Setup handler context (pointers only, references already set in initializer)

@@ -12,20 +12,20 @@
 #include <lz4.h>
 
 #include <cstring>
-#include <stdexcept>
 
 namespace nvecd::cache {
 
 // Helper struct for serialization (POD type for LZ4 compression)
+// id: 256-byte fixed buffer, score: 4-byte float = 260 bytes per result
 struct SerializedSimilarityResult {
   char id[256];  // Fixed-size ID buffer
   float score;
 };
 
-std::vector<uint8_t> ResultCompressor::CompressSimilarityResults(
+utils::Expected<std::vector<uint8_t>, utils::Error> ResultCompressor::CompressSimilarityResults(
     const std::vector<similarity::SimilarityResult>& results) {
   if (results.empty()) {
-    return {};
+    return std::vector<uint8_t>{};
   }
 
   // Serialize SimilarityResult to POD format
@@ -48,7 +48,8 @@ std::vector<uint8_t> ResultCompressor::CompressSimilarityResults(
   // Calculate maximum compressed size
   const int max_dst_size = LZ4_compressBound(static_cast<int>(src_size));
   if (max_dst_size <= 0) {
-    throw std::runtime_error("LZ4_compressBound failed");
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kCacheCompressionFailed, "LZ4_compressBound failed"));
   }
 
   std::vector<uint8_t> compressed(static_cast<size_t>(max_dst_size));
@@ -60,7 +61,7 @@ std::vector<uint8_t> ResultCompressor::CompressSimilarityResults(
       static_cast<int>(src_size), max_dst_size);
 
   if (compressed_size <= 0) {
-    throw std::runtime_error("LZ4 compression failed");
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCacheCompressionFailed, "LZ4 compression failed"));
   }
 
   // Resize to actual compressed size
@@ -68,10 +69,10 @@ std::vector<uint8_t> ResultCompressor::CompressSimilarityResults(
   return compressed;
 }
 
-std::vector<similarity::SimilarityResult> ResultCompressor::DecompressSimilarityResults(
+utils::Expected<std::vector<similarity::SimilarityResult>, utils::Error> ResultCompressor::DecompressSimilarityResults(
     const std::vector<uint8_t>& compressed, size_t original_size) {
   if (compressed.empty() || original_size == 0) {
-    return {};
+    return std::vector<similarity::SimilarityResult>{};
   }
 
   // original_size is in bytes
@@ -88,12 +89,15 @@ std::vector<similarity::SimilarityResult> ResultCompressor::DecompressSimilarity
       static_cast<int>(compressed.size()), static_cast<int>(original_size));
 
   if (decompressed_size < 0) {
-    throw std::runtime_error("LZ4 decompression failed");
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kCacheDecompressionFailed, "LZ4 decompression failed"));
   }
 
   if (static_cast<size_t>(decompressed_size) != original_size) {
-    throw std::runtime_error("LZ4 decompression size mismatch: expected " + std::to_string(original_size) +
-                             " bytes, got " + std::to_string(decompressed_size) + " bytes");
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCacheDecompressionFailed,
+                                                  "LZ4 decompression size mismatch: expected " +
+                                                      std::to_string(original_size) + " bytes, got " +
+                                                      std::to_string(decompressed_size) + " bytes"));
   }
 
   // Deserialize to SimilarityResult

@@ -244,4 +244,22 @@ TEST_F(DistanceSIMDTest, PublicAPIUsesOptimalImpl) {
   EXPECT_LE(cosine, 1.0f);
 }
 
+TEST_F(DistanceSIMDTest, CosineSimilarity_NearZeroVectors) {
+  // Test with very small (near-zero) vectors that would cause issues with == 0.0F
+  std::vector<float> near_zero(768, 1e-20f);  // Tiny but not exactly zero
+  std::vector<float> normal = test_vectors_[768];
+
+  // Should return 0.0 (not NaN or Inf) for near-zero vectors
+  float result = CosineSimilarity(near_zero, normal);
+  EXPECT_EQ(result, 0.0f);  // Below epsilon threshold
+  EXPECT_FALSE(std::isnan(result));
+  EXPECT_FALSE(std::isinf(result));
+}
+
+TEST_F(DistanceSIMDTest, Normalize_NearZeroVector) {
+  std::vector<float> near_zero(768, 1e-20f);  // Near-zero
+  bool normalized = nvecd::vectors::Normalize(near_zero);
+  EXPECT_FALSE(normalized);  // Should fail for near-zero vectors
+}
+
 }  // namespace nvecd::vectors::simd

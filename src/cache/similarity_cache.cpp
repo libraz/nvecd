@@ -17,7 +17,8 @@ namespace nvecd::cache {
 // Forward declaration from result_compressor.cpp
 // Must match SerializedSimilarityResult size for compression/decompression
 namespace {
-constexpr size_t kSerializedResultSize = 256 + sizeof(float);  // id buffer + score
+// Must match SerializedSimilarityResult layout: char id[256] + float score
+constexpr size_t kSerializedResultSize = 256 + sizeof(float);
 }  // namespace
 
 SimilarityCache::SimilarityCache(size_t max_memory_bytes, double min_query_cost_ms, int ttl_seconds)
@@ -100,18 +101,14 @@ std::optional<std::vector<similarity::SimilarityResult>> SimilarityCache::Lookup
     }
   }
 
-  // Cache hit
-  stats_.cache_hits++;
-
   // Decompress result and copy query_cost_ms before releasing lock
   const auto& entry = iter->second.first;
   auto entry_created_at = entry.created_at;
-  std::vector<similarity::SimilarityResult> result;
-  try {
-    result = ResultCompressor::DecompressSimilarityResults(entry.compressed_data, entry.original_size);
-  } catch (const std::exception& e) {
+  auto decompress_result = ResultCompressor::DecompressSimilarityResults(entry.compressed_data, entry.original_size);
+  if (!decompress_result.has_value()) {
     // Decompression failed, treat as miss
     stats_.cache_misses++;
+    stats_.cache_misses_not_found++;
     stats_.decompression_failures++;
 
     // Release shared lock, acquire unique lock to erase corrupted entry
@@ -134,6 +131,10 @@ std::optional<std::vector<similarity::SimilarityResult>> SimilarityCache::Lookup
 
     return std::nullopt;
   }
+  auto result = std::move(*decompress_result);
+
+  // Cache hit (counted after successful decompression)
+  stats_.cache_hits++;
 
   // Copy query_cost_ms before releasing lock to avoid use-after-free
   const double query_cost_ms = entry.query_cost_ms;
@@ -163,17 +164,16 @@ std::optional<std::vector<similarity::SimilarityResult>> SimilarityCache::Lookup
 bool SimilarityCache::Insert(const CacheKey& key, const std::vector<similarity::SimilarityResult>& results,
                              double query_cost_ms) {
   // Check if query cost meets threshold
-  if (query_cost_ms < min_query_cost_ms_) {
+  if (query_cost_ms < min_query_cost_ms_.load(std::memory_order_relaxed)) {
     return false;
   }
 
   // Compress result
-  std::vector<uint8_t> compressed;
-  try {
-    compressed = ResultCompressor::CompressSimilarityResults(results);
-  } catch (const std::exception& e) {
+  auto compress_result = ResultCompressor::CompressSimilarityResults(results);
+  if (!compress_result.has_value()) {
     return false;
   }
+  auto compressed = std::move(*compress_result);
 
   // Calculate original size in bytes (for decompression)
   // Must use serialized size, not sizeof(SimilarityResult) which includes std::string overhead
@@ -310,6 +310,45 @@ void SimilarityCache::ClearIf(std::function<bool(const CacheKey&)> predicate) {
   }
 
   stats_.current_memory_bytes = total_memory_bytes_;
+}
+
+size_t SimilarityCache::PurgeExpired() {
+  const int ttl = ttl_seconds_.load(std::memory_order_relaxed);
+  if (ttl <= 0) {
+    return 0;  // No TTL configured
+  }
+
+  std::unique_lock lock(mutex_);
+
+  auto now = std::chrono::steady_clock::now();
+  size_t purged = 0;
+
+  for (auto it = cache_map_.begin(); it != cache_map_.end();) {
+    auto age_seconds = std::chrono::duration_cast<std::chrono::seconds>(now - it->second.first.created_at).count();
+    if (age_seconds >= ttl || it->second.first.invalidated.load()) {
+      // Calculate entry memory before removal
+      const size_t entry_memory = sizeof(CachedEntry) + it->second.first.compressed_data.capacity() + sizeof(CacheKey);
+
+      // Remove from LRU list
+      lru_list_.erase(it->second.second);
+
+      // Update memory tracking
+      total_memory_bytes_ -= entry_memory;
+      stats_.current_entries--;
+
+      it = cache_map_.erase(it);
+      ++purged;
+    } else {
+      ++it;
+    }
+  }
+
+  if (purged > 0) {
+    stats_.current_memory_bytes = total_memory_bytes_;
+    stats_.ttl_expirations += purged;
+  }
+
+  return purged;
 }
 
 bool SimilarityCache::EvictForSpace(size_t required_bytes) {

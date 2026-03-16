@@ -6,12 +6,17 @@
  * - Dot Product (inner product)
  * - Cosine Similarity (normalized dot product)
  * - L2 Distance (Euclidean distance)
+ *
+ * All functions automatically use the best available SIMD implementation
+ * (AVX2, NEON, or scalar fallback) via runtime CPU detection.
  */
 
 #pragma once
 
 #include <cmath>
 #include <vector>
+
+#include "vectors/distance_simd.h"
 
 namespace nvecd::vectors {
 
@@ -20,6 +25,7 @@ namespace nvecd::vectors {
  *
  * Dot product: sum(lhs[i] * rhs[i])
  * Higher values indicate greater similarity.
+ * Uses SIMD-optimized implementation when available.
  *
  * @param lhs First vector (left-hand side)
  * @param rhs Second vector (right-hand side)
@@ -30,17 +36,14 @@ inline float DotProduct(const std::vector<float>& lhs, const std::vector<float>&
     return 0.0F;
   }
 
-  float sum = 0.0F;
-  for (size_t i = 0; i < lhs.size(); ++i) {
-    sum += lhs[i] * rhs[i];
-  }
-  return sum;
+  return simd::GetOptimalImpl().dot_product(lhs.data(), rhs.data(), lhs.size());
 }
 
 /**
  * @brief Calculate L2 norm (magnitude) of a vector
  *
  * L2 norm: sqrt(sum(vec[i]^2))
+ * Uses SIMD-optimized implementation when available.
  *
  * @param vec Vector
  * @return L2 norm value
@@ -50,11 +53,7 @@ inline float L2Norm(const std::vector<float>& vec) {
     return 0.0F;
   }
 
-  float sum_sq = 0.0F;
-  for (float val : vec) {
-    sum_sq += val * val;
-  }
-  return std::sqrt(sum_sq);
+  return simd::GetOptimalImpl().l2_norm(vec.data(), vec.size());
 }
 
 /**
@@ -62,6 +61,7 @@ inline float L2Norm(const std::vector<float>& vec) {
  *
  * Cosine similarity: dot(lhs, rhs) / (||lhs|| * ||rhs||)
  * Returns value in [-1, 1], where 1 means identical direction.
+ * Uses SIMD-optimized implementation when available.
  *
  * @param lhs First vector (left-hand side)
  * @param rhs Second vector (right-hand side)
@@ -72,12 +72,14 @@ inline float CosineSimilarity(const std::vector<float>& lhs, const std::vector<f
     return 0.0F;
   }
 
-  float dot = DotProduct(lhs, rhs);
-  float norm_lhs = L2Norm(lhs);
-  float norm_rhs = L2Norm(rhs);
+  const auto& impl = simd::GetOptimalImpl();
+  float dot = impl.dot_product(lhs.data(), rhs.data(), lhs.size());
+  float norm_lhs = impl.l2_norm(lhs.data(), lhs.size());
+  float norm_rhs = impl.l2_norm(rhs.data(), rhs.size());
 
-  if (norm_lhs == 0.0F || norm_rhs == 0.0F) {
-    return 0.0F;  // Undefined for zero vectors
+  constexpr float kNormEpsilon = 1e-7F;
+  if (norm_lhs < kNormEpsilon || norm_rhs < kNormEpsilon) {
+    return 0.0F;  // Undefined for zero/near-zero vectors
   }
 
   return dot / (norm_lhs * norm_rhs);
@@ -88,6 +90,7 @@ inline float CosineSimilarity(const std::vector<float>& lhs, const std::vector<f
  *
  * L2 distance: sqrt(sum((lhs[i] - rhs[i])^2))
  * Lower values indicate greater similarity.
+ * Uses SIMD-optimized implementation when available.
  *
  * @param lhs First vector (left-hand side)
  * @param rhs Second vector (right-hand side)
@@ -98,12 +101,7 @@ inline float L2Distance(const std::vector<float>& lhs, const std::vector<float>&
     return 0.0F;
   }
 
-  float sum_sq = 0.0F;
-  for (size_t i = 0; i < lhs.size(); ++i) {
-    float diff = lhs[i] - rhs[i];
-    sum_sq += diff * diff;
-  }
-  return std::sqrt(sum_sq);
+  return simd::GetOptimalImpl().l2_distance(lhs.data(), rhs.data(), lhs.size());
 }
 
 /**
@@ -116,8 +114,9 @@ inline float L2Distance(const std::vector<float>& lhs, const std::vector<float>&
  */
 inline bool Normalize(std::vector<float>& vec) {
   float norm = L2Norm(vec);
-  if (norm == 0.0F) {
-    return false;  // Cannot normalize zero vector
+  constexpr float kNormEpsilon = 1e-7F;
+  if (norm < kNormEpsilon) {
+    return false;  // Cannot normalize zero/near-zero vector
   }
 
   for (float& val : vec) {

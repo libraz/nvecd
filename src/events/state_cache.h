@@ -9,6 +9,7 @@
 #pragma once
 
 #include <atomic>
+#include <list>
 #include <optional>
 #include <shared_mutex>
 #include <string>
@@ -143,18 +144,29 @@ class StateCache {
 
   size_t max_size_;  ///< Maximum cache size
 
-  mutable std::shared_mutex mutex_;           ///< Reader-writer lock
-  std::unordered_map<StateKey, int> states_;  ///< Key -> last_score (or kDeletedScore)
+  mutable std::shared_mutex mutex_;  ///< Reader-writer lock
+
+  /// LRU list: most recently used at front
+  std::list<StateKey> lru_list_;
+
+  /// Key -> (score, LRU iterator)
+  std::unordered_map<StateKey, std::pair<int, std::list<StateKey>::iterator>> states_;
 
   // Statistics (atomic for thread-safe access)
   mutable std::atomic<uint64_t> total_hits_{0};
   mutable std::atomic<uint64_t> total_misses_{0};
 
   /**
-   * @brief Evict oldest entry if cache is full
+   * @brief Evict least recently used entry if cache is full
    * @pre mutex_ is locked for writing
    */
   void EvictIfFull();
+
+  /**
+   * @brief Move key to front of LRU list
+   * @pre mutex_ is locked for writing
+   */
+  void TouchLocked(const StateKey& key);
 };
 
 }  // namespace nvecd::events

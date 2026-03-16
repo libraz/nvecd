@@ -45,10 +45,10 @@ namespace {
 
 constexpr int kGetAllItemsLimit = 1000000;  // Large limit to get all co-occurrence items
 
-constexpr uint32_t kMaxConfigSize = 16 * 1024 * 1024;       // 16MB max for config section
-constexpr uint32_t kMaxStatsSize = 16 * 1024 * 1024;        // 16MB max for statistics section
-constexpr uint32_t kMaxStoreDataSize = 512 * 1024 * 1024;   // 512MB max for store data
-constexpr uint32_t kMaxStoreStatsSize = 16 * 1024 * 1024;   // 16MB max for store statistics
+constexpr uint32_t kMaxConfigSize = 16 * 1024 * 1024;      // 16MB max for config section
+constexpr uint32_t kMaxStatsSize = 16 * 1024 * 1024;       // 16MB max for statistics section
+constexpr uint32_t kMaxStoreDataSize = 512 * 1024 * 1024;  // 512MB max for store data
+constexpr uint32_t kMaxStoreStatsSize = 16 * 1024 * 1024;  // 16MB max for store statistics
 
 /// @brief Absolute file offset of the file_crc32 field in the V1 header.
 /// kFixedHeaderSize (8) + header_size(4) + flags(4) + snapshot_timestamp(8) + total_file_size(8) = 32
@@ -835,8 +835,8 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
       // Write the computed CRC32 at the file_crc32 position
       std::ofstream crc_output(temp_filepath, std::ios::binary | std::ios::in | std::ios::out);
       if (!crc_output) {
-        return MakeUnexpected(
-            MakeError(ErrorCode::kStorageDumpWriteError, "Failed to reopen temp file for CRC32 write: " + temp_filepath));
+        return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError,
+                                        "Failed to reopen temp file for CRC32 write: " + temp_filepath));
       }
       crc_output.seekp(static_cast<std::streamoff>(kFileCRC32Offset), std::ios::beg);
       WriteBinary(crc_output, header.file_crc32);
@@ -990,8 +990,8 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
         uint32_t store_stats_crc = 0;
         ReadBinary(input_stream, store_stats_crc);
         if (store_stats_size > kMaxStoreStatsSize) {
-          return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError,
-                                          "Store statistics size exceeds maximum: " + std::to_string(store_stats_size)));
+          return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Store statistics size exceeds maximum: " +
+                                                                                std::to_string(store_stats_size)));
         }
         std::string store_stats_data(store_stats_size, '\0');
         input_stream.read(store_stats_data.data(), store_stats_size);
@@ -1006,8 +1006,8 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
             }
             return MakeUnexpected(
                 MakeError(ErrorCode::kStorageDumpReadError, "CRC32 mismatch in store statistics for '" + store_name +
-                                                               "': expected " + std::to_string(store_stats_crc) +
-                                                               ", got " + std::to_string(actual_crc)));
+                                                                "': expected " + std::to_string(store_stats_crc) +
+                                                                ", got " + std::to_string(actual_crc)));
           }
         }
         std::istringstream store_stats_ss(store_stats_data);
@@ -1048,10 +1048,9 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
             integrity_error->message = "CRC32 mismatch in store data for '" + store_name + "': expected " +
                                        std::to_string(store_data_crc) + ", got " + std::to_string(actual_crc);
           }
-          return MakeUnexpected(
-              MakeError(ErrorCode::kStorageDumpReadError, "CRC32 mismatch in store data for '" + store_name +
-                                                             "': expected " + std::to_string(store_data_crc) + ", got " +
-                                                             std::to_string(actual_crc)));
+          return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError,
+                                          "CRC32 mismatch in store data for '" + store_name + "': expected " +
+                                              std::to_string(store_data_crc) + ", got " + std::to_string(actual_crc)));
         }
       }
 

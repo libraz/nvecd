@@ -181,8 +181,8 @@ utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
   spdlog::info("VectorStore initialized (default_dimension={})", config_.vectors.default_dimension);
 
   // Create SimilarityEngine
-  similarity_engine_ = std::make_unique<similarity::SimilarityEngine>(event_store_.get(), co_index_.get(),
-                                                                      vector_store_.get(), config_.similarity);
+  similarity_engine_ = std::make_unique<similarity::SimilarityEngine>(
+      event_store_.get(), co_index_.get(), vector_store_.get(), config_.similarity, config_.vectors);
   spdlog::info("SimilarityEngine initialized (fusion: alpha={}, beta={})", config_.similarity.fusion_alpha,
                config_.similarity.fusion_beta);
 

@@ -17,6 +17,7 @@
 
 #include <cstring>
 #include <memory>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -44,7 +45,10 @@ NvecdClient_C* nvecdclient_create(const NvecdClientConfig_C* config) {
     return nullptr;
   }
 
-  auto* client_c = new NvecdClient_C();
+  auto* client_c = new (std::nothrow) NvecdClient_C();
+  if (client_c == nullptr) {
+    return nullptr;
+  }
 
   ClientConfig cpp_config;
   cpp_config.host = (config->host != nullptr) ? config->host : "127.0.0.1";
@@ -144,6 +148,11 @@ int nvecdclient_sim(NvecdClient_C* client, const char* id, uint32_t top_k, const
 
   c_result->count = cpp_result->results.size();
   c_result->mode = strdup_safe(cpp_result->mode);
+  if (c_result->mode == nullptr) {
+    free(c_result);
+    client->last_error = "Memory allocation failed";
+    return -1;
+  }
 
   if (c_result->count > 0) {
     c_result->results = static_cast<NvecdSimResultItem_C*>(malloc(sizeof(NvecdSimResultItem_C) * c_result->count));
@@ -156,6 +165,17 @@ int nvecdclient_sim(NvecdClient_C* client, const char* id, uint32_t top_k, const
 
     for (size_t i = 0; i < c_result->count; ++i) {
       c_result->results[i].id = strdup_safe(cpp_result->results[i].id);
+      if (c_result->results[i].id == nullptr) {
+        // Cleanup previously allocated IDs
+        for (size_t j = 0; j < i; ++j) {
+          free(c_result->results[j].id);
+        }
+        free(c_result->results);
+        free(c_result->mode);
+        free(c_result);
+        client->last_error = "Memory allocation failed";
+        return -1;
+      }
       c_result->results[i].score = cpp_result->results[i].score;
     }
   } else {
@@ -189,6 +209,11 @@ int nvecdclient_simv(NvecdClient_C* client, const float* vector, size_t dimensio
 
   c_result->count = cpp_result->results.size();
   c_result->mode = strdup_safe(cpp_result->mode);
+  if (c_result->mode == nullptr) {
+    free(c_result);
+    client->last_error = "Memory allocation failed";
+    return -1;
+  }
 
   if (c_result->count > 0) {
     c_result->results = static_cast<NvecdSimResultItem_C*>(malloc(sizeof(NvecdSimResultItem_C) * c_result->count));
@@ -201,6 +226,17 @@ int nvecdclient_simv(NvecdClient_C* client, const float* vector, size_t dimensio
 
     for (size_t i = 0; i < c_result->count; ++i) {
       c_result->results[i].id = strdup_safe(cpp_result->results[i].id);
+      if (c_result->results[i].id == nullptr) {
+        // Cleanup previously allocated IDs
+        for (size_t j = 0; j < i; ++j) {
+          free(c_result->results[j].id);
+        }
+        free(c_result->results);
+        free(c_result->mode);
+        free(c_result);
+        client->last_error = "Memory allocation failed";
+        return -1;
+      }
       c_result->results[i].score = cpp_result->results[i].score;
     }
   } else {
@@ -234,6 +270,11 @@ int nvecdclient_info(NvecdClient_C* client, NvecdServerInfo_C** info) {
   }
 
   c_info->version = strdup_safe(cpp_result->version);
+  if (c_info->version == nullptr) {
+    free(c_info);
+    client->last_error = "Memory allocation failed";
+    return -1;
+  }
   c_info->uptime_seconds = cpp_result->uptime_seconds;
   c_info->total_requests = cpp_result->total_requests;
   c_info->active_connections = cpp_result->active_connections;

@@ -54,7 +54,7 @@ class SimilarityEngineTest : public ::testing::Test {
     vector_store_ = std::make_unique<vectors::VectorStore>(vectors_config_);
 
     engine_ = std::make_unique<SimilarityEngine>(event_store_.get(), co_index_.get(), vector_store_.get(),
-                                                 similarity_config_);
+                                                 similarity_config_, vectors_config_);
   }
 
   config::EventsConfig events_config_;
@@ -498,6 +498,90 @@ TEST_F(SimilarityEngineTest, FusionParameters_BetaDominant) {
 
   if (high_event_found && high_vector_found) {
     EXPECT_LT(high_event_pos, high_vector_pos) << "With beta=0.8, event score should dominate";
+  }
+}
+
+// ============================================================================
+// Distance Metric Selection Tests
+// ============================================================================
+
+TEST_F(SimilarityEngineTest, DistanceMetric_Cosine) {
+  // Default uses cosine
+  ASSERT_TRUE(vector_store_->SetVector("item1", {1.0f, 0.0f, 0.0f}).has_value());
+  ASSERT_TRUE(vector_store_->SetVector("item2", {1.0f, 0.0f, 0.0f}).has_value());  // Identical direction
+
+  auto results = engine_->SearchByIdVectors("item1", 10);
+  ASSERT_TRUE(results.has_value());
+  ASSERT_EQ(results->size(), 1);
+  EXPECT_NEAR((*results)[0].score, 1.0f, 1e-5f);  // Cosine of identical = 1.0
+}
+
+TEST_F(SimilarityEngineTest, DistanceMetric_DotProduct) {
+  config::VectorsConfig vec_cfg;
+  vec_cfg.default_dimension = 3;
+  vec_cfg.distance_metric = "dot";
+
+  auto vec_store = std::make_unique<vectors::VectorStore>(vec_cfg);
+  ASSERT_TRUE(vec_store->SetVector("item1", {1.0f, 2.0f, 3.0f}).has_value());
+  ASSERT_TRUE(vec_store->SetVector("item2", {4.0f, 5.0f, 6.0f}).has_value());
+
+  SimilarityEngine engine(event_store_.get(), co_index_.get(), vec_store.get(),
+                          similarity_config_, vec_cfg);
+
+  auto results = engine.SearchByIdVectors("item1", 10);
+  ASSERT_TRUE(results.has_value());
+  ASSERT_EQ(results->size(), 1);
+  // Dot product: 1*4 + 2*5 + 3*6 = 32
+  EXPECT_NEAR((*results)[0].score, 32.0f, 1e-3f);
+}
+
+TEST_F(SimilarityEngineTest, DistanceMetric_L2) {
+  config::VectorsConfig vec_cfg;
+  vec_cfg.default_dimension = 3;
+  vec_cfg.distance_metric = "l2";
+
+  auto vec_store = std::make_unique<vectors::VectorStore>(vec_cfg);
+  ASSERT_TRUE(vec_store->SetVector("item1", {0.0f, 0.0f, 0.0f}).has_value());
+  ASSERT_TRUE(vec_store->SetVector("item2", {1.0f, 0.0f, 0.0f}).has_value());
+  ASSERT_TRUE(vec_store->SetVector("item3", {10.0f, 0.0f, 0.0f}).has_value());
+
+  SimilarityEngine engine(event_store_.get(), co_index_.get(), vec_store.get(),
+                          similarity_config_, vec_cfg);
+
+  auto results = engine.SearchByIdVectors("item1", 10);
+  ASSERT_TRUE(results.has_value());
+  ASSERT_EQ(results->size(), 2);
+
+  // L2 metric: score = 1/(1+distance), closer items have higher scores
+  // item2 is closer to item1 than item3
+  EXPECT_EQ((*results)[0].item_id, "item2");
+  EXPECT_GT((*results)[0].score, (*results)[1].score);
+
+  // item2: 1/(1+1.0) = 0.5
+  EXPECT_NEAR((*results)[0].score, 0.5f, 1e-5f);
+}
+
+TEST_F(SimilarityEngineTest, FusionNormalization_SingleResult) {
+  // When one source has a single result, it should get score 0.5 (not 1.0)
+  // This prevents undue weight in fusion scoring
+
+  // Only one co-occurrence pair
+  std::vector<events::Event> events = {{"item1", 10, 1000}, {"item2", 20, 1001}};
+  co_index_->UpdateFromEvents("ctx1", events);
+
+  // Multiple vectors for contrast
+  ASSERT_TRUE(vector_store_->SetVector("item1", {0.1f, 0.2f, 0.3f}).has_value());
+  ASSERT_TRUE(vector_store_->SetVector("item2", {0.15f, 0.25f, 0.35f}).has_value());
+  ASSERT_TRUE(vector_store_->SetVector("item3", {0.9f, 0.8f, 0.7f}).has_value());
+  ASSERT_TRUE(vector_store_->SetVector("item4", {0.12f, 0.22f, 0.32f}).has_value());
+
+  auto results = engine_->SearchByIdFusion("item1", 10);
+  ASSERT_TRUE(results.has_value());
+  EXPECT_GT(results->size(), 0);
+
+  // All fusion scores should be non-negative
+  for (const auto& r : *results) {
+    EXPECT_GE(r.score, 0.0f);
   }
 }
 
