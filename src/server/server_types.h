@@ -9,6 +9,7 @@
 #pragma once
 
 #include <atomic>
+#include <ctime>
 #include <memory>
 #include <string>
 #include <vector>

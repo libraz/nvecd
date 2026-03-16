@@ -64,7 +64,7 @@ struct DistanceFunctions {
 inline const DistanceFunctions& GetOptimalImpl() {
   // Static initialization is thread-safe in C++11+
   static const DistanceFunctions impl = []() {
-    CpuInfo cpu = DetectCpuFeatures();
+    [[maybe_unused]] CpuInfo cpu = DetectCpuFeatures();
 
 #ifdef __AVX2__
     // AVX2 available at compile-time, check runtime support

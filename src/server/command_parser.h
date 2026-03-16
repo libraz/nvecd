@@ -12,6 +12,11 @@
 #include <vector>
 
 #include "events/event_store.h"
+// nameser.h (included via httplib.h on Linux) may define ADD as a macro
+// after event_store.h was already processed via #pragma once.
+#ifdef ADD
+#undef ADD
+#endif
 #include "server/command_types.h"
 #include "utils/error.h"
 #include "utils/expected.h"

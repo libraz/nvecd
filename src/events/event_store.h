@@ -10,6 +10,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
@@ -21,6 +22,15 @@
 #include "events/state_cache.h"
 #include "utils/error.h"
 #include "utils/expected.h"
+
+// nameser.h (included via resolv.h on Linux) defines ADD/DELETE macros
+// that conflict with our enum values. Undefine them here.
+#ifdef ADD
+#undef ADD
+#endif
+#ifdef DELETE
+#undef DELETE
+#endif
 
 namespace nvecd::events {
 

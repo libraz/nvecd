@@ -68,7 +68,7 @@ TEST_F(DistanceSIMDTest, DotProductCorrectness) {
     float scalar_result = DotProductScalar(vec_a.data(), vec_b.data(), dim);
 
     // Use relative tolerance for large values, absolute for small values
-    float tolerance = std::max(1e-3f, std::abs(scalar_result) * 1e-4f);
+    [[maybe_unused]] float tolerance = std::max(1e-3f, std::abs(scalar_result) * 1e-4f);
 
 #ifdef __AVX2__
     // Test AVX2 implementation
@@ -94,7 +94,7 @@ TEST_F(DistanceSIMDTest, L2NormCorrectness) {
     float scalar_result = L2NormScalar(vec.data(), dim);
 
     // Use relative tolerance
-    float tolerance = std::max(1e-3f, std::abs(scalar_result) * 1e-4f);
+    [[maybe_unused]] float tolerance = std::max(1e-3f, std::abs(scalar_result) * 1e-4f);
 
 #ifdef __AVX2__
     // Test AVX2 implementation
@@ -122,7 +122,7 @@ TEST_F(DistanceSIMDTest, L2DistanceCorrectness) {
     float scalar_result = L2DistanceScalar(vec_a.data(), vec_b.data(), dim);
 
     // Use relative tolerance
-    float tolerance = std::max(1e-3f, std::abs(scalar_result) * 1e-4f);
+    [[maybe_unused]] float tolerance = std::max(1e-3f, std::abs(scalar_result) * 1e-4f);
 
 #ifdef __AVX2__
     // Test AVX2 implementation
@@ -207,7 +207,7 @@ TEST_F(DistanceSIMDTest, NonMultipleOfVectorSize) {
 
     // DotProduct with itself
     float scalar = DotProductScalar(vec.data(), vec.data(), dim);
-    float tolerance = std::max(1e-3f, std::abs(scalar) * 1e-4f);
+    [[maybe_unused]] float tolerance = std::max(1e-3f, std::abs(scalar) * 1e-4f);
 
 #ifdef __AVX2__
     float avx2 = DotProductAVX2(vec.data(), vec.data(), dim);

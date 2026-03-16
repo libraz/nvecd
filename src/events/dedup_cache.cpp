@@ -5,6 +5,8 @@
 
 #include "events/dedup_cache.h"
 
+#include <mutex>
+
 namespace nvecd::events {
 
 DedupCache::DedupCache(size_t max_size, uint32_t window_sec) : max_size_(max_size), window_sec_(window_sec) {}
@@ -73,12 +75,12 @@ size_t DedupCache::Size() const {
 
 DedupCache::Statistics DedupCache::GetStatistics() const {
   std::shared_lock lock(mutex_);
-  return Statistics{
-      .size = cache_.size(),
-      .max_size = max_size_,
-      .total_hits = total_hits_.load(std::memory_order_relaxed),
-      .total_misses = total_misses_.load(std::memory_order_relaxed),
-  };
+  Statistics stats;
+  stats.size = cache_.size();
+  stats.max_size = max_size_;
+  stats.total_hits = total_hits_.load(std::memory_order_relaxed);
+  stats.total_misses = total_misses_.load(std::memory_order_relaxed);
+  return stats;
 }
 
 void DedupCache::EvictLRU() {
