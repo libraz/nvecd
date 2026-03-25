@@ -193,6 +193,12 @@
           "minimum": 1,
           "maximum": 100
         },
+        "mode": {
+          "type": "string",
+          "description": "Snapshot consistency mode: fork (COW, non-blocking) or lock (global write lock, blocking)",
+          "default": "fork",
+          "enum": ["fork", "lock"]
+        },
         "compression": {
           "type": "string",
           "description": "Snapshot compression method",
@@ -257,6 +263,12 @@
           "default": 3,
           "minimum": 1,
           "maximum": 100
+        },
+        "mode": {
+          "type": "string",
+          "description": "Snapshot consistency mode: fork (COW, non-blocking) or lock (global write lock, blocking)",
+          "default": "fork",
+          "enum": ["fork", "lock"]
         },
         "compression": {
           "type": "string",

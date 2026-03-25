@@ -63,4 +63,14 @@ utils::Expected<std::string, utils::Error> HandleDumpVerify(const std::string& d
  */
 utils::Expected<std::string, utils::Error> HandleDumpInfo(const std::string& dump_dir, const std::string& filepath);
 
+/**
+ * @brief Handle DUMP STATUS command
+ *
+ * Returns the status of the background fork snapshot operation.
+ *
+ * @param ctx Handler context (must have fork_snapshot_writer)
+ * @return Formatted status response, or error
+ */
+utils::Expected<std::string, utils::Error> HandleDumpStatus(HandlerContext& ctx);
+
 }  // namespace nvecd::server::handlers

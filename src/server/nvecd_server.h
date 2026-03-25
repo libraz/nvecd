@@ -19,6 +19,7 @@
 #include "server/connection_acceptor.h"
 #include "server/http_server.h"
 #include "server/rate_limiter.h"
+#include "storage/snapshot_fork.h"
 #include "server/request_dispatcher.h"
 #include "server/server_types.h"
 #include "server/thread_pool.h"
@@ -182,6 +183,7 @@ class NvecdServer {
   std::unique_ptr<ConnectionAcceptor> unix_acceptor_;  ///< Unix domain socket acceptor (optional)
   std::unique_ptr<HttpServer> http_server_;            // HTTP API server (optional)
   std::unique_ptr<RateLimiter> rate_limiter_;          // Per-client rate limiter (optional)
+  std::unique_ptr<storage::ForkSnapshotWriter> fork_writer_;  ///< Fork-based snapshot writer
 };
 
 }  // namespace nvecd::server

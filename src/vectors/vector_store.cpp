@@ -338,4 +338,8 @@ void VectorStore::DefragmentLocked() {
   tombstone_count_ = 0;
 }
 
+std::unique_lock<std::shared_mutex> VectorStore::AcquireWriteLock() {
+  return std::unique_lock<std::shared_mutex>(mutex_);
+}
+
 }  // namespace nvecd::vectors

@@ -327,6 +327,7 @@ TEST(RuntimeVariableManagerTest, IsMutable_ImmutableVariables) {
   EXPECT_FALSE(RuntimeVariableManager::IsMutable("vectors.default_dimension"));
   EXPECT_FALSE(RuntimeVariableManager::IsMutable("cache.max_memory_bytes"));
   EXPECT_FALSE(RuntimeVariableManager::IsMutable("snapshot.dir"));
+  EXPECT_FALSE(RuntimeVariableManager::IsMutable("snapshot.mode"));
   EXPECT_FALSE(RuntimeVariableManager::IsMutable("perf.thread_pool_size"));
 }
 

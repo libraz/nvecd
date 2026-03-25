@@ -39,6 +39,7 @@ TEST(ConfigTest, LoadValidConfig) {
   EXPECT_EQ(config.snapshot.default_filename, "test.snapshot");
   EXPECT_EQ(config.snapshot.interval_sec, 600);
   EXPECT_EQ(config.snapshot.retain, 5);
+  EXPECT_EQ(config.snapshot.mode, "fork");
 
   // Performance config
   EXPECT_EQ(config.perf.thread_pool_size, 4);
@@ -220,4 +221,32 @@ TEST(ConfigTest, DefaultValues) {
   EXPECT_EQ(config.perf.thread_pool_size, defaults::kThreadPoolSize);
   EXPECT_EQ(config.perf.max_connections, defaults::kMaxConnections);
   EXPECT_EQ(config.perf.connection_timeout_sec, defaults::kConnectionTimeoutSec);
+}
+
+/**
+ * @brief Test snapshot mode validation
+ */
+TEST(ConfigTest, ValidateSnapshotMode) {
+  Config config;  // Defaults are valid
+
+  // Valid modes
+  config.snapshot.mode = "fork";
+  EXPECT_TRUE(ValidateConfig(config));
+
+  config.snapshot.mode = "lock";
+  EXPECT_TRUE(ValidateConfig(config));
+
+  // Invalid mode
+  config.snapshot.mode = "invalid";
+  auto result = ValidateConfig(config);
+  EXPECT_FALSE(result);
+  EXPECT_EQ(result.error().code(), nvecd::utils::ErrorCode::kConfigInvalidValue);
+}
+
+/**
+ * @brief Test snapshot mode default value
+ */
+TEST(ConfigTest, SnapshotModeDefault) {
+  Config config;
+  EXPECT_EQ(config.snapshot.mode, "fork");
 }

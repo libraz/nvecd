@@ -43,6 +43,7 @@ enum class CommandType : std::uint8_t {
   kDumpLoad,
   kDumpVerify,
   kDumpInfo,
+  kDumpStatus,
   kDebugOn,
   kDebugOff,
   kCacheStats,
@@ -91,6 +92,8 @@ inline const char* CommandTypeToString(CommandType type) {
       return "DUMP_VERIFY";
     case CommandType::kDumpInfo:
       return "DUMP_INFO";
+    case CommandType::kDumpStatus:
+      return "DUMP_STATUS";
     case CommandType::kDebugOn:
       return "DEBUG_ON";
     case CommandType::kDebugOff:
@@ -142,6 +145,7 @@ inline CommandPrivilege GetCommandPrivilege(CommandType type) {
     case CommandType::kDumpLoad:
     case CommandType::kDumpVerify:
     case CommandType::kDumpInfo:
+    case CommandType::kDumpStatus:
     case CommandType::kConfigVerify:
       return CommandPrivilege::kAdmin;
     default:

@@ -168,13 +168,17 @@ target_link_libraries(nvecd_config PUBLIC nvecd_cache)
 # Storage library
 add_library(nvecd_storage STATIC
   storage/snapshot_format_v1.cpp
+  storage/snapshot_fork.cpp
+  storage/snapshot_lock.cpp
 )
 target_link_libraries(nvecd_storage PUBLIC
+  nvecd_config
   nvecd_events
   nvecd_vectors
   nvecd_utils
   ZLIB::ZLIB
   Threads::Threads
+  spdlog
 )
 
 # Client library (C++ API)

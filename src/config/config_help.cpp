@@ -92,6 +92,7 @@ nlohmann::json ConfigToJson(const Config& config) {
       {"default_filename", config.snapshot.default_filename},
       {"interval_sec", config.snapshot.interval_sec},
       {"retain", config.snapshot.retain},
+      {"mode", config.snapshot.mode},
   };
 
   // Performance configuration

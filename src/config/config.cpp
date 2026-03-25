@@ -188,6 +188,9 @@ SnapshotConfig ParseSnapshotConfig(const YAML::Node& node) {
   if (node["retain"]) {
     config.retain = node["retain"].as<int>();
   }
+  if (node["mode"]) {
+    config.mode = node["mode"].as<std::string>();
+  }
 
   return config;
 }
@@ -506,6 +509,10 @@ utils::Expected<void, utils::Error> ValidateConfig(const Config& config) {
   if (config.snapshot.retain < 0) {
     return utils::MakeUnexpected(
         utils::MakeError(utils::ErrorCode::kConfigInvalidValue, "snapshot.retain must be >= 0"));
+  }
+  if (config.snapshot.mode != "fork" && config.snapshot.mode != "lock") {
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
+        "snapshot.mode must be 'fork' or 'lock' (got: " + config.snapshot.mode + ")"));
   }
 
   // Validate performance configuration

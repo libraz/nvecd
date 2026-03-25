@@ -202,6 +202,12 @@ class VectorStore {
   std::shared_lock<std::shared_mutex> AcquireReadLock() const;
 
   /**
+   * @brief Acquire write lock for snapshot consistency
+   * @return Unique lock guard
+   */
+  std::unique_lock<std::shared_mutex> AcquireWriteLock();
+
+  /**
    * @brief Snapshot of compact storage for lock-free read access
    *
    * The caller should hold a read lock while using this snapshot.

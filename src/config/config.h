@@ -91,6 +91,7 @@ struct SnapshotConfig {
   std::string default_filename = defaults::kSnapshotDefaultFilename;  ///< Default snapshot filename
   int interval_sec = defaults::kSnapshotIntervalSec;                  ///< Auto-snapshot interval (0 = disabled)
   int retain = 3;                                                     ///< Number of snapshots to retain
+  std::string mode = "fork";  ///< Snapshot mode: "fork" (COW) or "lock" (global write lock)
 };
 
 /**

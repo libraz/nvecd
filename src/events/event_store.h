@@ -165,6 +165,18 @@ class EventStore {
    */
   size_t MemoryUsage() const;
 
+  /**
+   * @brief Acquire read lock for snapshot consistency
+   * @return Shared lock guard
+   */
+  std::shared_lock<std::shared_mutex> AcquireReadLock() const;
+
+  /**
+   * @brief Acquire write lock for snapshot consistency
+   * @return Unique lock guard
+   */
+  std::unique_lock<std::shared_mutex> AcquireWriteLock();
+
  private:
   config::EventsConfig config_;  ///< Configuration
 

@@ -155,6 +155,11 @@ void NvecdServer::Stop() {
   running_.store(false);
   shutdown_.store(true);
 
+  // Wait for any in-progress fork snapshot
+  if (fork_writer_) {
+    fork_writer_->WaitForChild();
+  }
+
   // Stop HTTP server
   if (http_server_) {
     http_server_->Stop();
@@ -274,6 +279,11 @@ utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
   } else {
     spdlog::info("Snapshot directory: {}", config_.snapshot.dir);
   }
+
+  // Create ForkSnapshotWriter (always create, even in lock mode, for DUMP STATUS)
+  fork_writer_ = std::make_unique<storage::ForkSnapshotWriter>();
+  handler_ctx_.fork_snapshot_writer = fork_writer_.get();
+  spdlog::info("ForkSnapshotWriter initialized (mode: {})", config_.snapshot.mode);
 
   // Create RequestDispatcher
   dispatcher_ = std::make_unique<RequestDispatcher>(handler_ctx_);

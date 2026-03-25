@@ -371,6 +371,36 @@ target_link_libraries(snapshot_format_v1_test
 )
 gtest_discover_tests(snapshot_format_v1_test)
 
+add_executable(snapshot_lock_test
+  storage/snapshot_lock_test.cpp
+)
+target_link_libraries(snapshot_lock_test
+  nvecd_storage
+  nvecd_events
+  nvecd_vectors
+  nvecd_config
+  nvecd_utils
+  gtest
+  gtest_main
+)
+gtest_discover_tests(snapshot_lock_test)
+
+add_executable(snapshot_fork_test
+  storage/snapshot_fork_test.cpp
+)
+target_link_libraries(snapshot_fork_test
+  nvecd_storage
+  nvecd_events
+  nvecd_vectors
+  nvecd_config
+  nvecd_utils
+  gtest
+  gtest_main
+)
+gtest_discover_tests(snapshot_fork_test
+  PROPERTIES TIMEOUT 30
+)
+
 # Unix socket tests
 add_executable(connection_acceptor_unix_test
   server/connection_acceptor_unix_test.cpp

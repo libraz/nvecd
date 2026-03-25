@@ -15,7 +15,9 @@
 #include "config/config.h"
 #include "events/co_occurrence_index.h"
 #include "events/event_store.h"
+#include "storage/snapshot_fork.h"
 #include "storage/snapshot_format_v1.h"
+#include "storage/snapshot_lock.h"
 #include "utils/flag_guard.h"
 #include "utils/path_utils.h"
 #include "utils/structured_log.h"
@@ -62,21 +64,44 @@ utils::Expected<std::string, utils::Error> HandleDumpSave(HandlerContext& ctx, c
     return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kInternalError, error_msg));
   }
 
-  // Set read-only mode (RAII guard ensures it's cleared)
-  utils::FlagGuard read_only_guard(ctx.read_only);
+  // Branch on snapshot mode
+  if (ctx.config->snapshot.mode == "fork") {
+    // Fork mode: non-blocking background save
+    if (ctx.fork_snapshot_writer == nullptr) {
+      return utils::MakeUnexpected(
+          utils::MakeError(utils::ErrorCode::kInternalError, "Fork snapshot writer not initialized"));
+    }
 
-  // Call snapshot_v1 API
-  auto result = storage::snapshot_v1::WriteSnapshotV1(resolved_path, *ctx.config, *ctx.event_store, *ctx.co_index,
-                                                      *ctx.vector_store);
+    // Reap any finished child first
+    ctx.fork_snapshot_writer->CheckChild();
 
-  if (result) {
-    utils::LogStorageInfo("dump_save", "Successfully saved snapshot to: " + resolved_path);
-    return std::string("OK DUMP_SAVED " + resolved_path + "\r\n");
+    auto result = ctx.fork_snapshot_writer->StartBackgroundSave(
+        resolved_path, *ctx.config, *ctx.event_store, *ctx.co_index, *ctx.vector_store);
+
+    if (!result) {
+      utils::LogStorageError("dump_save", resolved_path, result.error().message());
+      return utils::MakeUnexpected(result.error());
+    }
+
+    utils::LogStorageInfo("dump_save", "Background snapshot started: " + resolved_path);
+    return std::string("OK DUMP_SAVE_STARTED " + resolved_path + "\r\n");
+
+  } else {
+    // Lock mode: synchronous blocking save
+    utils::FlagGuard read_only_guard(ctx.read_only);
+
+    auto result = storage::WriteSnapshotWithLock(
+        resolved_path, *ctx.config, *ctx.event_store, *ctx.co_index, *ctx.vector_store);
+
+    if (result) {
+      utils::LogStorageInfo("dump_save", "Successfully saved snapshot to: " + resolved_path);
+      return std::string("OK DUMP_SAVED " + resolved_path + "\r\n");
+    }
+
+    std::string error_msg = "Failed to save snapshot to " + resolved_path + ": " + result.error().message();
+    utils::LogStorageError("dump_save", resolved_path, result.error().message());
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kSnapshotSaveFailed, error_msg));
   }
-
-  std::string error_msg = "Failed to save snapshot to " + resolved_path + ": " + result.error().message();
-  utils::LogStorageError("dump_save", resolved_path, result.error().message());
-  return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kSnapshotSaveFailed, error_msg));
 }
 
 utils::Expected<std::string, utils::Error> HandleDumpLoad(HandlerContext& ctx, const std::string& filepath) {
@@ -185,6 +210,49 @@ utils::Expected<std::string, utils::Error> HandleDumpInfo(const std::string& dum
   result << "has_statistics: " << (info.has_statistics ? "true" : "false") << "\r\n";
   result << "END\r\n";
 
+  return result.str();
+}
+
+utils::Expected<std::string, utils::Error> HandleDumpStatus(HandlerContext& ctx) {
+  if (ctx.fork_snapshot_writer == nullptr) {
+    // No fork writer — return idle status
+    return std::string("OK DUMP_STATUS\r\nstatus: idle\r\nEND\r\n");
+  }
+
+  // Reap any finished child
+  ctx.fork_snapshot_writer->CheckChild();
+
+  auto status = ctx.fork_snapshot_writer->GetStatus();
+
+  std::ostringstream result;
+  result << "OK DUMP_STATUS\r\n";
+
+  switch (status.status) {
+    case storage::SnapshotStatus::kIdle:
+      result << "status: idle\r\n";
+      break;
+    case storage::SnapshotStatus::kInProgress:
+      result << "status: in_progress\r\n";
+      result << "filepath: " << status.filepath << "\r\n";
+      result << "pid: " << status.child_pid << "\r\n";
+      result << "start_time: " << status.start_time << "\r\n";
+      break;
+    case storage::SnapshotStatus::kCompleted:
+      result << "status: completed\r\n";
+      result << "filepath: " << status.filepath << "\r\n";
+      result << "start_time: " << status.start_time << "\r\n";
+      result << "end_time: " << status.end_time << "\r\n";
+      break;
+    case storage::SnapshotStatus::kFailed:
+      result << "status: failed\r\n";
+      result << "filepath: " << status.filepath << "\r\n";
+      result << "start_time: " << status.start_time << "\r\n";
+      result << "end_time: " << status.end_time << "\r\n";
+      result << "error: " << status.error_message << "\r\n";
+      break;
+  }
+
+  result << "END\r\n";
   return result.str();
 }
 

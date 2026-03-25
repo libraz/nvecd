@@ -78,6 +78,7 @@ static const std::map<std::string, bool> kVariableMutability = {
     {"snapshot.default_filename", false},
     {"snapshot.interval_sec", false},
     {"snapshot.retain", false},
+    {"snapshot.mode", false},
 
     // Performance (all immutable)
     {"perf.thread_pool_size", false},
@@ -391,6 +392,9 @@ std::string RuntimeVariableManager::GetVariableInternal(const std::string& varia
   }
   if (variable_name == "snapshot.retain") {
     return std::to_string(base_config_.snapshot.retain);
+  }
+  if (variable_name == "snapshot.mode") {
+    return base_config_.snapshot.mode;
   }
 
   // Performance

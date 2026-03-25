@@ -39,6 +39,10 @@ class SimilarityCache;
 namespace config {
 class RuntimeVariableManager;
 }  // namespace config
+
+namespace storage {
+class ForkSnapshotWriter;
+}  // namespace storage
 }  // namespace nvecd
 
 namespace nvecd::server {
@@ -170,6 +174,9 @@ struct HandlerContext {
 
   // Security
   std::string requirepass;  ///< Required password (empty = no auth)
+
+  // Snapshot fork writer (non-owning, owned by NvecdServer)
+  storage::ForkSnapshotWriter* fork_snapshot_writer = nullptr;
 
   // NOLINTEND(cppcoreguidelines-avoid-const-or-ref-data-members)
 };

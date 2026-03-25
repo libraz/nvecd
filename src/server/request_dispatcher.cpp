@@ -119,6 +119,11 @@ std::string RequestDispatcher::Dispatch(const std::string& request, ConnectionCo
       result = HandleDumpInfo(*cmd);
       break;
 
+    case CommandType::kDumpStatus:
+      ctx_.stats.dump_commands++;
+      result = HandleDumpStatus();
+      break;
+
     case CommandType::kDebugOn:
       result = HandleDebugOn(conn_ctx);
       break;
@@ -407,6 +412,10 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleDumpVerify(c
 
 utils::Expected<std::string, utils::Error> RequestDispatcher::HandleDumpInfo(const Command& cmd) const {
   return handlers::HandleDumpInfo(ctx_.dump_dir, cmd.path);
+}
+
+utils::Expected<std::string, utils::Error> RequestDispatcher::HandleDumpStatus() {
+  return handlers::HandleDumpStatus(ctx_);
 }
 
 utils::Expected<std::string, utils::Error> RequestDispatcher::HandleDebugOn(ConnectionContext& conn_ctx) {

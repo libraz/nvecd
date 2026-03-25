@@ -20,6 +20,7 @@ snapshot:
   default_filename: "test.snapshot"
   interval_sec: 600
   retain: 5
+  mode: "fork"
 
 performance:
   thread_pool_size: 4

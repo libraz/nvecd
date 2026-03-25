@@ -107,6 +107,9 @@ enum class ErrorCode : std::uint16_t {
   kSnapshotLoadFailed = 5014,          ///< Failed to load snapshot
   kSnapshotVerifyFailed = 5015,        ///< Snapshot verification failed
   kSnapshotInfoFailed = 5016,          ///< Failed to read snapshot info
+  kSnapshotForkFailed = 5020,          ///< fork() system call failed
+  kSnapshotAlreadyInProgress = 5021,   ///< Background snapshot already running
+  kSnapshotChildFailed = 5022,         ///< Fork child process exited with error
 
   // ===== Network/Server Errors (6000-6999) =====
   kNetworkBindFailed = 6000,             ///< Failed to bind to port
@@ -290,6 +293,12 @@ inline const char* ErrorCodeToString(ErrorCode code) {
       return "Snapshot verify failed";
     case ErrorCode::kSnapshotInfoFailed:
       return "Snapshot info failed";
+    case ErrorCode::kSnapshotForkFailed:
+      return "Snapshot fork failed";
+    case ErrorCode::kSnapshotAlreadyInProgress:
+      return "Snapshot already in progress";
+    case ErrorCode::kSnapshotChildFailed:
+      return "Snapshot child process failed";
 
     // Network
     case ErrorCode::kNetworkBindFailed:

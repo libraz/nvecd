@@ -304,7 +304,7 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request) 
     // DUMP SAVE|LOAD|VERIFY|INFO [filepath]
     if (tokens.size() < 2) {
       return utils::MakeUnexpected(
-          utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "DUMP requires subcommand: SAVE|LOAD|VERIFY|INFO"));
+          utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "DUMP requires subcommand: SAVE|LOAD|VERIFY|INFO|STATUS"));
     }
     std::string subcmd = ToUpper(tokens[1]);
     if (subcmd == "SAVE") {
@@ -315,6 +315,8 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request) 
       cmd.type = CommandType::kDumpVerify;
     } else if (subcmd == "INFO") {
       cmd.type = CommandType::kDumpInfo;
+    } else if (subcmd == "STATUS") {
+      cmd.type = CommandType::kDumpStatus;
     } else {
       return utils::MakeUnexpected(
           utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "Unknown DUMP subcommand: " + subcmd));

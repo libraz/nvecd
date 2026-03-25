@@ -200,4 +200,12 @@ size_t EventStore::MemoryUsage() const {
   return total;
 }
 
+std::shared_lock<std::shared_mutex> EventStore::AcquireReadLock() const {
+  return std::shared_lock<std::shared_mutex>(mutex_);
+}
+
+std::unique_lock<std::shared_mutex> EventStore::AcquireWriteLock() {
+  return std::unique_lock<std::shared_mutex>(mutex_);
+}
+
 }  // namespace nvecd::events

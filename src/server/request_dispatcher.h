@@ -74,6 +74,7 @@ class RequestDispatcher {
   utils::Expected<std::string, utils::Error> HandleDumpLoad(const Command& cmd);
   utils::Expected<std::string, utils::Error> HandleDumpVerify(const Command& cmd) const;
   utils::Expected<std::string, utils::Error> HandleDumpInfo(const Command& cmd) const;
+  utils::Expected<std::string, utils::Error> HandleDumpStatus();
   static utils::Expected<std::string, utils::Error> HandleDebugOn(ConnectionContext& conn_ctx);
   static utils::Expected<std::string, utils::Error> HandleDebugOff(ConnectionContext& conn_ctx);
 

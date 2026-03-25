@@ -187,4 +187,12 @@ size_t CoOccurrenceIndex::MemoryUsage() const {
   return total;
 }
 
+std::shared_lock<std::shared_mutex> CoOccurrenceIndex::AcquireReadLock() const {
+  return std::shared_lock<std::shared_mutex>(mutex_);
+}
+
+std::unique_lock<std::shared_mutex> CoOccurrenceIndex::AcquireWriteLock() {
+  return std::unique_lock<std::shared_mutex>(mutex_);
+}
+
 }  // namespace nvecd::events
