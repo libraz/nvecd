@@ -370,9 +370,32 @@ GET /health/detail HTTP/1.1
 
 Same format as `/info` endpoint.
 
+### GET /metrics
+
+Get server metrics in JSON format.
+
+**Request:**
+
+```http
+GET /metrics HTTP/1.1
+```
+
+**Response (200 OK):**
+
+```json
+{
+  "uptime_seconds": 3600,
+  "total_commands": 15000,
+  "connections": {"active": 5, "total": 1200},
+  "memory": {...}
+}
+```
+
 ### GET /config
 
 Current server configuration summary (sensitive values omitted).
+
+**CORS**: When `api.http.enable_cors` is `true`, the server adds `Access-Control-Allow-Origin` headers and handles OPTIONS preflight requests.
 
 **Request:**
 
@@ -522,6 +545,96 @@ Content-Type: application/json
   "event_count": 1000000,
   "size_bytes": 314572800
 }
+```
+
+### GET /dump/status
+
+Get the status of background snapshot operations.
+
+**Request:**
+
+```http
+GET /dump/status HTTP/1.1
+```
+
+**Response (200 OK):**
+
+```json
+{"status": "ok", "data": "IDLE"}
+```
+
+### GET /cache/stats
+
+Get cache statistics (hit rate, entries, memory usage).
+
+**Request:**
+
+```http
+GET /cache/stats HTTP/1.1
+```
+
+**Response (200 OK):**
+
+```json
+{
+  "enabled": true,
+  "total_queries": 10000,
+  "cache_hits": 8500,
+  "cache_misses": 1500,
+  "hit_rate": 0.85,
+  "current_entries": 2450,
+  "current_memory_mb": 12.45,
+  "evictions": 320
+}
+```
+
+### POST /cache/clear
+
+Clear the similarity cache.
+
+**Request:**
+
+```http
+POST /cache/clear HTTP/1.1
+Content-Type: application/json
+
+{
+  "scope": "all"
+}
+```
+
+**Response (200 OK):**
+
+```json
+{
+  "status": "ok",
+  "scope": "all",
+  "entries_removed": 2450
+}
+```
+
+### POST /cache/enable
+
+Enable the similarity cache.
+
+**Request:** No body required.
+
+**Response (200 OK):**
+
+```json
+{"status": "ok", "message": "Cache enabled"}
+```
+
+### POST /cache/disable
+
+Disable the similarity cache.
+
+**Request:** No body required.
+
+**Response (200 OK):**
+
+```json
+{"status": "ok", "message": "Cache disabled"}
 ```
 
 ### POST /debug/on

@@ -155,6 +155,11 @@ void NvecdServer::Stop() {
   running_.store(false);
   shutdown_.store(true);
 
+  // Stop snapshot scheduler before waiting for fork child
+  if (snapshot_scheduler_) {
+    snapshot_scheduler_->Stop();
+  }
+
   // Wait for any in-progress fork snapshot
   if (fork_writer_) {
     fork_writer_->WaitForChild();
@@ -288,6 +293,14 @@ utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
   // Create RequestDispatcher
   dispatcher_ = std::make_unique<RequestDispatcher>(handler_ctx_);
   spdlog::info("RequestDispatcher initialized");
+
+  // Create and start SnapshotScheduler (if auto-snapshot is enabled)
+  if (config_.snapshot.interval_sec > 0) {
+    snapshot_scheduler_ = std::make_unique<SnapshotScheduler>(config_.snapshot, fork_writer_.get(), &config_,
+                                                              event_store_.get(), co_index_.get(), vector_store_.get(),
+                                                              read_only_);
+    snapshot_scheduler_->Start();
+  }
 
   // Create RateLimiter if enabled
   if (config_.api.rate_limiting.enable) {

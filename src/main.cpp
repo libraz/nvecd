@@ -6,6 +6,8 @@
  * Reusability: 40% (simplified for initial version)
  */
 
+#include <spdlog/sinks/basic_file_sink.h>
+#include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/spdlog.h>
 
 #include <csignal>
@@ -14,6 +16,7 @@
 
 #include "config/config.h"
 #include "server/nvecd_server.h"
+#include "utils/structured_log.h"
 #include "vectors/distance_simd.h"
 #include "version.h"
 
@@ -21,11 +24,7 @@ namespace {
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 volatile std::sig_atomic_t g_shutdown_requested = 0;
 
-// Default configuration constants
-constexpr int kDefaultTcpPort = 11017;             // Default nvecd TCP port
-constexpr int kDefaultMaxConnections = 10000;      // Default maximum concurrent connections
-constexpr int kDefaultConnectionTimeoutSec = 300;  // Default connection timeout (5 minutes)
-constexpr int kShutdownPollIntervalMs = 100;       // Main loop poll interval
+constexpr int kShutdownPollIntervalMs = 100;  // Main loop poll interval
 
 /**
  * @brief Signal handler for graceful shutdown
@@ -40,39 +39,39 @@ void SignalHandler(int signal) {
 }
 
 /**
- * @brief Create default configuration for when no config file is specified
+ * @brief Apply logging configuration from config
+ *
+ * Sets spdlog level, structured log format, and optional file output
+ * based on the loaded configuration. This mirrors the mappings used by
+ * RuntimeVariableManager::ApplyLoggingLevel() and ApplyLoggingFormat().
  */
-nvecd::config::Config CreateDefaultConfig() {
-  nvecd::config::Config config;
+void ApplyLoggingConfig(const nvecd::config::Config& config) {
+  // Map config level string to spdlog level
+  spdlog::level::level_enum level = spdlog::level::info;
+  if (config.logging.level == "trace") {
+    level = spdlog::level::trace;
+  } else if (config.logging.level == "debug") {
+    level = spdlog::level::debug;
+  } else if (config.logging.level == "warn") {
+    level = spdlog::level::warn;
+  } else if (config.logging.level == "error") {
+    level = spdlog::level::err;
+  }
+  spdlog::set_level(level);
 
-  // API configuration
-  config.api.tcp.bind = "127.0.0.1";
-  config.api.tcp.port = kDefaultTcpPort;
+  // Apply structured log format (JSON or text)
+  nvecd::utils::StructuredLog::SetFormat(config.logging.json ? nvecd::utils::LogFormat::JSON
+                                                             : nvecd::utils::LogFormat::TEXT);
 
-  // Performance configuration
-  config.perf.thread_pool_size = 0;  // Auto-detect
-  config.perf.max_connections = kDefaultMaxConnections;
-  config.perf.connection_timeout_sec = kDefaultConnectionTimeoutSec;
-
-  // Events configuration (use defaults from config.h)
-  // config.events.ctx_buffer_size = 50;
-  // config.events.decay_interval_sec = 3600;
-  // config.events.decay_alpha = 0.99;
-
-  // Vectors configuration (use defaults)
-  // config.vectors.default_dimension = 768;
-  // config.vectors.distance_metric = "cosine";
-
-  // Similarity configuration (use defaults)
-  // config.similarity.default_top_k = 100;
-  // config.similarity.max_top_k = 1000;
-  // config.similarity.fusion_alpha = 0.6;
-  // config.similarity.fusion_beta = 0.4;
-
-  // Network configuration - allow localhost for development
-  config.network.allow_cidrs = {"127.0.0.1/32"};
-
-  return config;
+  // Configure file sink if specified
+  if (!config.logging.file.empty()) {
+    auto file_sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(config.logging.file, true);
+    auto console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
+    auto logger = std::make_shared<spdlog::logger>("", spdlog::sinks_init_list{console_sink, file_sink});
+    logger->set_level(level);
+    logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
+    spdlog::set_default_logger(logger);
+  }
 }
 
 }  // namespace
@@ -162,6 +161,7 @@ int main(int argc, char* argv[]) {
       return 1;
     }
     config = *config_result;
+    ApplyLoggingConfig(config);
     spdlog::info("Configuration loaded successfully");
 
     // Config test mode: validate and exit
@@ -191,7 +191,10 @@ int main(int argc, char* argv[]) {
     }
   } else {
     spdlog::info("No configuration file specified, using defaults");
-    config = CreateDefaultConfig();
+    // Config struct is default-initialized from config.h defaults.
+    // Only override: restrict network access to localhost when no config file is specified.
+    config.network.allow_cidrs = {"127.0.0.1/32"};
+    ApplyLoggingConfig(config);
   }
 
   // Create and start server

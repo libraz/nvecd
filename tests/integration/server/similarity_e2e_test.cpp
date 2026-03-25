@@ -77,25 +77,24 @@ TEST_F(SimilarityE2ETest, EventCoOccurrenceOrdering) {
 
   auto results = ParseSimResults(resp);
 
-  // The co-occurrence algorithm may require more data or have score
-  // thresholds that result in 0 results. If results are returned,
-  // verify that B ranks before C (B co-occurs with A in 2 contexts vs 1).
-  if (results.size() >= 2) {
-    int b_pos = -1;
-    int c_pos = -1;
-    for (size_t i = 0; i < results.size(); ++i) {
-      if (results[i].first == "B") {
-        b_pos = static_cast<int>(i);
-      }
-      if (results[i].first == "C") {
-        c_pos = static_cast<int>(i);
-      }
-    }
+  // B co-occurs with A in 2 contexts, C in 1 context.
+  // We must get at least 2 results containing both B and C.
+  ASSERT_GE(results.size(), 2u) << "Expected at least 2 results";
 
-    if (b_pos != -1 && c_pos != -1) {
-      EXPECT_LT(b_pos, c_pos) << "B should rank before C (co-occurs with A in 2 contexts vs 1)";
+  int b_pos = -1;
+  int c_pos = -1;
+  for (size_t i = 0; i < results.size(); ++i) {
+    if (results[i].first == "B") {
+      b_pos = static_cast<int>(i);
+    }
+    if (results[i].first == "C") {
+      c_pos = static_cast<int>(i);
     }
   }
+
+  ASSERT_NE(b_pos, -1) << "B not found in results";
+  ASSERT_NE(c_pos, -1) << "C not found in results";
+  EXPECT_LT(b_pos, c_pos) << "B should rank before C (co-occurs with A in 2 contexts vs 1)";
 }
 
 // ---------------------------------------------------------------------------

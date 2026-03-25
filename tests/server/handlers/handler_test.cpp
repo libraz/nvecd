@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <filesystem>
 #include <memory>
 #include <string>
 
@@ -368,6 +369,80 @@ TEST_F(HandlerTest, DumpVerify_NonexistentFile_ReturnsError) {
 TEST_F(HandlerTest, DumpLoad_NonexistentFile_ReturnsError) {
   auto result = HandleDumpLoad(*ctx_, "/tmp/nonexistent_snapshot_12345.dmp");
   ASSERT_FALSE(result.has_value());
+}
+
+TEST_F(HandlerTest, DumpSave_WithValidData_Succeeds) {
+  // Populate vector data
+  vector_store_->SetVector("item1", {0.1f, 0.2f, 0.3f});
+
+  // Use lock mode since fork_snapshot_writer is not available in test
+  config_->snapshot.mode = "lock";
+  config_->snapshot.dir = "/tmp";
+
+  std::string dump_path = "/tmp/nvecd_handler_test_dump.dmp";
+  auto result = HandleDumpSave(*ctx_, dump_path);
+  ASSERT_TRUE(result.has_value()) << "DumpSave failed: "
+      << (result.has_value() ? "" : result.error().message());
+  EXPECT_THAT(*result, HasSubstr("DUMP_SAVED"));
+
+  // Verify file was created
+  EXPECT_TRUE(std::filesystem::exists(dump_path));
+
+  // Clean up
+  std::filesystem::remove(dump_path);
+}
+
+TEST_F(HandlerTest, DumpLoad_RoundTrip_RestoresData) {
+  // Populate data
+  vector_store_->SetVector("item1", {0.1f, 0.2f, 0.3f});
+  vector_store_->SetVector("item2", {0.4f, 0.5f, 0.6f});
+
+  config_->snapshot.mode = "lock";
+  config_->snapshot.dir = "/tmp";
+
+  std::string dump_path = "/tmp/nvecd_handler_test_roundtrip.dmp";
+
+  // Save
+  auto save_result = HandleDumpSave(*ctx_, dump_path);
+  ASSERT_TRUE(save_result.has_value()) << "DumpSave failed: " << save_result.error().message();
+
+  // Clear stores
+  vector_store_->Clear();
+  ASSERT_EQ(vector_store_->GetVectorCount(), 0u);
+
+  // Load
+  auto load_result = HandleDumpLoad(*ctx_, dump_path);
+  ASSERT_TRUE(load_result.has_value()) << "DumpLoad failed: " << load_result.error().message();
+  EXPECT_THAT(*load_result, HasSubstr("DUMP_LOADED"));
+
+  // Verify data is restored
+  EXPECT_GE(vector_store_->GetVectorCount(), 2u);
+  auto vec1 = vector_store_->GetVector("item1");
+  EXPECT_TRUE(vec1.has_value()) << "item1 should be restored after load";
+
+  // Clean up
+  std::filesystem::remove(dump_path);
+}
+
+TEST_F(HandlerTest, DumpVerify_ValidFile_Succeeds) {
+  // Populate and save data first
+  vector_store_->SetVector("item1", {0.1f, 0.2f, 0.3f});
+
+  config_->snapshot.mode = "lock";
+  config_->snapshot.dir = "/tmp";
+
+  std::string dump_path = "/tmp/nvecd_handler_test_verify.dmp";
+  auto save_result = HandleDumpSave(*ctx_, dump_path);
+  ASSERT_TRUE(save_result.has_value()) << "DumpSave failed: " << save_result.error().message();
+
+  // Verify the saved file
+  auto verify_result = HandleDumpVerify("/tmp", dump_path);
+  ASSERT_TRUE(verify_result.has_value()) << "DumpVerify failed: "
+      << verify_result.error().message();
+  EXPECT_THAT(*verify_result, HasSubstr("DUMP_VERIFIED"));
+
+  // Clean up
+  std::filesystem::remove(dump_path);
 }
 
 // ============================================================================

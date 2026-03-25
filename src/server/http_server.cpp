@@ -16,6 +16,7 @@
 #include <sstream>
 
 #include "cache/similarity_cache.h"
+#include "storage/snapshot_fork.h"
 #include "events/co_occurrence_index.h"
 #include "events/event_store.h"
 #include "server/command_parser.h"
@@ -127,6 +128,10 @@ void HttpServer::SetupRoutes() {
                [this](const httplib::Request& req, httplib::Response& res) { HandleCacheStats(req, res); });
   server_->Post("/cache/clear",
                 [this](const httplib::Request& req, httplib::Response& res) { HandleCacheClear(req, res); });
+  server_->Post("/cache/enable",
+                [this](const httplib::Request& req, httplib::Response& res) { HandleCacheEnable(req, res); });
+  server_->Post("/cache/disable",
+                [this](const httplib::Request& req, httplib::Response& res) { HandleCacheDisable(req, res); });
 
   // Snapshot management
   server_->Post("/dump/save",
@@ -137,6 +142,8 @@ void HttpServer::SetupRoutes() {
                 [this](const httplib::Request& req, httplib::Response& res) { HandleDumpVerify(req, res); });
   server_->Post("/dump/info",
                 [this](const httplib::Request& req, httplib::Response& res) { HandleDumpInfo(req, res); });
+  server_->Get("/dump/status",
+               [this](const httplib::Request& req, httplib::Response& res) { HandleDumpStatus(req, res); });
 
   // Debug mode
   server_->Post("/debug/on", [this](const httplib::Request& req, httplib::Response& res) { HandleDebugOn(req, res); });
@@ -1275,6 +1282,98 @@ void HttpServer::HandleCacheClear(const httplib::Request& req, httplib::Response
 
   } catch (const std::exception& e) {
     spdlog::error("Unexpected exception in HandleCacheClear: {}", e.what());
+    SendError(res, kHttpInternalServerError, R"({"error":"Internal server error"})");
+  }
+}
+
+void HttpServer::HandleCacheEnable(const httplib::Request& /*req*/, httplib::Response& res) {
+  // Safety net at httplib library boundary - catches unexpected exceptions only
+  try {
+    auto* cache_ptr =
+        (handler_context_ != nullptr) ? handler_context_->cache.load(std::memory_order_acquire) : nullptr;
+    if (cache_ptr == nullptr) {
+      SendError(res, kHttpInternalServerError, "Cache not initialized");
+      return;
+    }
+
+    cache_ptr->SetEnabled(true);
+
+    json response;
+    response["status"] = "ok";
+    response["message"] = "Cache enabled";
+    SendJson(res, kHttpOk, response);
+
+  } catch (const std::exception& e) {
+    spdlog::error("Unexpected exception in HandleCacheEnable: {}", e.what());
+    SendError(res, kHttpInternalServerError, R"({"error":"Internal server error"})");
+  }
+}
+
+void HttpServer::HandleCacheDisable(const httplib::Request& /*req*/, httplib::Response& res) {
+  // Safety net at httplib library boundary - catches unexpected exceptions only
+  try {
+    auto* cache_ptr =
+        (handler_context_ != nullptr) ? handler_context_->cache.load(std::memory_order_acquire) : nullptr;
+    if (cache_ptr == nullptr) {
+      SendError(res, kHttpInternalServerError, "Cache not initialized");
+      return;
+    }
+
+    cache_ptr->SetEnabled(false);
+
+    json response;
+    response["status"] = "ok";
+    response["message"] = "Cache disabled";
+    SendJson(res, kHttpOk, response);
+
+  } catch (const std::exception& e) {
+    spdlog::error("Unexpected exception in HandleCacheDisable: {}", e.what());
+    SendError(res, kHttpInternalServerError, R"({"error":"Internal server error"})");
+  }
+}
+
+void HttpServer::HandleDumpStatus(const httplib::Request& /*req*/, httplib::Response& res) {
+  // Safety net at httplib library boundary - catches unexpected exceptions only
+  try {
+    if (handler_context_ == nullptr || handler_context_->fork_snapshot_writer == nullptr) {
+      json response;
+      response["status"] = "ok";
+      response["data"] = "IDLE";
+      SendJson(res, kHttpOk, response);
+      return;
+    }
+
+    // Reap any finished child
+    handler_context_->fork_snapshot_writer->CheckChild();
+
+    auto snapshot_status = handler_context_->fork_snapshot_writer->GetStatus();
+
+    json response;
+    response["status"] = "ok";
+
+    switch (snapshot_status.status) {
+      case storage::SnapshotStatus::kIdle:
+        response["data"] = "IDLE";
+        break;
+      case storage::SnapshotStatus::kInProgress:
+        response["data"] = "IN_PROGRESS";
+        response["filepath"] = snapshot_status.filepath;
+        break;
+      case storage::SnapshotStatus::kCompleted:
+        response["data"] = "COMPLETED";
+        response["filepath"] = snapshot_status.filepath;
+        break;
+      case storage::SnapshotStatus::kFailed:
+        response["data"] = "FAILED";
+        response["filepath"] = snapshot_status.filepath;
+        response["error_message"] = snapshot_status.error_message;
+        break;
+    }
+
+    SendJson(res, kHttpOk, response);
+
+  } catch (const std::exception& e) {
+    spdlog::error("Unexpected exception in HandleDumpStatus: {}", e.what());
     SendError(res, kHttpInternalServerError, R"({"error":"Internal server error"})");
   }
 }

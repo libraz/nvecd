@@ -299,32 +299,28 @@ TEST_F(EdgeCaseE2ETest, MultipleContextsIsolation) {
 
   auto results = ParseSimResults(resp);
 
-  // The co-occurrence algorithm may have score thresholds that produce
-  // empty results. If results are returned, verify expected items.
-  if (!results.empty()) {
-    bool found_b_0 = false;
-    bool found_b_49 = false;
-    bool found_isolated = false;
+  // With 50 contexts of co-occurrence, we must get results.
+  ASSERT_GE(results.size(), 2u) << "Expected at least 2 results from 50 co-occurring contexts";
 
-    for (const auto& result : results) {
-      if (result.first == "item_B_0") {
-        found_b_0 = true;
-      }
-      if (result.first == "item_B_49") {
-        found_b_49 = true;
-      }
-      if (result.first == "isolated_item") {
-        found_isolated = true;
-      }
-    }
+  bool found_b_0 = false;
+  bool found_b_49 = false;
+  bool found_isolated = false;
 
-    // If co-occurring items are returned, check they include expected ones
-    if (results.size() >= 2) {
-      EXPECT_TRUE(found_b_0) << "item_B_0 should appear (co-occurs with item_A in ctx_0)";
-      EXPECT_TRUE(found_b_49) << "item_B_49 should appear (co-occurs with item_A in ctx_49)";
+  for (const auto& result : results) {
+    if (result.first == "item_B_0") {
+      found_b_0 = true;
     }
-    EXPECT_FALSE(found_isolated) << "isolated_item should NOT appear (never co-occurred with item_A)";
+    if (result.first == "item_B_49") {
+      found_b_49 = true;
+    }
+    if (result.first == "isolated_item") {
+      found_isolated = true;
+    }
   }
+
+  EXPECT_TRUE(found_b_0) << "item_B_0 should appear (co-occurs with item_A in ctx_0)";
+  EXPECT_TRUE(found_b_49) << "item_B_49 should appear (co-occurs with item_A in ctx_49)";
+  EXPECT_FALSE(found_isolated) << "isolated_item should NOT appear (never co-occurred with item_A)";
 }
 
 // ---------------------------------------------------------------------------

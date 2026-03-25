@@ -370,9 +370,32 @@ GET /health/detail HTTP/1.1
 
 `/info` エンドポイントと同じ形式。
 
+### GET /metrics
+
+サーバーメトリクスを JSON 形式で取得します。
+
+**リクエスト:**
+
+```http
+GET /metrics HTTP/1.1
+```
+
+**レスポンス（200 OK）:**
+
+```json
+{
+  "uptime_seconds": 3600,
+  "total_commands": 15000,
+  "connections": {"active": 5, "total": 1200},
+  "memory": {...}
+}
+```
+
 ### GET /config
 
 現在のサーバー設定の概要（機密値は省略）。
+
+**CORS**: `api.http.enable_cors` が `true` の場合、サーバーは `Access-Control-Allow-Origin` ヘッダーを追加し、OPTIONS プリフライトリクエストを処理します。
 
 **リクエスト:**
 
@@ -522,6 +545,96 @@ Content-Type: application/json
   "event_count": 1000000,
   "size_bytes": 314572800
 }
+```
+
+### GET /dump/status
+
+バックグラウンドスナップショット操作のステータスを取得します。
+
+**リクエスト:**
+
+```http
+GET /dump/status HTTP/1.1
+```
+
+**レスポンス（200 OK）:**
+
+```json
+{"status": "ok", "data": "IDLE"}
+```
+
+### GET /cache/stats
+
+キャッシュ統計情報を取得（ヒット率、エントリ数、メモリ使用量）。
+
+**リクエスト:**
+
+```http
+GET /cache/stats HTTP/1.1
+```
+
+**レスポンス（200 OK）:**
+
+```json
+{
+  "enabled": true,
+  "total_queries": 10000,
+  "cache_hits": 8500,
+  "cache_misses": 1500,
+  "hit_rate": 0.85,
+  "current_entries": 2450,
+  "current_memory_mb": 12.45,
+  "evictions": 320
+}
+```
+
+### POST /cache/clear
+
+類似度キャッシュをクリアします。
+
+**リクエスト:**
+
+```http
+POST /cache/clear HTTP/1.1
+Content-Type: application/json
+
+{
+  "scope": "all"
+}
+```
+
+**レスポンス（200 OK）:**
+
+```json
+{
+  "status": "ok",
+  "scope": "all",
+  "entries_removed": 2450
+}
+```
+
+### POST /cache/enable
+
+類似度キャッシュを有効化します。
+
+**リクエスト:** ボディ不要。
+
+**レスポンス（200 OK）:**
+
+```json
+{"status": "ok", "message": "Cache enabled"}
+```
+
+### POST /cache/disable
+
+類似度キャッシュを無効化します。
+
+**リクエスト:** ボディ不要。
+
+**レスポンス（200 OK）:**
+
+```json
+{"status": "ok", "message": "Cache disabled"}
 ```
 
 ### POST /debug/on

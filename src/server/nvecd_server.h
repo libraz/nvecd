@@ -17,6 +17,7 @@
 #include "events/co_occurrence_index.h"
 #include "events/event_store.h"
 #include "server/connection_acceptor.h"
+#include "server/snapshot_scheduler.h"
 #include "server/http_server.h"
 #include "server/rate_limiter.h"
 #include "storage/snapshot_fork.h"
@@ -184,6 +185,7 @@ class NvecdServer {
   std::unique_ptr<HttpServer> http_server_;            // HTTP API server (optional)
   std::unique_ptr<RateLimiter> rate_limiter_;          // Per-client rate limiter (optional)
   std::unique_ptr<storage::ForkSnapshotWriter> fork_writer_;  ///< Fork-based snapshot writer
+  std::unique_ptr<SnapshotScheduler> snapshot_scheduler_;    ///< Background auto-snapshot scheduler
 };
 
 }  // namespace nvecd::server

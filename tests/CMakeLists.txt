@@ -144,6 +144,49 @@ target_link_libraries(handler_test
 )
 gtest_discover_tests(handler_test)
 
+add_executable(snapshot_scheduler_test
+  server/snapshot_scheduler_test.cpp
+)
+target_link_libraries(snapshot_scheduler_test
+  nvecd_server
+  nvecd_storage
+  nvecd_events
+  nvecd_vectors
+  nvecd_config
+  nvecd_utils
+  gtest
+  gtest_main
+)
+gtest_discover_tests(snapshot_scheduler_test
+  PROPERTIES TIMEOUT 30
+)
+
+add_executable(rate_limiter_test
+  server/rate_limiter_test.cpp
+)
+target_link_libraries(rate_limiter_test
+  nvecd_server
+  gtest
+  gtest_main
+)
+gtest_discover_tests(rate_limiter_test)
+
+add_executable(request_dispatcher_test
+  server/request_dispatcher_test.cpp
+)
+target_link_libraries(request_dispatcher_test
+  nvecd_server
+  nvecd_cache
+  nvecd_similarity
+  nvecd_events
+  nvecd_vectors
+  nvecd_config
+  nvecd_utils
+  gtest
+  gtest_main
+)
+gtest_discover_tests(request_dispatcher_test)
+
 # Events tests
 add_executable(ring_buffer_test
   events/ring_buffer_test.cpp

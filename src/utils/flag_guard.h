@@ -33,4 +33,25 @@ class FlagGuard {
   std::atomic<bool>& flag_;
 };
 
+/**
+ * @brief RAII guard for resetting atomic boolean flags (does NOT set on construction)
+ *
+ * Use after successfully acquiring the flag via compare_exchange_strong.
+ * Only resets the flag to false on destruction.
+ */
+class FlagResetGuard {
+ public:
+  explicit FlagResetGuard(std::atomic<bool>& flag) : flag_(flag) {}
+  ~FlagResetGuard() { flag_ = false; }
+
+  // Non-copyable and non-movable
+  FlagResetGuard(const FlagResetGuard&) = delete;
+  FlagResetGuard& operator=(const FlagResetGuard&) = delete;
+  FlagResetGuard(FlagResetGuard&&) = delete;
+  FlagResetGuard& operator=(FlagResetGuard&&) = delete;
+
+ private:
+  std::atomic<bool>& flag_;
+};
+
 }  // namespace nvecd::utils

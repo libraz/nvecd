@@ -247,6 +247,21 @@ class HttpServer {
    */
   void HandleCacheClear(const httplib::Request& req, httplib::Response& res);
 
+  /**
+   * @brief Handle POST /cache/enable
+   */
+  void HandleCacheEnable(const httplib::Request& req, httplib::Response& res);
+
+  /**
+   * @brief Handle POST /cache/disable
+   */
+  void HandleCacheDisable(const httplib::Request& req, httplib::Response& res);
+
+  /**
+   * @brief Handle GET /dump/status
+   */
+  void HandleDumpStatus(const httplib::Request& req, httplib::Response& res);
+
   //
   // Utility methods
   //

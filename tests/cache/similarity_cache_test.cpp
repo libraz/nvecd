@@ -705,6 +705,8 @@ TEST(SimilarityCacheTest, ConcurrentMarkInvalidatedAndLookup) {
   EXPECT_GT(stats.cache_misses, 0);
   // cache_misses_invalidated should be > 0 since invalidators ran continuously
   EXPECT_GT(stats.cache_misses_invalidated, 0);
+  EXPECT_LE(stats.cache_misses_invalidated, stats.cache_misses)
+      << "Invalidated misses should not exceed total misses";
 }
 
 TEST(SimilarityCacheTest, EvictForSpaceFailsGracefully) {
@@ -787,6 +789,185 @@ TEST(SimilarityCacheTest, PurgeExpired_MixedFreshAndExpired) {
   size_t purged = cache.PurgeExpired();
   EXPECT_EQ(purged, 3);
   EXPECT_EQ(cache.GetStatistics().current_entries, 2);
+}
+
+// ============================================================================
+// Selective Cache Invalidation Tests
+// ============================================================================
+
+TEST(SimilarityCacheTest, RegisterAndInvalidateByItemId) {
+  SimilarityCache cache(1024 * 1024, 0.0);
+
+  auto key1 = MakeKey("query1", 10);
+  std::vector<similarity::SimilarityResult> results = {
+      {"A", 0.95f}, {"B", 0.90f}, {"C", 0.85f}};
+
+  cache.Insert(key1, results, 1.0);
+  cache.RegisterResultItems(key1, {"A", "B", "C"});
+
+  // Verify entry exists before invalidation
+  auto before = cache.Lookup(key1);
+  ASSERT_TRUE(before.has_value());
+
+  // Invalidate by item "B" — should remove key1
+  size_t count = cache.InvalidateByItemId("B");
+  EXPECT_GE(count, 1);
+
+  // key1 should no longer be retrievable
+  auto after = cache.Lookup(key1);
+  EXPECT_FALSE(after.has_value());
+}
+
+TEST(SimilarityCacheTest, InvalidateByItemId_OnlyAffectsMatching) {
+  SimilarityCache cache(1024 * 1024, 0.0);
+
+  auto key1 = MakeKey("query1", 10);
+  auto key2 = MakeKey("query2", 10);
+  auto key3 = MakeKey("query3", 10);
+
+  std::vector<similarity::SimilarityResult> results = {{"dummy", 0.95f}};
+
+  cache.Insert(key1, results, 1.0);
+  cache.Insert(key2, results, 1.0);
+  cache.Insert(key3, results, 1.0);
+
+  cache.RegisterResultItems(key1, {"X", "Y"});
+  cache.RegisterResultItems(key2, {"X", "Z"});
+  cache.RegisterResultItems(key3, {"W"});
+
+  // Invalidate by "X" — should affect key1 and key2 but not key3
+  cache.InvalidateByItemId("X");
+
+  auto result1 = cache.Lookup(key1);
+  EXPECT_FALSE(result1.has_value()) << "key1 should be invalidated (contains X)";
+
+  auto result2 = cache.Lookup(key2);
+  EXPECT_FALSE(result2.has_value()) << "key2 should be invalidated (contains X)";
+
+  auto result3 = cache.Lookup(key3);
+  EXPECT_TRUE(result3.has_value()) << "key3 should NOT be invalidated (does not contain X)";
+}
+
+TEST(SimilarityCacheTest, InvalidateByItemId_ReturnsCount) {
+  SimilarityCache cache(1024 * 1024, 0.0);
+
+  auto key1 = MakeKey("query1", 10);
+  auto key2 = MakeKey("query2", 10);
+
+  std::vector<similarity::SimilarityResult> results = {{"dummy", 0.95f}};
+
+  cache.Insert(key1, results, 1.0);
+  cache.Insert(key2, results, 1.0);
+
+  cache.RegisterResultItems(key1, {"shared", "other1"});
+  cache.RegisterResultItems(key2, {"shared", "other2"});
+
+  size_t invalidated = cache.InvalidateByItemId("shared");
+  EXPECT_EQ(invalidated, 2);
+}
+
+TEST(SimilarityCacheTest, InvalidateByItemId_NonexistentItem) {
+  SimilarityCache cache(1024 * 1024, 0.0);
+
+  auto key1 = MakeKey("query1", 10);
+  std::vector<similarity::SimilarityResult> results = {{"dummy", 0.95f}};
+
+  cache.Insert(key1, results, 1.0);
+  cache.RegisterResultItems(key1, {"A", "B"});
+
+  // Invalidate by an item that no entry references
+  size_t invalidated = cache.InvalidateByItemId("nonexistent");
+  EXPECT_EQ(invalidated, 0);
+
+  // Original entry should still be intact
+  auto result = cache.Lookup(key1);
+  EXPECT_TRUE(result.has_value());
+}
+
+TEST(SimilarityCacheTest, RegisterResultItems_CapsAtMax) {
+  SimilarityCache cache(1024 * 1024, 0.0);
+
+  auto key1 = MakeKey("query1", 10);
+  std::vector<similarity::SimilarityResult> results = {{"dummy", 0.95f}};
+  cache.Insert(key1, results, 1.0);
+
+  // Register more than kMaxTrackedItemsPerEntry (50) items
+  std::vector<std::string> many_items;
+  many_items.reserve(100);
+  for (int i = 0; i < 100; ++i) {
+    many_items.push_back("item_" + std::to_string(i));
+  }
+  cache.RegisterResultItems(key1, many_items);
+
+  // Should not crash — that is the primary assertion
+
+  // Invalidating one of the first 50 items should still work
+  size_t invalidated = cache.InvalidateByItemId("item_0");
+  EXPECT_EQ(invalidated, 1);
+
+  auto result = cache.Lookup(key1);
+  EXPECT_FALSE(result.has_value());
+}
+
+TEST(SimilarityCacheTest, ConcurrentRegisterAndInvalidate) {
+  SimilarityCache cache(10 * 1024 * 1024, 0.0);
+
+  std::vector<similarity::SimilarityResult> results = {{"dummy", 0.95f}};
+
+  // Pre-populate cache entries
+  const int entry_count = 100;
+  for (int i = 0; i < entry_count; ++i) {
+    auto key = MakeKey("query" + std::to_string(i), 10);
+    cache.Insert(key, results, 1.0);
+  }
+
+  std::atomic<bool> stop{false};
+
+  // 2 threads: RegisterResultItems on various keys
+  std::vector<std::thread> registerers;
+  for (int t = 0; t < 2; ++t) {
+    registerers.emplace_back([&cache, &stop, t]() {
+      int i = 0;
+      while (!stop.load(std::memory_order_relaxed)) {
+        auto key = MakeKey("query" + std::to_string(i % entry_count), 10);
+        std::vector<std::string> items = {
+            "item_" + std::to_string(t) + "_" + std::to_string(i),
+            "shared_item_" + std::to_string(i % 10)};
+        cache.RegisterResultItems(key, items);
+        ++i;
+        std::this_thread::yield();
+      }
+    });
+  }
+
+  // 2 threads: InvalidateByItemId on shared items
+  std::vector<std::thread> invalidators;
+  for (int t = 0; t < 2; ++t) {
+    invalidators.emplace_back([&cache, &stop]() {
+      int i = 0;
+      while (!stop.load(std::memory_order_relaxed)) {
+        cache.InvalidateByItemId("shared_item_" + std::to_string(i % 10));
+        ++i;
+        std::this_thread::yield();
+      }
+    });
+  }
+
+  // Run for 100ms
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  stop.store(true, std::memory_order_relaxed);
+
+  for (auto& t : registerers) {
+    t.join();
+  }
+  for (auto& t : invalidators) {
+    t.join();
+  }
+
+  // Should complete without crash or data race
+  auto stats = cache.GetStatistics();
+  // Some entries may have been invalidated
+  EXPECT_LE(stats.current_entries, entry_count);
 }
 
 }  // namespace

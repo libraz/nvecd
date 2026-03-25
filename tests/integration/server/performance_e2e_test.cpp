@@ -270,7 +270,8 @@ TEST_F(PerformanceE2ETest, DISABLED_SearchScalability) {
 
   // Check degradation: O(n) is expected for brute-force search
   // time should scale roughly linearly with data size
-  if (results.size() >= 2) {
+  ASSERT_GE(results.size(), 2u) << "Expected at least 2 scale data points";
+  {
     double first_time = results.front().second;
     double last_time = results.back().second;
     auto first_scale = static_cast<double>(results.front().first);

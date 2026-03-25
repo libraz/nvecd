@@ -618,5 +618,282 @@ TEST(VectorStoreTest, HighDimension_Normalization) {
   EXPECT_NEAR(norm, 1.0f, 1e-5f);  // Should be normalized to 1.0
 }
 
+// ============================================================================
+// Tombstone and Defragmentation
+// ============================================================================
+
+TEST(VectorStoreTest, DeleteCreatesTombstone) {
+  auto config = MakeConfig();
+  VectorStore store(config);
+
+  std::vector<float> vec1 = {1.0f, 2.0f, 3.0f};
+  std::vector<float> vec2 = {4.0f, 5.0f, 6.0f};
+  std::vector<float> vec3 = {7.0f, 8.0f, 9.0f};
+
+  ASSERT_TRUE(store.SetVector("item1", vec1).has_value());
+  ASSERT_TRUE(store.SetVector("item2", vec2).has_value());
+  ASSERT_TRUE(store.SetVector("item3", vec3).has_value());
+
+  // Delete middle item
+  EXPECT_TRUE(store.DeleteVector("item2"));
+
+  // Active count should be 2
+  EXPECT_EQ(store.GetVectorCount(), 2);
+
+  // Deleted item should not be accessible
+  EXPECT_FALSE(store.HasVector("item2"));
+  EXPECT_FALSE(store.GetVector("item2").has_value());
+
+  // Remaining items should still be accessible
+  EXPECT_TRUE(store.HasVector("item1"));
+  EXPECT_TRUE(store.HasVector("item3"));
+
+  auto retrieved1 = store.GetVector("item1");
+  ASSERT_TRUE(retrieved1.has_value());
+  EXPECT_EQ(retrieved1->data, vec1);
+
+  auto retrieved3 = store.GetVector("item3");
+  ASSERT_TRUE(retrieved3.has_value());
+  EXPECT_EQ(retrieved3->data, vec3);
+}
+
+TEST(VectorStoreTest, AutoDefragmentAt25PercentThreshold) {
+  auto config = MakeConfig();
+  VectorStore store(config);
+
+  // Insert 8 items
+  for (int i = 0; i < 8; ++i) {
+    std::vector<float> vec = {static_cast<float>(i), static_cast<float>(i + 1),
+                              static_cast<float>(i + 2)};
+    ASSERT_TRUE(store.SetVector("item" + std::to_string(i), vec).has_value());
+  }
+  EXPECT_EQ(store.GetVectorCount(), 8);
+
+  // Delete 2 of 8 = 25%, threshold is >, so no defrag yet.
+  // Compact count should still include tombstones.
+  EXPECT_TRUE(store.DeleteVector("item1"));
+  EXPECT_TRUE(store.DeleteVector("item3"));
+  EXPECT_EQ(store.GetVectorCount(), 6);
+
+  // With 2 tombstones out of 8 total slots (25%), auto-defrag should NOT
+  // have triggered yet (condition is tombstone_count * 4 > total_slots,
+  // i.e. strictly greater than 25%).
+  // Compact count still 8 (tombstones remain).
+  {
+    auto lock = store.AcquireReadLock();
+    EXPECT_EQ(store.GetCompactCount(), 8);
+  }
+
+  // Delete a third item: 3 tombstones out of 8 total (37.5% > 25%).
+  // This should trigger auto-defragmentation.
+  EXPECT_TRUE(store.DeleteVector("item5"));
+  EXPECT_EQ(store.GetVectorCount(), 5);
+
+  // After auto-defrag, compact storage should be clean (no tombstones).
+  {
+    auto lock = store.AcquireReadLock();
+    EXPECT_EQ(store.GetCompactCount(), 5);
+  }
+
+  // Verify remaining items are still accessible
+  for (int i : {0, 2, 4, 6, 7}) {
+    EXPECT_TRUE(store.HasVector("item" + std::to_string(i)))
+        << "item" << i << " should still exist";
+  }
+}
+
+TEST(VectorStoreTest, DefragmentPreservesDataIntegrity) {
+  auto config = MakeConfig();
+  VectorStore store(config);
+
+  // Insert 10 items with known data
+  std::vector<std::vector<float>> expected_data(10);
+  for (int i = 0; i < 10; ++i) {
+    expected_data[i] = {static_cast<float>(i * 10), static_cast<float>(i * 10 + 1),
+                        static_cast<float>(i * 10 + 2), static_cast<float>(i * 10 + 3)};
+    ASSERT_TRUE(store.SetVector("vec" + std::to_string(i), expected_data[i]).has_value());
+  }
+
+  // Delete 5 scattered items: indices 1, 3, 5, 7, 9
+  for (int i : {1, 3, 5, 7, 9}) {
+    EXPECT_TRUE(store.DeleteVector("vec" + std::to_string(i)));
+  }
+  EXPECT_EQ(store.GetVectorCount(), 5);
+
+  // Explicit defragment
+  store.Defragment();
+
+  // Verify remaining 5 items have correct data
+  for (int i : {0, 2, 4, 6, 8}) {
+    auto retrieved = store.GetVector("vec" + std::to_string(i));
+    ASSERT_TRUE(retrieved.has_value()) << "vec" << i << " should exist after defragment";
+    EXPECT_EQ(retrieved->data, expected_data[i])
+        << "vec" << i << " data mismatch after defragment";
+  }
+
+  // Verify deleted items are still gone
+  for (int i : {1, 3, 5, 7, 9}) {
+    EXPECT_FALSE(store.HasVector("vec" + std::to_string(i)))
+        << "vec" << i << " should not exist after defragment";
+  }
+
+  // Compact storage should have no tombstones
+  {
+    auto lock = store.AcquireReadLock();
+    EXPECT_EQ(store.GetCompactCount(), 5);
+  }
+}
+
+TEST(VectorStoreTest, GetAllIdsSkipsTombstones) {
+  auto config = MakeConfig();
+  VectorStore store(config);
+
+  std::vector<float> vec = {0.1f, 0.2f, 0.3f};
+  ASSERT_TRUE(store.SetVector("alpha", vec).has_value());
+  ASSERT_TRUE(store.SetVector("beta", vec).has_value());
+  ASSERT_TRUE(store.SetVector("gamma", vec).has_value());
+  ASSERT_TRUE(store.SetVector("delta", vec).has_value());
+  ASSERT_TRUE(store.SetVector("epsilon", vec).has_value());
+
+  // Delete 2 items
+  EXPECT_TRUE(store.DeleteVector("beta"));
+  EXPECT_TRUE(store.DeleteVector("delta"));
+
+  auto ids = store.GetAllIds();
+  EXPECT_EQ(ids.size(), 3);
+
+  std::sort(ids.begin(), ids.end());
+  EXPECT_EQ(ids[0], "alpha");
+  EXPECT_EQ(ids[1], "epsilon");
+  EXPECT_EQ(ids[2], "gamma");
+}
+
+TEST(VectorStoreTest, DeleteAndReinsertAfterDefragment) {
+  auto config = MakeConfig();
+  VectorStore store(config);
+
+  // Insert initial items
+  std::vector<float> vec_a = {1.0f, 2.0f, 3.0f};
+  std::vector<float> vec_b = {4.0f, 5.0f, 6.0f};
+  std::vector<float> vec_c = {7.0f, 8.0f, 9.0f};
+  std::vector<float> vec_d = {10.0f, 11.0f, 12.0f};
+
+  ASSERT_TRUE(store.SetVector("a", vec_a).has_value());
+  ASSERT_TRUE(store.SetVector("b", vec_b).has_value());
+  ASSERT_TRUE(store.SetVector("c", vec_c).has_value());
+  ASSERT_TRUE(store.SetVector("d", vec_d).has_value());
+  EXPECT_EQ(store.GetVectorCount(), 4);
+
+  // Delete some items
+  EXPECT_TRUE(store.DeleteVector("a"));
+  EXPECT_TRUE(store.DeleteVector("c"));
+  EXPECT_EQ(store.GetVectorCount(), 2);
+
+  // Explicit defragment
+  store.Defragment();
+  EXPECT_EQ(store.GetVectorCount(), 2);
+
+  // Reinsert new items (including a previously deleted ID)
+  std::vector<float> vec_a_new = {100.0f, 200.0f, 300.0f};
+  std::vector<float> vec_e = {13.0f, 14.0f, 15.0f};
+  ASSERT_TRUE(store.SetVector("a", vec_a_new).has_value());
+  ASSERT_TRUE(store.SetVector("e", vec_e).has_value());
+  EXPECT_EQ(store.GetVectorCount(), 4);
+
+  // Verify data integrity for all items
+  auto retrieved_a = store.GetVector("a");
+  ASSERT_TRUE(retrieved_a.has_value());
+  EXPECT_EQ(retrieved_a->data, vec_a_new);  // New data, not old
+
+  auto retrieved_b = store.GetVector("b");
+  ASSERT_TRUE(retrieved_b.has_value());
+  EXPECT_EQ(retrieved_b->data, vec_b);
+
+  auto retrieved_d = store.GetVector("d");
+  ASSERT_TRUE(retrieved_d.has_value());
+  EXPECT_EQ(retrieved_d->data, vec_d);
+
+  auto retrieved_e = store.GetVector("e");
+  ASSERT_TRUE(retrieved_e.has_value());
+  EXPECT_EQ(retrieved_e->data, vec_e);
+
+  // Deleted item "c" should still be gone
+  EXPECT_FALSE(store.HasVector("c"));
+
+  // All IDs should be correct
+  auto ids = store.GetAllIds();
+  EXPECT_EQ(ids.size(), 4);
+  std::sort(ids.begin(), ids.end());
+  EXPECT_EQ(ids[0], "a");
+  EXPECT_EQ(ids[1], "b");
+  EXPECT_EQ(ids[2], "d");
+  EXPECT_EQ(ids[3], "e");
+}
+
+TEST(VectorStoreTest, ConcurrentDeleteAndRead) {
+  auto config = MakeConfig();
+  VectorStore store(config);
+
+  // Pre-populate with items
+  constexpr int num_items = 200;
+  std::vector<float> vec = {1.0f, 2.0f, 3.0f};
+  for (int i = 0; i < num_items; ++i) {
+    ASSERT_TRUE(store.SetVector("item" + std::to_string(i), vec).has_value());
+  }
+
+  std::atomic<bool> stop{false};
+  std::atomic<int> read_count{0};
+  std::atomic<int> delete_count{0};
+
+  // Deleter thread: deletes items from the front
+  std::thread deleter([&store, &stop, &delete_count]() {
+    for (int i = 0; i < num_items && !stop.load(); ++i) {
+      if (store.DeleteVector("item" + std::to_string(i))) {
+        delete_count.fetch_add(1);
+      }
+      std::this_thread::sleep_for(std::chrono::microseconds(5));
+    }
+  });
+
+  // Reader threads: read items and check consistency
+  std::vector<std::thread> readers;
+  for (int t = 0; t < 4; ++t) {
+    readers.emplace_back([&store, &stop, &read_count]() {
+      while (!stop.load()) {
+        // Read operations should not crash regardless of concurrent deletes
+        store.GetVectorCount();
+        store.GetAllIds();
+
+        for (int i = 0; i < num_items; i += 10) {
+          auto result = store.GetVector("item" + std::to_string(i));
+          if (result.has_value()) {
+            // If we got a result, data should be valid
+            EXPECT_EQ(result->data.size(), 3);
+            read_count.fetch_add(1);
+          }
+          store.HasVector("item" + std::to_string(i));
+        }
+      }
+    });
+  }
+
+  // Run for a short time
+  std::this_thread::sleep_for(std::chrono::milliseconds(150));
+  stop.store(true);
+
+  deleter.join();
+  for (auto& reader : readers) {
+    reader.join();
+  }
+
+  // Verify consistency: count matches expectations
+  EXPECT_GT(delete_count.load(), 0);
+  EXPECT_GT(read_count.load(), 0);
+
+  size_t remaining = store.GetVectorCount();
+  auto ids = store.GetAllIds();
+  EXPECT_EQ(ids.size(), remaining);
+}
+
 }  // namespace
 }  // namespace nvecd::vectors
