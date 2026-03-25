@@ -18,13 +18,6 @@
 namespace nvecd::server::handlers {
 
 /**
- * @brief Handle INFO command (CONFIG SHOW variant)
- * @param ctx Server context
- * @return Response string or error
- */
-utils::Expected<std::string, utils::Error> HandleAdminInfo(const ServerContext& ctx);
-
-/**
  * @brief Handle CONFIG HELP command
  * @param path Configuration path (empty for root)
  * @return Response string or error

@@ -10,10 +10,11 @@
 #include <sstream>
 
 #include "cache/similarity_cache.h"
-#include "version.h"
 #include "events/co_occurrence_index.h"
 #include "events/event_store.h"
+#include "utils/memory_utils.h"
 #include "vectors/vector_store.h"
+#include "version.h"
 
 namespace nvecd::server::handlers {
 
@@ -47,7 +48,7 @@ utils::Expected<std::string, utils::Error> HandleInfo(const HandlerContext& ctx)
   oss << "# Memory\n";
   oss << "used_memory_bytes: " << used_memory_bytes << "\n";
   oss << "used_memory_human: " << std::fixed << std::setprecision(2) << used_memory_mb << " MB\n";
-  oss << "memory_health: HEALTHY\n";
+  oss << "memory_health: " << utils::MemoryHealthStatusToString(utils::GetMemoryHealthStatus()) << "\n";
 
   // Cache section
   oss << "\n";

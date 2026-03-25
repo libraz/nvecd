@@ -157,7 +157,7 @@ class VectorStore {
 
   mutable std::shared_mutex mutex_;                  ///< Reader-writer lock
   std::unordered_map<std::string, Vector> vectors_;  ///< ID -> Vector mapping
-  std::atomic<size_t> dimension_{0};                   ///< Fixed dimension (0 = not set)
+  std::atomic<size_t> dimension_{0};                 ///< Fixed dimension (0 = not set)
 };
 
 }  // namespace nvecd::vectors

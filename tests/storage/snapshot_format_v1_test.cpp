@@ -7,6 +7,8 @@
  * retrieval, error cases, and edge cases.
  */
 
+#include "storage/snapshot_format_v1.h"
+
 #include <gtest/gtest.h>
 
 #include <filesystem>
@@ -17,7 +19,6 @@
 #include "events/co_occurrence_index.h"
 #include "events/event_store.h"
 #include "storage/snapshot_format.h"
-#include "storage/snapshot_format_v1.h"
 #include "vectors/vector_store.h"
 
 namespace fs = std::filesystem;
@@ -31,8 +32,7 @@ class SnapshotFormatV1Test : public ::testing::Test {
   void SetUp() override {
     // Create a unique temp directory for each test
     test_dir_ = fs::temp_directory_path() /
-                ("nvecd_snapshot_v1_test_" +
-                 std::to_string(::testing::UnitTest::GetInstance()->random_seed()));
+                ("nvecd_snapshot_v1_test_" + std::to_string(::testing::UnitTest::GetInstance()->random_seed()));
     fs::create_directories(test_dir_);
 
     // Create stores with default configs
@@ -49,9 +49,7 @@ class SnapshotFormatV1Test : public ::testing::Test {
     }
   }
 
-  std::string TestFilePath(const std::string& name) {
-    return (test_dir_ / name).string();
-  }
+  std::string TestFilePath(const std::string& name) { return (test_dir_ / name).string(); }
 
   /// @brief Populate stores with test data for round-trip verification
   void PopulateStores() {
@@ -96,8 +94,7 @@ TEST_F(SnapshotFormatV1Test, WriteAndRead_RoundTrip) {
   const std::string path = TestFilePath("round_trip.dmp");
 
   // Write snapshot
-  auto write_result =
-      WriteSnapshotV1(path, config_, *event_store_, *co_index_, *vector_store_);
+  auto write_result = WriteSnapshotV1(path, config_, *event_store_, *co_index_, *vector_store_);
   ASSERT_TRUE(write_result.has_value()) << "WriteSnapshotV1 failed: " << write_result.error().message();
 
   // Create fresh stores for reading
@@ -108,8 +105,7 @@ TEST_F(SnapshotFormatV1Test, WriteAndRead_RoundTrip) {
   vectors::VectorStore loaded_vectors(vectors_cfg);
   config::Config loaded_config;
 
-  auto read_result =
-      ReadSnapshotV1(path, loaded_config, loaded_events, loaded_co, loaded_vectors);
+  auto read_result = ReadSnapshotV1(path, loaded_config, loaded_events, loaded_co, loaded_vectors);
   ASSERT_TRUE(read_result.has_value()) << "ReadSnapshotV1 failed: " << read_result.error().message();
 
   // Verify event store round-trip
@@ -159,8 +155,7 @@ TEST_F(SnapshotFormatV1Test, WriteAndVerify_IntegrityOk) {
 
   const std::string path = TestFilePath("integrity_ok.dmp");
 
-  auto write_result =
-      WriteSnapshotV1(path, config_, *event_store_, *co_index_, *vector_store_);
+  auto write_result = WriteSnapshotV1(path, config_, *event_store_, *co_index_, *vector_store_);
   ASSERT_TRUE(write_result.has_value()) << "WriteSnapshotV1 failed: " << write_result.error().message();
 
   snapshot_format::IntegrityError integrity_error;
@@ -178,8 +173,7 @@ TEST_F(SnapshotFormatV1Test, GetSnapshotInfo_ValidFile) {
 
   const std::string path = TestFilePath("info_valid.dmp");
 
-  auto write_result =
-      WriteSnapshotV1(path, config_, *event_store_, *co_index_, *vector_store_);
+  auto write_result = WriteSnapshotV1(path, config_, *event_store_, *co_index_, *vector_store_);
   ASSERT_TRUE(write_result.has_value()) << "WriteSnapshotV1 failed: " << write_result.error().message();
 
   SnapshotInfo info;
@@ -207,8 +201,7 @@ TEST_F(SnapshotFormatV1Test, ReadNonexistent_ReturnsError) {
   vectors::VectorStore loaded_vectors(vectors_cfg);
   config::Config loaded_config;
 
-  auto read_result =
-      ReadSnapshotV1(path, loaded_config, loaded_events, loaded_co, loaded_vectors);
+  auto read_result = ReadSnapshotV1(path, loaded_config, loaded_events, loaded_co, loaded_vectors);
   EXPECT_FALSE(read_result.has_value());
 }
 
@@ -231,8 +224,7 @@ TEST_F(SnapshotFormatV1Test, VerifyCorrupted_ReturnsError) {
 
   const std::string path = TestFilePath("corrupted.dmp");
 
-  auto write_result =
-      WriteSnapshotV1(path, config_, *event_store_, *co_index_, *vector_store_);
+  auto write_result = WriteSnapshotV1(path, config_, *event_store_, *co_index_, *vector_store_);
   ASSERT_TRUE(write_result.has_value()) << "WriteSnapshotV1 failed: " << write_result.error().message();
 
   // Read the file, corrupt a byte in the middle, write it back
@@ -240,8 +232,7 @@ TEST_F(SnapshotFormatV1Test, VerifyCorrupted_ReturnsError) {
   {
     std::ifstream ifs(path, std::ios::binary);
     ASSERT_TRUE(ifs.is_open());
-    file_data.assign(std::istreambuf_iterator<char>(ifs),
-                     std::istreambuf_iterator<char>());
+    file_data.assign(std::istreambuf_iterator<char>(ifs), std::istreambuf_iterator<char>());
   }
   ASSERT_GT(file_data.size(), 100u);
 
@@ -259,8 +250,7 @@ TEST_F(SnapshotFormatV1Test, VerifyCorrupted_ReturnsError) {
   auto verify_result = VerifySnapshotIntegrity(path, integrity_error);
 
   // Either the function returns an error or the integrity_error is set
-  EXPECT_TRUE(!verify_result.has_value() || integrity_error.HasError())
-      << "Corrupted file should fail verification";
+  EXPECT_TRUE(!verify_result.has_value() || integrity_error.HasError()) << "Corrupted file should fail verification";
 }
 
 // ---------------------------------------------------------------------------
@@ -281,8 +271,7 @@ TEST_F(SnapshotFormatV1Test, WriteEmptyStores) {
   // Do NOT populate stores - test with empty data
   const std::string path = TestFilePath("empty_stores.dmp");
 
-  auto write_result =
-      WriteSnapshotV1(path, config_, *event_store_, *co_index_, *vector_store_);
+  auto write_result = WriteSnapshotV1(path, config_, *event_store_, *co_index_, *vector_store_);
   ASSERT_TRUE(write_result.has_value()) << "WriteSnapshotV1 failed: " << write_result.error().message();
 
   // Verify the file was created
@@ -296,8 +285,7 @@ TEST_F(SnapshotFormatV1Test, WriteEmptyStores) {
   vectors::VectorStore loaded_vectors(vectors_cfg);
   config::Config loaded_config;
 
-  auto read_result =
-      ReadSnapshotV1(path, loaded_config, loaded_events, loaded_co, loaded_vectors);
+  auto read_result = ReadSnapshotV1(path, loaded_config, loaded_events, loaded_co, loaded_vectors);
   ASSERT_TRUE(read_result.has_value()) << "ReadSnapshotV1 failed: " << read_result.error().message();
 
   // All stores should be empty

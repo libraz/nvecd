@@ -47,8 +47,7 @@ class TcpClient {
     server_addr.sin_port = htons(port);
     inet_pton(AF_INET, host.c_str(), &server_addr.sin_addr);
 
-    if (connect(sock_, reinterpret_cast<struct sockaddr*>(&server_addr),
-                sizeof(server_addr)) < 0) {
+    if (connect(sock_, reinterpret_cast<struct sockaddr*>(&server_addr), sizeof(server_addr)) < 0) {
       close(sock_);
       throw std::runtime_error("Failed to connect");
     }
@@ -156,15 +155,13 @@ TEST_F(EndToEndTest, EventAdd_Basic) {
 TEST_F(EndToEndTest, EventAdd_InvalidScore) {
   TcpClient client("127.0.0.1", port_);
   auto resp = client.SendCommand("EVENT ctx1 ADD item1 notanumber");
-  EXPECT_TRUE(resp.find("ERROR") != std::string::npos ||
-              resp.find("ERR") != std::string::npos);
+  EXPECT_TRUE(resp.find("ERROR") != std::string::npos || resp.find("ERR") != std::string::npos);
 }
 
 TEST_F(EndToEndTest, EventAdd_MissingArgs) {
   TcpClient client("127.0.0.1", port_);
   auto resp = client.SendCommand("EVENT ctx1 ADD");
-  EXPECT_TRUE(resp.find("ERROR") != std::string::npos ||
-              resp.find("ERR") != std::string::npos);
+  EXPECT_TRUE(resp.find("ERROR") != std::string::npos || resp.find("ERR") != std::string::npos);
 }
 
 // ---------------------------------------------------------------------------
@@ -183,8 +180,7 @@ TEST_F(EndToEndTest, Vecset_DimensionMismatch) {
   client.SendCommand("VECSET item1 1.0 2.0 3.0");
   // Try to set a different vector with 2 dimensions (mismatch)
   auto resp = client.SendCommand("VECSET item2 1.0 2.0");
-  EXPECT_TRUE(resp.find("ERROR") != std::string::npos ||
-              resp.find("ERR") != std::string::npos);
+  EXPECT_TRUE(resp.find("ERROR") != std::string::npos || resp.find("ERR") != std::string::npos);
 }
 
 // ---------------------------------------------------------------------------
@@ -225,8 +221,7 @@ TEST_F(EndToEndTest, Sim_NotFound) {
   TcpClient client("127.0.0.1", port_);
   auto resp = client.SendCommand("SIM nonexistent 10 using=events");
   // Should return OK with 0 results or ERROR
-  EXPECT_TRUE(resp.find("OK") == 0 ||
-              resp.find("ERROR") != std::string::npos);
+  EXPECT_TRUE(resp.find("OK") == 0 || resp.find("ERROR") != std::string::npos);
 }
 
 // ---------------------------------------------------------------------------
@@ -261,10 +256,8 @@ TEST_F(EndToEndTest, Info_AfterData) {
   auto resp = client.SendCommand("INFO");
   EXPECT_TRUE(resp.find("OK INFO") != std::string::npos);
   // Should have non-zero counts
-  EXPECT_TRUE(resp.find("vector_count: 0") == std::string::npos ||
-              resp.find("vector_count: 1") != std::string::npos);
-  EXPECT_TRUE(resp.find("event_count: 0") == std::string::npos ||
-              resp.find("event_count: 1") != std::string::npos);
+  EXPECT_TRUE(resp.find("vector_count: 0") == std::string::npos || resp.find("vector_count: 1") != std::string::npos);
+  EXPECT_TRUE(resp.find("event_count: 0") == std::string::npos || resp.find("event_count: 1") != std::string::npos);
 }
 
 // ---------------------------------------------------------------------------
@@ -274,23 +267,20 @@ TEST_F(EndToEndTest, Info_AfterData) {
 TEST_F(EndToEndTest, ConfigHelp_Root) {
   TcpClient client("127.0.0.1", port_);
   auto resp = client.SendCommand("CONFIG HELP");
-  EXPECT_TRUE(resp.find("+OK") != std::string::npos ||
-              resp.find("OK") != std::string::npos);
+  EXPECT_TRUE(resp.find("+OK") != std::string::npos || resp.find("OK") != std::string::npos);
 }
 
 TEST_F(EndToEndTest, ConfigHelp_Path) {
   TcpClient client("127.0.0.1", port_);
   auto resp = client.SendCommand("CONFIG HELP api");
-  EXPECT_TRUE(resp.find("+OK") != std::string::npos ||
-              resp.find("OK") != std::string::npos ||
+  EXPECT_TRUE(resp.find("+OK") != std::string::npos || resp.find("OK") != std::string::npos ||
               resp.find("-ERR") != std::string::npos);
 }
 
 TEST_F(EndToEndTest, ConfigShow_Full) {
   TcpClient client("127.0.0.1", port_);
   auto resp = client.SendCommand("CONFIG SHOW");
-  EXPECT_TRUE(resp.find("+OK") != std::string::npos ||
-              resp.find("OK") != std::string::npos);
+  EXPECT_TRUE(resp.find("+OK") != std::string::npos || resp.find("OK") != std::string::npos);
 }
 
 // ---------------------------------------------------------------------------
@@ -391,6 +381,5 @@ TEST_F(EndToEndTest, FullPipeline) {
 TEST_F(EndToEndTest, UnknownCommand) {
   TcpClient client("127.0.0.1", port_);
   auto resp = client.SendCommand("FOOBAR");
-  EXPECT_TRUE(resp.find("ERROR") != std::string::npos ||
-              resp.find("ERR") != std::string::npos);
+  EXPECT_TRUE(resp.find("ERROR") != std::string::npos || resp.find("ERR") != std::string::npos);
 }

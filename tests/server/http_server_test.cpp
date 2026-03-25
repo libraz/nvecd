@@ -161,6 +161,14 @@ TEST_F(HttpServerTest, HealthDetail) {
   EXPECT_TRUE(body["components"].contains("co_index"));
 }
 
+TEST_F(HttpServerTest, HealthDetail_ReturnsRealUptime) {
+  std::this_thread::sleep_for(std::chrono::seconds(1));
+  auto res = client_->Get("/health/detail");
+  ASSERT_TRUE(res);
+  auto body = json::parse(res->body);
+  EXPECT_GT(body["uptime_seconds"].get<uint64_t>(), 0);
+}
+
 // Info and Config tests
 TEST_F(HttpServerTest, Info) {
   auto res = client_->Get("/info");
@@ -172,6 +180,21 @@ TEST_F(HttpServerTest, Info) {
   EXPECT_TRUE(body.contains("version"));
   EXPECT_TRUE(body.contains("memory"));
   EXPECT_TRUE(body.contains("stores"));
+}
+
+TEST_F(HttpServerTest, Info_ReturnsRealUptime) {
+  std::this_thread::sleep_for(std::chrono::seconds(1));
+  auto res = client_->Get("/info");
+  ASSERT_TRUE(res);
+  auto body = json::parse(res->body);
+  EXPECT_GT(body["uptime_seconds"].get<uint64_t>(), 0);
+}
+
+TEST_F(HttpServerTest, Info_ReturnsRealPeakMemory) {
+  auto res = client_->Get("/info");
+  ASSERT_TRUE(res);
+  auto body = json::parse(res->body);
+  EXPECT_GT(body["memory"]["peak_memory_bytes"].get<uint64_t>(), 0);
 }
 
 TEST_F(HttpServerTest, Config) {
@@ -198,6 +221,13 @@ TEST_F(HttpServerTest, Metrics) {
   EXPECT_TRUE(res->body.find("# TYPE nvecd_uptime_seconds counter") != std::string::npos);
   EXPECT_TRUE(res->body.find("nvecd_commands_total") != std::string::npos);
   EXPECT_TRUE(res->body.find("nvecd_memory_bytes") != std::string::npos);
+}
+
+TEST_F(HttpServerTest, Metrics_ReturnsRealUptime) {
+  std::this_thread::sleep_for(std::chrono::seconds(1));
+  auto res = client_->Get("/metrics");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(res->body.find("nvecd_uptime_seconds 0"), std::string::npos);
 }
 
 // Vector operations tests

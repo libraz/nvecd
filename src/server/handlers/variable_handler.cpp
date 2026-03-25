@@ -14,7 +14,7 @@
 namespace nvecd::server::handlers {
 
 utils::Expected<std::string, utils::Error> HandleSet(config::RuntimeVariableManager* manager,
-                                                      const std::string& variable_name, const std::string& value) {
+                                                     const std::string& variable_name, const std::string& value) {
   if (manager == nullptr) {
     return utils::MakeUnexpected(
         utils::MakeError(utils::ErrorCode::kInternalError, "RuntimeVariableManager not initialized"));
@@ -29,7 +29,7 @@ utils::Expected<std::string, utils::Error> HandleSet(config::RuntimeVariableMana
 }
 
 utils::Expected<std::string, utils::Error> HandleShowVariables(config::RuntimeVariableManager* manager,
-                                                                const std::string& pattern) {
+                                                               const std::string& pattern) {
   if (manager == nullptr) {
     return utils::MakeUnexpected(
         utils::MakeError(utils::ErrorCode::kInternalError, "RuntimeVariableManager not initialized"));
@@ -75,7 +75,7 @@ utils::Expected<std::string, utils::Error> HandleShowVariables(config::RuntimeVa
 }
 
 utils::Expected<std::string, utils::Error> HandleGet(config::RuntimeVariableManager* manager,
-                                                      const std::string& variable_name) {
+                                                     const std::string& variable_name) {
   if (manager == nullptr) {
     return utils::MakeUnexpected(
         utils::MakeError(utils::ErrorCode::kInternalError, "RuntimeVariableManager not initialized"));

@@ -150,7 +150,6 @@ void HttpServer::SetupAccessControl() {
       return httplib::Server::HandlerResponse::Unhandled;
     }
 
-    ;
     const auto& remote = req.remote_addr.empty() ? std::string("<unknown>") : req.remote_addr;
     nvecd::utils::StructuredLog()
         .Event("server_warning")
@@ -274,8 +273,6 @@ void HttpServer::SendError(httplib::Response& res, int status_code, const std::s
 //
 
 void HttpServer::HandleHealth(const httplib::Request& /*req*/, httplib::Response& res) {
-  ;
-
   json response;
   response["status"] = "ok";
   response["timestamp"] =
@@ -285,8 +282,6 @@ void HttpServer::HandleHealth(const httplib::Request& /*req*/, httplib::Response
 }
 
 void HttpServer::HandleHealthLive(const httplib::Request& /*req*/, httplib::Response& res) {
-  ;
-
   // Liveness probe: Always return 200 OK if the process is running
   // This is used by orchestrators (Kubernetes, Docker) to detect deadlocks
   json response;
@@ -298,8 +293,6 @@ void HttpServer::HandleHealthLive(const httplib::Request& /*req*/, httplib::Resp
 }
 
 void HttpServer::HandleHealthReady(const httplib::Request& /*req*/, httplib::Response& res) {
-  ;
-
   // Readiness probe: Return 200 OK if ready to accept traffic, 503 otherwise
   bool is_ready = (loading_ == nullptr || !loading_->load());
 
@@ -321,8 +314,6 @@ void HttpServer::HandleHealthReady(const httplib::Request& /*req*/, httplib::Res
 }
 
 void HttpServer::HandleHealthDetail(const httplib::Request& /*req*/, httplib::Response& res) {
-  ;
-
   // Detailed health: Return comprehensive component status
   json response;
 
@@ -332,8 +323,8 @@ void HttpServer::HandleHealthDetail(const httplib::Request& /*req*/, httplib::Re
   response["timestamp"] =
       std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 
-  // Calculate uptime (simple ServerStats doesn't track uptime)
-  response["uptime_seconds"] = 0;
+  const ServerStats& effective_stats = (tcp_stats_ != nullptr) ? *tcp_stats_ : stats_;
+  response["uptime_seconds"] = effective_stats.GetUptimeSeconds();
 
   // Components status
   json components;
@@ -387,9 +378,9 @@ void HttpServer::HandleHealthDetail(const httplib::Request& /*req*/, httplib::Re
 void HttpServer::HandleInfo(const httplib::Request& /*req*/, httplib::Response& res) {
   // Increment request counter on the effective stats instance
   if (tcp_stats_ != nullptr) {
-    ;
+    tcp_stats_->info_commands.fetch_add(1);
   } else {
-    ;
+    stats_.info_commands.fetch_add(1);
   }
 
   try {
@@ -401,7 +392,7 @@ void HttpServer::HandleInfo(const httplib::Request& /*req*/, httplib::Response& 
     // Server info
     response["server"] = "nvecd";
     response["version"] = nvecd::Version::String();
-    response["uptime_seconds"] = 0;  // Simple ServerStats doesn't track uptime
+    response["uptime_seconds"] = effective_stats.GetUptimeSeconds();
 
     // Statistics (direct field access from simple ServerStats)
     response["total_requests"] = effective_stats.total_commands.load();
@@ -435,11 +426,14 @@ void HttpServer::HandleInfo(const httplib::Request& /*req*/, httplib::Response& 
     // Memory tracking (simple ServerStats doesn't have UpdateMemoryUsage method)
     // Memory is tracked through store statistics instead
 
+    // Process memory information (retrieved early for peak memory fields)
+    auto proc_info = utils::GetProcessMemoryInfo();
+
     json memory_obj;
     memory_obj["used_memory_bytes"] = total_memory;
     memory_obj["used_memory_human"] = utils::FormatBytes(total_memory);
-    memory_obj["peak_memory_bytes"] = 0;  // Simple ServerStats doesn't track peak memory
-    memory_obj["peak_memory_human"] = utils::FormatBytes(0);
+    memory_obj["peak_memory_bytes"] = proc_info ? proc_info->peak_rss_bytes : 0;
+    memory_obj["peak_memory_human"] = utils::FormatBytes(proc_info ? proc_info->peak_rss_bytes : 0);
     memory_obj["used_memory_events"] = utils::FormatBytes(event_memory);
     memory_obj["used_memory_vectors"] = utils::FormatBytes(vector_memory);
     memory_obj["used_memory_co_occurrence"] = utils::FormatBytes(co_memory);
@@ -458,8 +452,7 @@ void HttpServer::HandleInfo(const httplib::Request& /*req*/, httplib::Response& 
       }
     }
 
-    // Process memory information
-    auto proc_info = utils::GetProcessMemoryInfo();
+    // Process memory details
     if (proc_info) {
       memory_obj["process_rss"] = proc_info->rss_bytes;
       memory_obj["process_rss_human"] = utils::FormatBytes(proc_info->rss_bytes);
@@ -509,8 +502,6 @@ void HttpServer::HandleInfo(const httplib::Request& /*req*/, httplib::Response& 
 }
 
 void HttpServer::HandleConfig(const httplib::Request& /*req*/, httplib::Response& res) {
-  ;
-
   if (full_config_ == nullptr) {
     SendError(res, kHttpInternalServerError, "Configuration not available");
     return;
@@ -558,8 +549,6 @@ void HttpServer::HandleConfig(const httplib::Request& /*req*/, httplib::Response
 //
 
 void HttpServer::HandleEvent(const httplib::Request& req, httplib::Response& res) {
-  ;
-
   // Check if server is loading
   if (loading_ != nullptr && loading_->load()) {
     SendError(res, kHttpServiceUnavailable, "Server is loading, please try again later");
@@ -639,8 +628,6 @@ void HttpServer::HandleEvent(const httplib::Request& req, httplib::Response& res
 }
 
 void HttpServer::HandleVecset(const httplib::Request& req, httplib::Response& res) {
-  ;
-
   // Check if server is loading
   if (loading_ != nullptr && loading_->load()) {
     SendError(res, kHttpServiceUnavailable, "Server is loading, please try again later");
@@ -688,8 +675,6 @@ void HttpServer::HandleVecset(const httplib::Request& req, httplib::Response& re
 }
 
 void HttpServer::HandleSim(const httplib::Request& req, httplib::Response& res) {
-  ;
-
   // Check if server is loading
   if (loading_ != nullptr && loading_->load()) {
     SendError(res, kHttpServiceUnavailable, "Server is loading, please try again later");
@@ -766,8 +751,6 @@ void HttpServer::HandleSim(const httplib::Request& req, httplib::Response& res) 
 }
 
 void HttpServer::HandleSimv(const httplib::Request& req, httplib::Response& res) {
-  ;
-
   // Check if server is loading
   if (loading_ != nullptr && loading_->load()) {
     SendError(res, kHttpServiceUnavailable, "Server is loading, please try again later");
@@ -832,8 +815,6 @@ void HttpServer::HandleSimv(const httplib::Request& req, httplib::Response& res)
 //
 
 void HttpServer::HandleDumpSave(const httplib::Request& req, httplib::Response& res) {
-  ;
-
   try {
     // Parse JSON body (filepath is optional)
     std::string filepath;
@@ -869,8 +850,6 @@ void HttpServer::HandleDumpSave(const httplib::Request& req, httplib::Response& 
 }
 
 void HttpServer::HandleDumpLoad(const httplib::Request& req, httplib::Response& res) {
-  ;
-
   try {
     // Parse JSON body
     json body = json::parse(req.body);
@@ -912,8 +891,6 @@ void HttpServer::HandleDumpLoad(const httplib::Request& req, httplib::Response& 
 }
 
 void HttpServer::HandleDumpVerify(const httplib::Request& req, httplib::Response& res) {
-  ;
-
   try {
     // Parse JSON body
     json body = json::parse(req.body);
@@ -956,8 +933,6 @@ void HttpServer::HandleDumpVerify(const httplib::Request& req, httplib::Response
 }
 
 void HttpServer::HandleDumpInfo(const httplib::Request& req, httplib::Response& res) {
-  ;
-
   try {
     // Parse JSON body
     json body = json::parse(req.body);
@@ -1004,8 +979,6 @@ void HttpServer::HandleDumpInfo(const httplib::Request& req, httplib::Response& 
 //
 
 void HttpServer::HandleDebugOn(const httplib::Request& /*req*/, httplib::Response& res) {
-  ;
-
   // Note: HTTP is stateless, so we cannot enable per-connection debug mode
   // This endpoint exists for API compatibility, but has limited functionality
   json response;
@@ -1015,8 +988,6 @@ void HttpServer::HandleDebugOn(const httplib::Request& /*req*/, httplib::Respons
 }
 
 void HttpServer::HandleDebugOff(const httplib::Request& /*req*/, httplib::Response& res) {
-  ;
-
   // Note: HTTP is stateless, so we cannot disable per-connection debug mode
   json response;
   response["status"] = "ok";
@@ -1031,8 +1002,6 @@ void HttpServer::HandleDebugOff(const httplib::Request& /*req*/, httplib::Respon
 //
 
 void HttpServer::HandleMetrics(const httplib::Request& /*req*/, httplib::Response& res) {
-  ;
-
   try {
     // Use TCP server's stats if available (includes all protocol stats), otherwise use HTTP-only stats
     const ServerStats& effective_stats = (tcp_stats_ != nullptr) ? *tcp_stats_ : stats_;
@@ -1042,7 +1011,7 @@ void HttpServer::HandleMetrics(const httplib::Request& /*req*/, httplib::Respons
     // Server uptime
     metrics << "# HELP nvecd_uptime_seconds Server uptime in seconds\n";
     metrics << "# TYPE nvecd_uptime_seconds counter\n";
-    metrics << "nvecd_uptime_seconds " << 0 << "\n\n";  // Simple ServerStats doesn't track uptime
+    metrics << "nvecd_uptime_seconds " << effective_stats.GetUptimeSeconds() << "\n\n";
 
     // Total commands
     metrics << "# HELP nvecd_commands_total Total commands processed\n";
@@ -1089,7 +1058,8 @@ void HttpServer::HandleMetrics(const httplib::Request& /*req*/, httplib::Respons
     }
 
     // Cache metrics
-    auto* metrics_cache = (handler_context_ != nullptr) ? handler_context_->cache.load(std::memory_order_acquire) : nullptr;
+    auto* metrics_cache =
+        (handler_context_ != nullptr) ? handler_context_->cache.load(std::memory_order_acquire) : nullptr;
     if (metrics_cache != nullptr) {
       auto cache_stats = metrics_cache->GetStatistics();
 
@@ -1131,10 +1101,9 @@ void HttpServer::HandleMetrics(const httplib::Request& /*req*/, httplib::Respons
 //
 
 void HttpServer::HandleCacheStats(const httplib::Request& /*req*/, httplib::Response& res) {
-  ;
-
   try {
-    auto* stats_cache = (handler_context_ != nullptr) ? handler_context_->cache.load(std::memory_order_acquire) : nullptr;
+    auto* stats_cache =
+        (handler_context_ != nullptr) ? handler_context_->cache.load(std::memory_order_acquire) : nullptr;
     if (stats_cache == nullptr) {
       SendError(res, kHttpInternalServerError, "Cache not initialized");
       return;
@@ -1166,10 +1135,9 @@ void HttpServer::HandleCacheStats(const httplib::Request& /*req*/, httplib::Resp
 }
 
 void HttpServer::HandleCacheClear(const httplib::Request& req, httplib::Response& res) {
-  ;
-
   try {
-    auto* clear_cache = (handler_context_ != nullptr) ? handler_context_->cache.load(std::memory_order_acquire) : nullptr;
+    auto* clear_cache =
+        (handler_context_ != nullptr) ? handler_context_->cache.load(std::memory_order_acquire) : nullptr;
     if (clear_cache == nullptr) {
       SendError(res, kHttpInternalServerError, "Cache not initialized");
       return;

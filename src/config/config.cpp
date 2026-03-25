@@ -482,8 +482,8 @@ utils::Expected<void, utils::Error> ValidateConfig(const Config& config) {
 
   // Validate performance configuration
   if (config.perf.thread_pool_size < 0) {
-    return utils::MakeUnexpected(
-        utils::MakeError(utils::ErrorCode::kConfigInvalidValue, "performance.thread_pool_size must be >= 0 (0 = auto-detect)"));
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
+                                                  "performance.thread_pool_size must be >= 0 (0 = auto-detect)"));
   }
   if (config.perf.max_connections <= 0) {
     return utils::MakeUnexpected(

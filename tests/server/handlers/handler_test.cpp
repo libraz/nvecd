@@ -5,8 +5,8 @@
  * Tests all handler types: cache, info, debug, admin, and variable handlers.
  */
 
-#include <gtest/gtest.h>
 #include <gmock/gmock.h>
+#include <gtest/gtest.h>
 
 #include <atomic>
 #include <memory>
@@ -19,9 +19,11 @@
 #include "server/handlers/admin_handler.h"
 #include "server/handlers/cache_handler.h"
 #include "server/handlers/debug_handler.h"
+#include "server/handlers/dump_handler.h"
 #include "server/handlers/info_handler.h"
 #include "server/handlers/variable_handler.h"
 #include "server/server_types.h"
+#include "utils/error.h"
 #include "vectors/vector_store.h"
 #include "version.h"
 
@@ -44,18 +46,17 @@ class HandlerTest : public ::testing::Test {
     vector_store_ = std::make_unique<nvecd::vectors::VectorStore>(vectors_cfg);
 
     // Construct HandlerContext in-place (non-copyable, non-movable due to atomics)
-    ctx_ = new (ctx_storage_) HandlerContext{
-        /*.event_store=*/event_store_.get(),
-        /*.co_index=*/nullptr,
-        /*.vector_store=*/vector_store_.get(),
-        /*.similarity_engine=*/nullptr,
-        /*.cache=*/{},
-        /*.variable_manager=*/nullptr,
-        /*.stats=*/stats_,
-        /*.config=*/nullptr,
-        /*.loading=*/loading_,
-        /*.read_only=*/read_only_,
-        /*.dump_dir=*/""};
+    ctx_ = new (ctx_storage_) HandlerContext{/*.event_store=*/event_store_.get(),
+                                             /*.co_index=*/nullptr,
+                                             /*.vector_store=*/vector_store_.get(),
+                                             /*.similarity_engine=*/nullptr,
+                                             /*.cache=*/{},
+                                             /*.variable_manager=*/nullptr,
+                                             /*.stats=*/stats_,
+                                             /*.config=*/nullptr,
+                                             /*.loading=*/loading_,
+                                             /*.read_only=*/read_only_,
+                                             /*.dump_dir=*/""};
   }
 
   void TearDown() override {
@@ -214,29 +215,6 @@ TEST_F(HandlerTest, DebugOff_SetsDebugModeFalse) {
 // Admin Handler Tests
 // ============================================================================
 
-TEST_F(HandlerTest, AdminInfo_ReturnsServerContext) {
-  ServerContext server_ctx;
-  server_ctx.uptime_seconds = 42;
-  server_ctx.connections_total = 10;
-  server_ctx.vectors_total = 100;
-  server_ctx.events_total = 500;
-  server_ctx.cache_enabled = true;
-  server_ctx.cache_hits = 30;
-  server_ctx.cache_misses = 70;
-
-  auto result = HandleAdminInfo(server_ctx);
-  ASSERT_TRUE(result.has_value());
-  EXPECT_THAT(*result, HasSubstr("version: " + nvecd::Version::String()));
-  EXPECT_THAT(*result, HasSubstr("uptime_seconds: 42"));
-  EXPECT_THAT(*result, HasSubstr("connections_total: 10"));
-  EXPECT_THAT(*result, HasSubstr("vectors_total: 100"));
-  EXPECT_THAT(*result, HasSubstr("events_total: 500"));
-  EXPECT_THAT(*result, HasSubstr("cache_enabled: true"));
-  EXPECT_THAT(*result, HasSubstr("cache_hits: 30"));
-  EXPECT_THAT(*result, HasSubstr("cache_misses: 70"));
-  EXPECT_THAT(*result, HasSubstr("cache_hit_rate:"));
-}
-
 TEST_F(HandlerTest, ConfigHelp_EmptyPath_ReturnsTopLevel) {
   auto result = HandleConfigHelp("");
   ASSERT_TRUE(result.has_value());
@@ -259,6 +237,74 @@ TEST_F(HandlerTest, ConfigVerify_EmptyFilepath_ReturnsError) {
 TEST_F(HandlerTest, ConfigVerify_NonexistentFile_ReturnsError) {
   auto result = HandleConfigVerify("/tmp/nonexistent_config_12345.yaml");
   ASSERT_FALSE(result.has_value());
+}
+
+// ============================================================================
+// Dump Handler Tests
+// ============================================================================
+
+TEST_F(HandlerTest, DumpSave_NullConfig_ReturnsError) {
+  // ctx_ has config = nullptr by default
+  auto result = HandleDumpSave(*ctx_, "");
+  ASSERT_FALSE(result.has_value());
+  EXPECT_THAT(result.error().message(), HasSubstr("configuration is not available"));
+}
+
+TEST_F(HandlerTest, DumpSave_NullStores_ReturnsError) {
+  nvecd::config::Config config;
+  ctx_->config = &config;
+  // co_index is nullptr in our fixture setup
+  auto result = HandleDumpSave(*ctx_, "");
+  ASSERT_FALSE(result.has_value());
+  EXPECT_THAT(result.error().message(), HasSubstr("required stores not initialized"));
+}
+
+TEST_F(HandlerTest, DumpLoad_EmptyFilepath_ReturnsError) {
+  auto result = HandleDumpLoad(*ctx_, "");
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), nvecd::utils::ErrorCode::kInvalidArgument);
+  EXPECT_THAT(result.error().message(), HasSubstr("requires a filepath"));
+}
+
+TEST_F(HandlerTest, DumpVerify_EmptyFilepath_ReturnsError) {
+  auto result = HandleDumpVerify("", "");
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), nvecd::utils::ErrorCode::kInvalidArgument);
+  EXPECT_THAT(result.error().message(), HasSubstr("requires a filepath"));
+}
+
+TEST_F(HandlerTest, DumpInfo_EmptyFilepath_ReturnsError) {
+  auto result = HandleDumpInfo("", "");
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), nvecd::utils::ErrorCode::kInvalidArgument);
+  EXPECT_THAT(result.error().message(), HasSubstr("requires a filepath"));
+}
+
+TEST_F(HandlerTest, DumpVerify_NonexistentFile_ReturnsError) {
+  auto result = HandleDumpVerify("/tmp", "/tmp/nonexistent_snapshot_12345.dmp");
+  ASSERT_FALSE(result.has_value());
+}
+
+TEST_F(HandlerTest, DumpLoad_NonexistentFile_ReturnsError) {
+  nvecd::config::Config config;
+  ctx_->config = &config;
+  ctx_->dump_dir = "/tmp";
+  auto result = HandleDumpLoad(*ctx_, "/tmp/nonexistent_snapshot_12345.dmp");
+  ASSERT_FALSE(result.has_value());
+}
+
+// ============================================================================
+// Info Handler Dynamic Memory Health Tests
+// ============================================================================
+
+TEST_F(HandlerTest, Info_ContainsDynamicMemoryHealth) {
+  auto result = HandleInfo(*ctx_);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_THAT(*result, HasSubstr("memory_health:"));
+  bool has_valid_health = result->find("memory_health: HEALTHY") != std::string::npos ||
+                          result->find("memory_health: WARNING") != std::string::npos ||
+                          result->find("memory_health: CRITICAL") != std::string::npos;
+  EXPECT_TRUE(has_valid_health);
 }
 
 // ============================================================================

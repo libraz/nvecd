@@ -24,7 +24,7 @@ namespace nvecd::server::handlers {
  * @return Response string or error
  */
 utils::Expected<std::string, utils::Error> HandleSet(config::RuntimeVariableManager* manager,
-                                                      const std::string& variable_name, const std::string& value);
+                                                     const std::string& variable_name, const std::string& value);
 
 /**
  * @brief Handle SHOW VARIABLES command
@@ -33,7 +33,7 @@ utils::Expected<std::string, utils::Error> HandleSet(config::RuntimeVariableMana
  * @return Response string or error
  */
 utils::Expected<std::string, utils::Error> HandleShowVariables(config::RuntimeVariableManager* manager,
-                                                                const std::string& pattern = "");
+                                                               const std::string& pattern = "");
 
 /**
  * @brief Handle GET command (single variable)
@@ -42,6 +42,6 @@ utils::Expected<std::string, utils::Error> HandleShowVariables(config::RuntimeVa
  * @return Response string or error
  */
 utils::Expected<std::string, utils::Error> HandleGet(config::RuntimeVariableManager* manager,
-                                                      const std::string& variable_name);
+                                                     const std::string& variable_name);
 
 }  // namespace nvecd::server::handlers

@@ -81,8 +81,7 @@ utils::Expected<std::string, utils::Error> HandleDumpSave(HandlerContext& ctx, c
 
 utils::Expected<std::string, utils::Error> HandleDumpLoad(HandlerContext& ctx, const std::string& filepath) {
   if (filepath.empty()) {
-    return utils::MakeUnexpected(
-        utils::MakeError(utils::ErrorCode::kInvalidArgument, "DUMP LOAD requires a filepath"));
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kInvalidArgument, "DUMP LOAD requires a filepath"));
   }
 
   auto validated = utils::ValidateDumpPath(filepath, ctx.dump_dir);
@@ -156,8 +155,7 @@ utils::Expected<std::string, utils::Error> HandleDumpVerify(const std::string& d
 
 utils::Expected<std::string, utils::Error> HandleDumpInfo(const std::string& dump_dir, const std::string& filepath) {
   if (filepath.empty()) {
-    return utils::MakeUnexpected(
-        utils::MakeError(utils::ErrorCode::kInvalidArgument, "DUMP INFO requires a filepath"));
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kInvalidArgument, "DUMP INFO requires a filepath"));
   }
 
   auto validated = utils::ValidateDumpPath(filepath, dump_dir);
@@ -172,9 +170,9 @@ utils::Expected<std::string, utils::Error> HandleDumpInfo(const std::string& dum
   auto info_result = storage::snapshot_v1::GetSnapshotInfo(resolved_path, info);
 
   if (!info_result) {
-    return utils::MakeUnexpected(utils::MakeError(
-        utils::ErrorCode::kSnapshotInfoFailed,
-        "Failed to read snapshot info from " + resolved_path + ": " + info_result.error().message()));
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kSnapshotInfoFailed,
+                         "Failed to read snapshot info from " + resolved_path + ": " + info_result.error().message()));
   }
 
   std::ostringstream result;

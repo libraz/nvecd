@@ -9,9 +9,9 @@
 #include <sstream>
 
 // Include concrete types before request_dispatcher.h to resolve forward declarations
+#include "cache/similarity_cache.h"
 #include "events/co_occurrence_index.h"
 #include "events/event_store.h"
-#include "cache/similarity_cache.h"
 #include "server/handlers/admin_handler.h"
 #include "server/handlers/cache_handler.h"
 #include "server/handlers/debug_handler.h"
@@ -62,6 +62,7 @@ std::string RequestDispatcher::Dispatch(const std::string& request, ConnectionCo
       break;
 
     case CommandType::kInfo:
+      ctx_.stats.info_commands++;
       result = HandleInfo(*cmd);
       break;
 
@@ -81,18 +82,22 @@ std::string RequestDispatcher::Dispatch(const std::string& request, ConnectionCo
       break;
 
     case CommandType::kDumpSave:
+      ctx_.stats.dump_commands++;
       result = HandleDumpSave(*cmd);
       break;
 
     case CommandType::kDumpLoad:
+      ctx_.stats.dump_commands++;
       result = HandleDumpLoad(*cmd);
       break;
 
     case CommandType::kDumpVerify:
+      ctx_.stats.dump_commands++;
       result = HandleDumpVerify(*cmd);
       break;
 
     case CommandType::kDumpInfo:
+      ctx_.stats.dump_commands++;
       result = HandleDumpInfo(*cmd);
       break;
 
@@ -163,7 +168,7 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleEvent(const 
     return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kInternalError, "EventStore not initialized"));
   }
 
-  auto result = ctx_.event_store->AddEvent(cmd.ctx, cmd.id, cmd.score);
+  auto result = ctx_.event_store->AddEvent(cmd.ctx, cmd.id, cmd.score, cmd.event_type);
   if (!result) {
     return utils::MakeUnexpected(result.error());
   }

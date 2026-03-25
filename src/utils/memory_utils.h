@@ -3,8 +3,7 @@
  * @brief Memory health check and monitoring utilities
  */
 
-#ifndef MYGRAMDB_UTILS_MEMORY_UTILS_H_
-#define MYGRAMDB_UTILS_MEMORY_UTILS_H_
+#pragma once
 
 #include <cstdint>
 #include <optional>
@@ -101,5 +100,3 @@ std::string MemoryHealthStatusToString(MemoryHealthStatus status);
 uint64_t EstimateOptimizationMemory(uint64_t index_memory_usage, size_t batch_size);
 
 }  // namespace nvecd::utils
-
-#endif  // MYGRAMDB_UTILS_MEMORY_UTILS_H_

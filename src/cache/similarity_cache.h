@@ -303,7 +303,7 @@ class SimilarityCache {
   size_t max_memory_bytes_;
   std::atomic<double> min_query_cost_ms_;
   std::atomic<int> ttl_seconds_{0};  ///< TTL in seconds (0 = no expiration)
-  std::atomic<bool> enabled_{true};           ///< Cache enabled flag
+  std::atomic<bool> enabled_{true};  ///< Cache enabled flag
 
   // Memory tracking
   size_t total_memory_bytes_ = 0;

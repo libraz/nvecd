@@ -525,8 +525,7 @@ TEST_F(SimilarityEngineTest, DistanceMetric_DotProduct) {
   ASSERT_TRUE(vec_store->SetVector("item1", {1.0f, 2.0f, 3.0f}).has_value());
   ASSERT_TRUE(vec_store->SetVector("item2", {4.0f, 5.0f, 6.0f}).has_value());
 
-  SimilarityEngine engine(event_store_.get(), co_index_.get(), vec_store.get(),
-                          similarity_config_, vec_cfg);
+  SimilarityEngine engine(event_store_.get(), co_index_.get(), vec_store.get(), similarity_config_, vec_cfg);
 
   auto results = engine.SearchByIdVectors("item1", 10);
   ASSERT_TRUE(results.has_value());
@@ -545,8 +544,7 @@ TEST_F(SimilarityEngineTest, DistanceMetric_L2) {
   ASSERT_TRUE(vec_store->SetVector("item2", {1.0f, 0.0f, 0.0f}).has_value());
   ASSERT_TRUE(vec_store->SetVector("item3", {10.0f, 0.0f, 0.0f}).has_value());
 
-  SimilarityEngine engine(event_store_.get(), co_index_.get(), vec_store.get(),
-                          similarity_config_, vec_cfg);
+  SimilarityEngine engine(event_store_.get(), co_index_.get(), vec_store.get(), similarity_config_, vec_cfg);
 
   auto results = engine.SearchByIdVectors("item1", 10);
   ASSERT_TRUE(results.has_value());

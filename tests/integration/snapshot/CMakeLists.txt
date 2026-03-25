@@ -22,4 +22,5 @@ gtest_discover_tests(snapshot_integration_test
   PROPERTIES
     RESOURCE_LOCK server_port_and_storage_io
     TIMEOUT 300  # 5 minutes timeout for large snapshot test
+    LABELS integration
 )

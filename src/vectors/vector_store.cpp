@@ -54,9 +54,9 @@ utils::Expected<void, utils::Error> VectorStore::SetVector(const std::string& ve
 
     // Validate dimension
     if (data.size() != current_dim) {
-      auto error = utils::MakeError(
-          utils::ErrorCode::kVectorDimensionMismatch,
-          "Vector dimension mismatch: expected " + std::to_string(current_dim) + ", got " + std::to_string(data.size()));
+      auto error = utils::MakeError(utils::ErrorCode::kVectorDimensionMismatch,
+                                    "Vector dimension mismatch: expected " + std::to_string(current_dim) + ", got " +
+                                        std::to_string(data.size()));
       utils::LogVectorStoreError("set_vector", vector_id, static_cast<int>(data.size()), error.message());
       return utils::MakeUnexpected(error);
     }
