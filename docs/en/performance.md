@@ -286,47 +286,42 @@ echo "DUMP SAVE /backup/nvecd-$(date +%Y%m%d-%H%M%S).dmp" | nc localhost 11017
 
 ## Performance Benchmarks
 
-### Typical Query Performance
+For detailed benchmark results with measured data, see the **[Benchmarks](benchmarks.md)** page.
 
-**Environment:**
-- Apple M1 (NEON SIMD)
-- 10K vectors (768-dim)
-- 50K events across 5K contexts
+### Summary (100K vectors, dim=128, cosine, Apple M4 Max)
 
-**Results:**
+| Query Type | Cold (no cache) | Warm (cached) |
+|------------|-----------------|---------------|
+| SIM (ID search, vectors) | **1.12ms** | 0.00025ms |
+| SIMV (vector query) | **0.98ms** | 0.00025ms |
 
-| Query Type | Mode | Cold (no cache) | Warm (cached) |
-|------------|------|-----------------|---------------|
-| SIM (ID search) | vectors | 2.5ms | 0.05ms |
-| SIM (ID search) | events | 0.8ms | 0.05ms |
-| SIM (ID search) | fusion | 3.2ms | 0.05ms |
-| SIMV (vector query) | vectors | 2.8ms | 0.05ms |
-
-**Key Findings:**
-- SIMD acceleration: 3-6x faster than scalar
-- Cache hit latency: ~50 microseconds (50× faster than cold)
-- Fusion queries: Only 25% slower than pure vector search
+**Key Performance Numbers:**
+- **4.71x** cumulative speedup from optimization pipeline
+- **4 million ops/sec** cache hit throughput
+- **50% memory reduction** from unified storage (no dual map)
+- **0ms write blocking** (eliminated 160ms Compact() rebuild)
 
 ### Scaling Characteristics
 
-**Query latency vs dataset size (vectors mode, 768-dim, AVX2):**
+**Query latency vs dataset size (vectors mode, dim=128, NEON):**
 
-| Dataset Size | Query Time |
-|--------------|------------|
-| 1K vectors | 0.3ms |
-| 10K vectors | 2.5ms |
-| 100K vectors | 25ms |
-| 1M vectors | 250ms |
+| Dataset Size | Full Scan | With Sampling (10K) |
+|---|---|---|
+| 1K vectors | 0.015ms | 0.015ms (full scan) |
+| 10K vectors | 0.13ms | 0.13ms (full scan) |
+| 100K vectors | 1.12ms | 1.12ms (full scan) |
+| 1M vectors | ~11ms | **~0.12ms** |
 
-**Linear scaling:** O(n) with dataset size (brute-force search)
+**Approximate search** with `sample_size: 10000` (default) enables sub-millisecond latency at 1M+ scale.
 
 **Cache effectiveness:**
 
-| Hit Rate | Latency Reduction |
-|----------|-------------------|
-| 50% | 2x faster |
-| 80% | 5x faster |
-| 90% | 10x faster |
+| Hit Rate | Effective Latency (100K) |
+|----------|--------------------------|
+| 0% (cold) | 1.12ms |
+| 50% | 0.56ms |
+| 90% | 0.11ms |
+| 99% | 0.011ms |
 
 ## Troubleshooting
 

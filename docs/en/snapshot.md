@@ -10,6 +10,54 @@ A snapshot is a single binary file (`.nvec`) that contains:
 - Co-occurrence index (relationship scores)
 - Integrity checksums (CRC32) for corruption detection
 
+## Snapshot Modes
+
+Nvecd supports two snapshot modes, configured via `snapshot.mode`:
+
+### Fork Mode (Default, Recommended)
+
+Uses `fork()` to create a copy-on-write (COW) child process:
+
+1. Server acquires exclusive write locks on all stores
+2. `fork()` creates a child process (COW memory pages)
+3. Server immediately releases locks and resumes serving requests
+4. Child process serializes data to disk in the background
+5. Child calls `_exit()` upon completion
+
+**Advantages**:
+- Near-zero downtime — parent resumes serving immediately after fork
+- Consistent snapshot — child sees frozen memory state
+- No extra memory needed (COW pages shared until modified)
+
+**Trade-offs**:
+- Requires OS support for `fork()` (Linux, macOS)
+- Write operations after fork cause COW page copies (transient memory spike)
+
+### Lock Mode
+
+Uses a global write lock during the entire snapshot:
+
+1. Server acquires exclusive write locks on all stores
+2. Data is serialized directly to disk
+3. Locks are released after writing completes
+
+**Advantages**:
+- Simpler implementation, no forked processes
+- Predictable memory usage
+
+**Trade-offs**:
+- Write operations are blocked during the entire save
+- Save duration scales with data size
+
+### Configuration
+
+```yaml
+snapshot:
+  mode: "fork"    # "fork" (COW, recommended) or "lock"
+```
+
+---
+
 ## Commands
 
 ### DUMP SAVE - Create Snapshot
@@ -43,6 +91,8 @@ size: 1048576 bytes
 ```
 
 **Auto-generated filename format**: `dump_YYYYMMDD_HHMMSS.nvec`
+
+**Note:** When `snapshot.mode` is `fork` (default), DUMP SAVE starts a background snapshot via `fork()`. The command returns immediately while the child process writes the snapshot. Use `DUMP STATUS` to check progress.
 
 ---
 
@@ -138,6 +188,49 @@ vector_store_count: 2000
 co_occurrence_count: 1500
 file_size: 1048576
 created_at: 2025-01-18T12:00:00
+```
+
+---
+
+### DUMP STATUS - Check Background Snapshot Status
+
+Check the status of the most recent background snapshot operation.
+
+**Syntax:**
+```
+DUMP STATUS
+```
+
+**Response:**
+```
+OK STATUS
+status: idle
+```
+
+**Status Values:**
+| Status | Description |
+|--------|-------------|
+| `idle` | No snapshot in progress |
+| `in_progress` | Fork child is writing snapshot |
+| `completed` | Last snapshot saved successfully |
+| `failed` | Last snapshot failed (check error_message) |
+
+**In-Progress Response:**
+```
+OK STATUS
+status: in_progress
+child_pid: 12345
+filepath: /var/lib/nvecd/snapshots/dump_20250325_120000.nvec
+start_time: 1711360800
+```
+
+**Completed Response:**
+```
+OK STATUS
+status: completed
+filepath: /var/lib/nvecd/snapshots/dump_20250325_120000.nvec
+start_time: 1711360800
+end_time: 1711360802
 ```
 
 ---

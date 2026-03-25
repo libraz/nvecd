@@ -102,6 +102,7 @@ snapshot:
   default_filename: "nvecd.snapshot" # Default filename
   interval_sec: 0                   # Auto-snapshot interval (0 = disabled)
   retain: 3                         # Number of snapshots to retain
+  mode: "fork"                     # Snapshot mode: "fork" (COW) or "lock"
 ```
 
 | Option | Type | Default | Description |
@@ -110,6 +111,7 @@ snapshot:
 | `default_filename` | string | "nvecd.snapshot" | Default filename for manual saves. |
 | `interval_sec` | int | 0 | Auto-snapshot interval in seconds (0 = disabled). |
 | `retain` | int | 3 | Number of auto-snapshots to retain (manual snapshots unaffected). |
+| `mode` | string | "fork" | Snapshot strategy. `fork`: Copy-on-write via fork() -- parent continues serving. `lock`: Global write lock during save. |
 
 **Auto-snapshot filenames**: `auto_YYYYMMDD_HHMMSS.snapshot`
 
@@ -154,8 +156,6 @@ api:
 
 #### HTTP API (Optional)
 
-> ⚠️ **Not Implemented Yet** - HTTP/JSON API is planned for future releases.
-
 ```yaml
 api:
   http:
@@ -166,9 +166,21 @@ api:
     cors_allow_origin: ""      # Allowed origin
 ```
 
-#### Rate Limiting (Optional)
+#### Unix Domain Socket (Optional)
 
-> ⚠️ **Not Implemented Yet** - Rate limiting is planned for future releases.
+```yaml
+api:
+  unix_socket:
+    path: ""                     # Unix socket path (empty = disabled)
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `path` | string | "" | Unix domain socket path. Empty string disables Unix socket. |
+
+**Note**: Unix domain sockets provide lower-latency local connections. They bypass TCP/IP overhead and are ideal for co-located services.
+
+#### Rate Limiting (Optional)
 
 ```yaml
 api:
@@ -178,6 +190,13 @@ api:
     refill_rate: 10            # Tokens per second
     max_clients: 10000         # Max tracked clients
 ```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `enable` | bool | false | Enable per-client rate limiting (token bucket algorithm). |
+| `capacity` | int | 100 | Maximum burst tokens per client. |
+| `refill_rate` | int | 10 | Tokens refilled per second per client. |
+| `max_clients` | int | 10000 | Maximum number of tracked client IPs. |
 
 ---
 
@@ -220,9 +239,24 @@ logging:
 
 ---
 
-### Query Result Cache Configuration (Optional)
+### Security Configuration
 
-> ⚠️ **Not Implemented Yet** - Query result caching is planned for future releases.
+Controls authentication for write and admin commands.
+
+```yaml
+security:
+  requirepass: ""                # Required password (empty = no auth)
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `requirepass` | string | "" | Password for write/admin commands. Empty = no authentication. |
+
+**Note**: When `requirepass` is set, clients must authenticate with `AUTH <password>` before executing write or admin commands. Read commands (EVENT, SIM, SIMV, INFO) do not require authentication.
+
+---
+
+### Query Result Cache Configuration (Optional)
 
 ```yaml
 cache:

@@ -46,6 +46,11 @@ similarity:
                                     # - Alpha + Beta should equal 1.0
   fusion_beta: 0.4                  # Weight for co-occurrence in fusion mode (default: 0.4)
                                     # - Higher beta = more event influence
+  sample_size: 10000                # Random sampling size for approximate search (default: 10000)
+                                    # - 0 = exact search (scan all vectors)
+                                    # - >0 = approximate search using reservoir sampling
+                                    # - Only activates when dataset > sample_size * 2
+                                    # - Recommended: 10000 for datasets >20K vectors
 
 # Snapshot Persistence Configuration
 snapshot:
@@ -59,6 +64,9 @@ snapshot:
   retain: 3                         # Number of snapshots to retain (default: 3)
                                     # - Older auto-saved snapshots are cleaned up
                                     # - Manual snapshots are not affected
+  mode: "fork"                      # Snapshot mode (default: "fork")
+                                    # - "fork" : Copy-on-write using fork() (recommended, near-zero downtime)
+                                    # - "lock" : Global write lock during snapshot (simpler, brief pause)
 
 # Performance Configuration
 performance:
@@ -88,6 +96,13 @@ api:
     cors_allow_origin: ""           # Allowed origin when CORS is enabled
                                     # - Example: "https://app.example.com"
                                     # - "*" allows all origins (not recommended)
+
+  # Unix Domain Socket (optional, disabled by default)
+  unix_socket:
+    path: ""                        # Unix socket path (default: "" = disabled)
+                                    # - Example: "/var/run/nvecd/nvecd.sock"
+                                    # - Provides lower-latency local connections
+                                    # - Both TCP and UDS can run simultaneously
 
   # Rate Limiting (optional, disabled by default)
   rate_limiting:
@@ -137,3 +152,10 @@ cache:
                                     # - Reduces memory usage at small CPU cost
   eviction_batch_size: 10           # Number of entries to evict at once (default: 10)
                                     # - When memory is full
+
+# Security Configuration (optional)
+security:
+  requirepass: ""                   # Password for write/admin commands (default: "" = no auth)
+                                    # - When set, clients must AUTH before write operations
+                                    # - Read-only commands (SIM, INFO) are not affected
+                                    # - Example: "my-secret-password"

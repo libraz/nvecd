@@ -4,51 +4,8 @@
   "title": "nvecd Configuration Schema",
   "description": "JSON Schema for nvecd configuration validation",
   "type": "object",
-  "required": ["vectors", "events"],
   "additionalProperties": false,
   "properties": {
-    "vectors": {
-      "type": "object",
-      "description": "Vector store configuration",
-      "additionalProperties": false,
-      "properties": {
-        "dimension": {
-          "type": "integer",
-          "description": "Vector dimension (number of features per vector)",
-          "minimum": 1,
-          "maximum": 4096
-        },
-        "default_dimension": {
-          "type": "integer",
-          "description": "Default vector dimension (alias for dimension)",
-          "minimum": 1,
-          "maximum": 4096
-        },
-        "default_top_k": {
-          "type": "integer",
-          "description": "Default number of results to return in similarity searches",
-          "default": 10,
-          "minimum": 1,
-          "maximum": 1000
-        },
-        "normalize": {
-          "type": "boolean",
-          "description": "Automatically normalize vectors to unit length (L2 normalization)",
-          "default": true
-        },
-        "distance_metric": {
-          "type": "string",
-          "description": "Distance metric for similarity search",
-          "default": "cosine",
-          "enum": ["cosine", "dot", "l2"]
-        },
-        "use_simd": {
-          "type": "boolean",
-          "description": "Use SIMD optimizations (AVX2, NEON) for distance calculations",
-          "default": true
-        }
-      }
-    },
     "events": {
       "type": "object",
       "description": "Event store and co-occurrence tracking configuration",
@@ -57,7 +14,7 @@
         "ctx_buffer_size": {
           "type": "integer",
           "description": "Number of events to track per context (ring buffer size)",
-          "default": 100,
+          "default": 50,
           "minimum": 10,
           "maximum": 10000
         },
@@ -68,64 +25,46 @@
           "minimum": 0,
           "maximum": 86400
         },
-        "score_decay_interval_sec": {
-          "type": "integer",
-          "description": "Co-occurrence score decay interval in seconds (alias for decay_interval_sec)",
-          "default": 3600,
-          "minimum": 0,
-          "maximum": 86400
-        },
         "decay_alpha": {
           "type": "number",
           "description": "Decay factor (0.0-1.0)",
-          "default": 0.9,
+          "default": 0.99,
           "minimum": 0.0,
           "maximum": 1.0
         },
-        "score_decay_rate": {
-          "type": "number",
-          "description": "Co-occurrence score decay rate (alias for decay_alpha)",
-          "default": 0.9,
-          "minimum": 0.1,
-          "maximum": 1.0
-        },
-        "min_score_threshold": {
+        "dedup_window_sec": {
           "type": "integer",
-          "description": "Minimum co-occurrence score to keep in index (scores below are pruned)",
-          "default": 1,
+          "description": "Deduplication time window in seconds (0 = disabled)",
+          "default": 60,
           "minimum": 0,
-          "maximum": 1000
+          "maximum": 86400
+        },
+        "dedup_cache_size": {
+          "type": "integer",
+          "description": "Deduplication cache size (LRU)",
+          "default": 10000,
+          "minimum": 0,
+          "maximum": 1000000
         }
       }
     },
-    "fusion": {
+    "vectors": {
       "type": "object",
-      "description": "Fusion search configuration (combining vector similarity + co-occurrence)",
+      "description": "Vector store configuration",
       "additionalProperties": false,
       "properties": {
-        "enable": {
-          "type": "boolean",
-          "description": "Enable fusion search mode",
-          "default": true
+        "default_dimension": {
+          "type": "integer",
+          "description": "Default vector dimension (number of features per vector)",
+          "default": 768,
+          "minimum": 1,
+          "maximum": 4096
         },
-        "vector_weight": {
-          "type": "number",
-          "description": "Weight for vector similarity component (0.0 - 1.0)",
-          "default": 0.7,
-          "minimum": 0.0,
-          "maximum": 1.0
-        },
-        "cooccurrence_weight": {
-          "type": "number",
-          "description": "Weight for co-occurrence component (0.0 - 1.0)",
-          "default": 0.3,
-          "minimum": 0.0,
-          "maximum": 1.0
-        },
-        "normalize_scores": {
-          "type": "boolean",
-          "description": "Normalize component scores before fusion",
-          "default": true
+        "distance_metric": {
+          "type": "string",
+          "description": "Distance metric for similarity search",
+          "default": "cosine",
+          "enum": ["cosine", "dot", "l2"]
         }
       }
     },
@@ -137,36 +76,42 @@
         "default_top_k": {
           "type": "integer",
           "description": "Default number of results to return in similarity searches",
-          "default": 10,
+          "default": 100,
           "minimum": 1,
-          "maximum": 1000
+          "maximum": 10000
         },
         "max_top_k": {
           "type": "integer",
           "description": "Maximum number of results allowed in similarity searches",
-          "default": 100,
+          "default": 1000,
           "minimum": 1,
           "maximum": 10000
         },
         "fusion_alpha": {
           "type": "number",
           "description": "Weight for vector similarity component in fusion mode (0.0 - 1.0)",
-          "default": 0.7,
+          "default": 0.6,
           "minimum": 0.0,
           "maximum": 1.0
         },
         "fusion_beta": {
           "type": "number",
           "description": "Weight for co-occurrence component in fusion mode (0.0 - 1.0)",
-          "default": 0.3,
+          "default": 0.4,
           "minimum": 0.0,
           "maximum": 1.0
+        },
+        "sample_size": {
+          "type": "integer",
+          "description": "Random sampling size for approximate search (0 = exact search)",
+          "default": 10000,
+          "minimum": 0
         }
       }
     },
     "snapshot": {
       "type": "object",
-      "description": "Snapshot persistence configuration (alias for dump)",
+      "description": "Snapshot persistence configuration",
       "additionalProperties": false,
       "properties": {
         "dir": {
@@ -198,12 +143,6 @@
           "description": "Snapshot consistency mode: fork (COW, non-blocking) or lock (global write lock, blocking)",
           "default": "fork",
           "enum": ["fork", "lock"]
-        },
-        "compression": {
-          "type": "string",
-          "description": "Snapshot compression method",
-          "default": "none",
-          "enum": ["none", "lz4", "zstd"]
         }
       }
     },
@@ -215,7 +154,7 @@
         "thread_pool_size": {
           "type": "integer",
           "description": "Worker thread pool size",
-          "default": 4,
+          "default": 8,
           "minimum": 1,
           "maximum": 128
         },
@@ -229,52 +168,9 @@
         "connection_timeout_sec": {
           "type": "integer",
           "description": "Connection timeout in seconds",
-          "default": 30,
+          "default": 300,
           "minimum": 1,
           "maximum": 3600
-        }
-      }
-    },
-    "dump": {
-      "type": "object",
-      "description": "Snapshot persistence configuration",
-      "additionalProperties": false,
-      "properties": {
-        "dir": {
-          "type": "string",
-          "description": "Dump directory path",
-          "default": "/var/lib/nvecd/dumps"
-        },
-        "default_filename": {
-          "type": "string",
-          "description": "Default filename for manual DUMP SAVE",
-          "default": "nvecd.dmp"
-        },
-        "interval_sec": {
-          "type": "integer",
-          "description": "Snapshot interval in seconds (0 = disabled)",
-          "default": 0,
-          "minimum": 0,
-          "maximum": 86400
-        },
-        "retain": {
-          "type": "integer",
-          "description": "Number of snapshots to retain",
-          "default": 3,
-          "minimum": 1,
-          "maximum": 100
-        },
-        "mode": {
-          "type": "string",
-          "description": "Snapshot consistency mode: fork (COW, non-blocking) or lock (global write lock, blocking)",
-          "default": "fork",
-          "enum": ["fork", "lock"]
-        },
-        "compression": {
-          "type": "string",
-          "description": "Snapshot compression method",
-          "default": "none",
-          "enum": ["none", "lz4", "zstd"]
         }
       }
     },
@@ -407,7 +303,7 @@
           "type": "string",
           "description": "Log level",
           "default": "info",
-          "enum": ["debug", "info", "warn", "error"]
+          "enum": ["trace", "debug", "info", "warn", "error"]
         },
         "json": {
           "type": "boolean",
@@ -418,31 +314,6 @@
           "type": "string",
           "description": "Log file path (empty string = stdout, path = file output)",
           "default": ""
-        }
-      }
-    },
-    "memory": {
-      "type": "object",
-      "description": "Memory management configuration",
-      "additionalProperties": false,
-      "properties": {
-        "hard_limit_mb": {
-          "type": "integer",
-          "description": "Hard memory limit in MB (0 = no limit)",
-          "default": 0,
-          "minimum": 0
-        },
-        "vector_store_mb": {
-          "type": "integer",
-          "description": "Estimated memory for vector storage in MB (0 = auto)",
-          "default": 0,
-          "minimum": 0
-        },
-        "event_store_mb": {
-          "type": "integer",
-          "description": "Estimated memory for event storage in MB (0 = auto)",
-          "default": 0,
-          "minimum": 0
         }
       }
     },
@@ -474,12 +345,6 @@
           "default": 3600,
           "minimum": 0
         },
-        "invalidation_strategy": {
-          "type": "string",
-          "description": "Invalidation strategy",
-          "default": "id",
-          "enum": ["id", "all"]
-        },
         "compression_enabled": {
           "type": "boolean",
           "description": "Enable LZ4 compression",
@@ -490,6 +355,18 @@
           "description": "Number of entries to evict at once",
           "default": 10,
           "minimum": 1
+        }
+      }
+    },
+    "security": {
+      "type": "object",
+      "description": "Security configuration",
+      "additionalProperties": false,
+      "properties": {
+        "requirepass": {
+          "type": "string",
+          "description": "Required password for write/admin commands (empty = no auth)",
+          "default": ""
         }
       }
     }

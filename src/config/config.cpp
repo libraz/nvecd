@@ -165,7 +165,9 @@ SimilarityConfig ParseSimilarityConfig(const YAML::Node& node) {
   if (node["fusion_beta"]) {
     config.fusion_beta = node["fusion_beta"].as<double>();
   }
-  config.sample_size = GetYamlValue(node, "sample_size", 0u);
+  if (node["sample_size"]) {
+    config.sample_size = node["sample_size"].as<uint32_t>();
+  }
 
   return config;
 }

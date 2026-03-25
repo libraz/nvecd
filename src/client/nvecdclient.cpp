@@ -320,7 +320,7 @@ class NvecdClient::Impl {
 
     std::ostringstream cmd;
     cmd << "SIM " << EscapeString(id) << " " << top_k;
-    if (!mode.empty() && mode != "fusion") {
+    if (!mode.empty()) {
       cmd << " using=" << mode;
     }
 

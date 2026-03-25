@@ -263,9 +263,9 @@ graph TB
 ```bash
 # 1. 商品ベクトルを登録（埋め込みから）
 # 例: CLIP/BERT でエンコードされた商品画像 + 説明文
-VECSET product_12345 768 0.123 0.456 0.789 ... (768次元)
-VECSET product_67890 768 0.234 0.567 0.891 ...
-VECSET product_11111 768 0.345 0.678 0.912 ...
+VECSET product_12345 0.123 0.456 0.789 ... (768個のfloat)
+VECSET product_67890 0.234 0.567 0.891 ...
+VECSET product_11111 0.345 0.678 0.912 ...
 
 # 2. ユーザーインタラクションを追跡
 # ユーザー alice が商品を閲覧
@@ -358,9 +358,9 @@ graph LR
 ```bash
 # 1. 動画ベクトルを登録
 # 例: VideoMAE/CLAP でエンコードされた動画フレーム + 音声
-VECSET video_abc123 512 0.11 0.22 0.33 ... (512次元)
-VECSET video_def456 512 0.44 0.55 0.66 ...
-VECSET video_ghi789 512 0.77 0.88 0.99 ...
+VECSET video_abc123 0.11 0.22 0.33 ... (512個のfloat)
+VECSET video_def456 0.44 0.55 0.66 ...
+VECSET video_ghi789 0.77 0.88 0.99 ...
 
 # 2. リアルタイムユーザーエンゲージメントを追跡
 # ユーザーが動画の10%を視聴（低エンゲージメント）
@@ -411,9 +411,9 @@ def generate_feed(user_id, last_video_id, feed_size=20):
 
     feed = []
     for line in response.split('\n')[1:]:  # "OK RESULTS" 行をスキップ
-        if line.strip():
-            video_id, score = line.split()
-            feed.append({'video_id': video_id, 'score': float(score)})
+        parts = line.strip().split()
+        if len(parts) == 2:
+            feed.append({'video_id': parts[0], 'score': float(parts[1])})
 
     sock.close()
     return feed
@@ -508,8 +508,8 @@ performance:
 
 ```bash
 # 1. 記事ベクトルを登録
-VECSET article_tech_001 384 0.1 0.2 0.3 ... (384次元)
-VECSET article_sports_002 384 0.4 0.5 0.6 ...
+VECSET article_tech_001 0.1 0.2 0.3 ... (384個のfloat)
+VECSET article_sports_002 0.4 0.5 0.6 ...
 
 # 2. 読書行動を追跡
 # ユーザーが記事をクリック（低シグナル）
@@ -579,8 +579,8 @@ vectors:
 
 ```bash
 # 1. 楽曲ベクトルを登録
-VECSET song_pop_001 128 0.5 0.3 0.8 ... (128次元)
-VECSET song_rock_002 128 0.6 0.4 0.2 ...
+VECSET song_pop_001 0.5 0.3 0.8 ... (128個のfloat)
+VECSET song_rock_002 0.6 0.4 0.2 ...
 
 # 2. リスニング行動を追跡
 # ユーザーが完全に再生
@@ -642,8 +642,8 @@ vectors:
 
 ```bash
 # 1. ドキュメントベクトルを登録
-VECSET doc_python_tutorial 768 0.1 0.2 ... (768次元)
-VECSET doc_javascript_guide 768 0.3 0.4 ...
+VECSET doc_python_tutorial 0.1 0.2 ... (768個のfloat)
+VECSET doc_javascript_guide 0.3 0.4 ...
 
 # 2. クエリベクトルで検索
 # ユーザー検索: "how to sort arrays in python"
@@ -712,16 +712,16 @@ snapshot:
 
 ## パフォーマンスベンチマーク
 
-### 期待されるスループット
+詳細な実測ベンチマークは[ベンチマーク](benchmarks.md)を参照してください。
 
-| 操作 | スループット | レイテンシ (p50) | レイテンシ (p99) |
-|-----------|-----------|---------------|---------------|
-| EVENT     | ~50K/s    | <0.1ms        | <0.5ms        |
-| VECSET    | ~20K/s    | <0.2ms        | <1ms          |
-| SIM       | ~10K/s    | <1ms          | <5ms          |
-| SIMV      | ~8K/s     | <1.5ms        | <7ms          |
+### クエリレイテンシ概要 (100Kベクトル, dim=128, Apple M4 Max)
 
-*16コアサーバー、768次元ベクトル、100万ベクトル、10万コンテキストでのベンチマーク*
+| 操作 | コールドレイテンシ | キャッシュヒット | スループット/スレッド |
+|---|---|---|---|
+| SIM | **1.12ms** | 0.00025ms | 900 QPS |
+| SIMV | **0.98ms** | 0.00025ms | 1,000 QPS |
+
+1Mベクトル（デフォルトサンプリング10K）: クエリあたり **約0.12ms**、8スレッドで **64K QPS**。
 
 ### 最適化のヒント
 

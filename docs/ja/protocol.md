@@ -14,6 +14,9 @@ nc localhost 11017
 
 # telnet を使用
 telnet localhost 11017
+
+# Unix ドメインソケットを使用（設定されている場合）
+nc -U /var/run/nvecd.sock
 ```
 
 ---
@@ -44,8 +47,9 @@ ERROR <message>\r\n
 ## コマンドカテゴリ
 
 - **コアコマンド**: EVENT, VECSET, SIM, SIMV（nvecd 固有）
-- **管理コマンド**: INFO, CONFIG, DUMP, DEBUG（MygramDB 互換）
+- **管理コマンド**: AUTH, INFO, CONFIG, DUMP, DEBUG（MygramDB 互換）
 - **キャッシュコマンド**: CACHE（クエリ結果キャッシュ管理）
+- **ランタイム変数**: SET, GET, SHOW VARIABLES
 
 ---
 
@@ -289,6 +293,36 @@ item101 0.82
 
 ## 管理コマンド（MygramDB 互換）
 
+### AUTH — 接続の認証
+
+現在の接続をパスワードで認証します。`security.requirepass` が設定されている場合に必要です。
+
+**構文**:
+```
+AUTH <password>
+```
+
+**パラメータ**:
+- `<password>`: サーバーパスワード（設定ファイルの `security.requirepass` と一致する必要があります）
+
+**例**:
+```bash
+AUTH mysecretpassword
+→ OK
+
+# 認証なしの場合、書き込みコマンドは拒否されます:
+VECSET item1 0.1 0.2 0.3
+→ (error) NOAUTH Authentication required
+```
+
+**注意事項**:
+- 認証は接続ごとに適用されます（切断時にリセット）
+- 読み取りコマンド（SIM, SIMV, INFO, CONFIG SHOW）は認証なしで実行可能です
+- 書き込み/管理コマンド（VECSET, DUMP SAVE/LOAD, SET）は `requirepass` が設定されている場合に認証が必要です
+- `requirepass` が空の場合（デフォルト）、AUTH は不要です
+
+---
+
 ### INFO — サーバー統計
 
 包括的なサーバー情報と統計を取得します（Redis スタイル形式）。
@@ -452,6 +486,43 @@ file_size_bytes: 536870912
 file_size_human: 512.00 MB
 crc32: 0x12345678
 ```
+
+#### DUMP STATUS
+
+バックグラウンドスナップショット操作（fork ベース）のステータスを確認します。
+
+**構文**:
+```
+DUMP STATUS
+```
+
+**レスポンス**:
+```
+OK STATUS
+status: idle|in_progress|completed|failed
+child_pid: <pid>
+filepath: <path>
+start_time: <timestamp>
+end_time: <timestamp>
+error_message: <message>
+```
+
+**例**:
+```bash
+DUMP STATUS
+→ OK STATUS
+status: completed
+filepath: /var/lib/nvecd/snapshots/dump_20250325_120000.nvec
+start_time: 1711360800
+end_time: 1711360802
+```
+
+**注意事項**:
+- 最新のバックグラウンドスナップショットの状態を表示します
+- `in_progress`: fork された子プロセスがスナップショットを書き込み中
+- `completed`: 最後のスナップショットが正常に保存されました
+- `failed`: 最後のスナップショットでエラーが発生しました
+- `idle`: スナップショットがまだ開始されていません
 
 ---
 

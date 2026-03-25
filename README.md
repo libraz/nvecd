@@ -83,22 +83,51 @@ nvecd-cli -p 11017 CACHE STATS
 make test
 ```
 
-## Beta Development Status
+## Performance
 
-This project is currently in **beta development**.
-Not recommended for production use.
+100K vectors (dim=128, cosine, Apple M4 Max NEON):
+
+| Query | Latency | Throughput |
+|---|---|---|
+| SIM (cold) | **1.12ms** | 900 QPS/thread |
+| SIMV (cold) | **0.98ms** | 1,000 QPS/thread |
+| Cache hit | **0.00025ms** | 4M ops/sec |
+
+At 1M vectors with default sampling: **~0.12ms** per query, **64K QPS** on 8 threads. See [Benchmarks](docs/en/benchmarks.md) for details.
 
 ## Features
 
 - **Behavior-Based Recommendations** - Track user actions, get instant recommendations
-- **Vector Similarity Search** - Find similar items using embeddings
-- **Hybrid Fusion** - Combine user behavior + content similarity
+- **Vector Similarity Search** - Find similar items using embeddings (cosine, dot, L2)
+- **Hybrid Fusion Search** - Combine user behavior + content similarity with configurable weights
 - **Real-time Updates** - Recommendations adapt as users interact
-- **Smart Caching** - LRU cache with LZ4 compression for fast repeated queries
+- **Smart Caching** - LRU cache with LZ4 compression and selective invalidation
 - **SIMD Optimization** - AVX2/NEON acceleration for vector operations
-- **Persistent Storage** - Snapshot support (DUMP commands)
-- **Simple Protocol** - Text-based commands over TCP (Redis/Memcached style)
+- **Fork-Based Snapshots** - Copy-on-write persistence with near-zero downtime
+- **Dual Protocol** - TCP (Redis-style) and HTTP/REST JSON API
+- **Unix Domain Sockets** - Low-latency local connections
+- **Rate Limiting** - Per-client token bucket rate limiting
+- **Authentication** - Optional password-based AUTH for write commands
 - **CLI Tool** - `nvecd-cli` with tab completion and interactive mode
+- **Client Library** - C++ and C client libraries for language bindings
+
+## Architecture
+
+```mermaid
+graph LR
+    App[Application] -->|Track Events| Nvecd[Nvecd]
+    App -->|Register Vectors| Nvecd
+    Nvecd -->|Recommendations| App
+
+    subgraph Nvecd Engine
+        Events[Event Store] --> CoOcc[Co-occurrence Index]
+        Vectors[Vector Store] --> Sim[Similarity Engine]
+        CoOcc --> Sim
+        Sim --> Cache[Query Cache]
+    end
+```
+
+Nvecd combines user behavior tracking (events) with vector similarity search. The similarity engine fuses both signals to produce hybrid recommendations.
 
 ## When to Use Nvecd
 
@@ -116,14 +145,22 @@ Not recommended for production use.
 
 ## Documentation
 
+- [**Architecture**](docs/en/architecture.md) - System design and component overview
 - [**Protocol Reference**](docs/en/protocol.md) - All available commands
+- [**HTTP API Reference**](docs/en/http-api.md) - REST API documentation
 - [**Configuration Guide**](docs/en/configuration.md) - Configuration options
 - [**Use Cases**](docs/en/use-cases.md) - Real-world examples
 - [**Snapshot Management**](docs/en/snapshot.md) - Persistence and backups
+- [**Benchmarks**](docs/en/benchmarks.md) - Measured performance data and optimization results
 - [**Performance Tuning**](docs/en/performance.md) - Cache tuning and SIMD optimization
 - [**Installation Guide**](docs/en/installation.md) - Build and install instructions
-- [**Development Guide**](docs/en/development.md) - Contributing guidelines
+- [**Development Guide**](docs/en/development.md) - Getting started guide
 - [**Client Library**](docs/en/libnvecdclient.md) - C/C++ client library
+
+### Japanese Documentation
+
+- [README (日本語)](README_ja.md)
+- [ドキュメント一覧](docs/ja/)
 
 ## Requirements
 

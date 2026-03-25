@@ -14,6 +14,9 @@ nc localhost 11017
 
 # Using telnet
 telnet localhost 11017
+
+# Using Unix domain socket (if configured)
+nc -U /var/run/nvecd.sock
 ```
 
 ---
@@ -44,8 +47,9 @@ or Redis-style: `-ERR <message>\r\n` or `(error) <message>\r\n`
 ## Command Categories
 
 - **Core Commands**: EVENT, VECSET, SIM, SIMV (nvecd-specific)
-- **Admin Commands**: INFO, CONFIG, DUMP, DEBUG (MygramDB-compatible)
+- **Admin Commands**: AUTH, INFO, CONFIG, DUMP, DEBUG (MygramDB-compatible)
 - **Cache Commands**: CACHE (query result cache management)
+- **Runtime Variables**: SET, GET, SHOW VARIABLES
 
 ---
 
@@ -289,6 +293,36 @@ item101 0.82
 
 ## Admin Commands (MygramDB-compatible)
 
+### AUTH — Authenticate connection
+
+Authenticate the current connection with a password. Required when `security.requirepass` is configured.
+
+**Syntax**:
+```
+AUTH <password>
+```
+
+**Parameters**:
+- `<password>`: Server password (must match `security.requirepass` in config)
+
+**Example**:
+```bash
+AUTH mysecretpassword
+→ OK
+
+# Without auth, write commands are rejected:
+VECSET item1 0.1 0.2 0.3
+→ (error) NOAUTH Authentication required
+```
+
+**Notes**:
+- Authentication is per-connection (resets on disconnect)
+- Read commands (SIM, SIMV, INFO, CONFIG SHOW) work without auth
+- Write/admin commands (VECSET, DUMP SAVE/LOAD, SET) require auth when `requirepass` is set
+- If `requirepass` is empty (default), AUTH is not needed
+
+---
+
 ### INFO — Server statistics
 
 Get comprehensive server information and statistics (Redis-style format).
@@ -452,6 +486,43 @@ file_size_bytes: 536870912
 file_size_human: 512.00 MB
 crc32: 0x12345678
 ```
+
+#### DUMP STATUS
+
+Check the status of a background snapshot operation (fork-based).
+
+**Syntax**:
+```
+DUMP STATUS
+```
+
+**Response**:
+```
+OK STATUS
+status: idle|in_progress|completed|failed
+child_pid: <pid>
+filepath: <path>
+start_time: <timestamp>
+end_time: <timestamp>
+error_message: <message>
+```
+
+**Example**:
+```bash
+DUMP STATUS
+→ OK STATUS
+status: completed
+filepath: /var/lib/nvecd/snapshots/dump_20250325_120000.nvec
+start_time: 1711360800
+end_time: 1711360802
+```
+
+**Notes**:
+- Shows the state of the most recent background snapshot
+- `in_progress`: Fork child is writing the snapshot
+- `completed`: Last snapshot saved successfully
+- `failed`: Last snapshot encountered an error
+- `idle`: No snapshot has been started
 
 ---
 

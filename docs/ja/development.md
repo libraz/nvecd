@@ -66,8 +66,8 @@ SIM item1 10 using=fusion
 
 ```bash
 # 1. コンテンツベクトルを登録（埋め込みから）
-VECSET article123 768 0.123 0.456 ... (768次元)
-VECSET article456 768 0.789 0.234 ...
+VECSET article123 0.123 0.456 ... (768個のfloat)
+VECSET article456 0.789 0.234 ...
 
 # 2. ユーザーエンゲージメントを追跡
 EVENT user_alice ADD article123 95  # Alice が article123 に高いエンゲージメント
@@ -85,8 +85,8 @@ SIM article123 10 using=fusion
 
 ```bash
 # ドキュメントベクトルを登録
-VECSET doc1 384 0.1 0.2 ...
-VECSET doc2 384 0.3 0.4 ...
+VECSET doc1 0.1 0.2 ... (384個のfloat)
+VECSET doc2 0.3 0.4 ...
 
 # クエリベクトルで検索（ユーザーの検索から）
 SIMV 10 0.15 0.25 0.35 0.45 0.55 0.65

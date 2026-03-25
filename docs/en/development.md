@@ -66,8 +66,8 @@ Build a recommendation system combining content similarity and user behavior.
 
 ```bash
 # 1. Register content vectors (from embeddings)
-VECSET article123 768 0.123 0.456 ... (768 dimensions)
-VECSET article456 768 0.789 0.234 ...
+VECSET article123 0.123 0.456 ... (768 floats)
+VECSET article456 0.789 0.234 ...
 
 # 2. Track user engagement
 EVENT user_alice ADD article123 95  # Alice highly engaged with article123
@@ -85,8 +85,8 @@ Pure vector-based similarity search.
 
 ```bash
 # Register document vectors
-VECSET doc1 384 0.1 0.2 ...
-VECSET doc2 384 0.3 0.4 ...
+VECSET doc1 0.1 0.2 ... (384 floats)
+VECSET doc2 0.3 0.4 ...
 
 # Search with query vector (from user's search)
 SIMV 10 0.15 0.25 0.35 0.45 0.55

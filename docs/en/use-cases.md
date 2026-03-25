@@ -95,7 +95,7 @@ class SimpleRecommender {
     // item3 0.72
     // ...
 
-    const lines = response.split('\n');
+    const lines = response.replace(/\r/g, '').split('\n');
     if (!lines[0].startsWith('OK RESULTS')) {
       throw new Error('Unexpected response: ' + response);
     }
@@ -263,9 +263,9 @@ graph TB
 ```bash
 # 1. Register product vectors (from embeddings)
 # Example: Product images + descriptions encoded with CLIP/BERT
-VECSET product_12345 768 0.123 0.456 0.789 ... (768 dimensions)
-VECSET product_67890 768 0.234 0.567 0.891 ...
-VECSET product_11111 768 0.345 0.678 0.912 ...
+VECSET product_12345 0.123 0.456 0.789 ... (768 floats)
+VECSET product_67890 0.234 0.567 0.891 ...
+VECSET product_11111 0.345 0.678 0.912 ...
 
 # 2. Track user interactions
 # User alice views product
@@ -358,9 +358,9 @@ graph LR
 ```bash
 # 1. Register video vectors
 # Example: Video frames + audio encoded with VideoMAE/CLAP
-VECSET video_abc123 512 0.11 0.22 0.33 ... (512 dimensions)
-VECSET video_def456 512 0.44 0.55 0.66 ...
-VECSET video_ghi789 512 0.77 0.88 0.99 ...
+VECSET video_abc123 0.11 0.22 0.33 ... (512 floats)
+VECSET video_def456 0.44 0.55 0.66 ...
+VECSET video_ghi789 0.77 0.88 0.99 ...
 
 # 2. Track real-time user engagement
 # User watches 10% of video (low engagement)
@@ -411,9 +411,9 @@ def generate_feed(user_id, last_video_id, feed_size=20):
 
     feed = []
     for line in response.split('\n')[1:]:  # Skip "OK RESULTS" line
-        if line.strip():
-            video_id, score = line.split()
-            feed.append({'video_id': video_id, 'score': float(score)})
+        parts = line.strip().split()
+        if len(parts) == 2:
+            feed.append({'video_id': parts[0], 'score': float(parts[1])})
 
     sock.close()
     return feed
@@ -508,8 +508,8 @@ Recommend articles based on:
 
 ```bash
 # 1. Register article vectors
-VECSET article_tech_001 384 0.1 0.2 0.3 ... (384 dimensions)
-VECSET article_sports_002 384 0.4 0.5 0.6 ...
+VECSET article_tech_001 0.1 0.2 0.3 ... (384 floats)
+VECSET article_sports_002 0.4 0.5 0.6 ...
 
 # 2. Track reading behavior
 # User clicks article (low signal)
@@ -579,8 +579,8 @@ Recommend songs based on:
 
 ```bash
 # 1. Register song vectors
-VECSET song_pop_001 128 0.5 0.3 0.8 ... (128 dimensions)
-VECSET song_rock_002 128 0.6 0.4 0.2 ...
+VECSET song_pop_001 0.5 0.3 0.8 ... (128 floats)
+VECSET song_rock_002 0.6 0.4 0.2 ...
 
 # 2. Track listening behavior
 # User plays full song
@@ -642,8 +642,8 @@ Search by meaning, not keywords. Find semantically similar content.
 
 ```bash
 # 1. Register document vectors
-VECSET doc_python_tutorial 768 0.1 0.2 ... (768 dimensions)
-VECSET doc_javascript_guide 768 0.3 0.4 ...
+VECSET doc_python_tutorial 0.1 0.2 ... (768 floats)
+VECSET doc_javascript_guide 0.3 0.4 ...
 
 # 2. Search with query vector
 # User searches: "how to sort arrays in python"
@@ -712,16 +712,16 @@ snapshot:
 
 ## Performance Benchmarks
 
-### Expected Throughput
+For detailed measured benchmarks, see [Benchmarks](benchmarks.md).
 
-| Operation | Throughput | Latency (p50) | Latency (p99) |
-|-----------|-----------|---------------|---------------|
-| EVENT     | ~50K/s    | <0.1ms        | <0.5ms        |
-| VECSET    | ~20K/s    | <0.2ms        | <1ms          |
-| SIM       | ~10K/s    | <1ms          | <5ms          |
-| SIMV      | ~8K/s     | <1.5ms        | <7ms          |
+### Query Latency Summary (100K vectors, dim=128, Apple M4 Max)
 
-*Benchmarks on 16-core server, 768-dim vectors, 1M vectors, 100K contexts*
+| Operation | Cold Latency | Cached Latency | Throughput/thread |
+|-----------|-------------|----------------|-------------------|
+| SIM       | **1.12ms**  | 0.00025ms      | 900 QPS           |
+| SIMV      | **0.98ms**  | 0.00025ms      | 1,000 QPS         |
+
+At 1M vectors with default sampling (10K): **~0.12ms** per query, **64K QPS** on 8 threads.
 
 ### Optimization Tips
 
