@@ -124,6 +124,10 @@ struct ApiConfig {
     std::string cors_allow_origin;
   } http;
 
+  struct {
+    std::string path;  ///< Unix socket path (empty = disabled)
+  } unix_socket;
+
   /**
    * @brief Rate limiting configuration (token bucket algorithm)
    */

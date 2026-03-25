@@ -164,7 +164,7 @@ class SimilarityEngine {
   vectors::VectorStore* vector_store_;                ///< Vector store (not owned)
   config::SimilarityConfig config_;                   ///< Configuration
   DistanceFunc distance_func_;                        ///< Distance function for similarity
-  bool use_prenorm_ = false;  ///< Whether to use pre-computed norm optimization (cosine only)
+  bool use_prenorm_ = false;                          ///< Whether to use pre-computed norm optimization (cosine only)
 };
 
 }  // namespace nvecd::similarity

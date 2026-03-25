@@ -324,6 +324,18 @@
             }
           }
         },
+        "unix_socket": {
+          "type": "object",
+          "description": "Unix domain socket configuration",
+          "additionalProperties": false,
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "Unix socket path (empty string = disabled)",
+              "default": ""
+            }
+          }
+        },
         "rate_limiting": {
           "type": "object",
           "description": "Rate limiting configuration (token bucket algorithm)",

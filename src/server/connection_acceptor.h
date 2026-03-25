@@ -97,6 +97,12 @@ class ConnectionAcceptor {
    */
   bool IsRunning() const { return running_; }
 
+  /**
+   * @brief Check if this acceptor is in Unix domain socket mode
+   * @return true if listening on a Unix socket
+   */
+  bool IsUnixSocket() const { return !unix_socket_path_.empty(); }
+
  private:
   /**
    * @brief Accept loop (runs in separate thread)
@@ -128,6 +134,8 @@ class ConnectionAcceptor {
 
   std::set<int> active_fds_;
   std::mutex fds_mutex_;
+
+  std::string unix_socket_path_;  ///< Non-empty when in UDS mode
 };
 
 }  // namespace nvecd::server

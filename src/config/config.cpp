@@ -239,6 +239,12 @@ ApiConfig ParseApiConfig(const YAML::Node& node) {
     }
   }
 
+  // Unix socket configuration
+  if (node["unix_socket"]) {
+    const auto& unix_node = node["unix_socket"];
+    config.unix_socket.path = GetYamlValue<std::string>(unix_node, "path", "");
+  }
+
   // Rate limiting configuration
   if (node["rate_limiting"]) {
     const auto& rl_node = node["rate_limiting"];

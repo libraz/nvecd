@@ -178,7 +178,8 @@ class NvecdServer {
   std::unique_ptr<RequestDispatcher> dispatcher_;
   std::unique_ptr<ThreadPool> thread_pool_;
   std::unique_ptr<ConnectionAcceptor> acceptor_;
-  std::unique_ptr<HttpServer> http_server_;  // HTTP API server (optional)
+  std::unique_ptr<ConnectionAcceptor> unix_acceptor_;  ///< Unix domain socket acceptor (optional)
+  std::unique_ptr<HttpServer> http_server_;            // HTTP API server (optional)
 };
 
 }  // namespace nvecd::server

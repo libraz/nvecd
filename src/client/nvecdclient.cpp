@@ -13,6 +13,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include <cctype>
@@ -103,6 +104,37 @@ class NvecdClient::Impl {
   Expected<void, Error> Connect() {
     if (sock_ >= 0) {
       return MakeUnexpected(MakeError(ErrorCode::kClientAlreadyConnected, "Already connected"));
+    }
+
+    // Unix domain socket connection
+    if (!config_.unix_socket_path.empty()) {
+      sock_ = socket(AF_UNIX, SOCK_STREAM, 0);
+      if (sock_ < 0) {
+        return MakeUnexpected(MakeError(ErrorCode::kClientConnectionFailed,
+                                        "Failed to create unix socket: " + std::string(strerror(errno))));
+      }
+
+      // Set timeouts
+      struct timeval timeout_val = {};
+      timeout_val.tv_sec = static_cast<decltype(timeout_val.tv_sec)>(config_.timeout_ms / kMillisecondsPerSecond);
+      timeout_val.tv_usec = static_cast<decltype(timeout_val.tv_usec)>((config_.timeout_ms % kMillisecondsPerSecond) *
+                                                                       kMicrosecondsPerMillisecond);
+      (void)setsockopt(sock_, SOL_SOCKET, SO_RCVTIMEO, &timeout_val, sizeof(timeout_val));
+      (void)setsockopt(sock_, SOL_SOCKET, SO_SNDTIMEO, &timeout_val, sizeof(timeout_val));
+
+      struct sockaddr_un server_addr = {};
+      server_addr.sun_family = AF_UNIX;
+      std::strncpy(server_addr.sun_path, config_.unix_socket_path.c_str(), sizeof(server_addr.sun_path) - 1);
+
+      // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) - Required for socket API
+      if (connect(sock_, reinterpret_cast<struct sockaddr*>(&server_addr), sizeof(server_addr)) < 0) {
+        std::string err = "Unix socket connection failed: " + std::string(strerror(errno));
+        close(sock_);
+        sock_ = -1;
+        return MakeUnexpected(MakeError(ErrorCode::kClientConnectionFailed, err));
+      }
+
+      return {};  // Skip TCP connection code
     }
 
     sock_ = socket(AF_INET, SOCK_STREAM, 0);

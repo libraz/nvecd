@@ -293,5 +293,25 @@ target_link_libraries(snapshot_format_v1_test
 )
 gtest_discover_tests(snapshot_format_v1_test)
 
+# Unix socket tests
+add_executable(connection_acceptor_unix_test
+  server/connection_acceptor_unix_test.cpp
+)
+target_link_libraries(connection_acceptor_unix_test
+  nvecd_server
+  nvecd_storage
+  nvecd_cache
+  nvecd_similarity
+  nvecd_events
+  nvecd_vectors
+  nvecd_config
+  nvecd_utils
+  gtest
+  gtest_main
+)
+gtest_discover_tests(connection_acceptor_unix_test
+  PROPERTIES TIMEOUT 60
+)
+
 # Integration tests
 add_subdirectory(integration)

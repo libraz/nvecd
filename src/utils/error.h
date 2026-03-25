@@ -109,20 +109,22 @@ enum class ErrorCode : std::uint16_t {
   kSnapshotInfoFailed = 5016,          ///< Failed to read snapshot info
 
   // ===== Network/Server Errors (6000-6999) =====
-  kNetworkBindFailed = 6000,            ///< Failed to bind to port
-  kNetworkListenFailed = 6001,          ///< Failed to listen on socket
-  kNetworkAcceptFailed = 6002,          ///< Failed to accept connection
-  kNetworkConnectionRefused = 6003,     ///< Connection refused
-  kNetworkConnectionClosed = 6004,      ///< Connection closed by peer
-  kNetworkSendFailed = 6005,            ///< Failed to send data
-  kNetworkReceiveFailed = 6006,         ///< Failed to receive data
-  kNetworkInvalidRequest = 6007,        ///< Invalid request received
-  kNetworkProtocolError = 6008,         ///< Protocol error
-  kNetworkIPNotAllowed = 6009,          ///< IP address not in allowed CIDRs
-  kNetworkServerNotStarted = 6010,      ///< Server not started
-  kNetworkAlreadyRunning = 6011,        ///< Server already running
-  kNetworkSocketCreationFailed = 6012,  ///< Failed to create socket
-  kNetworkInvalidBindAddress = 6013,    ///< Invalid bind address
+  kNetworkBindFailed = 6000,             ///< Failed to bind to port
+  kNetworkListenFailed = 6001,           ///< Failed to listen on socket
+  kNetworkAcceptFailed = 6002,           ///< Failed to accept connection
+  kNetworkConnectionRefused = 6003,      ///< Connection refused
+  kNetworkConnectionClosed = 6004,       ///< Connection closed by peer
+  kNetworkSendFailed = 6005,             ///< Failed to send data
+  kNetworkReceiveFailed = 6006,          ///< Failed to receive data
+  kNetworkInvalidRequest = 6007,         ///< Invalid request received
+  kNetworkProtocolError = 6008,          ///< Protocol error
+  kNetworkIPNotAllowed = 6009,           ///< IP address not in allowed CIDRs
+  kNetworkServerNotStarted = 6010,       ///< Server not started
+  kNetworkAlreadyRunning = 6011,         ///< Server already running
+  kNetworkSocketCreationFailed = 6012,   ///< Failed to create socket
+  kNetworkInvalidBindAddress = 6013,     ///< Invalid bind address
+  kNetworkUnixSocketPathTooLong = 6014,  ///< Unix socket path exceeds system limit
+  kNetworkUnixSocketStale = 6015,        ///< Another server is listening on the unix socket
 
   // ===== Client Errors (7000-7999) =====
   kClientNotConnected = 7000,      ///< Client not connected
@@ -317,6 +319,10 @@ inline const char* ErrorCodeToString(ErrorCode code) {
       return "Socket creation failed";
     case ErrorCode::kNetworkInvalidBindAddress:
       return "Invalid bind address";
+    case ErrorCode::kNetworkUnixSocketPathTooLong:
+      return "Unix socket path too long";
+    case ErrorCode::kNetworkUnixSocketStale:
+      return "Unix socket already in use by another server";
 
     // Client
     case ErrorCode::kClientNotConnected:

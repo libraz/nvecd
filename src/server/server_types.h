@@ -61,6 +61,7 @@ struct ServerConfig {
   int send_buffer_size = kDefaultSendBufferSize;
   std::vector<std::string> allow_cidrs;
   std::vector<utils::CIDR> parsed_allow_cidrs;
+  std::string unix_socket_path;  ///< Unix socket path (empty = TCP mode)
 };
 
 /**

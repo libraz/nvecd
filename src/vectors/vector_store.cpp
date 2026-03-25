@@ -210,16 +210,22 @@ void VectorStore::Compact() {
   compact_valid_.store(true, std::memory_order_release);
 }
 
-size_t VectorStore::GetCompactCount() const { return idx_to_id_.size(); }
+size_t VectorStore::GetCompactCount() const {
+  return idx_to_id_.size();
+}
 
 const float* VectorStore::GetMatrixRow(size_t idx) const {
   size_t dim = dimension_.load(std::memory_order_relaxed);
   return matrix_.data() + idx * dim;
 }
 
-float VectorStore::GetNorm(size_t idx) const { return norms_[idx]; }
+float VectorStore::GetNorm(size_t idx) const {
+  return norms_[idx];
+}
 
-const std::string& VectorStore::GetIdByIndex(size_t idx) const { return idx_to_id_[idx]; }
+const std::string& VectorStore::GetIdByIndex(size_t idx) const {
+  return idx_to_id_[idx];
+}
 
 std::shared_lock<std::shared_mutex> VectorStore::AcquireReadLock() const {
   return std::shared_lock<std::shared_mutex>(mutex_);

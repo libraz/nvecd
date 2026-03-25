@@ -68,6 +68,7 @@ struct ClientConfig {
   uint16_t port = 11017;              ///< Default port for nvecd protocol
   uint32_t timeout_ms = 5000;         ///< Default timeout in milliseconds
   uint32_t recv_buffer_size = 65536;  ///< Default buffer size (64KB)
+  std::string unix_socket_path;       ///< Unix socket path (empty = use TCP)
 };
 // NOLINTEND(readability-magic-numbers,cppcoreguidelines-avoid-magic-numbers)
 

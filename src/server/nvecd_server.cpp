@@ -95,6 +95,26 @@ utils::Expected<void, utils::Error> NvecdServer::Start() {
   running_.store(true);
 
   spdlog::info("nvecd server started on {}:{}", config_.api.tcp.bind, acceptor_->GetPort());
+
+  // Start Unix domain socket acceptor (if configured)
+  if (!config_.api.unix_socket.path.empty()) {
+    ServerConfig uds_config;
+    uds_config.unix_socket_path = config_.api.unix_socket.path;
+    uds_config.max_connections = config_.perf.max_connections;
+
+    unix_acceptor_ = std::make_unique<ConnectionAcceptor>(uds_config, thread_pool_.get());
+    unix_acceptor_->SetConnectionHandler([this](int client_fd) { this->HandleConnection(client_fd); });
+
+    auto uds_result = unix_acceptor_->Start();
+    if (!uds_result) {
+      spdlog::warn("Failed to start Unix socket acceptor: {}", uds_result.error().message());
+      unix_acceptor_.reset();
+      // Non-fatal: TCP continues to work
+    } else {
+      spdlog::info("Unix domain socket listening on {}", config_.api.unix_socket.path);
+    }
+  }
+
   spdlog::info("Ready to accept connections");
 
   // Start HTTP server if enabled
@@ -137,6 +157,12 @@ void NvecdServer::Stop() {
   // Stop HTTP server
   if (http_server_) {
     http_server_->Stop();
+  }
+
+  // Stop Unix domain socket acceptor
+  if (unix_acceptor_) {
+    unix_acceptor_->Stop();
+    unix_acceptor_.reset();
   }
 
   // Stop accepting new connections
