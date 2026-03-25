@@ -6,9 +6,11 @@
  * Reusability: 75% (similar dispatch pattern, different handlers)
  */
 
+#include <chrono>
 #include <sstream>
 
 // Include concrete types before request_dispatcher.h to resolve forward declarations
+#include "cache/cache_key.h"
 #include "cache/similarity_cache.h"
 #include "events/co_occurrence_index.h"
 #include "events/event_store.h"
@@ -173,6 +175,12 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleEvent(const 
     return utils::MakeUnexpected(result.error());
   }
 
+  // Invalidate cache on data mutation
+  auto* cache_ptr = ctx_.cache.load(std::memory_order_acquire);
+  if (cache_ptr != nullptr) {
+    cache_ptr->Clear();
+  }
+
   return FormatOK("EVENT");
 }
 
@@ -186,6 +194,12 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleVecset(const
     return utils::MakeUnexpected(result.error());
   }
 
+  // Invalidate cache on data mutation
+  auto* cache_ptr = ctx_.cache.load(std::memory_order_acquire);
+  if (cache_ptr != nullptr) {
+    cache_ptr->Clear();
+  }
+
   return FormatOK("VECSET");
 }
 
@@ -196,6 +210,31 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSim(const Co
     return utils::MakeUnexpected(
         utils::MakeError(utils::ErrorCode::kInternalError, "SimilarityEngine not initialized"));
   }
+
+  // Cache lookup
+  auto* cache_ptr = ctx_.cache.load(std::memory_order_acquire);
+  cache::CacheKey cache_key;
+  bool cache_enabled = (cache_ptr != nullptr && cache_ptr->IsEnabled());
+  if (cache_enabled) {
+    std::string key_str = "SIM:" + cmd.id + ":" + std::to_string(cmd.top_k) + ":" + cmd.mode;
+    cache_key = cache::CacheKeyGenerator::Generate(key_str);
+    auto cached = cache_ptr->Lookup(cache_key);
+    if (cached.has_value()) {
+      std::vector<std::pair<std::string, float>> pairs;
+      pairs.reserve(cached->size());
+      for (const auto& item : *cached) {
+        pairs.emplace_back(item.item_id, item.score);
+      }
+      return FormatSimResults(pairs, static_cast<int>(pairs.size()));
+    }
+  }
+
+  // Auto-compact if needed
+  if (ctx_.vector_store != nullptr && !ctx_.vector_store->IsCompactValid()) {
+    ctx_.vector_store->Compact();
+  }
+
+  auto start = std::chrono::steady_clock::now();
 
   // Select search method based on mode
   utils::Expected<std::vector<similarity::SimilarityResult>, utils::Error> result;
@@ -209,6 +248,13 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSim(const Co
 
   if (!result) {
     return utils::MakeUnexpected(result.error());
+  }
+
+  // Cache store
+  if (cache_enabled) {
+    auto elapsed = std::chrono::steady_clock::now() - start;
+    double elapsed_ms = std::chrono::duration<double, std::milli>(elapsed).count();
+    cache_ptr->Insert(cache_key, *result, elapsed_ms);
   }
 
   // Convert SimilarityResult to pair<string, float>
@@ -229,9 +275,47 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSimv(const C
         utils::MakeError(utils::ErrorCode::kInternalError, "SimilarityEngine not initialized"));
   }
 
+  // Cache lookup
+  auto* cache_ptr = ctx_.cache.load(std::memory_order_acquire);
+  cache::CacheKey cache_key;
+  bool cache_enabled = (cache_ptr != nullptr && cache_ptr->IsEnabled());
+  if (cache_enabled) {
+    // Build cache key from vector hash: first few floats + size
+    std::string vec_hash;
+    for (size_t i = 0; i < std::min(cmd.vector.size(), static_cast<size_t>(4)); ++i) {
+      vec_hash += std::to_string(cmd.vector[i]) + ",";
+    }
+    vec_hash += std::to_string(cmd.vector.size());
+    std::string key_str = "SIMV:" + vec_hash + ":" + std::to_string(cmd.top_k);
+    cache_key = cache::CacheKeyGenerator::Generate(key_str);
+    auto cached = cache_ptr->Lookup(cache_key);
+    if (cached.has_value()) {
+      std::vector<std::pair<std::string, float>> pairs;
+      pairs.reserve(cached->size());
+      for (const auto& item : *cached) {
+        pairs.emplace_back(item.item_id, item.score);
+      }
+      return FormatSimResults(pairs, static_cast<int>(pairs.size()));
+    }
+  }
+
+  // Auto-compact if needed
+  if (ctx_.vector_store != nullptr && !ctx_.vector_store->IsCompactValid()) {
+    ctx_.vector_store->Compact();
+  }
+
+  auto start = std::chrono::steady_clock::now();
+
   auto result = ctx_.similarity_engine->SearchByVector(cmd.vector, cmd.top_k);
   if (!result) {
     return utils::MakeUnexpected(result.error());
+  }
+
+  // Cache store
+  if (cache_enabled) {
+    auto elapsed = std::chrono::steady_clock::now() - start;
+    double elapsed_ms = std::chrono::duration<double, std::milli>(elapsed).count();
+    cache_ptr->Insert(cache_key, *result, elapsed_ms);
   }
 
   // Convert SimilarityResult to pair<string, float>
@@ -286,7 +370,14 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleDumpSave(con
 }
 
 utils::Expected<std::string, utils::Error> RequestDispatcher::HandleDumpLoad(const Command& cmd) {
-  return handlers::HandleDumpLoad(ctx_, cmd.path);
+  auto result = handlers::HandleDumpLoad(ctx_, cmd.path);
+
+  // Compact vector store after snapshot load for optimized search
+  if (result && ctx_.vector_store != nullptr) {
+    ctx_.vector_store->Compact();
+  }
+
+  return result;
 }
 
 utils::Expected<std::string, utils::Error> RequestDispatcher::HandleDumpVerify(const Command& cmd) const {

@@ -36,6 +36,7 @@ constexpr uint32_t kDefaultTopK = 100;
 constexpr uint32_t kMaxTopK = 1000;
 constexpr double kFusionAlpha = 0.6;
 constexpr double kFusionBeta = 0.4;
+constexpr uint32_t kSampleSize = 0;
 
 // Snapshot defaults
 constexpr int kSnapshotIntervalSec = 0;  // 0 = disabled
@@ -79,6 +80,7 @@ struct SimilarityConfig {
   uint32_t max_top_k = defaults::kMaxTopK;          ///< Maximum number of results
   double fusion_alpha = defaults::kFusionAlpha;     ///< Weight for vector similarity in fusion mode
   double fusion_beta = defaults::kFusionBeta;       ///< Weight for co-occurrence in fusion mode
+  uint32_t sample_size = defaults::kSampleSize;     ///< Random sampling size for approximate search (0 = exact)
 };
 
 /**

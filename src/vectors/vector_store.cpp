@@ -5,6 +5,8 @@
 
 #include "vectors/vector_store.h"
 
+#include <cmath>
+
 #include "utils/error.h"
 #include "utils/structured_log.h"
 #include "vectors/distance.h"
@@ -63,6 +65,9 @@ utils::Expected<void, utils::Error> VectorStore::SetVector(const std::string& ve
 
     // Store vector
     vectors_[vector_id] = Vector(std::move(data), is_normalized);
+
+    // Invalidate compact storage
+    compact_valid_.store(false, std::memory_order_release);
   }
 
   return {};
@@ -88,6 +93,7 @@ bool VectorStore::DeleteVector(const std::string& vector_id) {
   }
 
   vectors_.erase(iter);
+  compact_valid_.store(false, std::memory_order_release);
   return true;
 }
 
@@ -118,6 +124,13 @@ void VectorStore::Clear() {
   std::unique_lock lock(mutex_);
   vectors_.clear();
   dimension_.store(0, std::memory_order_release);  // Reset dimension
+
+  // Clear compact storage
+  matrix_.clear();
+  norms_.clear();
+  id_to_idx_.clear();
+  idx_to_id_.clear();
+  compact_valid_.store(false, std::memory_order_release);
 }
 
 VectorStoreStatistics VectorStore::GetStatistics() const {
@@ -150,6 +163,74 @@ size_t VectorStore::MemoryUsage() const {
   }
 
   return total;
+}
+
+// ============================================================================
+// Compact Storage
+// ============================================================================
+
+void VectorStore::Compact() {
+  std::unique_lock lock(mutex_);
+
+  size_t dim = dimension_.load(std::memory_order_relaxed);
+  size_t n = vectors_.size();
+
+  if (n == 0 || dim == 0) {
+    matrix_.clear();
+    norms_.clear();
+    id_to_idx_.clear();
+    idx_to_id_.clear();
+    compact_valid_.store(true, std::memory_order_release);
+    return;
+  }
+
+  matrix_.resize(n * dim);
+  norms_.resize(n);
+  id_to_idx_.clear();
+  id_to_idx_.reserve(n);
+  idx_to_id_.clear();
+  idx_to_id_.reserve(n);
+
+  size_t idx = 0;
+  for (const auto& [id, vec] : vectors_) {
+    std::copy(vec.data.begin(), vec.data.end(), matrix_.begin() + static_cast<ptrdiff_t>(idx * dim));
+
+    // Compute L2 norm inline to avoid dependency issues
+    float norm = 0.0F;
+    for (float v : vec.data) {
+      norm += v * v;
+    }
+    norms_[idx] = std::sqrt(norm);
+
+    id_to_idx_[id] = idx;
+    idx_to_id_.push_back(id);
+    ++idx;
+  }
+
+  compact_valid_.store(true, std::memory_order_release);
+}
+
+size_t VectorStore::GetCompactCount() const { return idx_to_id_.size(); }
+
+const float* VectorStore::GetMatrixRow(size_t idx) const {
+  size_t dim = dimension_.load(std::memory_order_relaxed);
+  return matrix_.data() + idx * dim;
+}
+
+float VectorStore::GetNorm(size_t idx) const { return norms_[idx]; }
+
+const std::string& VectorStore::GetIdByIndex(size_t idx) const { return idx_to_id_[idx]; }
+
+std::shared_lock<std::shared_mutex> VectorStore::AcquireReadLock() const {
+  return std::shared_lock<std::shared_mutex>(mutex_);
+}
+
+std::optional<size_t> VectorStore::GetCompactIndex(const std::string& id) const {
+  auto it = id_to_idx_.find(id);
+  if (it == id_to_idx_.end()) {
+    return std::nullopt;
+  }
+  return it->second;
 }
 
 }  // namespace nvecd::vectors

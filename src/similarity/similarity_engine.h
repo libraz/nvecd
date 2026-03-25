@@ -13,6 +13,7 @@
 
 #include <functional>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "config/config.h"
@@ -151,11 +152,19 @@ class SimilarityEngine {
    */
   static DistanceFunc SelectDistanceFunction(const std::string& metric);
 
+  /// @brief Generate random sample indices using reservoir sampling
+  std::vector<size_t> SampleIndices(size_t total, size_t sample_size) const;
+
+  /// @brief Search vectors only among candidate IDs (pre-filtered)
+  utils::Expected<std::vector<SimilarityResult>, utils::Error> SearchByIdVectorsFiltered(
+      const std::string& item_id, const std::unordered_set<std::string>& candidate_ids, int top_k);
+
   [[maybe_unused]] events::EventStore* event_store_;  ///< Event store (not owned)
   events::CoOccurrenceIndex* co_index_;               ///< Co-occurrence index (not owned)
   vectors::VectorStore* vector_store_;                ///< Vector store (not owned)
   config::SimilarityConfig config_;                   ///< Configuration
   DistanceFunc distance_func_;                        ///< Distance function for similarity
+  bool use_prenorm_ = false;  ///< Whether to use pre-computed norm optimization (cosine only)
 };
 
 }  // namespace nvecd::similarity

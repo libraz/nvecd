@@ -86,6 +86,28 @@ inline float CosineSimilarity(const std::vector<float>& lhs, const std::vector<f
 }
 
 /**
+ * @brief Cosine similarity with pre-computed L2 norms
+ *
+ * Avoids redundant norm computation for stored vectors whose norms
+ * have been pre-computed in compact storage.
+ *
+ * @param lhs Pointer to first vector data
+ * @param rhs Pointer to second vector data
+ * @param dim Vector dimension
+ * @param norm_lhs Pre-computed L2 norm of lhs
+ * @param norm_rhs Pre-computed L2 norm of rhs
+ * @return Cosine similarity, or 0.0 if either norm is near-zero
+ */
+inline float CosineSimilarityPreNorm(const float* lhs, const float* rhs, size_t dim, float norm_lhs, float norm_rhs) {
+  constexpr float kNormEpsilon = 1e-7F;
+  if (norm_lhs < kNormEpsilon || norm_rhs < kNormEpsilon) {
+    return 0.0F;
+  }
+  float dot = simd::GetOptimalImpl().dot_product(lhs, rhs, dim);
+  return dot / (norm_lhs * norm_rhs);
+}
+
+/**
  * @brief Calculate L2 (Euclidean) distance between two vectors
  *
  * L2 distance: sqrt(sum((lhs[i] - rhs[i])^2))

@@ -7,6 +7,8 @@
 
 #include <algorithm>
 #include <map>
+#include <numeric>
+#include <random>
 #include <unordered_set>
 
 #include "utils/error.h"
@@ -22,7 +24,8 @@ SimilarityEngine::SimilarityEngine(events::EventStore* event_store, events::CoOc
       co_index_(co_index),
       vector_store_(vector_store),
       config_(config),
-      distance_func_(SelectDistanceFunction(vectors_config.distance_metric)) {}
+      distance_func_(SelectDistanceFunction(vectors_config.distance_metric)),
+      use_prenorm_(vectors_config.distance_metric.empty() || vectors_config.distance_metric == "cosine") {}
 
 SimilarityEngine::DistanceFunc SimilarityEngine::SelectDistanceFunction(const std::string& metric) {
   if (metric == "dot") {
@@ -73,6 +76,49 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
     return utils::MakeUnexpected(validated_top_k.error());
   }
 
+  // Fast path: use compact contiguous storage for better cache locality
+  if (vector_store_->IsCompactValid() && use_prenorm_) {
+    auto lock = vector_store_->AcquireReadLock();
+    size_t n = vector_store_->GetCompactCount();
+    size_t dim = vector_store_->GetDimension();
+
+    auto query_idx_opt = vector_store_->GetCompactIndex(item_id);
+    if (!query_idx_opt) {
+      return utils::MakeUnexpected(
+          utils::MakeError(utils::ErrorCode::kVectorNotFound, "Query vector not found: " + item_id));
+    }
+    size_t query_idx = *query_idx_opt;
+    const float* query_ptr = vector_store_->GetMatrixRow(query_idx);
+    float query_norm = vector_store_->GetNorm(query_idx);
+
+    // Determine whether to sample
+    bool use_sampling = config_.sample_size > 0 && n > config_.sample_size * 2;
+
+    std::vector<size_t> scan_indices;
+    if (use_sampling) {
+      scan_indices = SampleIndices(n, config_.sample_size);
+    } else {
+      scan_indices.resize(n);
+      std::iota(scan_indices.begin(), scan_indices.end(), size_t(0));
+    }
+
+    std::vector<SimilarityResult> results;
+    results.reserve(scan_indices.size());
+
+    for (size_t idx : scan_indices) {
+      if (idx == query_idx) {
+        continue;
+      }
+      float score = vectors::CosineSimilarityPreNorm(query_ptr, vector_store_->GetMatrixRow(idx), dim, query_norm,
+                                                     vector_store_->GetNorm(idx));
+      results.emplace_back(vector_store_->GetIdByIndex(idx), score);
+    }
+
+    return MergeAndSelectTopK(std::move(results), validated_top_k.value());
+  }
+
+  // Fallback: brute-force with hash map lookups (when compact is not valid)
+
   // Get query vector
   auto query_vec = vector_store_->GetVector(item_id);
   if (!query_vec) {
@@ -122,7 +168,20 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
   int fetch_k = std::min(validated_top_k.value() * 3, static_cast<int>(config_.max_top_k));
 
   auto event_results = SearchByIdEvents(item_id, fetch_k);
-  auto vector_results = SearchByIdVectors(item_id, fetch_k);
+
+  // Pre-filtering: use event results as candidate set for vector search
+  utils::Expected<std::vector<SimilarityResult>, utils::Error> vector_results;
+  if (event_results && event_results->size() >= static_cast<size_t>(fetch_k)) {
+    // Use event results as candidate set (pre-filter)
+    std::unordered_set<std::string> candidate_ids;
+    for (const auto& r : *event_results) {
+      candidate_ids.insert(r.item_id);
+    }
+    vector_results = SearchByIdVectorsFiltered(item_id, candidate_ids, fetch_k);
+  } else {
+    // Not enough event candidates, fall back to full vector scan
+    vector_results = SearchByIdVectors(item_id, fetch_k);
+  }
 
   // If both failed, return error
   if (!event_results && !vector_results) {
@@ -191,6 +250,44 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
     return utils::MakeUnexpected(error);
   }
 
+  // Fast path: use compact contiguous storage for better cache locality
+  if (vector_store_->IsCompactValid() && use_prenorm_) {
+    auto lock = vector_store_->AcquireReadLock();
+    size_t n = vector_store_->GetCompactCount();
+    size_t dim = vector_store_->GetDimension();
+
+    // Compute query norm
+    float query_norm = 0.0F;
+    for (float v : query_vector) {
+      query_norm += v * v;
+    }
+    query_norm = std::sqrt(query_norm);
+
+    // Determine whether to sample
+    bool use_sampling = config_.sample_size > 0 && n > config_.sample_size * 2;
+
+    std::vector<size_t> scan_indices;
+    if (use_sampling) {
+      scan_indices = SampleIndices(n, config_.sample_size);
+    } else {
+      scan_indices.resize(n);
+      std::iota(scan_indices.begin(), scan_indices.end(), size_t(0));
+    }
+
+    std::vector<SimilarityResult> results;
+    results.reserve(scan_indices.size());
+
+    for (size_t idx : scan_indices) {
+      float score = vectors::CosineSimilarityPreNorm(query_vector.data(), vector_store_->GetMatrixRow(idx), dim,
+                                                     query_norm, vector_store_->GetNorm(idx));
+      results.emplace_back(vector_store_->GetIdByIndex(idx), score);
+    }
+
+    return MergeAndSelectTopK(std::move(results), validated_top_k.value());
+  }
+
+  // Fallback: brute-force with hash map lookups (when compact is not valid)
+
   // Get all vector IDs
   auto all_ids = vector_store_->GetAllIds();
 
@@ -211,6 +308,96 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
   }
 
   // Sort by score descending and select top-k
+  return MergeAndSelectTopK(std::move(results), validated_top_k.value());
+}
+
+// ============================================================================
+// Sampling
+// ============================================================================
+
+std::vector<size_t> SimilarityEngine::SampleIndices(size_t total, size_t sample_size) const {
+  if (sample_size >= total) {
+    std::vector<size_t> all(total);
+    std::iota(all.begin(), all.end(), size_t(0));
+    return all;
+  }
+
+  // Reservoir sampling (Algorithm R)
+  thread_local std::mt19937 rng(std::random_device{}());
+
+  std::vector<size_t> reservoir(sample_size);
+  std::iota(reservoir.begin(), reservoir.end(), size_t(0));
+
+  for (size_t i = sample_size; i < total; ++i) {
+    std::uniform_int_distribution<size_t> dist(0, i);
+    size_t j = dist(rng);
+    if (j < sample_size) {
+      reservoir[j] = i;
+    }
+  }
+
+  return reservoir;
+}
+
+// ============================================================================
+// Pre-filtered Search
+// ============================================================================
+
+utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::SearchByIdVectorsFiltered(
+    const std::string& item_id, const std::unordered_set<std::string>& candidate_ids, int top_k) {
+  auto validated_top_k = ValidateTopK(top_k);
+  if (!validated_top_k) {
+    return utils::MakeUnexpected(validated_top_k.error());
+  }
+
+  auto query_vec = vector_store_->GetVector(item_id);
+  if (!query_vec) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kVectorNotFound, "Query vector not found: " + item_id));
+  }
+
+  std::vector<SimilarityResult> results;
+  results.reserve(candidate_ids.size());
+
+  // Use compact path if available
+  if (vector_store_->IsCompactValid() && use_prenorm_) {
+    auto lock = vector_store_->AcquireReadLock();
+    size_t dim = vector_store_->GetDimension();
+    auto query_idx_opt = vector_store_->GetCompactIndex(item_id);
+    if (!query_idx_opt) {
+      return utils::MakeUnexpected(
+          utils::MakeError(utils::ErrorCode::kVectorNotFound, "Query vector not found in compact: " + item_id));
+    }
+    const float* query_ptr = vector_store_->GetMatrixRow(*query_idx_opt);
+    float query_norm = vector_store_->GetNorm(*query_idx_opt);
+
+    for (const auto& cid : candidate_ids) {
+      if (cid == item_id) {
+        continue;
+      }
+      auto cidx = vector_store_->GetCompactIndex(cid);
+      if (!cidx) {
+        continue;  // candidate not in vector store
+      }
+      float score = vectors::CosineSimilarityPreNorm(query_ptr, vector_store_->GetMatrixRow(*cidx), dim, query_norm,
+                                                     vector_store_->GetNorm(*cidx));
+      results.emplace_back(cid, score);
+    }
+  } else {
+    // Fallback: use hash map
+    for (const auto& cid : candidate_ids) {
+      if (cid == item_id) {
+        continue;
+      }
+      auto cvec = vector_store_->GetVector(cid);
+      if (!cvec) {
+        continue;
+      }
+      float score = distance_func_(query_vec->data, cvec->data);
+      results.emplace_back(cid, score);
+    }
+  }
+
   return MergeAndSelectTopK(std::move(results), validated_top_k.value());
 }
 

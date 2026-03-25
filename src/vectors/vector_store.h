@@ -152,12 +152,83 @@ class VectorStore {
    */
   size_t MemoryUsage() const;
 
+  /**
+   * @brief Rebuild compact contiguous storage from vectors map
+   *
+   * Copies all vectors into a contiguous float array and pre-computes
+   * L2 norms for each vector. Requires exclusive lock internally.
+   * Call after bulk operations for optimal search performance.
+   */
+  void Compact();
+
+  /**
+   * @brief Check if compact storage is valid
+   * @return True if compact storage is up-to-date with vectors map
+   */
+  bool IsCompactValid() const { return compact_valid_.load(std::memory_order_acquire); }
+
+  /**
+   * @brief Get number of vectors in compact storage
+   * @return Number of rows in compact matrix
+   */
+  size_t GetCompactCount() const;
+
+  /**
+   * @brief Get pointer to vector data at given index in compact storage
+   *
+   * Caller MUST hold read lock via AcquireReadLock().
+   *
+   * @param idx Row index in compact matrix
+   * @return Pointer to first element of the vector
+   */
+  const float* GetMatrixRow(size_t idx) const;
+
+  /**
+   * @brief Get pre-computed L2 norm for vector at given index
+   *
+   * Caller MUST hold read lock via AcquireReadLock().
+   *
+   * @param idx Row index in compact matrix
+   * @return L2 norm of the vector
+   */
+  float GetNorm(size_t idx) const;
+
+  /**
+   * @brief Get ID for vector at given index in compact storage
+   *
+   * Caller MUST hold read lock via AcquireReadLock().
+   *
+   * @param idx Row index in compact matrix
+   * @return Reference to the vector ID string
+   */
+  const std::string& GetIdByIndex(size_t idx) const;
+
+  /**
+   * @brief Acquire read lock for external batch operations
+   * @return Shared lock guard
+   */
+  std::shared_lock<std::shared_mutex> AcquireReadLock() const;
+
+  /**
+   * @brief Get index for a given ID in compact storage
+   * @param id Vector ID to look up
+   * @return Index in compact matrix, or nullopt if not found
+   */
+  std::optional<size_t> GetCompactIndex(const std::string& id) const;
+
  private:
   config::VectorsConfig config_;  ///< Configuration
 
   mutable std::shared_mutex mutex_;                  ///< Reader-writer lock
   std::unordered_map<std::string, Vector> vectors_;  ///< ID -> Vector mapping
   std::atomic<size_t> dimension_{0};                 ///< Fixed dimension (0 = not set)
+
+  // Compact storage (read-optimized contiguous mirror of vectors_)
+  std::vector<float> matrix_;                          ///< [n x dim] contiguous float array
+  std::vector<float> norms_;                           ///< [n] pre-computed L2 norms
+  std::unordered_map<std::string, size_t> id_to_idx_;  ///< ID -> row index
+  std::vector<std::string> idx_to_id_;                 ///< row index -> ID
+  std::atomic<bool> compact_valid_{false};             ///< Whether compact storage is up-to-date
 };
 
 }  // namespace nvecd::vectors
