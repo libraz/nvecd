@@ -10,7 +10,7 @@
 
 #include <algorithm>
 #include <cctype>
-#include <sstream>
+#include <string_view>
 
 #include "utils/structured_log.h"
 
@@ -21,34 +21,44 @@ namespace {
 constexpr size_t kUsingPrefixLength = 6;  // Length of "using=" prefix
 
 /**
- * @brief Split string by delimiter
+ * @brief Split string_view by delimiter, returning owned strings
  */
-std::vector<std::string> Split(const std::string& str, char delimiter) {
+std::vector<std::string> Split(std::string_view str, char delimiter) {
   std::vector<std::string> tokens;
-  std::stringstream stream(str);
-  std::string token;
-  while (std::getline(stream, token, delimiter)) {
-    if (!token.empty()) {
-      tokens.push_back(token);
+  size_t start = 0;
+  while (start < str.size()) {
+    size_t end = str.find(delimiter, start);
+    if (end == std::string_view::npos) {
+      end = str.size();
     }
+    if (end > start) {
+      tokens.emplace_back(str.substr(start, end - start));
+    }
+    start = end + 1;
   }
   return tokens;
 }
 
 /**
- * @brief Trim whitespace from both ends
+ * @brief Trim whitespace from both ends, returning owned string
  */
-std::string Trim(const std::string& str) {
-  auto start = std::find_if_not(str.begin(), str.end(), [](unsigned char chr) { return std::isspace(chr); });
-  auto end = std::find_if_not(str.rbegin(), str.rend(), [](unsigned char chr) { return std::isspace(chr); }).base();
-  return (start < end) ? std::string(start, end) : "";
+std::string Trim(std::string_view str) {
+  size_t start = 0;
+  while (start < str.size() && std::isspace(static_cast<unsigned char>(str[start]))) {
+    ++start;
+  }
+  size_t end = str.size();
+  while (end > start && std::isspace(static_cast<unsigned char>(str[end - 1]))) {
+    --end;
+  }
+  return std::string(str.substr(start, end - start));
 }
 
 /**
  * @brief Convert string to uppercase
  */
-std::string ToUpper(const std::string& str) {
-  std::string result = str;
+std::string ToUpper(std::string_view str) {
+  std::string result(str);
   std::transform(result.begin(), result.end(), result.begin(), [](unsigned char chr) { return std::toupper(chr); });
   return result;
 }
@@ -315,9 +325,9 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request) 
 
   } else if (cmd_name == "DEBUG") {
     // DEBUG ON|OFF
-    if (tokens.size() < 2) {
+    if (tokens.size() != 2) {
       return utils::MakeUnexpected(
-          utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "DEBUG requires argument: ON|OFF"));
+          utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "DEBUG requires exactly one argument: ON|OFF"));
     }
     std::string arg = ToUpper(tokens[1]);
     if (arg == "ON") {
@@ -393,6 +403,23 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request) 
       return utils::MakeUnexpected(
           utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "Unknown SHOW subcommand: " + subcmd));
     }
+
+  } else if (cmd_name == "AUTH") {
+    // AUTH <password>
+    if (tokens.size() < 2) {
+      return utils::MakeUnexpected(
+          utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "AUTH requires 1 argument: <password>"));
+    }
+    cmd.type = CommandType::kAuth;
+    // Join all remaining tokens as password (in case password contains spaces)
+    std::string password;
+    for (size_t i = 1; i < tokens.size(); ++i) {
+      if (i > 1) {
+        password += " ";
+      }
+      password += tokens[i];
+    }
+    cmd.variable_value = password;  // Reuse variable_value field for password
 
   } else {
     cmd.type = CommandType::kUnknown;

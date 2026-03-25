@@ -170,6 +170,13 @@ struct CacheConfig {
 };
 
 /**
+ * @brief Security configuration
+ */
+struct SecurityConfig {
+  std::string requirepass;  ///< Required password for write/admin commands (empty = no auth)
+};
+
+/**
  * @brief Root configuration
  */
 struct Config {
@@ -182,6 +189,7 @@ struct Config {
   NetworkConfig network;        ///< Network security configuration
   LoggingConfig logging;        ///< Logging configuration
   CacheConfig cache;            ///< Cache configuration
+  SecurityConfig security;      ///< Security configuration
 };
 
 /**

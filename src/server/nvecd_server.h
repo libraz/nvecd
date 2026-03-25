@@ -18,6 +18,7 @@
 #include "events/event_store.h"
 #include "server/connection_acceptor.h"
 #include "server/http_server.h"
+#include "server/rate_limiter.h"
 #include "server/request_dispatcher.h"
 #include "server/server_types.h"
 #include "server/thread_pool.h"
@@ -180,6 +181,7 @@ class NvecdServer {
   std::unique_ptr<ConnectionAcceptor> acceptor_;
   std::unique_ptr<ConnectionAcceptor> unix_acceptor_;  ///< Unix domain socket acceptor (optional)
   std::unique_ptr<HttpServer> http_server_;            // HTTP API server (optional)
+  std::unique_ptr<RateLimiter> rate_limiter_;          // Per-client rate limiter (optional)
 };
 
 }  // namespace nvecd::server

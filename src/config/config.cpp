@@ -10,11 +10,12 @@
 
 #include <yaml-cpp/yaml.h>
 
+#include <cerrno>
+#include <cstdlib>
 #include <fstream>
 #include <nlohmann/json-schema.hpp>
 #include <nlohmann/json.hpp>
 #include <sstream>
-#include <stdexcept>
 
 #include "config/config_schema_embedded.h"
 #include "utils/error.h"
@@ -43,20 +44,33 @@ nlohmann::json YamlToJson(const YAML::Node& yaml_node) {
   }
 
   if (yaml_node.IsScalar()) {
-    // Try different types
-    try {
-      return yaml_node.as<int64_t>();
-    } catch (...) {
-      try {
-        return yaml_node.as<double>();
-      } catch (...) {
-        try {
-          return yaml_node.as<bool>();
-        } catch (...) {
-          return yaml_node.as<std::string>();
-        }
-      }
+    const std::string& scalar = yaml_node.Scalar();
+
+    // Try bool (YAML 1.1 true/false variants)
+    if (scalar == "true" || scalar == "True" || scalar == "TRUE") {
+      return true;
     }
+    if (scalar == "false" || scalar == "False" || scalar == "FALSE") {
+      return false;
+    }
+
+    // Try integer
+    char* end = nullptr;
+    errno = 0;
+    long long ll_val = std::strtoll(scalar.c_str(), &end, 10);
+    if (errno == 0 && end != scalar.c_str() && *end == '\0') {
+      return static_cast<int64_t>(ll_val);
+    }
+
+    // Try double
+    errno = 0;
+    double d_val = std::strtod(scalar.c_str(), &end);
+    if (errno == 0 && end != scalar.c_str() && *end == '\0') {
+      return d_val;
+    }
+
+    // Default to string
+    return scalar;
   }
 
   if (yaml_node.IsSequence()) {
@@ -88,13 +102,8 @@ T GetYamlValue(const YAML::Node& node, const std::string& key, const T& default_
   if (!node[key]) {
     return default_value;
   }
-  try {
-    return node[key].as<T>();
-  } catch (const YAML::Exception& e) {
-    std::stringstream err;
-    err << "Failed to parse config key '" << key << "': " << e.what();
-    throw std::runtime_error(err.str());
-  }
+  // yaml-cpp's as<T>(fallback) returns fallback on conversion failure without throwing
+  return node[key].as<T>(default_value);
 }
 
 /**
@@ -329,6 +338,17 @@ CacheConfig ParseCacheConfig(const YAML::Node& node) {
 }
 
 /**
+ * @brief Parse security configuration
+ */
+SecurityConfig ParseSecurityConfig(const YAML::Node& node) {
+  SecurityConfig config;
+  if (node["requirepass"]) {
+    config.requirepass = node["requirepass"].as<std::string>();
+  }
+  return config;
+}
+
+/**
  * @brief Validate configuration against JSON Schema
  * Reference: ../mygram-db/src/config/config.cpp:ValidateConfigJson
  *
@@ -336,34 +356,31 @@ CacheConfig ParseCacheConfig(const YAML::Node& node) {
  * @return Expected<void, Error> with success or validation error
  */
 utils::Expected<void, utils::Error> ValidateConfigSchema(const nlohmann::json& config_json) {
-  try {
-    // Parse embedded schema
-    json schema_json = json::parse(kConfigSchemaJson);
+  // Parse embedded schema using non-throwing variant
+  auto schema_json = json::parse(kConfigSchemaJson, nullptr, false);
+  if (schema_json.is_discarded()) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kConfigParseError, "Failed to parse embedded JSON schema"));
+  }
 
-    // Create validator
+  // json_validator throws on validation failure — library boundary catch
+  try {
     json_validator validator;
     validator.set_root_schema(schema_json);
-
-    // Validate
-    try {
-      validator.validate(config_json);
-      utils::StructuredLog().Event("config_validation").Field("status", "passed").Info();
-    } catch (const std::exception& e) {
-      std::stringstream err_msg;
-      err_msg << "Configuration validation failed:\n";
-      err_msg << "  " << e.what() << "\n\n";
-      err_msg << "  Common configuration issues:\n";
-      err_msg << "    - Missing required fields (vectors, events, etc.)\n";
-      err_msg << "    - Invalid data types (string instead of number, etc.)\n";
-      err_msg << "    - Invalid enum values (check allowed values)\n";
-      err_msg << "    - Out of range values (check min/max constraints)\n\n";
-      err_msg << "  Please check your configuration against the schema.\n";
-      err_msg << "  Use 'CONFIG HELP <path>' to see configuration options.";
-      return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kConfigValidationError, err_msg.str()));
-    }
-  } catch (const json::parse_error& e) {
-    return utils::MakeUnexpected(
-        utils::MakeError(utils::ErrorCode::kConfigParseError, std::string("JSON parse error: ") + e.what()));
+    validator.validate(config_json);
+    utils::StructuredLog().Event("config_validation").Field("status", "passed").Info();
+  } catch (const std::exception& e) {
+    std::stringstream err_msg;
+    err_msg << "Configuration validation failed:\n";
+    err_msg << "  " << e.what() << "\n\n";
+    err_msg << "  Common configuration issues:\n";
+    err_msg << "    - Missing required fields (vectors, events, etc.)\n";
+    err_msg << "    - Invalid data types (string instead of number, etc.)\n";
+    err_msg << "    - Invalid enum values (check allowed values)\n";
+    err_msg << "    - Out of range values (check min/max constraints)\n\n";
+    err_msg << "  Please check your configuration against the schema.\n";
+    err_msg << "  Use 'CONFIG HELP <path>' to see configuration options.";
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kConfigValidationError, err_msg.str()));
   }
 
   return {};
@@ -372,6 +389,7 @@ utils::Expected<void, utils::Error> ValidateConfigSchema(const nlohmann::json& c
 }  // namespace
 
 utils::Expected<Config, utils::Error> LoadConfig(const std::string& path) {
+  // Library boundary: yaml-cpp throws exceptions by design
   try {
     // Load YAML file
     YAML::Node root = YAML::LoadFile(path);
@@ -414,6 +432,9 @@ utils::Expected<Config, utils::Error> LoadConfig(const std::string& path) {
     }
     if (root["cache"]) {
       config.cache = ParseCacheConfig(root["cache"]);
+    }
+    if (root["security"]) {
+      config.security = ParseSecurityConfig(root["security"]);
     }
 
     // Validate configuration (semantic validation)

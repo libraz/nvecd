@@ -56,6 +56,7 @@ struct ServerConfig {
   std::string host = "127.0.0.1";
   uint16_t port = kDefaultPort;
   int max_connections = kDefaultMaxConnections;
+  int max_connections_per_ip = 100;  ///< Maximum connections per IP (0 = unlimited)
   int worker_threads = 0;  // Number of worker threads (0 = CPU count)
   int recv_buffer_size = kDefaultRecvBufferSize;
   int send_buffer_size = kDefaultSendBufferSize;
@@ -69,7 +70,9 @@ struct ServerConfig {
  */
 struct ConnectionContext {
   int client_fd = -1;
-  bool debug_mode = false;  // Debug mode flag
+  bool debug_mode = false;      ///< Debug mode flag
+  bool authenticated = false;   ///< Whether client has authenticated
+  std::string client_ip;        ///< Client IP address (for rate limiting and logging)
 };
 
 /**
@@ -81,17 +84,17 @@ struct ConnectionContext {
  * Uses std::atomic for thread-safe counter updates without locks.
  */
 struct ServerStats {
-  // Server start time (Unix timestamp)
+  // Read-mostly (set once at startup)
   uint64_t start_time = static_cast<uint64_t>(std::time(nullptr));
 
-  // Connection statistics
-  std::atomic<uint64_t> total_connections{0};
-  std::atomic<uint64_t> active_connections{0};
-
-  // Command statistics
-  std::atomic<uint64_t> total_commands{0};
+  // Hot counters - separate cache lines for frequently updated counters
+  alignas(64) std::atomic<uint64_t> total_connections{0};
+  alignas(64) std::atomic<uint64_t> active_connections{0};
+  alignas(64) std::atomic<uint64_t> total_commands{0};
   std::atomic<uint64_t> failed_commands{0};
-  std::atomic<uint64_t> event_commands{0};
+
+  // Per-command type counters (less contended, grouped together)
+  alignas(64) std::atomic<uint64_t> event_commands{0};
   std::atomic<uint64_t> sim_commands{0};
   std::atomic<uint64_t> vecset_commands{0};
   std::atomic<uint64_t> info_commands{0};
@@ -164,6 +167,9 @@ struct HandlerContext {
 
   // Snapshot directory
   std::string dump_dir;
+
+  // Security
+  std::string requirepass;  ///< Required password (empty = no auth)
 
   // NOLINTEND(cppcoreguidelines-avoid-const-or-ref-data-members)
 };

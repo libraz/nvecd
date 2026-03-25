@@ -61,6 +61,16 @@ struct VariableInfo {
  */
 class RuntimeVariableManager {
  public:
+  /** @brief Passkey to allow make_unique with private constructor semantics */
+  struct ConstructorTag {
+   private:
+    friend class RuntimeVariableManager;
+    ConstructorTag() = default;
+  };
+
+  /** @brief Constructor accessible via ConstructorTag (use Create() factory) */
+  explicit RuntimeVariableManager(ConstructorTag);
+
   /**
    * @brief Create manager from initial config
    * @param initial_config Initial configuration

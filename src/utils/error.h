@@ -125,6 +125,7 @@ enum class ErrorCode : std::uint16_t {
   kNetworkInvalidBindAddress = 6013,     ///< Invalid bind address
   kNetworkUnixSocketPathTooLong = 6014,  ///< Unix socket path exceeds system limit
   kNetworkUnixSocketStale = 6015,        ///< Another server is listening on the unix socket
+  kNetworkRateLimited = 6016,            ///< Request rate limited
 
   // ===== Client Errors (7000-7999) =====
   kClientNotConnected = 7000,      ///< Client not connected
@@ -323,6 +324,8 @@ inline const char* ErrorCodeToString(ErrorCode code) {
       return "Unix socket path too long";
     case ErrorCode::kNetworkUnixSocketStale:
       return "Unix socket already in use by another server";
+    case ErrorCode::kNetworkRateLimited:
+      return "Rate limited";
 
     // Client
     case ErrorCode::kClientNotConnected:

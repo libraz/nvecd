@@ -7,6 +7,7 @@
 
 #include <spdlog/spdlog.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -41,7 +42,7 @@ void ConnectionIOHandler::HandleConnection(int client_fd, ConnectionContext& ctx
 
   std::vector<char> buffer(config_.recv_buffer_size);
   std::string accumulated;
-  const size_t max_accumulated = config_.max_query_length * 10;
+  const size_t max_accumulated = config_.max_accumulated_bytes;
 
   while (!shutdown_flag_) {
     ssize_t bytes = recv(client_fd, buffer.data(), buffer.size() - 1, 0);
@@ -121,35 +122,49 @@ bool ConnectionIOHandler::ProcessBuffer(std::string& accumulated, int client_fd,
 // Kept as member function for consistency and potential future extensions
 // NOLINTNEXTLINE(readability-convert-member-functions-to-static)
 bool ConnectionIOHandler::SendResponse(int client_fd, const std::string& response) {
-  std::string full_response = response + "\r\n";
-  size_t total_sent = 0;
-  size_t to_send = full_response.length();
+  // Use writev() to send response + CRLF without string concatenation
+  static constexpr char kCRLF[] = "\r\n";
 
-  // Handle partial sends
-  while (total_sent < to_send) {
-    // Use MSG_NOSIGNAL to prevent SIGPIPE when client closes connection unexpectedly
-    // Pointer arithmetic needed for partial send resumption with POSIX send()
-    ssize_t sent =
-        send(client_fd, full_response.c_str() + total_sent,  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
-             to_send - total_sent, MSG_NOSIGNAL);
+  struct iovec iov[2];  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+  iov[0].iov_base = const_cast<char*>(response.c_str());  // NOLINT(cppcoreguidelines-pro-type-const-cast)
+  iov[0].iov_len = response.size();
+  iov[1].iov_base = const_cast<char*>(kCRLF);  // NOLINT(cppcoreguidelines-pro-type-const-cast)
+  iov[1].iov_len = 2;
+
+  size_t total_to_send = response.size() + 2;
+  size_t total_sent = 0;
+
+  while (total_sent < total_to_send) {
+    ssize_t sent = writev(client_fd, iov, 2);
 
     if (sent < 0) {
       if (errno == EINTR) {
-        continue;  // Interrupted, retry
+        continue;
       }
-      // EPIPE is expected when client closes connection
       if (errno != EPIPE) {
-        spdlog::debug("send error on fd {}: {}", client_fd, strerror(errno));
+        spdlog::debug("writev error on fd {}: {}", client_fd, strerror(errno));
       }
       return false;
     }
 
     if (sent == 0) {
-      spdlog::debug("send returned 0 on fd {}", client_fd);
+      spdlog::debug("writev returned 0 on fd {}", client_fd);
       return false;
     }
 
     total_sent += sent;
+
+    // Adjust iov for partial writes
+    auto bytes_sent = static_cast<size_t>(sent);
+    if (bytes_sent >= iov[0].iov_len) {
+      bytes_sent -= iov[0].iov_len;
+      iov[0].iov_len = 0;
+      iov[1].iov_base = static_cast<char*>(iov[1].iov_base) + bytes_sent;  // NOLINT
+      iov[1].iov_len -= bytes_sent;
+    } else {
+      iov[0].iov_base = static_cast<char*>(iov[0].iov_base) + bytes_sent;  // NOLINT
+      iov[0].iov_len -= bytes_sent;
+    }
   }
 
   return true;

@@ -5,6 +5,7 @@
 
 #include "cache/cache_key_generator.h"
 
+#include <cstdint>
 #include <cstring>
 #include <iomanip>
 #include <sstream>
@@ -29,6 +30,15 @@ CacheKey GenerateSimvCacheKey(const std::vector<float>& vector, int top_k, const
 }
 
 std::string HashVector(const std::vector<float>& vector) {
+  if (vector.empty()) {
+    return std::string(32, '0');  // Return zero hash for empty vector
+  }
+
+  // Guard against integer overflow
+  if (vector.size() > SIZE_MAX / sizeof(float)) {
+    return std::string(32, '0');  // Return zero hash on overflow
+  }
+
   // Hash raw bytes of vector using MD5
   const uint8_t* data =
       reinterpret_cast<const uint8_t*>(vector.data());  // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)

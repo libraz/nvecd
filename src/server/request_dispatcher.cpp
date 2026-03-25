@@ -9,6 +9,8 @@
 #include <chrono>
 #include <sstream>
 
+#include <spdlog/spdlog.h>
+
 // Include concrete types before request_dispatcher.h to resolve forward declarations
 #include "cache/cache_key.h"
 #include "cache/similarity_cache.h"
@@ -36,6 +38,20 @@ std::string RequestDispatcher::Dispatch(const std::string& request, ConnectionCo
   if (!cmd) {
     utils::LogCommandParseError(request, cmd.error().message(), 0);
     return FormatError(cmd.error().message());
+  }
+
+  // Handle AUTH command
+  if (cmd->type == CommandType::kAuth) {
+    return HandleAuth(*cmd, conn_ctx);
+  }
+
+  // Check authorization for non-read commands
+  if (!ctx_.requirepass.empty()) {
+    auto privilege = GetCommandPrivilege(cmd->type);
+    if (privilege != CommandPrivilege::kRead && !conn_ctx.authenticated) {
+      ctx_.stats.failed_commands++;
+      return FormatError("NOAUTH Authentication required");
+    }
   }
 
   // Route to appropriate handler
@@ -146,18 +162,23 @@ std::string RequestDispatcher::Dispatch(const std::string& request, ConnectionCo
       result = handlers::HandleCacheDisable(ctx_);
       break;
 
+    case CommandType::kAuth:
+      // Handled above before the switch; should not reach here
+      break;
+
     case CommandType::kUnknown:
       result = utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandUnknown, "Unknown command"));
       break;
   }
 
-  // Handle result
+  // Handle result — always increment total_commands
+  ctx_.stats.total_commands++;
+
   if (!result) {
     ctx_.stats.failed_commands++;
     return FormatError(result.error().message());
   }
 
-  ctx_.stats.total_commands++;
   return *result;
 }
 
@@ -231,7 +252,10 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSim(const Co
 
   // Auto-compact if needed
   if (ctx_.vector_store != nullptr && !ctx_.vector_store->IsCompactValid()) {
-    ctx_.vector_store->Compact();
+    auto compact_result = ctx_.vector_store->Compact();
+    if (!compact_result) {
+      spdlog::warn("Compact failed: {}", compact_result.error().message());
+    }
   }
 
   auto start = std::chrono::steady_clock::now();
@@ -301,7 +325,10 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSimv(const C
 
   // Auto-compact if needed
   if (ctx_.vector_store != nullptr && !ctx_.vector_store->IsCompactValid()) {
-    ctx_.vector_store->Compact();
+    auto compact_result = ctx_.vector_store->Compact();
+    if (!compact_result) {
+      spdlog::warn("Compact failed: {}", compact_result.error().message());
+    }
   }
 
   auto start = std::chrono::steady_clock::now();
@@ -374,7 +401,10 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleDumpLoad(con
 
   // Compact vector store after snapshot load for optimized search
   if (result && ctx_.vector_store != nullptr) {
-    ctx_.vector_store->Compact();
+    auto compact_result = ctx_.vector_store->Compact();
+    if (!compact_result) {
+      spdlog::warn("Compact failed: {}", compact_result.error().message());
+    }
   }
 
   return result;
@@ -434,6 +464,25 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleGet(const Co
 
 utils::Expected<std::string, utils::Error> RequestDispatcher::HandleShowVariables(const Command& cmd) {
   return handlers::HandleShowVariables(ctx_.variable_manager, cmd.pattern);
+}
+
+//
+// Auth handler
+//
+
+std::string RequestDispatcher::HandleAuth(const Command& cmd, ConnectionContext& conn_ctx) {
+  if (ctx_.requirepass.empty()) {
+    // No password configured - auth not needed
+    return "+OK (no password required)\r\n";
+  }
+
+  if (cmd.variable_value == ctx_.requirepass) {
+    conn_ctx.authenticated = true;
+    return "+OK\r\n";
+  }
+
+  ctx_.stats.failed_commands++;
+  return FormatError("ERR invalid password");
 }
 
 }  // namespace nvecd::server

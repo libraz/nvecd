@@ -55,6 +55,9 @@ enum class CommandType : std::uint8_t {
   kGet,
   kShowVariables,
 
+  // Auth command
+  kAuth,
+
   // Special
   kUnknown
 };
@@ -106,10 +109,44 @@ inline const char* CommandTypeToString(CommandType type) {
       return "GET";
     case CommandType::kShowVariables:
       return "SHOW_VARIABLES";
+    case CommandType::kAuth:
+      return "AUTH";
     case CommandType::kUnknown:
       return "UNKNOWN";
   }
   return "UNKNOWN";
+}
+
+/**
+ * @brief Command privilege level for authorization
+ */
+enum class CommandPrivilege : std::uint8_t {
+  kRead,   ///< Read-only commands (always allowed)
+  kWrite,  ///< Write commands (require auth when password set)
+  kAdmin   ///< Admin commands (require auth when password set)
+};
+
+/**
+ * @brief Get privilege level for a command type
+ */
+inline CommandPrivilege GetCommandPrivilege(CommandType type) {
+  switch (type) {
+    case CommandType::kEvent:
+    case CommandType::kVecset:
+    case CommandType::kSet:
+    case CommandType::kCacheClear:
+    case CommandType::kCacheEnable:
+    case CommandType::kCacheDisable:
+      return CommandPrivilege::kWrite;
+    case CommandType::kDumpSave:
+    case CommandType::kDumpLoad:
+    case CommandType::kDumpVerify:
+    case CommandType::kDumpInfo:
+    case CommandType::kConfigVerify:
+      return CommandPrivilege::kAdmin;
+    default:
+      return CommandPrivilege::kRead;
+  }
 }
 
 }  // namespace nvecd::server

@@ -12,6 +12,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <unordered_map>
 
 #include "server/server_types.h"
 #include "utils/error.h"
@@ -133,7 +134,9 @@ class ConnectionAcceptor {
   std::unique_ptr<std::thread> accept_thread_;
 
   std::set<int> active_fds_;
+  std::unordered_map<std::string, int> per_ip_connections_;  ///< Active connections per IP
   std::mutex fds_mutex_;
+  std::unordered_map<int, std::string> fd_to_ip_;  ///< Map fd to client IP for cleanup
 
   std::string unix_socket_path_;  ///< Non-empty when in UDS mode
 };

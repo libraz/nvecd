@@ -141,7 +141,8 @@ TEST(SimilarityCacheTest, HitRate_MultipleKeys) {
 
     // Hit
     auto result2 = cache.Lookup(key);
-    EXPECT_TRUE(result2.has_value());
+    ASSERT_TRUE(result2.has_value()) << "Cache miss on key " << i << " after insert";
+    EXPECT_EQ((*result2)[0].item_id, "result" + std::to_string(i));
   }
 
   auto stats = cache.GetStatistics();
@@ -168,16 +169,29 @@ TEST(SimilarityCacheTest, HitRate_WorkloadSimulation) {
   }
 
   // Execute queries (80% hit expected)
+  int expected_hits = 0;
+  int expected_misses = 0;
   for (int i = 0; i < total_queries; ++i) {
     // 80% of queries hit existing keys (0-99), 20% miss (100+)
     int id = (i % 5 == 0) ? (100 + i) : (i % unique_queries);
     auto key = MakeKey("item" + std::to_string(id), 10);
 
     auto result = cache.Lookup(key);
-    (void)result;  // Suppress unused warning
+    if (id < unique_queries) {
+      // This key was inserted, so it must be a hit
+      ASSERT_TRUE(result.has_value()) << "Expected hit for item" << id;
+      ++expected_hits;
+    } else {
+      // This key was never inserted, so it must be a miss
+      EXPECT_FALSE(result.has_value()) << "Expected miss for item" << id;
+      ++expected_misses;
+    }
   }
 
   auto stats = cache.GetStatistics();
+  EXPECT_EQ(stats.cache_hits, static_cast<uint64_t>(expected_hits));
+  EXPECT_EQ(stats.cache_misses, static_cast<uint64_t>(expected_misses));
+  EXPECT_EQ(stats.total_queries, static_cast<uint64_t>(total_queries));
   double expected_hit_rate = 0.8;
   EXPECT_NEAR(stats.HitRate(), expected_hit_rate, 0.05);
   EXPECT_GT(stats.HitRate(), 0.75);  // Should be at least 75%
@@ -239,13 +253,24 @@ TEST(SimilarityCacheTest, Eviction_LRUPolicy) {
     cache.Insert(key, results, 1.0);
   }
 
-  // item1 should still be in cache (recently accessed)
-  auto still_there = cache.Lookup(key1);
-  // Note: LRU may or may not keep item1 depending on cache size
-  // This is a soft check
-
   auto stats = cache.GetStatistics();
   EXPECT_GT(stats.evictions, 0);
+
+  // item1 was accessed most recently before the bulk inserts, so under LRU
+  // policy it should be retained longer than item2/item3. However, with a
+  // very small cache (2048 bytes) and 90+ subsequent inserts, even item1 may
+  // be evicted. We assert the weaker invariant: if the cache still holds
+  // entries from the original set, item1 (the most recently accessed) should
+  // be among them.
+  auto still_there_1 = cache.Lookup(key1);
+  auto still_there_2 = cache.Lookup(key2);
+  auto still_there_3 = cache.Lookup(key3);
+  if (still_there_2.has_value() || still_there_3.has_value()) {
+    // If less-recently-used items survived, the most-recently-used must too
+    EXPECT_TRUE(still_there_1.has_value())
+        << "LRU violation: item2 or item3 survived eviction but item1 "
+           "(most recently accessed) did not";
+  }
 }
 
 // ============================================================================
@@ -462,12 +487,18 @@ TEST(SimilarityCacheTest, ConcurrentReadsAndWrites) {
 
   // Reader threads: query entries
   std::vector<std::thread> readers;
+  std::atomic<int> total_lookups{0};
+  std::atomic<int> total_hits{0};
   for (int t = 0; t < 4; ++t) {
-    readers.emplace_back([&cache]() {
+    readers.emplace_back([&cache, &total_lookups, &total_hits]() {
       for (int i = 0; i < 100; ++i) {
         auto key = MakeKey("item" + std::to_string(i % 50), 10);  // Query first 50 items
         auto result = cache.Lookup(key);
-        // May or may not hit depending on timing
+        total_lookups.fetch_add(1, std::memory_order_relaxed);
+        // Hit/miss depends on whether writer has inserted this key yet
+        if (result.has_value()) {
+          total_hits.fetch_add(1, std::memory_order_relaxed);
+        }
       }
     });
   }
@@ -477,9 +508,16 @@ TEST(SimilarityCacheTest, ConcurrentReadsAndWrites) {
     reader.join();
   }
 
-  // Should complete without crash
   auto stats = cache.GetStatistics();
-  EXPECT_GT(stats.total_queries, 0);
+  // 4 reader threads x 100 lookups = 400 reader queries
+  EXPECT_EQ(total_lookups.load(), 400);
+  // Stats must reflect all queries (writer inserts don't count as queries)
+  EXPECT_EQ(stats.total_queries, 400);
+  // Hits + misses must account for all queries
+  EXPECT_EQ(stats.cache_hits + stats.cache_misses, stats.total_queries);
+  // Some hits should occur since writer and readers run concurrently
+  // (writer inserts 100 items while readers query 50 items repeatedly)
+  EXPECT_GT(stats.cache_hits, 0);
 }
 
 // ============================================================================
@@ -530,7 +568,10 @@ TEST(SimilarityCacheTest, ConcurrentSetMinQueryCostAndInsert) {
 
   // Should complete without crash or TSAN violations
   auto stats = cache.GetStatistics();
-  EXPECT_GE(stats.current_entries, 0);
+  // Some inserts must have succeeded (4 threads inserting continuously for 100ms)
+  EXPECT_GT(stats.current_entries, 0);
+  // Memory tracking must remain consistent
+  EXPECT_GT(stats.current_memory_bytes, 0);
 }
 
 // ============================================================================
@@ -654,9 +695,16 @@ TEST(SimilarityCacheTest, ConcurrentMarkInvalidatedAndLookup) {
     t.join();
   }
 
-  // Should complete without crash
+  // Should complete without crash or TSAN violations
   auto stats = cache.GetStatistics();
-  EXPECT_GE(stats.cache_misses_invalidated, 0);
+  // Invalidators ran concurrently with lookups, so some lookups must have
+  // encountered invalidated entries. Both hits and misses should be recorded.
+  EXPECT_GT(stats.total_queries, 0);
+  EXPECT_EQ(stats.cache_hits + stats.cache_misses, stats.total_queries);
+  // At least some lookups must have missed due to invalidation
+  EXPECT_GT(stats.cache_misses, 0);
+  // cache_misses_invalidated should be > 0 since invalidators ran continuously
+  EXPECT_GT(stats.cache_misses_invalidated, 0);
 }
 
 TEST(SimilarityCacheTest, EvictForSpaceFailsGracefully) {

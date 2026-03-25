@@ -85,8 +85,10 @@ static const std::map<std::string, bool> kVariableMutability = {
     {"perf.connection_timeout_sec", false},
 };
 
+RuntimeVariableManager::RuntimeVariableManager(ConstructorTag) {}
+
 Expected<std::unique_ptr<RuntimeVariableManager>, Error> RuntimeVariableManager::Create(const Config& initial_config) {
-  auto manager = std::unique_ptr<RuntimeVariableManager>(new RuntimeVariableManager());
+  auto manager = std::make_unique<RuntimeVariableManager>(ConstructorTag{});
   manager->base_config_ = initial_config;
   manager->InitializeRuntimeValues();
   return manager;

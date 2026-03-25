@@ -11,6 +11,9 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <cerrno>
+#include <climits>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <memory>
@@ -636,29 +639,32 @@ int main(int argc, char* argv[]) {
       }
     } else if (arg == "-p") {
       if (i + 1 < argc) {
-        try {
-          config.port =
-              static_cast<uint16_t>(std::stoi(argv[++i]));  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
-        } catch (const std::exception& e) {
+        ++i;
+        const char* port_str = argv[i];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+        char* end = nullptr;
+        errno = 0;
+        long port_val = std::strtol(port_str, &end, 10);
+        if (errno != 0 || end == port_str || *end != '\0' || port_val < 0 || port_val > 65535) {
           std::cerr << "Error: Invalid port number" << '\n';
           return 1;
         }
+        config.port = static_cast<uint16_t>(port_val);
       } else {
         std::cerr << "Error: -p requires an argument" << '\n';
         return 1;
       }
     } else if (arg == "--retry") {
       if (i + 1 < argc) {
-        try {
-          config.retry_count = std::stoi(argv[++i]);  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
-          if (config.retry_count < 0) {
-            std::cerr << "Error: --retry value must be non-negative" << '\n';
-            return 1;
-          }
-        } catch (const std::exception& e) {
+        ++i;
+        const char* retry_str = argv[i];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+        char* retry_end = nullptr;
+        errno = 0;
+        long retry_val = std::strtol(retry_str, &retry_end, 10);
+        if (errno != 0 || retry_end == retry_str || *retry_end != '\0' || retry_val < 0 || retry_val > INT_MAX) {
           std::cerr << "Error: Invalid retry count" << '\n';
           return 1;
         }
+        config.retry_count = static_cast<int>(retry_val);
       } else {
         std::cerr << "Error: --retry requires an argument" << '\n';
         return 1;

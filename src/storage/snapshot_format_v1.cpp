@@ -641,9 +641,14 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
                   "Failed to open file for writing: " + temp_filepath + " (" + std::strerror(errno) + ")"));
   }
 
-  try {
+  {
     // Write fixed header (magic + version)
     output_stream.write(snapshot_format::kMagicNumber.data(), snapshot_format::kMagicNumber.size());
+    if (!output_stream.good()) {
+      std::error_code rm_ec;
+      std::filesystem::remove(temp_filepath, rm_ec);
+      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write magic number"));
+    }
     uint32_t version = snapshot_format::kCurrentVersion;
     WriteBinary(output_stream, version);
 
@@ -804,6 +809,14 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
       output_stream.write(store_data.data(), store_data_size);
     }
 
+    // Check stream state after all store writes
+    if (!output_stream.good()) {
+      output_stream.close();
+      std::error_code rm_ec;
+      std::filesystem::remove(temp_filepath, rm_ec);
+      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Stream error during snapshot write"));
+    }
+
     // Calculate total file size
     header.total_file_size = static_cast<uint64_t>(output_stream.tellp());
 
@@ -825,7 +838,17 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
         return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError,
                                         "Failed to reopen temp file for CRC32 computation: " + temp_filepath));
       }
-      std::string file_contents((std::istreambuf_iterator<char>(crc_input)), std::istreambuf_iterator<char>());
+      crc_input.seekg(0, std::ios::end);
+      auto file_size = static_cast<size_t>(crc_input.tellg());
+      crc_input.seekg(0, std::ios::beg);
+      std::string file_contents(file_size, '\0');
+      crc_input.read(file_contents.data(), static_cast<std::streamsize>(file_size));
+      if (crc_input.fail()) {
+        std::error_code rm_ec;
+        std::filesystem::remove(temp_filepath, rm_ec);
+        return MakeUnexpected(
+            MakeError(ErrorCode::kStorageDumpWriteError, "Failed to read temp file for CRC32 computation"));
+      }
       crc_input.close();
 
       // Zero out the file_crc32 field for CRC computation (it was 0 when written)
@@ -865,16 +888,17 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
 #endif
 
     // Atomic rename
-    std::filesystem::rename(temp_filepath, filepath);
+    std::error_code rename_ec;
+    std::filesystem::rename(temp_filepath, filepath, rename_ec);
+    if (rename_ec) {
+      std::error_code rm_ec;
+      std::filesystem::remove(temp_filepath, rm_ec);
+      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError,
+                                      "Failed to rename temp file to " + filepath + ": " + rename_ec.message()));
+    }
 
     LogStorageInfo("snapshot_write", "Snapshot written successfully to " + filepath);
     return {};
-
-  } catch (const std::exception& e) {
-    output_stream.close();
-    std::filesystem::remove(temp_filepath);
-    return MakeUnexpected(
-        MakeError(ErrorCode::kStorageDumpWriteError, "Exception during snapshot write: " + std::string(e.what())));
   }
 }
 
@@ -890,16 +914,21 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
                                                                           " (" + std::strerror(errno) + ")"));
   }
 
-  try {
+  {
     // Read and verify fixed header (magic + version)
     std::array<char, 4> magic{};
     input_stream.read(magic.data(), magic.size());
+    if (!input_stream.good()) {
+      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read magic number"));
+    }
     if (magic != snapshot_format::kMagicNumber) {
       return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Invalid magic number"));
     }
 
     uint32_t version = 0;
-    ReadBinary(input_stream, version);
+    if (!ReadBinary(input_stream, version)) {
+      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read version"));
+    }
     if (version != 1) {
       return MakeUnexpected(
           MakeError(ErrorCode::kStorageDumpReadError, "Unsupported version: " + std::to_string(version)));
@@ -915,14 +944,21 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
     // Read config section
     uint32_t config_size = 0;
     uint32_t config_crc = 0;
-    ReadBinary(input_stream, config_size);
-    ReadBinary(input_stream, config_crc);
+    if (!ReadBinary(input_stream, config_size)) {
+      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read config size"));
+    }
+    if (!ReadBinary(input_stream, config_crc)) {
+      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read config CRC"));
+    }
     if (config_size > kMaxConfigSize) {
       return MakeUnexpected(
           MakeError(ErrorCode::kStorageDumpReadError, "Config size exceeds maximum: " + std::to_string(config_size)));
     }
     std::string config_data(config_size, '\0');
     input_stream.read(config_data.data(), config_size);
+    if (!input_stream.good()) {
+      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read config data"));
+    }
     {
       uint32_t actual_crc = CalculateCRC32(config_data);
       if (actual_crc != config_crc) {
@@ -946,14 +982,21 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
     if ((header.flags & snapshot_format::flags_v1::kWithStatistics) != 0 && stats != nullptr) {
       uint32_t stats_size = 0;
       uint32_t stats_crc = 0;
-      ReadBinary(input_stream, stats_size);
-      ReadBinary(input_stream, stats_crc);
+      if (!ReadBinary(input_stream, stats_size)) {
+        return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read statistics size"));
+      }
+      if (!ReadBinary(input_stream, stats_crc)) {
+        return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read statistics CRC"));
+      }
       if (stats_size > kMaxStatsSize) {
         return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError,
                                         "Statistics size exceeds maximum: " + std::to_string(stats_size)));
       }
       std::string stats_data(stats_size, '\0');
       input_stream.read(stats_data.data(), stats_size);
+      if (!input_stream.good()) {
+        return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read statistics data"));
+      }
       {
         uint32_t actual_crc = CalculateCRC32(stats_data);
         if (actual_crc != stats_crc) {
@@ -1079,10 +1122,6 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
 
     LogStorageInfo("snapshot_read", "Snapshot loaded successfully from " + filepath);
     return {};
-
-  } catch (const std::exception& e) {
-    return MakeUnexpected(
-        MakeError(ErrorCode::kStorageDumpReadError, "Exception during snapshot read: " + std::string(e.what())));
   }
 }
 
@@ -1096,10 +1135,15 @@ Expected<void, Error> VerifySnapshotIntegrity(const std::string& filepath,
     return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, integrity_error.message));
   }
 
-  try {
+  {
     // Read and verify fixed header (magic + version)
     std::array<char, 4> magic{};
     input_stream.read(magic.data(), magic.size());
+    if (!input_stream.good()) {
+      integrity_error.type = snapshot_format::CRCErrorType::FileCRC;
+      integrity_error.message = "Failed to read magic number";
+      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, integrity_error.message));
+    }
     if (magic != snapshot_format::kMagicNumber) {
       integrity_error.type = snapshot_format::CRCErrorType::FileCRC;
       integrity_error.message = "Invalid magic number";
@@ -1107,7 +1151,11 @@ Expected<void, Error> VerifySnapshotIntegrity(const std::string& filepath,
     }
 
     uint32_t version = 0;
-    ReadBinary(input_stream, version);
+    if (!ReadBinary(input_stream, version)) {
+      integrity_error.type = snapshot_format::CRCErrorType::FileCRC;
+      integrity_error.message = "Failed to read version";
+      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, integrity_error.message));
+    }
     if (version < snapshot_format::kMinSupportedVersion || version > snapshot_format::kMaxSupportedVersion) {
       integrity_error.type = snapshot_format::CRCErrorType::FileCRC;
       integrity_error.message = "Unsupported version: " + std::to_string(version);
@@ -1136,7 +1184,13 @@ Expected<void, Error> VerifySnapshotIntegrity(const std::string& filepath,
     // Verify file CRC32
     if (header.file_crc32 != 0) {
       input_stream.seekg(0, std::ios::beg);
-      std::string file_contents((std::istreambuf_iterator<char>(input_stream)), std::istreambuf_iterator<char>());
+      std::string file_contents(static_cast<size_t>(actual_file_size), '\0');
+      input_stream.read(file_contents.data(), static_cast<std::streamsize>(actual_file_size));
+      if (input_stream.fail()) {
+        integrity_error.type = snapshot_format::CRCErrorType::FileCRC;
+        integrity_error.message = "Failed to read file contents for CRC verification";
+        return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, integrity_error.message));
+      }
 
       // Zero out the file_crc32 field for CRC computation
       if (file_contents.size() >= kFileCRC32Offset + sizeof(uint32_t)) {
@@ -1154,11 +1208,6 @@ Expected<void, Error> VerifySnapshotIntegrity(const std::string& filepath,
 
     LogStorageInfo("snapshot_verify", "Snapshot integrity verified: " + filepath);
     return {};
-
-  } catch (const std::exception& e) {
-    integrity_error.type = snapshot_format::CRCErrorType::FileCRC;
-    integrity_error.message = "Exception during verification: " + std::string(e.what());
-    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, integrity_error.message));
   }
 }
 
@@ -1170,45 +1219,44 @@ Expected<void, Error> GetSnapshotInfo(const std::string& filepath, SnapshotInfo&
                                                                           " (" + std::strerror(errno) + ")"));
   }
 
-  try {
-    // Read and verify fixed header (magic + version)
-    std::array<char, 4> magic{};
-    input_stream.read(magic.data(), magic.size());
-    if (magic != snapshot_format::kMagicNumber) {
-      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Invalid magic number"));
-    }
-
-    uint32_t version = 0;
-    ReadBinary(input_stream, version);
-    info.version = version;
-
-    if (version != 1) {
-      return MakeUnexpected(
-          MakeError(ErrorCode::kStorageDumpReadError, "Unsupported version: " + std::to_string(version)));
-    }
-
-    // Read V1 header
-    HeaderV1 header;
-    auto read_header_result = ReadHeaderV1(input_stream, header);
-    if (!read_header_result) {
-      return read_header_result;
-    }
-
-    info.flags = header.flags;
-    info.timestamp = header.snapshot_timestamp;
-    info.file_size = header.total_file_size;
-    info.has_statistics = (header.flags & snapshot_format::flags_v1::kWithStatistics) != 0;
-
-    // We could read more info (like store count) by continuing to parse,
-    // but for now this is sufficient for GetSnapshotInfo
-    info.store_count = 3;  // We always have 3 stores
-
-    return {};
-
-  } catch (const std::exception& e) {
-    return MakeUnexpected(
-        MakeError(ErrorCode::kStorageDumpReadError, "Exception during info read: " + std::string(e.what())));
+  // Read and verify fixed header (magic + version)
+  std::array<char, 4> magic{};
+  input_stream.read(magic.data(), magic.size());
+  if (!input_stream.good()) {
+    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read magic number"));
   }
+  if (magic != snapshot_format::kMagicNumber) {
+    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Invalid magic number"));
+  }
+
+  uint32_t version = 0;
+  if (!ReadBinary(input_stream, version)) {
+    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read version"));
+  }
+  info.version = version;
+
+  if (version != 1) {
+    return MakeUnexpected(
+        MakeError(ErrorCode::kStorageDumpReadError, "Unsupported version: " + std::to_string(version)));
+  }
+
+  // Read V1 header
+  HeaderV1 header;
+  auto read_header_result = ReadHeaderV1(input_stream, header);
+  if (!read_header_result) {
+    return read_header_result;
+  }
+
+  info.flags = header.flags;
+  info.timestamp = header.snapshot_timestamp;
+  info.file_size = header.total_file_size;
+  info.has_statistics = (header.flags & snapshot_format::flags_v1::kWithStatistics) != 0;
+
+  // We could read more info (like store count) by continuing to parse,
+  // but for now this is sufficient for GetSnapshotInfo
+  info.store_count = 3;  // We always have 3 stores
+
+  return {};
 }
 
 }  // namespace nvecd::storage::snapshot_v1

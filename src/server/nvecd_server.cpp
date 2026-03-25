@@ -8,11 +8,12 @@
 
 #include "server/nvecd_server.h"
 
+#include <arpa/inet.h>
 #include <spdlog/spdlog.h>
+#include <sys/socket.h>
 
 #include <chrono>
 #include <filesystem>
-#include <stdexcept>
 #include <thread>
 
 #include "cache/similarity_cache.h"
@@ -263,18 +264,30 @@ utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
   handler_ctx_.cache.store(cache_.get(), std::memory_order_release);
   handler_ctx_.variable_manager = variable_manager_.get();
   handler_ctx_.dump_dir = config_.snapshot.dir;
+  handler_ctx_.requirepass = config_.security.requirepass;
 
   // Create snapshot directory if it doesn't exist
-  try {
-    std::filesystem::create_directories(config_.snapshot.dir);
+  std::error_code ec;
+  std::filesystem::create_directories(config_.snapshot.dir, ec);
+  if (ec) {
+    spdlog::warn("Failed to create snapshot directory {}: {}", config_.snapshot.dir, ec.message());
+  } else {
     spdlog::info("Snapshot directory: {}", config_.snapshot.dir);
-  } catch (const std::exception& e) {
-    spdlog::warn("Failed to create snapshot directory {}: {}", config_.snapshot.dir, e.what());
   }
 
   // Create RequestDispatcher
   dispatcher_ = std::make_unique<RequestDispatcher>(handler_ctx_);
   spdlog::info("RequestDispatcher initialized");
+
+  // Create RateLimiter if enabled
+  if (config_.api.rate_limiting.enable) {
+    rate_limiter_ =
+        std::make_unique<RateLimiter>(config_.api.rate_limiting.capacity, config_.api.rate_limiting.refill_rate,
+                                      config_.api.rate_limiting.max_clients);
+    spdlog::info("RateLimiter initialized (capacity={}, refill_rate={}/s, max_clients={})",
+                 config_.api.rate_limiting.capacity, config_.api.rate_limiting.refill_rate,
+                 config_.api.rate_limiting.max_clients);
+  }
 
   spdlog::info("All components initialized successfully");
 
@@ -292,10 +305,24 @@ void NvecdServer::HandleConnection(int client_fd) {
     ConnectionContext conn_ctx;
     conn_ctx.client_fd = client_fd;
 
+    // Extract client IP for rate limiting
+    struct sockaddr_in peer_addr {};
+    socklen_t peer_len = sizeof(peer_addr);
+    if (getpeername(
+            client_fd,
+            reinterpret_cast<struct sockaddr*>(&peer_addr),  // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+            &peer_len) == 0) {
+      char ip_buf[INET_ADDRSTRLEN];
+      if (inet_ntop(AF_INET, &peer_addr.sin_addr, ip_buf, sizeof(ip_buf)) != nullptr) {
+        conn_ctx.client_ip = ip_buf;
+      }
+    }
+
     // Create I/O configuration
     IOConfig io_config;
     io_config.recv_buffer_size = kDefaultIORecvBufferSize;
     io_config.max_query_length = kDefaultMaxQueryLength;
+    io_config.max_accumulated_bytes = kDefaultMaxAccumulatedBytes;
     io_config.recv_timeout_sec = config_.perf.connection_timeout_sec;
 
     // Create request processor
@@ -315,6 +342,13 @@ void NvecdServer::HandleConnection(int client_fd) {
 std::string NvecdServer::ProcessRequest(const std::string& request, ConnectionContext& conn_ctx) {
   if (!dispatcher_) {
     return "ERROR Server not initialized\r\n";
+  }
+
+  // Rate limit check
+  if (rate_limiter_ && !conn_ctx.client_ip.empty()) {
+    if (!rate_limiter_->Allow(conn_ctx.client_ip)) {
+      return "ERROR Rate limit exceeded\r\n";
+    }
   }
 
   return dispatcher_->Dispatch(request, conn_ctx);

@@ -19,31 +19,28 @@
 namespace nvecd::server::handlers {
 
 utils::Expected<std::string, utils::Error> HandleConfigHelp(const std::string& path) {
-  try {
-    config::ConfigSchemaExplorer explorer;
-
-    if (path.empty()) {
-      // Show top-level sections
-      auto paths = explorer.ListPaths("");
-      std::string result = config::ConfigSchemaExplorer::FormatPathList(paths, "");
-      return std::string("+OK\n") + result;
-    }
-
-    // Show help for specific path
-    auto help_info = explorer.GetHelp(path);
-    if (!help_info.has_value()) {
-      return utils::MakeUnexpected(
-          utils::MakeError(utils::ErrorCode::kNotFound, "Configuration path not found: " + path));
-    }
-
-    std::string result = config::ConfigSchemaExplorer::FormatHelp(help_info.value());
-    return std::string("+OK\n") + result;
-
-  } catch (const std::exception& e) {
-    utils::StructuredLog().Event("server_error").Field("operation", "config_help").Field("error", e.what()).Error();
-    return utils::MakeUnexpected(
-        utils::MakeError(utils::ErrorCode::kInternalError, std::string("CONFIG HELP failed: ") + e.what()));
+  auto explorer_result = config::ConfigSchemaExplorer::Create();
+  if (!explorer_result) {
+    return utils::MakeUnexpected(explorer_result.error());
   }
+  auto& explorer = *explorer_result;
+
+  if (path.empty()) {
+    // Show top-level sections
+    auto paths = explorer.ListPaths("");
+    std::string result = config::ConfigSchemaExplorer::FormatPathList(paths, "");
+    return std::string("+OK\n") + result;
+  }
+
+  // Show help for specific path
+  auto help_info = explorer.GetHelp(path);
+  if (!help_info.has_value()) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kNotFound, "Configuration path not found: " + path));
+  }
+
+  std::string result = config::ConfigSchemaExplorer::FormatHelp(help_info.value());
+  return std::string("+OK\n") + result;
 }
 
 utils::Expected<std::string, utils::Error> HandleConfigShow(const ServerContext& ctx, const std::string& path) {
@@ -57,14 +54,16 @@ utils::Expected<std::string, utils::Error> HandleConfigShow(const ServerContext&
         utils::MakeError(utils::ErrorCode::kInternalError, "Server configuration is not available"));
   }
 
-  try {
-    std::string result = config::FormatConfigForDisplay(*ctx.config, path);
-    return std::string("+OK\n") + result;
-  } catch (const std::exception& e) {
-    utils::StructuredLog().Event("server_error").Field("operation", "config_show").Field("error", e.what()).Error();
-    return utils::MakeUnexpected(
-        utils::MakeError(utils::ErrorCode::kInternalError, std::string("CONFIG SHOW failed: ") + e.what()));
+  auto result = config::FormatConfigForDisplay(*ctx.config, path);
+  if (!result) {
+    utils::StructuredLog()
+        .Event("server_error")
+        .Field("operation", "config_show")
+        .Field("error", result.error().message())
+        .Error();
+    return utils::MakeUnexpected(result.error());
   }
+  return std::string("+OK\n") + *result;
 }
 
 utils::Expected<std::string, utils::Error> HandleConfigVerify(const std::string& filepath) {

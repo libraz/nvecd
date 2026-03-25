@@ -77,6 +77,9 @@ class RequestDispatcher {
   static utils::Expected<std::string, utils::Error> HandleDebugOn(ConnectionContext& conn_ctx);
   static utils::Expected<std::string, utils::Error> HandleDebugOff(ConnectionContext& conn_ctx);
 
+  // Auth handler
+  std::string HandleAuth(const Command& cmd, ConnectionContext& conn_ctx);
+
   // Variable command handlers
   utils::Expected<std::string, utils::Error> HandleSet(const Command& cmd);
   utils::Expected<std::string, utils::Error> HandleGet(const Command& cmd);

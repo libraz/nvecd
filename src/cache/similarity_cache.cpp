@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 
 namespace nvecd::cache {
 
@@ -185,6 +186,10 @@ bool SimilarityCache::Insert(const CacheKey& key, const std::vector<similarity::
 
   // Calculate original size in bytes (for decompression)
   // Must use serialized size, not sizeof(SimilarityResult) which includes std::string overhead
+  // Guard against integer overflow in size calculation
+  if (results.size() > SIZE_MAX / kSerializedResultSize) {
+    return false;
+  }
   const size_t original_size = results.size() * kSerializedResultSize;
 
   // Calculate entry memory usage

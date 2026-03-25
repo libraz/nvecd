@@ -170,7 +170,7 @@ size_t VectorStore::MemoryUsage() const {
 // Compact Storage
 // ============================================================================
 
-void VectorStore::Compact() {
+utils::Expected<void, utils::Error> VectorStore::Compact() {
   std::unique_lock lock(mutex_);
 
   size_t dim = dimension_.load(std::memory_order_relaxed);
@@ -182,7 +182,15 @@ void VectorStore::Compact() {
     id_to_idx_.clear();
     idx_to_id_.clear();
     compact_valid_.store(true, std::memory_order_release);
-    return;
+    return {};
+  }
+
+  // Guard against integer overflow in matrix allocation
+  if (dim > 0 && n > SIZE_MAX / dim) {
+    return utils::MakeUnexpected(utils::MakeError(
+        utils::ErrorCode::kVectorStoreError,
+        "Compact storage overflow: n=" + std::to_string(n) +
+            " dim=" + std::to_string(dim)));
   }
 
   matrix_.resize(n * dim);
@@ -205,6 +213,7 @@ void VectorStore::Compact() {
   }
 
   compact_valid_.store(true, std::memory_order_release);
+  return {};
 }
 
 size_t VectorStore::GetCompactCount() const {
@@ -226,6 +235,21 @@ const std::string& VectorStore::GetIdByIndex(size_t idx) const {
 
 std::shared_lock<std::shared_mutex> VectorStore::AcquireReadLock() const {
   return std::shared_lock<std::shared_mutex>(mutex_);
+}
+
+VectorStore::CompactSnapshot VectorStore::GetCompactSnapshot() const {
+  std::shared_lock lock(mutex_);
+  CompactSnapshot snap;
+  if (!compact_valid_.load(std::memory_order_relaxed) || matrix_.empty()) {
+    return snap;
+  }
+  snap.matrix = matrix_.data();
+  snap.norms = norms_.data();
+  snap.count = idx_to_id_.size();
+  snap.dim = dimension_.load(std::memory_order_relaxed);
+  snap.id_to_idx = &id_to_idx_;
+  snap.idx_to_id = &idx_to_id_;
+  return snap;
 }
 
 std::optional<size_t> VectorStore::GetCompactIndex(const std::string& id) const {

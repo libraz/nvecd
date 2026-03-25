@@ -378,6 +378,23 @@ void ConnectionAcceptor::AcceptLoop() {
       }
     }
 
+    // Per-IP connection limit check
+    if (config_.max_connections_per_ip > 0 && !client_ip.empty() && client_ip != "unix") {
+      std::lock_guard<std::mutex> lock(fds_mutex_);
+      auto it = per_ip_connections_.find(client_ip);
+      if (it != per_ip_connections_.end() && it->second >= config_.max_connections_per_ip) {
+        nvecd::utils::StructuredLog()
+            .Event("server_warning")
+            .Field("type", "per_ip_limit_reached")
+            .Field("client_ip", client_ip)
+            .Field("connections", static_cast<uint64_t>(it->second))
+            .Field("limit", static_cast<uint64_t>(config_.max_connections_per_ip))
+            .Warn();
+        close(client_fd);
+        continue;
+      }
+    }
+
     // Set receive timeout to avoid blocking indefinitely
     struct timeval timeout {};
     timeout.tv_sec = 1;  // 1 second timeout (short for quick shutdown)
@@ -391,10 +408,14 @@ void ConnectionAcceptor::AcceptLoop() {
           .Warn();
     }
 
-    // Track connection
+    // Track connection (global and per-IP)
     {
       std::lock_guard<std::mutex> lock(fds_mutex_);
       active_fds_.insert(client_fd);
+      if (!client_ip.empty() && client_ip != "unix") {
+        per_ip_connections_[client_ip]++;
+        fd_to_ip_[client_fd] = client_ip;
+      }
     }
 
     // Submit to thread pool
@@ -484,6 +505,19 @@ bool ConnectionAcceptor::SetSocketOptions(int socket_fd) const {
 void ConnectionAcceptor::RemoveConnection(int socket_fd) {
   std::lock_guard<std::mutex> lock(fds_mutex_);
   active_fds_.erase(socket_fd);
+
+  // Decrement per-IP connection count
+  auto ip_it = fd_to_ip_.find(socket_fd);
+  if (ip_it != fd_to_ip_.end()) {
+    auto& count = per_ip_connections_[ip_it->second];
+    if (count > 0) {
+      --count;
+    }
+    if (count == 0) {
+      per_ip_connections_.erase(ip_it->second);
+    }
+    fd_to_ip_.erase(ip_it);
+  }
 }
 
 }  // namespace nvecd::server

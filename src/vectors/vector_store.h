@@ -159,7 +159,7 @@ class VectorStore {
    * L2 norms for each vector. Requires exclusive lock internally.
    * Call after bulk operations for optimal search performance.
    */
-  void Compact();
+  utils::Expected<void, utils::Error> Compact();
 
   /**
    * @brief Check if compact storage is valid
@@ -208,6 +208,31 @@ class VectorStore {
    * @return Shared lock guard
    */
   std::shared_lock<std::shared_mutex> AcquireReadLock() const;
+
+  /**
+   * @brief Snapshot of compact storage for lock-free read access
+   *
+   * Valid as long as no Compact() is called. The caller should use
+   * IsCompactValid() to check validity before using.
+   */
+  struct CompactSnapshot {
+    const float* matrix = nullptr;   ///< Pointer to contiguous matrix
+    const float* norms = nullptr;    ///< Pointer to norm array
+    size_t count = 0;                ///< Number of vectors
+    size_t dim = 0;                  ///< Vector dimension
+    const std::unordered_map<std::string, size_t>* id_to_idx = nullptr;
+    const std::vector<std::string>* idx_to_id = nullptr;
+  };
+
+  /**
+   * @brief Get a snapshot of compact storage under read lock
+   *
+   * Acquires read lock briefly to copy pointers, then releases.
+   * The returned snapshot is valid as long as compact_valid_ is true.
+   *
+   * @return CompactSnapshot with pointers to compact data, or empty if invalid
+   */
+  CompactSnapshot GetCompactSnapshot() const;
 
   /**
    * @brief Get index for a given ID in compact storage

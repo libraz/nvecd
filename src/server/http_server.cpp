@@ -383,6 +383,7 @@ void HttpServer::HandleInfo(const httplib::Request& /*req*/, httplib::Response& 
     stats_.info_commands.fetch_add(1);
   }
 
+  // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
     json response;
 
@@ -497,7 +498,8 @@ void HttpServer::HandleInfo(const httplib::Request& /*req*/, httplib::Response& 
     SendJson(res, kHttpOk, response);
 
   } catch (const std::exception& e) {
-    SendError(res, kHttpInternalServerError, "Internal error: " + std::string(e.what()));
+    spdlog::error("Unexpected exception in HandleInfo: {}", e.what());
+    SendError(res, kHttpInternalServerError, R"({"error":"Internal server error"})");
   }
 }
 
@@ -507,6 +509,7 @@ void HttpServer::HandleConfig(const httplib::Request& /*req*/, httplib::Response
     return;
   }
 
+  // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
     json response;
 
@@ -539,7 +542,8 @@ void HttpServer::HandleConfig(const httplib::Request& /*req*/, httplib::Response
     SendJson(res, kHttpOk, response);
 
   } catch (const std::exception& e) {
-    SendError(res, kHttpInternalServerError, "Internal error: " + std::string(e.what()));
+    spdlog::error("Unexpected exception in HandleConfig: {}", e.what());
+    SendError(res, kHttpInternalServerError, R"({"error":"Internal server error"})");
   }
 }
 
@@ -555,13 +559,23 @@ void HttpServer::HandleEvent(const httplib::Request& req, httplib::Response& res
     return;
   }
 
+  // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
-    // Parse JSON body
-    json body = json::parse(req.body);
+    // Parse JSON body (non-throwing)
+    auto body = json::parse(req.body, nullptr, false);
+    if (body.is_discarded()) {
+      SendError(res, kHttpBadRequest, "Invalid JSON body");
+      return;
+    }
 
     // Validate required fields
     if (!body.contains("ctx") || !body.contains("id") || !body.contains("type")) {
       SendError(res, kHttpBadRequest, "Missing required fields: ctx, id, type");
+      return;
+    }
+
+    if (!body["ctx"].is_string() || !body["id"].is_string() || !body["type"].is_string()) {
+      SendError(res, kHttpBadRequest, "Fields ctx, id, type must be strings");
       return;
     }
 
@@ -592,6 +606,10 @@ void HttpServer::HandleEvent(const httplib::Request& req, httplib::Response& res
 
     int score = 0;
     if (event_type != events::EventType::DEL) {
+      if (!body["score"].is_number()) {
+        SendError(res, kHttpBadRequest, "Field 'score' must be a number");
+        return;
+      }
       score = body["score"];
     }
 
@@ -620,10 +638,9 @@ void HttpServer::HandleEvent(const httplib::Request& req, httplib::Response& res
     response["status"] = "ok";
     SendJson(res, kHttpOk, response);
 
-  } catch (const json::parse_error& e) {
-    SendError(res, kHttpBadRequest, "Invalid JSON: " + std::string(e.what()));
   } catch (const std::exception& e) {
-    SendError(res, kHttpInternalServerError, "Internal error: " + std::string(e.what()));
+    spdlog::error("Unexpected exception in HandleEvent: {}", e.what());
+    SendError(res, kHttpInternalServerError, R"({"error":"Internal server error"})");
   }
 }
 
@@ -634,14 +651,37 @@ void HttpServer::HandleVecset(const httplib::Request& req, httplib::Response& re
     return;
   }
 
+  // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
-    // Parse JSON body
-    json body = json::parse(req.body);
+    // Parse JSON body (non-throwing)
+    auto body = json::parse(req.body, nullptr, false);
+    if (body.is_discarded()) {
+      SendError(res, kHttpBadRequest, "Invalid JSON body");
+      return;
+    }
 
     // Validate required fields
     if (!body.contains("id") || !body.contains("vector")) {
       SendError(res, kHttpBadRequest, "Missing required fields: id, vector");
       return;
+    }
+
+    if (!body["id"].is_string()) {
+      SendError(res, kHttpBadRequest, "Field 'id' must be a string");
+      return;
+    }
+
+    if (!body["vector"].is_array()) {
+      SendError(res, kHttpBadRequest, "Field 'vector' must be an array of numbers");
+      return;
+    }
+
+    // Validate all vector elements are numbers
+    for (const auto& elem : body["vector"]) {
+      if (!elem.is_number()) {
+        SendError(res, kHttpBadRequest, "Field 'vector' must contain only numbers");
+        return;
+      }
     }
 
     std::string id = body["id"];
@@ -667,10 +707,9 @@ void HttpServer::HandleVecset(const httplib::Request& req, httplib::Response& re
     response["dimension"] = vector.size();
     SendJson(res, kHttpOk, response);
 
-  } catch (const json::parse_error& e) {
-    SendError(res, kHttpBadRequest, "Invalid JSON: " + std::string(e.what()));
   } catch (const std::exception& e) {
-    SendError(res, kHttpInternalServerError, "Internal error: " + std::string(e.what()));
+    spdlog::error("Unexpected exception in HandleVecset: {}", e.what());
+    SendError(res, kHttpInternalServerError, R"({"error":"Internal server error"})");
   }
 }
 
@@ -681,13 +720,23 @@ void HttpServer::HandleSim(const httplib::Request& req, httplib::Response& res) 
     return;
   }
 
+  // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
-    // Parse JSON body
-    json body = json::parse(req.body);
+    // Parse JSON body (non-throwing)
+    auto body = json::parse(req.body, nullptr, false);
+    if (body.is_discarded()) {
+      SendError(res, kHttpBadRequest, "Invalid JSON body");
+      return;
+    }
 
     // Validate required fields
     if (!body.contains("id")) {
       SendError(res, kHttpBadRequest, "Missing required field: id");
+      return;
+    }
+
+    if (!body["id"].is_string()) {
+      SendError(res, kHttpBadRequest, "Field 'id' must be a string");
       return;
     }
 
@@ -743,10 +792,9 @@ void HttpServer::HandleSim(const httplib::Request& req, httplib::Response& res) 
 
     SendJson(res, kHttpOk, response);
 
-  } catch (const json::parse_error& e) {
-    SendError(res, kHttpBadRequest, "Invalid JSON: " + std::string(e.what()));
   } catch (const std::exception& e) {
-    SendError(res, kHttpInternalServerError, "Internal error: " + std::string(e.what()));
+    spdlog::error("Unexpected exception in HandleSim: {}", e.what());
+    SendError(res, kHttpInternalServerError, R"({"error":"Internal server error"})");
   }
 }
 
@@ -757,14 +805,32 @@ void HttpServer::HandleSimv(const httplib::Request& req, httplib::Response& res)
     return;
   }
 
+  // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
-    // Parse JSON body
-    json body = json::parse(req.body);
+    // Parse JSON body (non-throwing)
+    auto body = json::parse(req.body, nullptr, false);
+    if (body.is_discarded()) {
+      SendError(res, kHttpBadRequest, "Invalid JSON body");
+      return;
+    }
 
     // Validate required fields
     if (!body.contains("vector")) {
       SendError(res, kHttpBadRequest, "Missing required field: vector");
       return;
+    }
+
+    if (!body["vector"].is_array()) {
+      SendError(res, kHttpBadRequest, "Field 'vector' must be an array of numbers");
+      return;
+    }
+
+    // Validate all vector elements are numbers
+    for (const auto& elem : body["vector"]) {
+      if (!elem.is_number()) {
+        SendError(res, kHttpBadRequest, "Field 'vector' must contain only numbers");
+        return;
+      }
     }
 
     std::vector<float> vector = body["vector"].get<std::vector<float>>();
@@ -802,10 +868,9 @@ void HttpServer::HandleSimv(const httplib::Request& req, httplib::Response& res)
 
     SendJson(res, kHttpOk, response);
 
-  } catch (const json::parse_error& e) {
-    SendError(res, kHttpBadRequest, "Invalid JSON: " + std::string(e.what()));
   } catch (const std::exception& e) {
-    SendError(res, kHttpInternalServerError, "Internal error: " + std::string(e.what()));
+    spdlog::error("Unexpected exception in HandleSimv: {}", e.what());
+    SendError(res, kHttpInternalServerError, R"({"error":"Internal server error"})");
   }
 }
 
@@ -815,11 +880,16 @@ void HttpServer::HandleSimv(const httplib::Request& req, httplib::Response& res)
 //
 
 void HttpServer::HandleDumpSave(const httplib::Request& req, httplib::Response& res) {
+  // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
     // Parse JSON body (filepath is optional)
     std::string filepath;
     if (!req.body.empty()) {
-      json body = json::parse(req.body);
+      auto body = json::parse(req.body, nullptr, false);
+      if (body.is_discarded()) {
+        SendError(res, kHttpBadRequest, "Invalid JSON body");
+        return;
+      }
       filepath = body.value("filepath", "");
     }
 
@@ -842,20 +912,29 @@ void HttpServer::HandleDumpSave(const httplib::Request& req, httplib::Response& 
     }
     SendJson(res, kHttpOk, response);
 
-  } catch (const json::parse_error& e) {
-    SendError(res, kHttpBadRequest, "Invalid JSON: " + std::string(e.what()));
   } catch (const std::exception& e) {
-    SendError(res, kHttpInternalServerError, "Internal error: " + std::string(e.what()));
+    spdlog::error("Unexpected exception in HandleDumpSave: {}", e.what());
+    SendError(res, kHttpInternalServerError, R"({"error":"Internal server error"})");
   }
 }
 
 void HttpServer::HandleDumpLoad(const httplib::Request& req, httplib::Response& res) {
+  // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
-    // Parse JSON body
-    json body = json::parse(req.body);
+    // Parse JSON body (non-throwing)
+    auto body = json::parse(req.body, nullptr, false);
+    if (body.is_discarded()) {
+      SendError(res, kHttpBadRequest, "Invalid JSON body");
+      return;
+    }
 
     if (!body.contains("filepath")) {
       SendError(res, kHttpBadRequest, "Missing required field: filepath");
+      return;
+    }
+
+    if (!body["filepath"].is_string()) {
+      SendError(res, kHttpBadRequest, "Field 'filepath' must be a string");
       return;
     }
 
@@ -883,20 +962,29 @@ void HttpServer::HandleDumpLoad(const httplib::Request& req, httplib::Response& 
     response["filepath"] = filepath;
     SendJson(res, kHttpOk, response);
 
-  } catch (const json::parse_error& e) {
-    SendError(res, kHttpBadRequest, "Invalid JSON: " + std::string(e.what()));
   } catch (const std::exception& e) {
-    SendError(res, kHttpInternalServerError, "Internal error: " + std::string(e.what()));
+    spdlog::error("Unexpected exception in HandleDumpLoad: {}", e.what());
+    SendError(res, kHttpInternalServerError, R"({"error":"Internal server error"})");
   }
 }
 
 void HttpServer::HandleDumpVerify(const httplib::Request& req, httplib::Response& res) {
+  // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
-    // Parse JSON body
-    json body = json::parse(req.body);
+    // Parse JSON body (non-throwing)
+    auto body = json::parse(req.body, nullptr, false);
+    if (body.is_discarded()) {
+      SendError(res, kHttpBadRequest, "Invalid JSON body");
+      return;
+    }
 
     if (!body.contains("filepath")) {
       SendError(res, kHttpBadRequest, "Missing required field: filepath");
+      return;
+    }
+
+    if (!body["filepath"].is_string()) {
+      SendError(res, kHttpBadRequest, "Field 'filepath' must be a string");
       return;
     }
 
@@ -925,20 +1013,29 @@ void HttpServer::HandleDumpVerify(const httplib::Request& req, httplib::Response
     response["valid"] = true;
     SendJson(res, kHttpOk, response);
 
-  } catch (const json::parse_error& e) {
-    SendError(res, kHttpBadRequest, "Invalid JSON: " + std::string(e.what()));
   } catch (const std::exception& e) {
-    SendError(res, kHttpInternalServerError, "Internal error: " + std::string(e.what()));
+    spdlog::error("Unexpected exception in HandleDumpVerify: {}", e.what());
+    SendError(res, kHttpInternalServerError, R"({"error":"Internal server error"})");
   }
 }
 
 void HttpServer::HandleDumpInfo(const httplib::Request& req, httplib::Response& res) {
+  // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
-    // Parse JSON body
-    json body = json::parse(req.body);
+    // Parse JSON body (non-throwing)
+    auto body = json::parse(req.body, nullptr, false);
+    if (body.is_discarded()) {
+      SendError(res, kHttpBadRequest, "Invalid JSON body");
+      return;
+    }
 
     if (!body.contains("filepath")) {
       SendError(res, kHttpBadRequest, "Missing required field: filepath");
+      return;
+    }
+
+    if (!body["filepath"].is_string()) {
+      SendError(res, kHttpBadRequest, "Field 'filepath' must be a string");
       return;
     }
 
@@ -966,10 +1063,9 @@ void HttpServer::HandleDumpInfo(const httplib::Request& req, httplib::Response& 
     response["info"] = result_str;
     SendJson(res, kHttpOk, response);
 
-  } catch (const json::parse_error& e) {
-    SendError(res, kHttpBadRequest, "Invalid JSON: " + std::string(e.what()));
   } catch (const std::exception& e) {
-    SendError(res, kHttpInternalServerError, "Internal error: " + std::string(e.what()));
+    spdlog::error("Unexpected exception in HandleDumpInfo: {}", e.what());
+    SendError(res, kHttpInternalServerError, R"({"error":"Internal server error"})");
   }
 }
 
@@ -1002,6 +1098,7 @@ void HttpServer::HandleDebugOff(const httplib::Request& /*req*/, httplib::Respon
 //
 
 void HttpServer::HandleMetrics(const httplib::Request& /*req*/, httplib::Response& res) {
+  // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
     // Use TCP server's stats if available (includes all protocol stats), otherwise use HTTP-only stats
     const ServerStats& effective_stats = (tcp_stats_ != nullptr) ? *tcp_stats_ : stats_;
@@ -1092,7 +1189,8 @@ void HttpServer::HandleMetrics(const httplib::Request& /*req*/, httplib::Respons
     res.set_content(metrics.str(), "text/plain; version=0.0.4; charset=utf-8");
 
   } catch (const std::exception& e) {
-    SendError(res, kHttpInternalServerError, "Internal error: " + std::string(e.what()));
+    spdlog::error("Unexpected exception in HandleMetrics: {}", e.what());
+    SendError(res, kHttpInternalServerError, R"({"error":"Internal server error"})");
   }
 }
 
@@ -1101,6 +1199,7 @@ void HttpServer::HandleMetrics(const httplib::Request& /*req*/, httplib::Respons
 //
 
 void HttpServer::HandleCacheStats(const httplib::Request& /*req*/, httplib::Response& res) {
+  // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
     auto* stats_cache =
         (handler_context_ != nullptr) ? handler_context_->cache.load(std::memory_order_acquire) : nullptr;
@@ -1130,11 +1229,13 @@ void HttpServer::HandleCacheStats(const httplib::Request& /*req*/, httplib::Resp
     SendJson(res, kHttpOk, response);
 
   } catch (const std::exception& e) {
-    SendError(res, kHttpInternalServerError, "Internal error: " + std::string(e.what()));
+    spdlog::error("Unexpected exception in HandleCacheStats: {}", e.what());
+    SendError(res, kHttpInternalServerError, R"({"error":"Internal server error"})");
   }
 }
 
 void HttpServer::HandleCacheClear(const httplib::Request& req, httplib::Response& res) {
+  // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
     auto* clear_cache =
         (handler_context_ != nullptr) ? handler_context_->cache.load(std::memory_order_acquire) : nullptr;
@@ -1143,15 +1244,14 @@ void HttpServer::HandleCacheClear(const httplib::Request& req, httplib::Response
       return;
     }
 
-    // Parse optional scope parameter
+    // Parse optional scope parameter (non-throwing)
     std::string scope = "all";
     if (!req.body.empty()) {
-      try {
-        json body = json::parse(req.body);
+      auto body = json::parse(req.body, nullptr, false);
+      if (!body.is_discarded()) {
         scope = body.value("scope", "all");
-      } catch (const json::parse_error&) {
-        // Ignore parse errors, use default scope
       }
+      // Ignore parse errors, use default scope
     }
 
     // Get stats before clearing
@@ -1174,7 +1274,8 @@ void HttpServer::HandleCacheClear(const httplib::Request& req, httplib::Response
     SendJson(res, kHttpOk, response);
 
   } catch (const std::exception& e) {
-    SendError(res, kHttpInternalServerError, "Internal error: " + std::string(e.what()));
+    spdlog::error("Unexpected exception in HandleCacheClear: {}", e.what());
+    SendError(res, kHttpInternalServerError, R"({"error":"Internal server error"})");
   }
 }
 

@@ -26,6 +26,24 @@ target_link_libraries(network_utils_test
 )
 gtest_discover_tests(network_utils_test)
 
+add_executable(path_utils_test
+  utils/path_utils_test.cpp
+)
+target_link_libraries(path_utils_test
+  nvecd_utils
+  gtest_main
+)
+gtest_discover_tests(path_utils_test)
+
+add_executable(string_utils_test
+  utils/string_utils_test.cpp
+)
+target_link_libraries(string_utils_test
+  nvecd_utils
+  gtest_main
+)
+gtest_discover_tests(string_utils_test)
+
 # Config tests
 add_executable(config_test
   config/config_test.cpp
@@ -43,6 +61,21 @@ configure_file(
 gtest_discover_tests(config_test
   WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
 )
+
+add_executable(runtime_variable_manager_test
+  config/runtime_variable_manager_test.cpp
+)
+target_link_libraries(runtime_variable_manager_test
+  nvecd_config
+  nvecd_cache
+  nvecd_similarity
+  nvecd_events
+  nvecd_vectors
+  nvecd_utils
+  gtest
+  gtest_main
+)
+gtest_discover_tests(runtime_variable_manager_test)
 
 # Server tests
 add_executable(command_parser_test
@@ -202,6 +235,18 @@ target_link_libraries(distance_simd_test
 )
 gtest_discover_tests(distance_simd_test)
 
+# Distance function tests (high-level API)
+add_executable(distance_functions_test
+  vectors/distance_functions_test.cpp
+)
+target_link_libraries(distance_functions_test
+  nvecd_vectors
+  nvecd_utils
+  gtest
+  gtest_main
+)
+gtest_discover_tests(distance_functions_test)
+
 # Similarity tests
 add_executable(similarity_engine_test
   similarity/similarity_engine_test.cpp
@@ -236,6 +281,39 @@ target_link_libraries(similarity_cache_test
   gtest_main
 )
 gtest_discover_tests(similarity_cache_test)
+
+add_executable(cache_key_test
+  cache/cache_key_test.cpp
+)
+target_link_libraries(cache_key_test
+  nvecd_cache
+  nvecd_utils
+  gtest
+  gtest_main
+)
+gtest_discover_tests(cache_key_test)
+
+add_executable(cache_key_generator_test
+  cache/cache_key_generator_test.cpp
+)
+target_link_libraries(cache_key_generator_test
+  nvecd_cache
+  nvecd_utils
+  gtest
+  gtest_main
+)
+gtest_discover_tests(cache_key_generator_test)
+
+add_executable(md5_test
+  cache/md5_test.cpp
+)
+target_link_libraries(md5_test
+  nvecd_cache
+  nvecd_utils
+  gtest
+  gtest_main
+)
+gtest_discover_tests(md5_test)
 
 # Client library tests
 add_executable(nvecdclient_test

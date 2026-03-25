@@ -12,9 +12,10 @@
 #include <algorithm>
 #include <cctype>
 #include <sstream>
-#include <stdexcept>
 
 #include "config/config_schema_embedded.h"
+#include "utils/error.h"
+#include "utils/expected.h"
 
 namespace nvecd::config {
 
@@ -299,12 +300,14 @@ std::string JsonToYaml(const nlohmann::json& json, int indent = 0) {
 
 // ConfigSchemaExplorer implementation
 
-ConfigSchemaExplorer::ConfigSchemaExplorer() {
-  try {
-    schema_ = nlohmann::json::parse(kConfigSchemaJson);
-  } catch (const nlohmann::json::exception& e) {
-    throw std::runtime_error("Failed to parse embedded JSON Schema: " + std::string(e.what()));
+utils::Expected<ConfigSchemaExplorer, utils::Error> ConfigSchemaExplorer::Create() {
+  // Use non-throwing parse variant
+  auto schema = nlohmann::json::parse(kConfigSchemaJson, nullptr, false);
+  if (schema.is_discarded()) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kConfigParseError, "Failed to parse embedded JSON schema"));
   }
+  return ConfigSchemaExplorer(std::move(schema));
 }
 
 std::optional<ConfigHelpInfo> ConfigSchemaExplorer::GetHelp(const std::string& path) const {
@@ -572,7 +575,7 @@ std::string MaskSensitiveValue(const std::string& path, const std::string& value
   return value;
 }
 
-std::string FormatConfigForDisplay(const Config& config, const std::string& path) {
+utils::Expected<std::string, utils::Error> FormatConfigForDisplay(const Config& config, const std::string& path) {
   // Convert config struct to JSON
   nlohmann::json config_json = ConfigToJson(config);
 
@@ -580,7 +583,7 @@ std::string FormatConfigForDisplay(const Config& config, const std::string& path
   if (!path.empty()) {
     auto node = NavigateJsonPath(config_json, path);
     if (!node.has_value()) {
-      throw std::runtime_error("Path not found: " + path);
+      return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kNotFound, "Path not found: " + path));
     }
     config_json = node.value();
   }
