@@ -11,6 +11,8 @@
 #include <string>
 
 #include "server/server_types.h"
+#include "utils/error.h"
+#include "utils/expected.h"
 
 namespace nvecd::server::handlers {
 
@@ -24,8 +26,8 @@ namespace nvecd::server::handlers {
  * - Data counts (events, vectors, contexts)
  *
  * @param ctx Handler context
- * @return INFO response string
+ * @return INFO response string or error
  */
-std::string HandleInfo(const HandlerContext& ctx);
+utils::Expected<std::string, utils::Error> HandleInfo(const HandlerContext& ctx);
 
 }  // namespace nvecd::server::handlers

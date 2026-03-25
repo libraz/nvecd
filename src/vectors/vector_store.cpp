@@ -46,15 +46,17 @@ utils::Expected<void, utils::Error> VectorStore::SetVector(const std::string& ve
     std::unique_lock lock(mutex_);
 
     // Set dimension if this is the first vector
-    if (dimension_ == 0) {
-      dimension_ = data.size();
+    size_t current_dim = dimension_.load(std::memory_order_relaxed);
+    if (current_dim == 0) {
+      dimension_.store(data.size(), std::memory_order_release);
+      current_dim = data.size();
     }
 
     // Validate dimension
-    if (data.size() != dimension_) {
+    if (data.size() != current_dim) {
       auto error = utils::MakeError(
           utils::ErrorCode::kVectorDimensionMismatch,
-          "Vector dimension mismatch: expected " + std::to_string(dimension_) + ", got " + std::to_string(data.size()));
+          "Vector dimension mismatch: expected " + std::to_string(current_dim) + ", got " + std::to_string(data.size()));
       utils::LogVectorStoreError("set_vector", vector_id, static_cast<int>(data.size()), error.message());
       return utils::MakeUnexpected(error);
     }
@@ -115,7 +117,7 @@ size_t VectorStore::GetVectorCount() const {
 void VectorStore::Clear() {
   std::unique_lock lock(mutex_);
   vectors_.clear();
-  dimension_ = 0;  // Reset dimension
+  dimension_.store(0, std::memory_order_release);  // Reset dimension
 }
 
 VectorStoreStatistics VectorStore::GetStatistics() const {
@@ -123,7 +125,7 @@ VectorStoreStatistics VectorStore::GetStatistics() const {
 
   VectorStoreStatistics stats;
   stats.vector_count = vectors_.size();
-  stats.dimension = dimension_;
+  stats.dimension = dimension_.load(std::memory_order_relaxed);
   stats.memory_bytes = MemoryUsage();
 
   return stats;

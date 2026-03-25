@@ -94,6 +94,23 @@ target_link_libraries(server_stats_test
 )
 gtest_discover_tests(server_stats_test)
 
+add_executable(handler_test
+  server/handlers/handler_test.cpp
+)
+target_link_libraries(handler_test
+  nvecd_server
+  nvecd_cache
+  nvecd_similarity
+  nvecd_events
+  nvecd_vectors
+  nvecd_config
+  nvecd_utils
+  gtest
+  gtest_main
+  gmock
+)
+gtest_discover_tests(handler_test)
+
 # Events tests
 add_executable(ring_buffer_test
   events/ring_buffer_test.cpp
@@ -260,6 +277,21 @@ gtest_discover_tests(nvecdclient_c_test
 # Note: CLI tests removed - nvecd-cli should be tested manually
 # Interactive REPL testing is difficult to automate reliably
 # Manual testing procedure documented in docs/en/libnvecdclient.md
+
+# Storage tests
+add_executable(snapshot_format_v1_test
+  storage/snapshot_format_v1_test.cpp
+)
+target_link_libraries(snapshot_format_v1_test
+  nvecd_storage
+  nvecd_events
+  nvecd_vectors
+  nvecd_config
+  nvecd_utils
+  gtest
+  gtest_main
+)
+gtest_discover_tests(snapshot_format_v1_test)
 
 # Integration tests
 add_subdirectory(integration)

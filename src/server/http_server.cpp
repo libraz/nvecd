@@ -28,11 +28,6 @@
 #include "vectors/vector_store.h"
 #include "version.h"
 
-// Fix for httplib missing NI_MAXHOST on some platforms
-#ifndef NI_MAXHOST
-#define NI_MAXHOST 1025
-#endif
-
 using json = nlohmann::json;
 
 namespace nvecd::server {
@@ -1094,8 +1089,9 @@ void HttpServer::HandleMetrics(const httplib::Request& /*req*/, httplib::Respons
     }
 
     // Cache metrics
-    if (handler_context_ != nullptr && handler_context_->cache) {
-      auto cache_stats = handler_context_->cache->GetStatistics();
+    auto* metrics_cache = (handler_context_ != nullptr) ? handler_context_->cache.load(std::memory_order_acquire) : nullptr;
+    if (metrics_cache != nullptr) {
+      auto cache_stats = metrics_cache->GetStatistics();
 
       metrics << "# HELP nvecd_cache_queries_total Total cache queries\n";
       metrics << "# TYPE nvecd_cache_queries_total counter\n";
@@ -1138,12 +1134,13 @@ void HttpServer::HandleCacheStats(const httplib::Request& /*req*/, httplib::Resp
   ;
 
   try {
-    if (handler_context_ == nullptr || handler_context_->cache == nullptr) {
+    auto* stats_cache = (handler_context_ != nullptr) ? handler_context_->cache.load(std::memory_order_acquire) : nullptr;
+    if (stats_cache == nullptr) {
       SendError(res, kHttpInternalServerError, "Cache not initialized");
       return;
     }
 
-    auto stats = handler_context_->cache->GetStatistics();
+    auto stats = stats_cache->GetStatistics();
 
     json response;
     response["enabled"] = true;
@@ -1172,7 +1169,8 @@ void HttpServer::HandleCacheClear(const httplib::Request& req, httplib::Response
   ;
 
   try {
-    if (handler_context_ == nullptr || handler_context_->cache == nullptr) {
+    auto* clear_cache = (handler_context_ != nullptr) ? handler_context_->cache.load(std::memory_order_acquire) : nullptr;
+    if (clear_cache == nullptr) {
       SendError(res, kHttpInternalServerError, "Cache not initialized");
       return;
     }
@@ -1189,12 +1187,12 @@ void HttpServer::HandleCacheClear(const httplib::Request& req, httplib::Response
     }
 
     // Get stats before clearing
-    auto stats_before = handler_context_->cache->GetStatistics();
+    auto stats_before = clear_cache->GetStatistics();
     uint64_t entries_before = stats_before.current_entries;
 
     // Clear cache (currently only supports clearing all)
     if (scope == "all") {
-      handler_context_->cache->Clear();
+      clear_cache->Clear();
     } else {
       SendError(res, kHttpBadRequest, "Invalid scope. Only 'all' is supported currently.");
       return;

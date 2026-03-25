@@ -10,32 +10,22 @@
 #include <sstream>
 
 #include "cache/similarity_cache.h"
+#include "version.h"
 #include "events/co_occurrence_index.h"
 #include "events/event_store.h"
 #include "vectors/vector_store.h"
 
 namespace nvecd::server::handlers {
 
-namespace {
-
-// Server start time (const because it's set once at startup)
-const auto g_server_start_time = std::chrono::steady_clock::now();
-
-}  // namespace
-
-std::string HandleInfo(const HandlerContext& ctx) {
+utils::Expected<std::string, utils::Error> HandleInfo(const HandlerContext& ctx) {
   std::ostringstream oss;
-
-  // Calculate uptime
-  auto now = std::chrono::steady_clock::now();
-  auto uptime_sec = std::chrono::duration_cast<std::chrono::seconds>(now - g_server_start_time).count();
 
   oss << "OK INFO\n\n";
 
   // Server section
   oss << "# Server\n";
-  oss << "version: 0.1.0\n";
-  oss << "uptime_seconds: " << uptime_sec << "\n";
+  oss << "version: " << nvecd::Version::String() << "\n";
+  oss << "uptime_seconds: " << ctx.stats.GetUptimeSeconds() << "\n";
   oss << "\n";
 
   // Stats section
@@ -62,8 +52,9 @@ std::string HandleInfo(const HandlerContext& ctx) {
   // Cache section
   oss << "\n";
   oss << "# Cache\n";
-  if (ctx.cache != nullptr) {
-    auto cache_stats = ctx.cache->GetStatistics();
+  auto* info_cache_ptr = ctx.cache.load(std::memory_order_acquire);
+  if (info_cache_ptr != nullptr) {
+    auto cache_stats = info_cache_ptr->GetStatistics();
     oss << "cache_entries: " << cache_stats.current_entries << "\n";
     oss << "cache_hits: " << cache_stats.cache_hits << "\n";
     oss << "cache_misses: " << cache_stats.cache_misses << "\n";

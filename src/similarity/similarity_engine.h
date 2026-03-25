@@ -18,30 +18,13 @@
 #include "config/config.h"
 #include "events/co_occurrence_index.h"
 #include "events/event_store.h"
+#include "similarity/similarity_result.h"
 #include "utils/error.h"
 #include "utils/expected.h"
 #include "vectors/distance.h"
 #include "vectors/vector_store.h"
 
 namespace nvecd::similarity {
-
-/**
- * @brief Similarity search result
- */
-struct SimilarityResult {
-  std::string item_id;  ///< Item ID
-  float score{0.0F};    ///< Similarity score (higher = more similar)
-
-  SimilarityResult() = default;
-  SimilarityResult(std::string item_id_, float score_) : item_id(std::move(item_id_)), score(score_) {}
-
-  /**
-   * @brief Compare for sorting (descending by score)
-   */
-  bool operator<(const SimilarityResult& other) const {
-    return score > other.score;  // Descending order
-  }
-};
 
 /**
  * @brief Similarity search engine

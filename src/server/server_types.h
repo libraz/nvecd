@@ -151,7 +151,7 @@ struct HandlerContext {
   events::CoOccurrenceIndex* co_index = nullptr;
   vectors::VectorStore* vector_store = nullptr;
   similarity::SimilarityEngine* similarity_engine = nullptr;
-  cache::SimilarityCache* cache = nullptr;
+  std::atomic<cache::SimilarityCache*> cache{nullptr};
 
   // Runtime configuration
   config::RuntimeVariableManager* variable_manager = nullptr;

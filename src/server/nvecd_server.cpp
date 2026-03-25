@@ -41,7 +41,7 @@ NvecdServer::~NvecdServer() {
 
 utils::Expected<void, utils::Error> NvecdServer::Start() {
   if (running_.load()) {
-    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kAlreadyExists, "Server already running"));
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kNetworkAlreadyRunning, "Server already running"));
   }
 
   spdlog::info("Starting nvecd server...");
@@ -212,11 +212,11 @@ utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
       // Create cache if it doesn't exist
       cache_ = std::make_unique<cache::SimilarityCache>(config_.cache.max_memory_bytes, config_.cache.min_query_cost_ms,
                                                         config_.cache.ttl_seconds);
-      handler_ctx_.cache = cache_.get();
+      handler_ctx_.cache.store(cache_.get(), std::memory_order_release);
       spdlog::info("Cache enabled at runtime");
     } else if (!enabled && cache_) {
       // Disable cache (set pointer to null but keep cache for later re-enable)
-      handler_ctx_.cache = nullptr;
+      handler_ctx_.cache.store(nullptr, std::memory_order_release);
       spdlog::info("Cache disabled at runtime");
     }
     return {};
@@ -234,7 +234,7 @@ utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
   handler_ctx_.co_index = co_index_.get();
   handler_ctx_.vector_store = vector_store_.get();
   handler_ctx_.similarity_engine = similarity_engine_.get();
-  handler_ctx_.cache = cache_.get();
+  handler_ctx_.cache.store(cache_.get(), std::memory_order_release);
   handler_ctx_.variable_manager = variable_manager_.get();
   handler_ctx_.dump_dir = config_.snapshot.dir;
 

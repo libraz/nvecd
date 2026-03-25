@@ -15,6 +15,7 @@
 #include "config/config.h"
 #include "server/nvecd_server.h"
 #include "vectors/distance_simd.h"
+#include "version.h"
 
 namespace {
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
@@ -118,7 +119,7 @@ int main(int argc, char* argv[]) {
       return 0;
     }
     if (arg == "-v" || arg == "--version") {
-      std::cout << "nvecd version 0.1.0\n";
+      std::cout << "nvecd version " << nvecd::Version::String() << "\n";
       std::cout << "In-memory vector search engine with event-based co-occurrence tracking\n";
       return 0;
     }
@@ -148,7 +149,7 @@ int main(int argc, char* argv[]) {
   // NOLINTEND(cppcoreguidelines-pro-bounds-pointer-arithmetic)
 
   spdlog::info("nvecd server starting...");
-  spdlog::info("Version: 0.1.0");
+  spdlog::info("Version: {}", nvecd::Version::String());
   spdlog::info("Vector SIMD: {}", nvecd::vectors::simd::GetImplementationName());
 
   // Load configuration

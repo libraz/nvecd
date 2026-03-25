@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <optional>
 #include <shared_mutex>
 #include <string>
@@ -132,7 +133,7 @@ class VectorStore {
    *
    * @return Vector dimension (0 if empty)
    */
-  size_t GetDimension() const { return dimension_; }
+  size_t GetDimension() const { return dimension_.load(std::memory_order_acquire); }
 
   /**
    * @brief Clear all vectors
@@ -156,7 +157,7 @@ class VectorStore {
 
   mutable std::shared_mutex mutex_;                  ///< Reader-writer lock
   std::unordered_map<std::string, Vector> vectors_;  ///< ID -> Vector mapping
-  size_t dimension_ = 0;                             ///< Fixed dimension (0 = not set)
+  std::atomic<size_t> dimension_{0};                   ///< Fixed dimension (0 = not set)
 };
 
 }  // namespace nvecd::vectors

@@ -28,6 +28,7 @@ add_library(nvecd_server STATIC
   server/handlers/debug_handler.cpp
   server/handlers/variable_handler.cpp
   server/handlers/cache_handler.cpp
+  server/handlers/dump_handler.cpp
   server/request_dispatcher.cpp
   server/http_server.cpp
   server/nvecd_server.cpp
@@ -154,7 +155,6 @@ add_library(nvecd_cache STATIC
   cache/similarity_cache.cpp
 )
 target_link_libraries(nvecd_cache PUBLIC
-  nvecd_similarity
   nvecd_utils
   lz4
   Threads::Threads

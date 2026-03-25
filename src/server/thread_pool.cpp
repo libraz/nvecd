@@ -188,6 +188,7 @@ void ThreadPool::WorkerThread() {
       // Note: This check is technically redundant after the wait() condition,
       // but kept for defensive programming and clarity
       if (!tasks_.empty()) {
+        active_workers_++;  // Increment while holding lock to prevent premature shutdown detection
         task = std::move(tasks_.front());
         tasks_.pop();
       }
@@ -195,7 +196,6 @@ void ThreadPool::WorkerThread() {
 
     // Execute task (outside lock)
     if (task) {
-      active_workers_++;  // Increment before executing task
       try {
         task();
       } catch (const std::exception& e) {

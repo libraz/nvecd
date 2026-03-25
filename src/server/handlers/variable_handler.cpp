@@ -1,6 +1,6 @@
 /**
  * @file variable_handler.cpp
- * @brief Handler for SET/SHOW VARIABLES commands implementation
+ * @brief Handler for SET/GET/SHOW VARIABLES commands implementation
  *
  * Reference: ../mygram-db/src/server/handlers/variable_handler.cpp
  * Reusability: 80% (namespace changes, nvecd-specific variables)
@@ -11,25 +11,28 @@
 #include <algorithm>
 #include <sstream>
 
-namespace nvecd::server {
+namespace nvecd::server::handlers {
 
-std::string VariableHandler::HandleSet(config::RuntimeVariableManager* manager, const std::string& variable_name,
-                                       const std::string& value) {
+utils::Expected<std::string, utils::Error> HandleSet(config::RuntimeVariableManager* manager,
+                                                      const std::string& variable_name, const std::string& value) {
   if (manager == nullptr) {
-    return "-ERR RuntimeVariableManager not initialized\r\n";
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kInternalError, "RuntimeVariableManager not initialized"));
   }
 
   auto result = manager->SetVariable(variable_name, value);
   if (!result) {
-    return "-ERR " + result.error().message() + "\r\n";
+    return utils::MakeUnexpected(result.error());
   }
 
-  return "+OK\r\n";
+  return std::string("+OK\r\n");
 }
 
-std::string VariableHandler::HandleShowVariables(config::RuntimeVariableManager* manager, const std::string& pattern) {
+utils::Expected<std::string, utils::Error> HandleShowVariables(config::RuntimeVariableManager* manager,
+                                                                const std::string& pattern) {
   if (manager == nullptr) {
-    return "-ERR RuntimeVariableManager not initialized\r\n";
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kInternalError, "RuntimeVariableManager not initialized"));
   }
 
   // Get all variables with optional prefix filter
@@ -54,8 +57,6 @@ std::string VariableHandler::HandleShowVariables(config::RuntimeVariableManager*
   // Count lines for array response
   size_t count = 0;
   for (const auto& [name, info] : variables) {
-    // If pattern has wildcard at end, match prefix
-    // If no wildcard, match exact or prefix
     if (pattern.empty() || name.find(prefix) == 0) {
       count++;
     }
@@ -65,7 +66,6 @@ std::string VariableHandler::HandleShowVariables(config::RuntimeVariableManager*
 
   for (const auto& [name, info] : variables) {
     if (pattern.empty() || name.find(prefix) == 0) {
-      // Format: name=value (mutable) or name=value (immutable)
       oss << "$" << (name.size() + 1 + info.value.size() + (info.mutable_ ? 10 : 12)) << "\r\n";
       oss << name << "=" << info.value << (info.mutable_ ? " (mutable)" : " (immutable)") << "\r\n";
     }
@@ -74,21 +74,23 @@ std::string VariableHandler::HandleShowVariables(config::RuntimeVariableManager*
   return oss.str();
 }
 
-std::string VariableHandler::HandleGet(config::RuntimeVariableManager* manager, const std::string& variable_name) {
+utils::Expected<std::string, utils::Error> HandleGet(config::RuntimeVariableManager* manager,
+                                                      const std::string& variable_name) {
   if (manager == nullptr) {
-    return "-ERR RuntimeVariableManager not initialized\r\n";
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kInternalError, "RuntimeVariableManager not initialized"));
   }
 
   auto result = manager->GetVariable(variable_name);
   if (!result) {
-    return "-ERR " + result.error().message() + "\r\n";
+    return utils::MakeUnexpected(result.error());
   }
 
   // Return as bulk string
-  const std::string& value = *result;
+  const std::string& val = *result;
   std::ostringstream oss;
-  oss << "$" << value.size() << "\r\n" << value << "\r\n";
+  oss << "$" << val.size() << "\r\n" << val << "\r\n";
   return oss.str();
 }
 
-}  // namespace nvecd::server
+}  // namespace nvecd::server::handlers

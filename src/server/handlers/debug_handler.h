@@ -11,6 +11,8 @@
 #include <string>
 
 #include "server/server_types.h"
+#include "utils/error.h"
+#include "utils/expected.h"
 
 namespace nvecd::server::handlers {
 
@@ -21,9 +23,9 @@ namespace nvecd::server::handlers {
  * Debug mode shows detailed execution info for SIM/SIMV commands.
  *
  * @param ctx Connection context
- * @return OK response
+ * @return OK response or error
  */
-std::string HandleDebugOn(ConnectionContext& ctx);
+utils::Expected<std::string, utils::Error> HandleDebugOn(ConnectionContext& ctx);
 
 /**
  * @brief Handle DEBUG OFF command
@@ -31,8 +33,8 @@ std::string HandleDebugOn(ConnectionContext& ctx);
  * Disables debug mode for the current connection.
  *
  * @param ctx Connection context
- * @return OK response
+ * @return OK response or error
  */
-std::string HandleDebugOff(ConnectionContext& ctx);
+utils::Expected<std::string, utils::Error> HandleDebugOff(ConnectionContext& ctx);
 
 }  // namespace nvecd::server::handlers

@@ -12,18 +12,19 @@
 
 namespace nvecd::server::handlers {
 
-std::string HandleCacheStats(const HandlerContext& ctx) {
+utils::Expected<std::string, utils::Error> HandleCacheStats(const HandlerContext& ctx) {
   std::ostringstream oss;
   oss << "OK CACHE_STATS\n";
 
-  if (ctx.cache == nullptr) {
+  auto* cache_ptr = ctx.cache.load(std::memory_order_acquire);
+  if (cache_ptr == nullptr) {
     oss << "cache_enabled: false\n";
     oss << "cache_entries: 0\n";
     return oss.str();
   }
 
-  auto stats = ctx.cache->GetStatistics();
-  oss << "cache_enabled: " << (ctx.cache->IsEnabled() ? "true" : "false") << "\n";
+  auto stats = cache_ptr->GetStatistics();
+  oss << "cache_enabled: " << (cache_ptr->IsEnabled() ? "true" : "false") << "\n";
   oss << "cache_entries: " << stats.current_entries << "\n";
   oss << "cache_memory_bytes: " << stats.current_memory_bytes << "\n";
   oss << "total_queries: " << stats.total_queries << "\n";
@@ -37,31 +38,34 @@ std::string HandleCacheStats(const HandlerContext& ctx) {
   return oss.str();
 }
 
-std::string HandleCacheClear(HandlerContext& ctx) {
-  if (ctx.cache == nullptr) {
-    return "OK CACHE_CLEARED (no cache)\n";
+utils::Expected<std::string, utils::Error> HandleCacheClear(HandlerContext& ctx) {
+  auto* cache_ptr = ctx.cache.load(std::memory_order_acquire);
+  if (cache_ptr == nullptr) {
+    return std::string("OK CACHE_CLEARED (no cache)\n");
   }
 
-  ctx.cache->Clear();
-  return "OK CACHE_CLEARED\n";
+  cache_ptr->Clear();
+  return std::string("OK CACHE_CLEARED\n");
 }
 
-std::string HandleCacheEnable(HandlerContext& ctx) {
-  if (ctx.cache == nullptr) {
-    return "OK CACHE_ENABLED (no cache instance)\n";
+utils::Expected<std::string, utils::Error> HandleCacheEnable(HandlerContext& ctx) {
+  auto* cache_ptr = ctx.cache.load(std::memory_order_acquire);
+  if (cache_ptr == nullptr) {
+    return std::string("OK CACHE_ENABLED (no cache instance)\n");
   }
 
-  ctx.cache->SetEnabled(true);
-  return "OK CACHE_ENABLED\n";
+  cache_ptr->SetEnabled(true);
+  return std::string("OK CACHE_ENABLED\n");
 }
 
-std::string HandleCacheDisable(HandlerContext& ctx) {
-  if (ctx.cache == nullptr) {
-    return "OK CACHE_DISABLED (no cache instance)\n";
+utils::Expected<std::string, utils::Error> HandleCacheDisable(HandlerContext& ctx) {
+  auto* cache_ptr = ctx.cache.load(std::memory_order_acquire);
+  if (cache_ptr == nullptr) {
+    return std::string("OK CACHE_DISABLED (no cache instance)\n");
   }
 
-  ctx.cache->SetEnabled(false);
-  return "OK CACHE_DISABLED\n";
+  cache_ptr->SetEnabled(false);
+  return std::string("OK CACHE_DISABLED\n");
 }
 
 }  // namespace nvecd::server::handlers

@@ -7,14 +7,14 @@
 
 namespace nvecd::server::handlers {
 
-std::string HandleDebugOn(ConnectionContext& ctx) {
+utils::Expected<std::string, utils::Error> HandleDebugOn(ConnectionContext& ctx) {
   ctx.debug_mode = true;
-  return "OK DEBUG_ON\n";
+  return std::string("OK DEBUG_ON\n");
 }
 
-std::string HandleDebugOff(ConnectionContext& ctx) {
+utils::Expected<std::string, utils::Error> HandleDebugOff(ConnectionContext& ctx) {
   ctx.debug_mode = false;
-  return "OK DEBUG_OFF\n";
+  return std::string("OK DEBUG_OFF\n");
 }
 
 }  // namespace nvecd::server::handlers

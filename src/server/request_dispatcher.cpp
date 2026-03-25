@@ -6,9 +6,6 @@
  * Reusability: 75% (similar dispatch pattern, different handlers)
  */
 
-#include <array>
-#include <ctime>
-#include <filesystem>
 #include <sstream>
 
 // Include concrete types before request_dispatcher.h to resolve forward declarations
@@ -18,45 +15,16 @@
 #include "server/handlers/admin_handler.h"
 #include "server/handlers/cache_handler.h"
 #include "server/handlers/debug_handler.h"
+#include "server/handlers/dump_handler.h"
 #include "server/handlers/info_handler.h"
 #include "server/handlers/variable_handler.h"
 #include "server/request_dispatcher.h"
 #include "similarity/similarity_engine.h"
-#include "storage/snapshot_format_v1.h"
 #include "utils/error.h"
 #include "utils/structured_log.h"
 #include "vectors/vector_store.h"
 
 namespace nvecd::server {
-
-namespace {
-constexpr int kFilepathBufferSize = 256;
-
-/**
- * @brief RAII guard for atomic boolean flags
- *
- * Reference: ../mygram-db/src/server/handlers/dump_handler.cpp
- * Reusability: 100%
- *
- * Automatically sets flag to true on construction and resets to false on destruction.
- * Exception-safe: ensures flag is always reset even if exceptions are thrown.
- */
-class FlagGuard {
- public:
-  explicit FlagGuard(std::atomic<bool>& flag) : flag_(flag) { flag_ = true; }
-  ~FlagGuard() { flag_ = false; }
-
-  // Non-copyable and non-movable
-  FlagGuard(const FlagGuard&) = delete;
-  FlagGuard& operator=(const FlagGuard&) = delete;
-  FlagGuard(FlagGuard&&) = delete;
-  FlagGuard& operator=(FlagGuard&&) = delete;
-
- private:
-  std::atomic<bool>& flag_;
-};
-
-}  // namespace
 
 RequestDispatcher::RequestDispatcher(HandlerContext& handler_ctx) : ctx_(handler_ctx) {}
 
@@ -218,7 +186,7 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleVecset(const
 
 utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSim(const Command& cmd,
                                                                         ConnectionContext& conn_ctx) const {
-  (void)conn_ctx;  // TODO: Use for debug mode
+  (void)conn_ctx;
   if (ctx_.similarity_engine == nullptr) {
     return utils::MakeUnexpected(
         utils::MakeError(utils::ErrorCode::kInternalError, "SimilarityEngine not initialized"));
@@ -250,7 +218,7 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSim(const Co
 
 utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSimv(const Command& cmd,
                                                                          ConnectionContext& conn_ctx) const {
-  (void)conn_ctx;  // TODO: Use for debug mode
+  (void)conn_ctx;
   if (ctx_.similarity_engine == nullptr) {
     return utils::MakeUnexpected(
         utils::MakeError(utils::ErrorCode::kInternalError, "SimilarityEngine not initialized"));
@@ -276,7 +244,7 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleInfo(const C
 }
 
 utils::Expected<std::string, utils::Error> RequestDispatcher::HandleConfigHelp(const Command& cmd) {
-  return AdminHandler::HandleConfigHelp(cmd.path);
+  return handlers::HandleConfigHelp(cmd.path);
 }
 
 utils::Expected<std::string, utils::Error> RequestDispatcher::HandleConfigShow(const Command& cmd) {
@@ -291,244 +259,37 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleConfigShow(c
       ctx_.vector_store != nullptr ? static_cast<uint32_t>(ctx_.vector_store->GetDimension()) : 0;
   server_ctx.contexts_total = ctx_.event_store != nullptr ? ctx_.event_store->GetContextCount() : 0;
   server_ctx.events_total = ctx_.event_store != nullptr ? ctx_.event_store->GetTotalEventCount() : 0;
-  server_ctx.cache_enabled = (ctx_.cache != nullptr);
-  if (ctx_.cache != nullptr) {
-    auto cache_stats = ctx_.cache->GetStatistics();
+  auto* cache_ptr = ctx_.cache.load(std::memory_order_acquire);
+  server_ctx.cache_enabled = (cache_ptr != nullptr);
+  if (cache_ptr != nullptr) {
+    auto cache_stats = cache_ptr->GetStatistics();
     server_ctx.cache_hits = cache_stats.cache_hits;
     server_ctx.cache_misses = cache_stats.cache_misses;
   }
   server_ctx.queries_total = ctx_.stats.total_commands.load();
   server_ctx.queries_per_second = ctx_.stats.GetQueriesPerSecond();
 
-  return AdminHandler::HandleConfigShow(server_ctx, cmd.path);
+  return handlers::HandleConfigShow(server_ctx, cmd.path);
 }
 
 utils::Expected<std::string, utils::Error> RequestDispatcher::HandleConfigVerify(const Command& cmd) {
-  return AdminHandler::HandleConfigVerify(cmd.path);
+  return handlers::HandleConfigVerify(cmd.path);
 }
 
 utils::Expected<std::string, utils::Error> RequestDispatcher::HandleDumpSave(const Command& cmd) {
-  // Reference: ../mygram-db/src/server/handlers/dump_handler.cpp::HandleDumpSave
-  // Reusability: 90% (removed MySQL SYNC check)
-
-  // Determine filepath
-  std::string filepath;
-  if (!cmd.path.empty()) {
-    filepath = cmd.path;
-    if (filepath[0] != '/') {
-      filepath = ctx_.dump_dir + "/" + filepath;
-    }
-    // Canonicalize path and validate it's within dump_dir
-    try {
-      std::filesystem::path canonical = std::filesystem::weakly_canonical(filepath);
-      std::filesystem::path dump_canonical = std::filesystem::weakly_canonical(ctx_.dump_dir);
-      auto rel = canonical.lexically_relative(dump_canonical);
-      if (rel.empty() || rel.string().substr(0, 2) == "..") {
-        return utils::MakeUnexpected(
-            utils::MakeError(utils::ErrorCode::kInvalidArgument, "Invalid filepath: path traversal detected"));
-      }
-    } catch (const std::exception& e) {
-      return utils::MakeUnexpected(
-          utils::MakeError(utils::ErrorCode::kInvalidArgument, std::string("Invalid filepath: ") + e.what()));
-    }
-  } else {
-    // Generate default filename with timestamp
-    auto now = std::time(nullptr);
-    std::tm tm_buf{};
-    localtime_r(&now, &tm_buf);  // Thread-safe version of localtime
-    std::array<char, kFilepathBufferSize> buf{};
-    std::strftime(buf.data(), buf.size(), "snapshot_%Y%m%d_%H%M%S.dmp", &tm_buf);
-    filepath = ctx_.dump_dir + "/" + std::string(buf.data());
-  }
-
-  utils::LogStorageInfo("dump_save", "Attempting to save snapshot to: " + filepath);
-
-  // Check if config is available
-  if (ctx_.config == nullptr) {
-    std::string error_msg = "Cannot save snapshot: server configuration is not available";
-    utils::LogStorageError("dump_save", filepath, error_msg);
-    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kInternalError, error_msg));
-  }
-
-  // Check required stores
-  if (ctx_.event_store == nullptr || ctx_.co_index == nullptr || ctx_.vector_store == nullptr) {
-    std::string error_msg = "Cannot save snapshot: required stores not initialized";
-    utils::LogStorageError("dump_save", filepath, error_msg);
-    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kInternalError, error_msg));
-  }
-
-  // Set read-only mode (RAII guard ensures it's cleared even on exceptions)
-  FlagGuard read_only_guard(ctx_.read_only);
-
-  // Call snapshot_v1 API
-  auto result = storage::snapshot_v1::WriteSnapshotV1(filepath, *ctx_.config, *ctx_.event_store, *ctx_.co_index,
-                                                      *ctx_.vector_store);
-
-  if (result) {
-    utils::LogStorageInfo("dump_save", "Successfully saved snapshot to: " + filepath);
-    return FormatOK("DUMP_SAVED " + filepath);
-  }
-
-  std::string error_msg = "Failed to save snapshot to " + filepath + ": " + result.error().message();
-  utils::LogStorageError("dump_save", filepath, result.error().message());
-  return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kSnapshotSaveFailed, error_msg));
+  return handlers::HandleDumpSave(ctx_, cmd.path);
 }
 
 utils::Expected<std::string, utils::Error> RequestDispatcher::HandleDumpLoad(const Command& cmd) {
-  // Reference: ../mygram-db/src/server/handlers/dump_handler.cpp::HandleDumpLoad
-  // Reusability: 90% (removed MySQL SYNC check)
-
-  std::string filepath;
-  if (!cmd.path.empty()) {
-    filepath = cmd.path;
-    if (filepath[0] != '/') {
-      filepath = ctx_.dump_dir + "/" + filepath;
-    }
-    // Canonicalize path and validate it's within dump_dir
-    try {
-      std::filesystem::path canonical = std::filesystem::weakly_canonical(filepath);
-      std::filesystem::path dump_canonical = std::filesystem::weakly_canonical(ctx_.dump_dir);
-      auto rel = canonical.lexically_relative(dump_canonical);
-      if (rel.empty() || rel.string().substr(0, 2) == "..") {
-        return utils::MakeUnexpected(
-            utils::MakeError(utils::ErrorCode::kInvalidArgument, "Invalid filepath: path traversal detected"));
-      }
-    } catch (const std::exception& e) {
-      return utils::MakeUnexpected(
-          utils::MakeError(utils::ErrorCode::kInvalidArgument, std::string("Invalid filepath: ") + e.what()));
-    }
-  } else {
-    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kInvalidArgument, "DUMP LOAD requires a filepath"));
-  }
-
-  utils::LogStorageInfo("dump_load", "Attempting to load snapshot from: " + filepath);
-
-  // Check required stores
-  if (ctx_.event_store == nullptr || ctx_.co_index == nullptr || ctx_.vector_store == nullptr) {
-    std::string error_msg = "Cannot load snapshot: required stores not initialized";
-    utils::LogStorageError("dump_load", filepath, error_msg);
-    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kInternalError, error_msg));
-  }
-
-  // Set loading mode (RAII guard ensures it's cleared even on exceptions)
-  FlagGuard loading_guard(ctx_.loading);
-
-  // Variables to receive loaded data
-  config::Config loaded_config;
-  storage::snapshot_format::IntegrityError integrity_error;
-
-  // Call snapshot_v1 API
-  auto result = storage::snapshot_v1::ReadSnapshotV1(filepath, loaded_config, *ctx_.event_store, *ctx_.co_index,
-                                                     *ctx_.vector_store, nullptr, nullptr, &integrity_error);
-
-  if (result) {
-    utils::LogStorageInfo("dump_load", "Successfully loaded snapshot from: " + filepath);
-    return FormatOK("DUMP_LOADED " + filepath);
-  }
-
-  std::string error_msg = "Failed to load snapshot from " + filepath + ": " + result.error().message();
-  if (!integrity_error.message.empty()) {
-    error_msg += " (" + integrity_error.message + ")";
-  }
-  utils::LogStorageError("dump_load", filepath, error_msg);
-  return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kSnapshotLoadFailed, error_msg));
+  return handlers::HandleDumpLoad(ctx_, cmd.path);
 }
 
 utils::Expected<std::string, utils::Error> RequestDispatcher::HandleDumpVerify(const Command& cmd) const {
-  // Reference: ../mygram-db/src/server/handlers/dump_handler.cpp::HandleDumpVerify
-  // Reusability: 95%
-
-  std::string filepath;
-  if (!cmd.path.empty()) {
-    filepath = cmd.path;
-    if (filepath[0] != '/') {
-      filepath = ctx_.dump_dir + "/" + filepath;
-    }
-    // Canonicalize path and validate it's within dump_dir
-    try {
-      std::filesystem::path canonical = std::filesystem::weakly_canonical(filepath);
-      std::filesystem::path dump_canonical = std::filesystem::weakly_canonical(ctx_.dump_dir);
-      auto rel = canonical.lexically_relative(dump_canonical);
-      if (rel.empty() || rel.string().substr(0, 2) == "..") {
-        return utils::MakeUnexpected(
-            utils::MakeError(utils::ErrorCode::kInvalidArgument, "Invalid filepath: path traversal detected"));
-      }
-    } catch (const std::exception& e) {
-      return utils::MakeUnexpected(
-          utils::MakeError(utils::ErrorCode::kInvalidArgument, std::string("Invalid filepath: ") + e.what()));
-    }
-  } else {
-    return utils::MakeUnexpected(
-        utils::MakeError(utils::ErrorCode::kInvalidArgument, "DUMP VERIFY requires a filepath"));
-  }
-
-  utils::LogStorageInfo("dump_verify", "Verifying snapshot: " + filepath);
-
-  storage::snapshot_format::IntegrityError integrity_error;
-  auto result = storage::snapshot_v1::VerifySnapshotIntegrity(filepath, integrity_error);
-
-  if (result) {
-    utils::LogStorageInfo("dump_verify", "Snapshot verification succeeded: " + filepath);
-    return "OK DUMP_VERIFIED " + filepath + "\r\n";
-  }
-
-  std::string error_msg = "Snapshot verification failed for " + filepath + ": " + result.error().message();
-  if (!integrity_error.message.empty()) {
-    error_msg += " (" + integrity_error.message + ")";
-  }
-  utils::LogStorageError("dump_verify", filepath, error_msg);
-  return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kSnapshotVerifyFailed, error_msg));
+  return handlers::HandleDumpVerify(ctx_.dump_dir, cmd.path);
 }
 
 utils::Expected<std::string, utils::Error> RequestDispatcher::HandleDumpInfo(const Command& cmd) const {
-  // Reference: ../mygram-db/src/server/handlers/dump_handler.cpp::HandleDumpInfo
-  // Reusability: 90% (removed GTID, changed table_count to store_count)
-
-  std::string filepath;
-  if (!cmd.path.empty()) {
-    filepath = cmd.path;
-    if (filepath[0] != '/') {
-      filepath = ctx_.dump_dir + "/" + filepath;
-    }
-    // Canonicalize path and validate it's within dump_dir
-    try {
-      std::filesystem::path canonical = std::filesystem::weakly_canonical(filepath);
-      std::filesystem::path dump_canonical = std::filesystem::weakly_canonical(ctx_.dump_dir);
-      auto rel = canonical.lexically_relative(dump_canonical);
-      if (rel.empty() || rel.string().substr(0, 2) == "..") {
-        return utils::MakeUnexpected(
-            utils::MakeError(utils::ErrorCode::kInvalidArgument, "Invalid filepath: path traversal detected"));
-      }
-    } catch (const std::exception& e) {
-      return utils::MakeUnexpected(
-          utils::MakeError(utils::ErrorCode::kInvalidArgument, std::string("Invalid filepath: ") + e.what()));
-    }
-  } else {
-    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kInvalidArgument, "DUMP INFO requires a filepath"));
-  }
-
-  utils::LogStorageInfo("dump_info", "Reading snapshot info: " + filepath);
-
-  storage::snapshot_v1::SnapshotInfo info;
-  auto info_result = storage::snapshot_v1::GetSnapshotInfo(filepath, info);
-
-  if (!info_result) {
-    return utils::MakeUnexpected(
-        utils::MakeError(utils::ErrorCode::kSnapshotInfoFailed,
-                         "Failed to read snapshot info from " + filepath + ": " + info_result.error().message()));
-  }
-
-  std::ostringstream result;
-  result << "OK DUMP_INFO " << filepath << "\r\n";
-  result << "version: " << info.version << "\r\n";
-  result << "stores: " << info.store_count << "\r\n";
-  result << "flags: " << info.flags << "\r\n";
-  result << "file_size: " << info.file_size << "\r\n";
-  result << "timestamp: " << info.timestamp << "\r\n";
-  result << "has_statistics: " << (info.has_statistics ? "true" : "false") << "\r\n";
-  result << "END\r\n";
-
-  return result.str();
+  return handlers::HandleDumpInfo(ctx_.dump_dir, cmd.path);
 }
 
 utils::Expected<std::string, utils::Error> RequestDispatcher::HandleDebugOn(ConnectionContext& conn_ctx) {
@@ -568,15 +329,15 @@ std::string RequestDispatcher::FormatSimResults(const std::vector<std::pair<std:
 //
 
 utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSet(const Command& cmd) {
-  return VariableHandler::HandleSet(ctx_.variable_manager, cmd.variable_name, cmd.variable_value);
+  return handlers::HandleSet(ctx_.variable_manager, cmd.variable_name, cmd.variable_value);
 }
 
 utils::Expected<std::string, utils::Error> RequestDispatcher::HandleGet(const Command& cmd) {
-  return VariableHandler::HandleGet(ctx_.variable_manager, cmd.variable_name);
+  return handlers::HandleGet(ctx_.variable_manager, cmd.variable_name);
 }
 
 utils::Expected<std::string, utils::Error> RequestDispatcher::HandleShowVariables(const Command& cmd) {
-  return VariableHandler::HandleShowVariables(ctx_.variable_manager, cmd.pattern);
+  return handlers::HandleShowVariables(ctx_.variable_manager, cmd.pattern);
 }
 
 }  // namespace nvecd::server

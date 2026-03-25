@@ -23,7 +23,7 @@
 
 #include "cache/cache_key.h"
 #include "cache/result_compressor.h"
-#include "similarity/similarity_engine.h"
+#include "similarity/similarity_result.h"
 
 namespace nvecd::cache {
 

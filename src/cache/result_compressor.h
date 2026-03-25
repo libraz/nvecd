@@ -13,7 +13,7 @@
 #include <cstdint>
 #include <vector>
 
-#include "similarity/similarity_engine.h"
+#include "similarity/similarity_result.h"
 #include "utils/error.h"
 #include "utils/expected.h"
 

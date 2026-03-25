@@ -9,22 +9,22 @@
 
 #include "server/handlers/admin_handler.h"
 
-#include <spdlog/spdlog.h>
-
+#include <iomanip>
 #include <sstream>
 
 #include "config/config.h"
 #include "config/config_help.h"
 #include "utils/structured_log.h"
+#include "version.h"
 
-namespace nvecd::server {
+namespace nvecd::server::handlers {
 
-std::string AdminHandler::HandleInfo(const ServerContext& ctx) {
+utils::Expected<std::string, utils::Error> HandleAdminInfo(const ServerContext& ctx) {
   std::ostringstream oss;
 
   // Server section
   oss << "# Server\n";
-  oss << "version: 0.1.0\n";
+  oss << "version: " << nvecd::Version::String() << "\n";
   oss << "uptime_seconds: " << ctx.uptime_seconds << "\n";
   oss << "connections_total: " << ctx.connections_total << "\n";
   oss << "connections_current: " << ctx.connections_current << "\n";
@@ -58,10 +58,10 @@ std::string AdminHandler::HandleInfo(const ServerContext& ctx) {
   oss << "queries_total: " << ctx.queries_total << "\n";
   oss << "queries_per_second: " << std::fixed << std::setprecision(2) << ctx.queries_per_second << "\n";
 
-  return "+OK\n" + oss.str();
+  return std::string("+OK\n") + oss.str();
 }
 
-std::string AdminHandler::HandleConfigHelp(const std::string& path) {
+utils::Expected<std::string, utils::Error> HandleConfigHelp(const std::string& path) {
   try {
     config::ConfigSchemaExplorer explorer;
 
@@ -69,46 +69,51 @@ std::string AdminHandler::HandleConfigHelp(const std::string& path) {
       // Show top-level sections
       auto paths = explorer.ListPaths("");
       std::string result = config::ConfigSchemaExplorer::FormatPathList(paths, "");
-      return "+OK\n" + result;
+      return std::string("+OK\n") + result;
     }
 
     // Show help for specific path
     auto help_info = explorer.GetHelp(path);
     if (!help_info.has_value()) {
-      return "-ERR Configuration path not found: " + path + "\n";
+      return utils::MakeUnexpected(
+          utils::MakeError(utils::ErrorCode::kNotFound, "Configuration path not found: " + path));
     }
 
     std::string result = config::ConfigSchemaExplorer::FormatHelp(help_info.value());
-    return "+OK\n" + result;
+    return std::string("+OK\n") + result;
 
   } catch (const std::exception& e) {
     utils::StructuredLog().Event("server_error").Field("operation", "config_help").Field("error", e.what()).Error();
-    return "-ERR CONFIG HELP failed: " + std::string(e.what()) + "\n";
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kInternalError, std::string("CONFIG HELP failed: ") + e.what()));
   }
 }
 
-std::string AdminHandler::HandleConfigShow(const ServerContext& ctx, const std::string& path) {
-  try {
-    if (ctx.config == nullptr) {
-      utils::StructuredLog()
-          .Event("server_warning")
-          .Field("operation", "config_show")
-          .Field("reason", "config_not_available")
-          .Warn();
-      return "-ERR Server configuration is not available\n";
-    }
+utils::Expected<std::string, utils::Error> HandleConfigShow(const ServerContext& ctx, const std::string& path) {
+  if (ctx.config == nullptr) {
+    utils::StructuredLog()
+        .Event("server_warning")
+        .Field("operation", "config_show")
+        .Field("reason", "config_not_available")
+        .Warn();
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kInternalError, "Server configuration is not available"));
+  }
 
+  try {
     std::string result = config::FormatConfigForDisplay(*ctx.config, path);
-    return "+OK\n" + result;
+    return std::string("+OK\n") + result;
   } catch (const std::exception& e) {
     utils::StructuredLog().Event("server_error").Field("operation", "config_show").Field("error", e.what()).Error();
-    return "-ERR CONFIG SHOW failed: " + std::string(e.what()) + "\n";
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kInternalError, std::string("CONFIG SHOW failed: ") + e.what()));
   }
 }
 
-std::string AdminHandler::HandleConfigVerify(const std::string& filepath) {
+utils::Expected<std::string, utils::Error> HandleConfigVerify(const std::string& filepath) {
   if (filepath.empty()) {
-    return "-ERR CONFIG VERIFY requires a filepath\n";
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kInvalidArgument, "CONFIG VERIFY requires a filepath"));
   }
 
   // Try to load and validate the configuration file
@@ -120,7 +125,8 @@ std::string AdminHandler::HandleConfigVerify(const std::string& filepath) {
         .Field("filepath", filepath)
         .Field("error", config_result.error().to_string())
         .Error();
-    return "-ERR Configuration validation failed:\n  " + config_result.error().message() + "\n";
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kConfigValidationError,
+                                                   "Configuration validation failed: " + config_result.error().message()));
   }
 
   config::Config test_config = *config_result;
@@ -140,7 +146,7 @@ std::string AdminHandler::HandleConfigVerify(const std::string& filepath) {
     summary << "    http: " << test_config.api.http.bind << ":" << test_config.api.http.port << "\n";
   }
 
-  return "+OK\n" + summary.str();
+  return std::string("+OK\n") + summary.str();
 }
 
-}  // namespace nvecd::server
+}  // namespace nvecd::server::handlers
