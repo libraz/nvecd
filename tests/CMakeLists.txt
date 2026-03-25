@@ -398,7 +398,7 @@ target_link_libraries(snapshot_fork_test
   gtest_main
 )
 gtest_discover_tests(snapshot_fork_test
-  PROPERTIES TIMEOUT 30
+  PROPERTIES TIMEOUT 30 LABELS integration
 )
 
 # Unix socket tests
