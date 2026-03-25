@@ -4,6 +4,9 @@
  *
  * Thread-safe storage for high-dimensional vectors with automatic
  * dimension validation and optional normalization.
+ *
+ * Uses compact contiguous storage as the single source of truth
+ * for optimal search performance and reduced memory usage.
  */
 
 #pragma once
@@ -52,6 +55,10 @@ struct VectorStoreStatistics {
  *
  * Stores vectors with string IDs and enforces consistent dimensions.
  * Supports concurrent reads and exclusive writes.
+ *
+ * Uses compact contiguous storage (matrix_ + norms_) as the single
+ * source of truth. Deleted entries are tracked with tombstones and
+ * defragmented when fragmentation exceeds 25%.
  *
  * Thread-safety:
  * - Multiple concurrent readers (GetVector, GetAllIds, etc.)
@@ -153,23 +160,8 @@ class VectorStore {
   size_t MemoryUsage() const;
 
   /**
-   * @brief Rebuild compact contiguous storage from vectors map
-   *
-   * Copies all vectors into a contiguous float array and pre-computes
-   * L2 norms for each vector. Requires exclusive lock internally.
-   * Call after bulk operations for optimal search performance.
-   */
-  utils::Expected<void, utils::Error> Compact();
-
-  /**
-   * @brief Check if compact storage is valid
-   * @return True if compact storage is up-to-date with vectors map
-   */
-  bool IsCompactValid() const { return compact_valid_.load(std::memory_order_acquire); }
-
-  /**
-   * @brief Get number of vectors in compact storage
-   * @return Number of rows in compact matrix
+   * @brief Get number of vectors in compact storage (including tombstones)
+   * @return Total number of slots in compact matrix
    */
   size_t GetCompactCount() const;
 
@@ -212,13 +204,12 @@ class VectorStore {
   /**
    * @brief Snapshot of compact storage for lock-free read access
    *
-   * Valid as long as no Compact() is called. The caller should use
-   * IsCompactValid() to check validity before using.
+   * The caller should hold a read lock while using this snapshot.
    */
   struct CompactSnapshot {
     const float* matrix = nullptr;   ///< Pointer to contiguous matrix
     const float* norms = nullptr;    ///< Pointer to norm array
-    size_t count = 0;                ///< Number of vectors
+    size_t count = 0;                ///< Number of vectors (including tombstones)
     size_t dim = 0;                  ///< Vector dimension
     const std::unordered_map<std::string, size_t>* id_to_idx = nullptr;
     const std::vector<std::string>* idx_to_id = nullptr;
@@ -228,9 +219,8 @@ class VectorStore {
    * @brief Get a snapshot of compact storage under read lock
    *
    * Acquires read lock briefly to copy pointers, then releases.
-   * The returned snapshot is valid as long as compact_valid_ is true.
    *
-   * @return CompactSnapshot with pointers to compact data, or empty if invalid
+   * @return CompactSnapshot with pointers to compact data, or empty if no data
    */
   CompactSnapshot GetCompactSnapshot() const;
 
@@ -241,19 +231,43 @@ class VectorStore {
    */
   std::optional<size_t> GetCompactIndex(const std::string& id) const;
 
+  /**
+   * @brief Check if slot at given index is deleted (tombstone)
+   * @param idx Row index in compact matrix
+   * @return True if the slot is deleted
+   */
+  bool IsDeleted(size_t idx) const;
+
+  /**
+   * @brief Remove tombstones when fragmentation exceeds threshold
+   *
+   * Rebuilds compact storage by copying only non-deleted entries.
+   * Called automatically when tombstone ratio exceeds 25%.
+   * Thread-safe: acquires exclusive lock internally.
+   */
+  void Defragment();
+
  private:
+  /// @brief Internal defragment that assumes caller holds unique_lock
+  void DefragmentLocked();
+
+  /// @brief Internal memory usage calculation that assumes caller holds lock
+  size_t MemoryUsageLocked() const;
   config::VectorsConfig config_;  ///< Configuration
 
-  mutable std::shared_mutex mutex_;                  ///< Reader-writer lock
-  std::unordered_map<std::string, Vector> vectors_;  ///< ID -> Vector mapping
-  std::atomic<size_t> dimension_{0};                 ///< Fixed dimension (0 = not set)
+  mutable std::shared_mutex mutex_;    ///< Reader-writer lock
+  std::atomic<size_t> dimension_{0};   ///< Fixed dimension (0 = not set)
 
-  // Compact storage (read-optimized contiguous mirror of vectors_)
+  // Compact storage (single source of truth)
   std::vector<float> matrix_;                          ///< [n x dim] contiguous float array
   std::vector<float> norms_;                           ///< [n] pre-computed L2 norms
   std::unordered_map<std::string, size_t> id_to_idx_;  ///< ID -> row index
   std::vector<std::string> idx_to_id_;                 ///< row index -> ID
-  std::atomic<bool> compact_valid_{false};             ///< Whether compact storage is up-to-date
+
+  // Tombstone tracking
+  std::vector<bool> deleted_;       ///< Tombstone flags per slot
+  size_t active_count_ = 0;        ///< Number of non-deleted vectors
+  size_t tombstone_count_ = 0;     ///< Number of deleted slots
 };
 
 }  // namespace nvecd::vectors

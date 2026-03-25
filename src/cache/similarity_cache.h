@@ -19,6 +19,7 @@
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "cache/cache_key.h"
@@ -162,6 +163,28 @@ class SimilarityCache {
   bool Erase(const CacheKey& key);
 
   /**
+   * @brief Register which item IDs appear in a cache entry's results
+   *
+   * Builds reverse index for selective invalidation. Only tracks
+   * up to kMaxTrackedItemsPerEntry items per entry to bound memory.
+   *
+   * @param key Cache key
+   * @param item_ids Item IDs that appear in the query and results
+   */
+  void RegisterResultItems(const CacheKey& key, const std::vector<std::string>& item_ids);
+
+  /**
+   * @brief Invalidate all cache entries that reference a given item ID
+   *
+   * Uses reverse index for O(k) invalidation where k is the number
+   * of affected cache entries, instead of O(n) full cache clear.
+   *
+   * @param item_id The mutated item ID
+   * @return Number of entries invalidated
+   */
+  size_t InvalidateByItemId(const std::string& item_id);
+
+  /**
    * @brief Clear all cache entries
    */
   void Clear();
@@ -256,6 +279,7 @@ class SimilarityCache {
     double query_cost_ms = 0.0;                        ///< Original query execution time
     std::chrono::steady_clock::time_point created_at;  ///< Creation timestamp
     std::atomic<bool> invalidated{false};              ///< Invalidation flag (lock-free)
+    std::vector<std::string> referenced_item_ids;      ///< Item IDs in results (for reverse index cleanup)
 
     CachedEntry() = default;
     ~CachedEntry() = default;
@@ -264,7 +288,8 @@ class SimilarityCache {
           original_size(other.original_size),
           query_cost_ms(other.query_cost_ms),
           created_at(other.created_at),
-          invalidated(other.invalidated.load()) {}
+          invalidated(other.invalidated.load()),
+          referenced_item_ids(other.referenced_item_ids) {}
     CachedEntry& operator=(const CachedEntry& other) {
       if (this != &other) {
         compressed_data = other.compressed_data;
@@ -272,6 +297,7 @@ class SimilarityCache {
         query_cost_ms = other.query_cost_ms;
         created_at = other.created_at;
         invalidated.store(other.invalidated.load());
+        referenced_item_ids = other.referenced_item_ids;
       }
       return *this;
     }
@@ -280,7 +306,8 @@ class SimilarityCache {
           original_size(other.original_size),
           query_cost_ms(other.query_cost_ms),
           created_at(other.created_at),
-          invalidated(other.invalidated.load()) {}
+          invalidated(other.invalidated.load()),
+          referenced_item_ids(std::move(other.referenced_item_ids)) {}
     CachedEntry& operator=(CachedEntry&& other) noexcept {
       if (this != &other) {
         compressed_data = std::move(other.compressed_data);
@@ -288,6 +315,7 @@ class SimilarityCache {
         query_cost_ms = other.query_cost_ms;
         created_at = other.created_at;
         invalidated.store(other.invalidated.load());
+        referenced_item_ids = std::move(other.referenced_item_ids);
       }
       return *this;
     }
@@ -304,6 +332,12 @@ class SimilarityCache {
   std::atomic<double> min_query_cost_ms_;
   std::atomic<int> ttl_seconds_{0};  ///< TTL in seconds (0 = no expiration)
   std::atomic<bool> enabled_{true};  ///< Cache enabled flag
+
+  /// Reverse index: item_id -> set of CacheKeys containing that item in results
+  std::unordered_map<std::string, std::unordered_set<CacheKey>> item_to_cache_keys_;
+
+  /// Maximum item IDs tracked per cache entry for reverse index
+  static constexpr size_t kMaxTrackedItemsPerEntry = 50;
 
   // Memory tracking
   size_t total_memory_bytes_ = 0;

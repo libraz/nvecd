@@ -36,7 +36,7 @@ constexpr uint32_t kDefaultTopK = 100;
 constexpr uint32_t kMaxTopK = 1000;
 constexpr double kFusionAlpha = 0.6;
 constexpr double kFusionBeta = 0.4;
-constexpr uint32_t kSampleSize = 0;
+constexpr uint32_t kSampleSize = 10000;  ///< Default sample size for approximate search (0 = exact)
 
 // Snapshot defaults
 constexpr int kSnapshotIntervalSec = 0;  // 0 = disabled

@@ -77,108 +77,88 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
     return utils::MakeUnexpected(validated_top_k.error());
   }
 
-  // Fast path: use compact contiguous storage for better cache locality
-  if (vector_store_->IsCompactValid() && use_prenorm_ && vector_store_->GetVectorCount() > 0) {
-    auto snap = vector_store_->GetCompactSnapshot();
-    if (snap.count == 0 || snap.matrix == nullptr) {
-      return std::vector<SimilarityResult>{};
+  auto snap = vector_store_->GetCompactSnapshot();
+  if (snap.count == 0 || snap.matrix == nullptr) {
+    // Empty store: check if the query ID exists (it won't in an empty store)
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kVectorNotFound, "Query vector not found: " + item_id));
+  }
+
+  auto query_it = snap.id_to_idx->find(item_id);
+  if (query_it == snap.id_to_idx->end()) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kVectorNotFound, "Query vector not found: " + item_id));
+  }
+  size_t query_idx = query_it->second;
+  const float* query_ptr = snap.matrix + query_idx * snap.dim;
+  float query_norm = snap.norms[query_idx];
+
+  // For non-cosine metrics, build query vector once
+  std::vector<float> query_vec_data;
+  if (!use_prenorm_) {
+    query_vec_data.assign(query_ptr, query_ptr + snap.dim);
+  }
+
+  // Bounded min-heap: track top-k (score, index) pairs without string allocation
+  int k = validated_top_k.value();
+  using ScoreIdx = std::pair<float, size_t>;
+  auto cmp = [](const ScoreIdx& a, const ScoreIdx& b) { return a.first > b.first; };
+  std::priority_queue<ScoreIdx, std::vector<ScoreIdx>, decltype(cmp)> min_heap(cmp);
+
+  // Lambda to push a candidate into the min-heap
+  auto push_candidate = [&](size_t idx) {
+    if (idx == query_idx) {
+      return;
     }
-
-    auto query_it = snap.id_to_idx->find(item_id);
-    if (query_it == snap.id_to_idx->end()) {
-      return utils::MakeUnexpected(
-          utils::MakeError(utils::ErrorCode::kVectorNotFound, "Query vector not found: " + item_id));
+    if (vector_store_->IsDeleted(idx)) {
+      return;
     }
-    size_t query_idx = query_it->second;
-    const float* query_ptr = snap.matrix + query_idx * snap.dim;
-    float query_norm = snap.norms[query_idx];
-
-    // Bounded min-heap: track top-k (score, index) pairs without string allocation
-    int k = validated_top_k.value();
-    using ScoreIdx = std::pair<float, size_t>;
-    auto cmp = [](const ScoreIdx& a, const ScoreIdx& b) { return a.first > b.first; };
-    std::priority_queue<ScoreIdx, std::vector<ScoreIdx>, decltype(cmp)> min_heap(cmp);
-
-    // Lambda to push a candidate into the min-heap
-    auto push_candidate = [&](size_t idx) {
-      if (idx == query_idx) {
-        return;
-      }
-      float score = vectors::CosineSimilarityPreNorm(query_ptr, snap.matrix + idx * snap.dim, snap.dim, query_norm,
-                                                     snap.norms[idx]);
-      if (static_cast<int>(min_heap.size()) < k) {
-        min_heap.push({score, idx});
-      } else if (score > min_heap.top().first) {
-        min_heap.pop();
-        min_heap.push({score, idx});
-      }
-    };
-
-    // Determine whether to sample; avoid allocating full index vector for full scan
-    bool use_sampling = config_.sample_size > 0 && snap.count > config_.sample_size * 2;
-    if (use_sampling) {
-      auto scan_indices = SampleIndices(snap.count, config_.sample_size);
-      for (size_t idx : scan_indices) {
-        push_candidate(idx);
-      }
+    float score;
+    if (use_prenorm_) {
+      score = vectors::CosineSimilarityPreNorm(query_ptr, snap.matrix + idx * snap.dim, snap.dim, query_norm,
+                                               snap.norms[idx]);
     } else {
-      // Full scan with prefetching to hide memory latency
-      constexpr size_t kPrefetchAhead = 4;
-      for (size_t idx = 0; idx < snap.count; ++idx) {
-        // Prefetch upcoming vector data into L1 cache
-        if (idx + kPrefetchAhead < snap.count) {
-          __builtin_prefetch(snap.matrix + (idx + kPrefetchAhead) * snap.dim, 0, 0);
-        }
-        push_candidate(idx);
-      }
+      const float* cand_ptr = snap.matrix + idx * snap.dim;
+      std::vector<float> cand_data(cand_ptr, cand_ptr + snap.dim);
+      score = distance_func_(query_vec_data, cand_data);
     }
-
-    // Convert heap to sorted results (only top-k strings allocated)
-    std::vector<SimilarityResult> results;
-    results.reserve(min_heap.size());
-    while (!min_heap.empty()) {
-      auto [s, i] = min_heap.top();
+    if (static_cast<int>(min_heap.size()) < k) {
+      min_heap.push({score, idx});
+    } else if (score > min_heap.top().first) {
       min_heap.pop();
-      results.emplace_back((*snap.idx_to_id)[i], s);
+      min_heap.push({score, idx});
     }
-    std::sort(results.begin(), results.end());  // SimilarityResult sorts by score desc
-    return results;
+  };
+
+  // Determine whether to sample; avoid allocating full index vector for full scan
+  bool use_sampling = config_.sample_size > 0 && snap.count > config_.sample_size * 2;
+  if (use_sampling) {
+    auto scan_indices = SampleIndices(snap.count, config_.sample_size);
+    for (size_t idx : scan_indices) {
+      push_candidate(idx);
+    }
+  } else {
+    // Full scan with prefetching to hide memory latency
+    constexpr size_t kPrefetchAhead = 4;
+    for (size_t idx = 0; idx < snap.count; ++idx) {
+      // Prefetch upcoming vector data into L1 cache
+      if (idx + kPrefetchAhead < snap.count) {
+        __builtin_prefetch(snap.matrix + (idx + kPrefetchAhead) * snap.dim, 0, 0);
+      }
+      push_candidate(idx);
+    }
   }
 
-  // Fallback: brute-force with hash map lookups (when compact is not valid)
-
-  // Get query vector
-  auto query_vec = vector_store_->GetVector(item_id);
-  if (!query_vec) {
-    auto error = utils::MakeError(utils::ErrorCode::kVectorNotFound, "Query vector not found: " + item_id);
-    return utils::MakeUnexpected(error);
-  }
-
-  // Get all vector IDs
-  auto all_ids = vector_store_->GetAllIds();
-
-  // Compute similarity scores for all vectors
+  // Convert heap to sorted results (only top-k strings allocated)
   std::vector<SimilarityResult> results;
-  results.reserve(all_ids.size());
-
-  for (const auto& candidate_id : all_ids) {
-    if (candidate_id == item_id) {
-      continue;  // Skip self
-    }
-
-    auto candidate_vec = vector_store_->GetVector(candidate_id);
-    if (!candidate_vec) {
-      continue;  // Skip if vector not found
-    }
-
-    // Compute similarity using configured distance function
-    float score = distance_func_(query_vec->data, candidate_vec->data);
-
-    results.emplace_back(candidate_id, score);
+  results.reserve(min_heap.size());
+  while (!min_heap.empty()) {
+    auto [s, i] = min_heap.top();
+    min_heap.pop();
+    results.emplace_back((*snap.idx_to_id)[i], s);
   }
-
-  // Sort by score descending and select top-k
-  return MergeAndSelectTopK(std::move(results), validated_top_k.value());
+  std::sort(results.begin(), results.end());  // SimilarityResult sorts by score desc
+  return results;
 }
 
 // ============================================================================
@@ -278,87 +258,70 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
     return utils::MakeUnexpected(error);
   }
 
-  // Fast path: use compact contiguous storage for better cache locality
-  if (vector_store_->IsCompactValid() && use_prenorm_) {
-    auto snap = vector_store_->GetCompactSnapshot();
-    if (snap.count == 0 || snap.matrix == nullptr) {
-      return std::vector<SimilarityResult>{};
+  auto snap = vector_store_->GetCompactSnapshot();
+  if (snap.count == 0 || snap.matrix == nullptr) {
+    return std::vector<SimilarityResult>{};
+  }
+
+  // Compute query norm using SIMD
+  float query_norm = vectors::simd::GetOptimalImpl().l2_norm(query_vector.data(), query_vector.size());
+
+  // Bounded min-heap: track top-k (score, index) pairs without string allocation
+  int k = validated_top_k.value();
+  using ScoreIdx = std::pair<float, size_t>;
+  auto cmp = [](const ScoreIdx& a, const ScoreIdx& b) { return a.first > b.first; };
+  std::priority_queue<ScoreIdx, std::vector<ScoreIdx>, decltype(cmp)> min_heap(cmp);
+
+  // Lambda to push a candidate into the min-heap
+  auto push_candidate = [&](size_t idx) {
+    if (vector_store_->IsDeleted(idx)) {
+      return;
     }
-
-    // Compute query norm using SIMD
-    float query_norm = vectors::simd::GetOptimalImpl().l2_norm(query_vector.data(), query_vector.size());
-
-    // Bounded min-heap: track top-k (score, index) pairs without string allocation
-    int k = validated_top_k.value();
-    using ScoreIdx = std::pair<float, size_t>;
-    auto cmp = [](const ScoreIdx& a, const ScoreIdx& b) { return a.first > b.first; };
-    std::priority_queue<ScoreIdx, std::vector<ScoreIdx>, decltype(cmp)> min_heap(cmp);
-
-    // Lambda to push a candidate into the min-heap
-    auto push_candidate = [&](size_t idx) {
-      float score = vectors::CosineSimilarityPreNorm(query_vector.data(), snap.matrix + idx * snap.dim, snap.dim,
-                                                     query_norm, snap.norms[idx]);
-      if (static_cast<int>(min_heap.size()) < k) {
-        min_heap.push({score, idx});
-      } else if (score > min_heap.top().first) {
-        min_heap.pop();
-        min_heap.push({score, idx});
-      }
-    };
-
-    // Determine whether to sample; avoid allocating full index vector for full scan
-    bool use_sampling = config_.sample_size > 0 && snap.count > config_.sample_size * 2;
-    if (use_sampling) {
-      auto scan_indices = SampleIndices(snap.count, config_.sample_size);
-      for (size_t idx : scan_indices) {
-        push_candidate(idx);
-      }
+    float score;
+    if (use_prenorm_) {
+      score = vectors::CosineSimilarityPreNorm(query_vector.data(), snap.matrix + idx * snap.dim, snap.dim,
+                                               query_norm, snap.norms[idx]);
     } else {
-      // Full scan with prefetching to hide memory latency
-      constexpr size_t kPrefetchAhead = 4;
-      for (size_t idx = 0; idx < snap.count; ++idx) {
-        if (idx + kPrefetchAhead < snap.count) {
-          __builtin_prefetch(snap.matrix + (idx + kPrefetchAhead) * snap.dim, 0, 0);
-        }
-        push_candidate(idx);
-      }
+      const float* cand_ptr = snap.matrix + idx * snap.dim;
+      std::vector<float> cand_data(cand_ptr, cand_ptr + snap.dim);
+      score = distance_func_(query_vector, cand_data);
     }
-
-    // Convert heap to sorted results (only top-k strings allocated)
-    std::vector<SimilarityResult> results;
-    results.reserve(min_heap.size());
-    while (!min_heap.empty()) {
-      auto [s, i] = min_heap.top();
+    if (static_cast<int>(min_heap.size()) < k) {
+      min_heap.push({score, idx});
+    } else if (score > min_heap.top().first) {
       min_heap.pop();
-      results.emplace_back((*snap.idx_to_id)[i], s);
+      min_heap.push({score, idx});
     }
-    std::sort(results.begin(), results.end());  // SimilarityResult sorts by score desc
-    return results;
+  };
+
+  // Determine whether to sample; avoid allocating full index vector for full scan
+  bool use_sampling = config_.sample_size > 0 && snap.count > config_.sample_size * 2;
+  if (use_sampling) {
+    auto scan_indices = SampleIndices(snap.count, config_.sample_size);
+    for (size_t idx : scan_indices) {
+      push_candidate(idx);
+    }
+  } else {
+    // Full scan with prefetching to hide memory latency
+    constexpr size_t kPrefetchAhead = 4;
+    for (size_t idx = 0; idx < snap.count; ++idx) {
+      if (idx + kPrefetchAhead < snap.count) {
+        __builtin_prefetch(snap.matrix + (idx + kPrefetchAhead) * snap.dim, 0, 0);
+      }
+      push_candidate(idx);
+    }
   }
 
-  // Fallback: brute-force with hash map lookups (when compact is not valid)
-
-  // Get all vector IDs
-  auto all_ids = vector_store_->GetAllIds();
-
-  // Compute similarity scores for all vectors
+  // Convert heap to sorted results (only top-k strings allocated)
   std::vector<SimilarityResult> results;
-  results.reserve(all_ids.size());
-
-  for (const auto& candidate_id : all_ids) {
-    auto candidate_vec = vector_store_->GetVector(candidate_id);
-    if (!candidate_vec) {
-      continue;  // Skip if vector not found
-    }
-
-    // Compute similarity using configured distance function
-    float score = distance_func_(query_vector, candidate_vec->data);
-
-    results.emplace_back(candidate_id, score);
+  results.reserve(min_heap.size());
+  while (!min_heap.empty()) {
+    auto [s, i] = min_heap.top();
+    min_heap.pop();
+    results.emplace_back((*snap.idx_to_id)[i], s);
   }
-
-  // Sort by score descending and select top-k
-  return MergeAndSelectTopK(std::move(results), validated_top_k.value());
+  std::sort(results.begin(), results.end());  // SimilarityResult sorts by score desc
+  return results;
 }
 
 // ============================================================================
@@ -412,8 +375,7 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
   std::vector<SimilarityResult> results;
   results.reserve(candidate_ids.size());
 
-  // Use compact path if available
-  if (vector_store_->IsCompactValid() && use_prenorm_ && vector_store_->GetVectorCount() > 0) {
+  if (vector_store_->GetVectorCount() > 0) {
     auto snap = vector_store_->GetCompactSnapshot();
     if (snap.count == 0 || snap.matrix == nullptr) {
       return std::vector<SimilarityResult>{};
@@ -428,6 +390,12 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
     const float* query_ptr = snap.matrix + query_idx * snap.dim;
     float query_norm = snap.norms[query_idx];
 
+    // For non-cosine metrics, build query vector once
+    std::vector<float> query_vec_data;
+    if (!use_prenorm_) {
+      query_vec_data.assign(query_ptr, query_ptr + snap.dim);
+    }
+
     for (const auto& cid : candidate_ids) {
       if (cid == item_id) {
         continue;
@@ -437,21 +405,18 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
         continue;  // candidate not in vector store
       }
       size_t cidx = cidx_it->second;
-      float score = vectors::CosineSimilarityPreNorm(query_ptr, snap.matrix + cidx * snap.dim, snap.dim, query_norm,
-                                                     snap.norms[cidx]);
-      results.emplace_back(cid, score);
-    }
-  } else {
-    // Fallback: use hash map
-    for (const auto& cid : candidate_ids) {
-      if (cid == item_id) {
+      if (vector_store_->IsDeleted(cidx)) {
         continue;
       }
-      auto cvec = vector_store_->GetVector(cid);
-      if (!cvec) {
-        continue;
+      float score;
+      if (use_prenorm_) {
+        score = vectors::CosineSimilarityPreNorm(query_ptr, snap.matrix + cidx * snap.dim, snap.dim, query_norm,
+                                                 snap.norms[cidx]);
+      } else {
+        const float* cand_ptr = snap.matrix + cidx * snap.dim;
+        std::vector<float> cand_data(cand_ptr, cand_ptr + snap.dim);
+        score = distance_func_(query_vec_data, cand_data);
       }
-      float score = distance_func_(query_vec->data, cvec->data);
       results.emplace_back(cid, score);
     }
   }

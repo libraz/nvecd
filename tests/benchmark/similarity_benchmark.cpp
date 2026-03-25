@@ -7,7 +7,7 @@
  * --gtest_also_run_disabled_tests to execute.
  *
  * Measures:
- * 1. VectorStore::Compact() rebuild time
+ * 1. VectorStore::Defragment() rebuild time
  * 2. Brute-force scan with CosineSimilarityPreNorm
  * 3. MergeAndSelectTopK (partial_sort overhead)
  * 4. Reservoir sampling (SampleIndices overhead)
@@ -123,11 +123,11 @@ class SimilarityBenchmark : public ::testing::Test {
 };
 
 // ---------------------------------------------------------------------------
-// 1. Compact() time
+// 1. Defragment() time
 // ---------------------------------------------------------------------------
 
-TEST_F(SimilarityBenchmark, DISABLED_CompactTime) {
-  PrintHeader("VectorStore::Compact() rebuild time");
+TEST_F(SimilarityBenchmark, DISABLED_DefragmentTime) {
+  PrintHeader("VectorStore::Defragment() rebuild time");
 
   for (size_t si = 0; si < kNumScales; ++si) {
     size_t scale = kScales[si];
@@ -138,12 +138,17 @@ TEST_F(SimilarityBenchmark, DISABLED_CompactTime) {
     std::mt19937 rng(kSeed);
     PopulateStore(store, scale, kDim, rng);
 
+    // Delete ~25% of vectors to create tombstones, then defragment
+    for (size_t i = 0; i < scale / 4; ++i) {
+      store.DeleteVector("item_" + std::to_string(i * 4));
+    }
+
     std::vector<double> samples;
     samples.reserve(kIterations);
 
     for (int iter = 0; iter < kIterations; ++iter) {
       auto start = std::chrono::high_resolution_clock::now();
-      store.Compact();
+      store.Defragment();
       auto end = std::chrono::high_resolution_clock::now();
       double us = std::chrono::duration<double, std::micro>(end - start).count();
       samples.push_back(us);
@@ -170,7 +175,7 @@ TEST_F(SimilarityBenchmark, DISABLED_BruteForceScan) {
 
     std::mt19937 rng(kSeed);
     PopulateStore(store, scale, kDim, rng);
-    store.Compact();
+
 
     // Generate a query vector and pre-compute its norm.
     auto query = RandomVector(rng, kDim);
@@ -322,7 +327,7 @@ TEST_F(SimilarityBenchmark, DISABLED_SearchByIdVectors) {
 
     std::mt19937 rng(kSeed);
     PopulateStore(store, scale, kDim, rng);
-    store.Compact();
+
 
     config::EventsConfig ecfg;
     events::EventStore event_store(ecfg);
@@ -371,7 +376,7 @@ TEST_F(SimilarityBenchmark, DISABLED_SearchByVector) {
 
     std::mt19937 rng(kSeed);
     PopulateStore(store, scale, kDim, rng);
-    store.Compact();
+
 
     config::EventsConfig ecfg;
     events::EventStore event_store(ecfg);

@@ -196,10 +196,10 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleEvent(const 
     return utils::MakeUnexpected(result.error());
   }
 
-  // Invalidate cache on data mutation
+  // Selective cache invalidation for mutated item
   auto* cache_ptr = ctx_.cache.load(std::memory_order_acquire);
   if (cache_ptr != nullptr) {
-    cache_ptr->Clear();
+    cache_ptr->InvalidateByItemId(cmd.id);
   }
 
   return FormatOK("EVENT");
@@ -215,10 +215,10 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleVecset(const
     return utils::MakeUnexpected(result.error());
   }
 
-  // Invalidate cache on data mutation
+  // Selective cache invalidation for mutated item
   auto* cache_ptr = ctx_.cache.load(std::memory_order_acquire);
   if (cache_ptr != nullptr) {
-    cache_ptr->Clear();
+    cache_ptr->InvalidateByItemId(cmd.id);
   }
 
   return FormatOK("VECSET");
@@ -250,14 +250,6 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSim(const Co
     }
   }
 
-  // Auto-compact if needed
-  if (ctx_.vector_store != nullptr && !ctx_.vector_store->IsCompactValid()) {
-    auto compact_result = ctx_.vector_store->Compact();
-    if (!compact_result) {
-      spdlog::warn("Compact failed: {}", compact_result.error().message());
-    }
-  }
-
   auto start = std::chrono::steady_clock::now();
 
   // Select search method based on mode
@@ -279,6 +271,15 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSim(const Co
     auto elapsed = std::chrono::steady_clock::now() - start;
     double elapsed_ms = std::chrono::duration<double, std::milli>(elapsed).count();
     cache_ptr->Insert(cache_key, *result, elapsed_ms);
+
+    // Register result items for selective cache invalidation
+    std::vector<std::string> item_ids;
+    item_ids.reserve(result->size() + 1);
+    item_ids.push_back(cmd.id);  // Query ID itself
+    for (const auto& item : *result) {
+      item_ids.push_back(item.item_id);
+    }
+    cache_ptr->RegisterResultItems(cache_key, item_ids);
   }
 
   // Convert SimilarityResult to pair<string, float>
@@ -323,14 +324,6 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSimv(const C
     }
   }
 
-  // Auto-compact if needed
-  if (ctx_.vector_store != nullptr && !ctx_.vector_store->IsCompactValid()) {
-    auto compact_result = ctx_.vector_store->Compact();
-    if (!compact_result) {
-      spdlog::warn("Compact failed: {}", compact_result.error().message());
-    }
-  }
-
   auto start = std::chrono::steady_clock::now();
 
   auto result = ctx_.similarity_engine->SearchByVector(cmd.vector, cmd.top_k);
@@ -343,6 +336,14 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSimv(const C
     auto elapsed = std::chrono::steady_clock::now() - start;
     double elapsed_ms = std::chrono::duration<double, std::milli>(elapsed).count();
     cache_ptr->Insert(cache_key, *result, elapsed_ms);
+
+    // Register result items for selective cache invalidation
+    std::vector<std::string> item_ids;
+    item_ids.reserve(result->size());
+    for (const auto& item : *result) {
+      item_ids.push_back(item.item_id);
+    }
+    cache_ptr->RegisterResultItems(cache_key, item_ids);
   }
 
   // Convert SimilarityResult to pair<string, float>
@@ -397,17 +398,7 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleDumpSave(con
 }
 
 utils::Expected<std::string, utils::Error> RequestDispatcher::HandleDumpLoad(const Command& cmd) {
-  auto result = handlers::HandleDumpLoad(ctx_, cmd.path);
-
-  // Compact vector store after snapshot load for optimized search
-  if (result && ctx_.vector_store != nullptr) {
-    auto compact_result = ctx_.vector_store->Compact();
-    if (!compact_result) {
-      spdlog::warn("Compact failed: {}", compact_result.error().message());
-    }
-  }
-
-  return result;
+  return handlers::HandleDumpLoad(ctx_, cmd.path);
 }
 
 utils::Expected<std::string, utils::Error> RequestDispatcher::HandleDumpVerify(const Command& cmd) const {

@@ -85,7 +85,7 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86)|(X86)|(amd64)|(AMD64)")
 
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "arm|aarch64|ARM|ARM64")
   # ARM: NEON is baseline for AArch64, explicit flag for ARMv7
-  if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64")
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm64")
     message(STATUS "NEON SIMD enabled (AArch64 baseline)")
   else()
     # ARMv7: Explicitly enable NEON

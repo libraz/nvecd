@@ -239,6 +239,62 @@ bool SimilarityCache::Insert(const CacheKey& key, const std::vector<similarity::
   return true;
 }
 
+void SimilarityCache::RegisterResultItems(const CacheKey& key, const std::vector<std::string>& item_ids) {
+  std::unique_lock lock(mutex_);
+
+  auto it = cache_map_.find(key);
+  if (it == cache_map_.end()) {
+    return;  // Entry was evicted before registration
+  }
+
+  auto& entry = it->second.first;
+
+  // Limit tracked items to bound memory usage
+  size_t track_count = std::min(item_ids.size(), kMaxTrackedItemsPerEntry);
+  entry.referenced_item_ids.reserve(track_count);
+  for (size_t i = 0; i < track_count; ++i) {
+    entry.referenced_item_ids.push_back(item_ids[i]);
+    item_to_cache_keys_[item_ids[i]].insert(key);
+  }
+}
+
+size_t SimilarityCache::InvalidateByItemId(const std::string& item_id) {
+  std::unique_lock lock(mutex_);
+
+  auto rev_it = item_to_cache_keys_.find(item_id);
+  if (rev_it == item_to_cache_keys_.end()) {
+    return 0;
+  }
+
+  // Move keys to avoid iterator invalidation during erasure
+  auto keys_to_invalidate = std::move(rev_it->second);
+  item_to_cache_keys_.erase(rev_it);
+
+  size_t count = 0;
+  for (const auto& cache_key : keys_to_invalidate) {
+    // Clean up reverse index for OTHER item_ids referenced by this entry
+    auto entry_it = cache_map_.find(cache_key);
+    if (entry_it != cache_map_.end()) {
+      const auto& entry = entry_it->second.first;
+      for (const auto& ref_id : entry.referenced_item_ids) {
+        if (ref_id != item_id) {
+          auto other_rev_it = item_to_cache_keys_.find(ref_id);
+          if (other_rev_it != item_to_cache_keys_.end()) {
+            other_rev_it->second.erase(cache_key);
+            if (other_rev_it->second.empty()) {
+              item_to_cache_keys_.erase(other_rev_it);
+            }
+          }
+        }
+      }
+    }
+    EraseLocked(cache_key);
+    ++count;
+  }
+
+  return count;
+}
+
 bool SimilarityCache::MarkInvalidated(const CacheKey& key) {
   std::shared_lock lock(mutex_);
 
@@ -286,6 +342,7 @@ void SimilarityCache::Clear() {
 
   lru_list_.clear();
   cache_map_.clear();
+  item_to_cache_keys_.clear();
   total_memory_bytes_ = 0;
   stats_.current_entries = 0;
   stats_.current_memory_bytes = 0;
@@ -306,6 +363,17 @@ void SimilarityCache::ClearIf(std::function<bool(const CacheKey&)> predicate) {
   for (const auto& key : to_erase) {
     auto iter = cache_map_.find(key);
     if (iter != cache_map_.end()) {
+      // Clean up reverse index for erased entry
+      for (const auto& ref_id : iter->second.first.referenced_item_ids) {
+        auto rev_it = item_to_cache_keys_.find(ref_id);
+        if (rev_it != item_to_cache_keys_.end()) {
+          rev_it->second.erase(key);
+          if (rev_it->second.empty()) {
+            item_to_cache_keys_.erase(rev_it);
+          }
+        }
+      }
+
       // Calculate entry memory
       const size_t entry_memory =
           sizeof(CachedEntry) + iter->second.first.compressed_data.capacity() + sizeof(CacheKey);
@@ -339,6 +407,17 @@ size_t SimilarityCache::PurgeExpired() {
   for (auto it = cache_map_.begin(); it != cache_map_.end();) {
     auto age_seconds = std::chrono::duration_cast<std::chrono::seconds>(now - it->second.first.created_at).count();
     if (age_seconds >= ttl || it->second.first.invalidated.load()) {
+      // Clean up reverse index for purged entry
+      for (const auto& ref_id : it->second.first.referenced_item_ids) {
+        auto rev_it = item_to_cache_keys_.find(ref_id);
+        if (rev_it != item_to_cache_keys_.end()) {
+          rev_it->second.erase(it->first);
+          if (rev_it->second.empty()) {
+            item_to_cache_keys_.erase(rev_it);
+          }
+        }
+      }
+
       // Calculate entry memory before removal
       const size_t entry_memory = sizeof(CachedEntry) + it->second.first.compressed_data.capacity() + sizeof(CacheKey);
 
@@ -375,6 +454,17 @@ bool SimilarityCache::EvictForSpace(size_t required_bytes) {
       // Inconsistency - remove from LRU list
       lru_list_.pop_back();
       continue;
+    }
+
+    // Clean up reverse index for evicted entry
+    for (const auto& ref_id : iter->second.first.referenced_item_ids) {
+      auto rev_it = item_to_cache_keys_.find(ref_id);
+      if (rev_it != item_to_cache_keys_.end()) {
+        rev_it->second.erase(lru_key);
+        if (rev_it->second.empty()) {
+          item_to_cache_keys_.erase(rev_it);
+        }
+      }
     }
 
     // Calculate entry memory
