@@ -98,6 +98,7 @@ class SnapshotIntegrationTest : public ::testing::Test {
     config_.perf.max_connections = 10;
     config_.perf.thread_pool_size = 4;
     config_.snapshot.dir = test_dir_.string();
+    config_.snapshot.mode = "lock";  // Use synchronous mode for test determinism
 
     config_.events.ctx_buffer_size = 100;
     config_.events.decay_alpha = 0.95;
@@ -174,6 +175,25 @@ class SnapshotIntegrationTest : public ::testing::Test {
     EXPECT_TRUE(response.find("vector_count") != std::string::npos);
   }
 
+  /**
+   * @brief Wait for background fork snapshot to complete via DUMP STATUS polling
+   * @param client TCP client to use for polling
+   * @param timeout_ms Maximum wait time in milliseconds
+   * @return true if snapshot completed, false if timed out
+   */
+  bool WaitForSnapshotComplete(TcpClient& client, int timeout_ms = 5000) {
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (std::chrono::steady_clock::now() < deadline) {
+      std::string status = client.SendCommand("DUMP STATUS");
+      // "idle" or "completed" means snapshot is no longer in progress
+      if (status.find("idle") != std::string::npos || status.find("completed") != std::string::npos) {
+        return true;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    return false;
+  }
+
   fs::path test_dir_;
   config::Config config_;
   std::unique_ptr<NvecdServer> server_;
@@ -192,6 +212,7 @@ TEST_F(SnapshotIntegrationTest, BasicSaveLoadRoundTrip) {
   // Save snapshot
   std::string save_response = client.SendCommand("DUMP SAVE test_snapshot.dmp");
   EXPECT_TRUE(save_response.find("OK") == 0);
+  ASSERT_TRUE(WaitForSnapshotComplete(client)) << "Snapshot did not complete in time";
 
   // Close client connection before stopping server
   client.Close();
@@ -234,6 +255,8 @@ TEST_F(SnapshotIntegrationTest, SaveWithDefaultFilename) {
   EXPECT_TRUE(save_response.find("OK") == 0);
   EXPECT_TRUE(save_response.find("snapshot_") != std::string::npos);
 
+  ASSERT_TRUE(WaitForSnapshotComplete(client)) << "Snapshot did not complete in time";
+
   // Extract filename from response
   size_t start = save_response.find("snapshot_");
   ASSERT_NE(start, std::string::npos);
@@ -257,6 +280,7 @@ TEST_F(SnapshotIntegrationTest, VerifySnapshot) {
   // Save snapshot
   std::string save_response = client.SendCommand("DUMP SAVE test_verify.dmp");
   EXPECT_TRUE(save_response.find("OK") == 0);
+  ASSERT_TRUE(WaitForSnapshotComplete(client)) << "Snapshot did not complete in time";
 
   // Verify snapshot
   std::string verify_response = client.SendCommand("DUMP VERIFY test_verify.dmp");
@@ -275,6 +299,7 @@ TEST_F(SnapshotIntegrationTest, SnapshotInfo) {
   // Save snapshot
   std::string save_response = client.SendCommand("DUMP SAVE test_info.dmp");
   EXPECT_TRUE(save_response.find("OK") == 0);
+  ASSERT_TRUE(WaitForSnapshotComplete(client)) << "Snapshot did not complete in time";
 
   // Get snapshot info
   std::string info_response = client.SendCommand("DUMP INFO test_info.dmp");
@@ -376,7 +401,7 @@ TEST_F(SnapshotIntegrationTest, LargeSnapshot) {
     std::string ctx = "large_ctx_" + std::to_string(i);
     for (int j = 0; j < 10; ++j) {
       std::string vec_id = "large_vec_" + std::to_string(i * 10 + j);
-      std::string cmd = "EVENT " + ctx + " " + vec_id + " " + std::to_string(100 - j);
+      std::string cmd = "EVENT " + ctx + " ADD " + vec_id + " " + std::to_string(100 - j);
       client.SendCommand(cmd);
     }
   }
@@ -397,6 +422,7 @@ TEST_F(SnapshotIntegrationTest, LargeSnapshot) {
   auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
 
   EXPECT_TRUE(save_response.find("OK") == 0);
+  ASSERT_TRUE(WaitForSnapshotComplete(client)) << "Snapshot did not complete in time";
   std::cout << "Large snapshot save took " << duration.count() << "ms\n";
 
   // Verify file exists and has reasonable size

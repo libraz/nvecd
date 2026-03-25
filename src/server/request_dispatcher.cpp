@@ -201,6 +201,12 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleEvent(const 
     return utils::MakeUnexpected(result.error());
   }
 
+  // Update co-occurrence index from the full event list for this context
+  if (ctx_.co_index != nullptr) {
+    auto events = ctx_.event_store->GetEvents(cmd.ctx);
+    ctx_.co_index->UpdateFromEvents(cmd.ctx, events);
+  }
+
   // Selective cache invalidation for mutated item
   auto* cache_ptr = ctx_.cache.load(std::memory_order_acquire);
   if (cache_ptr != nullptr) {

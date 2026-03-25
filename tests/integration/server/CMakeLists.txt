@@ -106,6 +106,27 @@ gtest_discover_tests(cache_e2e_test
     LABELS integration
 )
 
+# Metrics Accuracy End-to-End Tests
+
+add_executable(metrics_e2e_test
+  metrics_e2e_test.cpp
+)
+
+target_link_libraries(metrics_e2e_test
+  nvecd_server
+  nvecd_storage
+  gtest_main
+)
+
+gtest_discover_tests(metrics_e2e_test
+  DISCOVERY_MODE POST_BUILD
+  DISCOVERY_TIMEOUT 30
+  PROPERTIES
+    RESOURCE_LOCK server_port
+    TIMEOUT 300
+    LABELS integration
+)
+
 # Edge Case End-to-End Tests
 
 add_executable(edge_case_e2e_test
@@ -124,5 +145,26 @@ gtest_discover_tests(edge_case_e2e_test
   PROPERTIES
     RESOURCE_LOCK server_port
     TIMEOUT 300
+    LABELS integration
+)
+
+# Adversarial End-to-End Tests
+
+add_executable(adversarial_e2e_test
+  adversarial_e2e_test.cpp
+)
+
+target_link_libraries(adversarial_e2e_test
+  nvecd_server
+  nvecd_storage
+  gtest_main
+)
+
+gtest_discover_tests(adversarial_e2e_test
+  DISCOVERY_MODE POST_BUILD
+  DISCOVERY_TIMEOUT 30
+  PROPERTIES
+    RESOURCE_LOCK server_port
+    TIMEOUT 120
     LABELS integration
 )
