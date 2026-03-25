@@ -35,27 +35,47 @@ namespace nvecd::vectors::simd {
  * @return Dot product sum
  */
 inline float DotProductNEON(const float* a, const float* b, size_t n) {
-  constexpr size_t kVecSize = 4;  // 128 bits / 32 bits per float
+  constexpr size_t kVecSize = 4;   // 128 bits / 32 bits per float
+  constexpr size_t kUnroll = 4;    // 4 accumulators to hide FMA latency
+  constexpr size_t kStride = kVecSize * kUnroll;  // 16 floats per iteration
 
-  float32x4_t sum_vec = vdupq_n_f32(0.0F);  // Initialize accumulator to zero
+  // 4 independent accumulators to exploit instruction-level parallelism
+  float32x4_t sum0 = vdupq_n_f32(0.0F);
+  float32x4_t sum1 = vdupq_n_f32(0.0F);
+  float32x4_t sum2 = vdupq_n_f32(0.0F);
+  float32x4_t sum3 = vdupq_n_f32(0.0F);
 
-  // Process 4 floats at a time
+  // Process 16 floats at a time (4 NEON registers x 4 floats)
   size_t vec_idx = 0;
-  for (; vec_idx + kVecSize <= n; vec_idx += kVecSize) {
-    float32x4_t a_vec =
-        vld1q_f32(a + vec_idx);  // Load 4 floats from a  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
-    float32x4_t b_vec =
-        vld1q_f32(b + vec_idx);  // Load 4 floats from b  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
-    sum_vec = vmlaq_f32(sum_vec, a_vec, b_vec);  // sum += a * b (fused)
+  for (; vec_idx + kStride <= n; vec_idx += kStride) {
+    // NOLINTBEGIN(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+    sum0 = vmlaq_f32(sum0, vld1q_f32(a + vec_idx),      vld1q_f32(b + vec_idx));
+    sum1 = vmlaq_f32(sum1, vld1q_f32(a + vec_idx + 4),  vld1q_f32(b + vec_idx + 4));
+    sum2 = vmlaq_f32(sum2, vld1q_f32(a + vec_idx + 8),  vld1q_f32(b + vec_idx + 8));
+    sum3 = vmlaq_f32(sum3, vld1q_f32(a + vec_idx + 12), vld1q_f32(b + vec_idx + 12));
+    // NOLINTEND(cppcoreguidelines-pro-bounds-pointer-arithmetic)
   }
 
-  // Horizontal sum of 4 lanes (AArch64 has reduction instruction)
+  // Process remaining 4-float blocks
+  for (; vec_idx + kVecSize <= n; vec_idx += kVecSize) {
+    float32x4_t a_vec =
+        vld1q_f32(a + vec_idx);  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+    float32x4_t b_vec =
+        vld1q_f32(b + vec_idx);  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+    sum0 = vmlaq_f32(sum0, a_vec, b_vec);
+  }
+
+  // Combine accumulators
+  sum0 = vaddq_f32(sum0, sum1);
+  sum2 = vaddq_f32(sum2, sum3);
+  sum0 = vaddq_f32(sum0, sum2);
+
+  // Horizontal sum of 4 lanes
 #if defined(__aarch64__)
-  float sum = vaddvq_f32(sum_vec);  // AArch64: Single instruction reduction
+  float sum = vaddvq_f32(sum0);
 #else
-  // ARMv7: Manual pairwise reduction
-  float32x2_t sum_lo = vget_low_f32(sum_vec);
-  float32x2_t sum_hi = vget_high_f32(sum_vec);
+  float32x2_t sum_lo = vget_low_f32(sum0);
+  float32x2_t sum_hi = vget_high_f32(sum0);
   float32x2_t sum_pair = vadd_f32(sum_lo, sum_hi);
   float sum = vget_lane_f32(sum_pair, 0) + vget_lane_f32(sum_pair, 1);
 #endif

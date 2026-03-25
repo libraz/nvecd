@@ -53,21 +53,36 @@ inline float HorizontalSumAVX2(__m256 v) {
  * @return Dot product sum
  */
 inline float DotProductAVX2(const float* a, const float* b, size_t n) {
-  constexpr size_t kVecSize = 8;  // 256 bits / 32 bits per float
+  constexpr size_t kVecSize = 8;   // 256 bits / 32 bits per float
+  constexpr size_t kUnroll = 4;    // 4 accumulators to hide FMA latency
+  constexpr size_t kStride = kVecSize * kUnroll;  // 32 floats per iteration
 
-  __m256 sum_vec = _mm256_setzero_ps();  // Initialize accumulator to zero
+  // 4 independent accumulators for instruction-level parallelism
+  __m256 sum0 = _mm256_setzero_ps();
+  __m256 sum1 = _mm256_setzero_ps();
+  __m256 sum2 = _mm256_setzero_ps();
+  __m256 sum3 = _mm256_setzero_ps();
 
-  // Process 8 floats at a time
+  // Process 32 floats at a time (4 AVX2 registers x 8 floats)
   size_t i = 0;
-  for (; i + kVecSize <= n; i += kVecSize) {
-    __m256 a_vec = _mm256_loadu_ps(a + i);  // Load 8 floats (unaligned)
-    __m256 b_vec = _mm256_loadu_ps(b + i);
-    __m256 prod = _mm256_mul_ps(a_vec, b_vec);  // Element-wise multiply
-    sum_vec = _mm256_add_ps(sum_vec, prod);     // Accumulate
+  for (; i + kStride <= n; i += kStride) {
+    sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(_mm256_loadu_ps(a + i),      _mm256_loadu_ps(b + i)));
+    sum1 = _mm256_add_ps(sum1, _mm256_mul_ps(_mm256_loadu_ps(a + i + 8),  _mm256_loadu_ps(b + i + 8)));
+    sum2 = _mm256_add_ps(sum2, _mm256_mul_ps(_mm256_loadu_ps(a + i + 16), _mm256_loadu_ps(b + i + 16)));
+    sum3 = _mm256_add_ps(sum3, _mm256_mul_ps(_mm256_loadu_ps(a + i + 24), _mm256_loadu_ps(b + i + 24)));
   }
 
-  // Horizontal sum of 8 lanes
-  float sum = HorizontalSumAVX2(sum_vec);
+  // Process remaining 8-float blocks
+  for (; i + kVecSize <= n; i += kVecSize) {
+    sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i)));
+  }
+
+  // Combine accumulators
+  sum0 = _mm256_add_ps(sum0, sum1);
+  sum2 = _mm256_add_ps(sum2, sum3);
+  sum0 = _mm256_add_ps(sum0, sum2);
+
+  float sum = HorizontalSumAVX2(sum0);
 
   // Handle remainder (scalar)
   for (; i < n; ++i) {
@@ -88,21 +103,35 @@ inline float DotProductAVX2(const float* a, const float* b, size_t n) {
  */
 inline float L2NormAVX2(const float* v, size_t n) {
   constexpr size_t kVecSize = 8;
+  constexpr size_t kStride = kVecSize * 4;
 
-  __m256 sum_vec = _mm256_setzero_ps();
+  __m256 sum0 = _mm256_setzero_ps();
+  __m256 sum1 = _mm256_setzero_ps();
+  __m256 sum2 = _mm256_setzero_ps();
+  __m256 sum3 = _mm256_setzero_ps();
 
-  // Process 8 floats at a time
   size_t i = 0;
-  for (; i + kVecSize <= n; i += kVecSize) {
-    __m256 v_vec = _mm256_loadu_ps(v + i);
-    __m256 sq = _mm256_mul_ps(v_vec, v_vec);  // v[i] * v[i]
-    sum_vec = _mm256_add_ps(sum_vec, sq);
+  for (; i + kStride <= n; i += kStride) {
+    __m256 v0 = _mm256_loadu_ps(v + i);
+    __m256 v1 = _mm256_loadu_ps(v + i + 8);
+    __m256 v2 = _mm256_loadu_ps(v + i + 16);
+    __m256 v3 = _mm256_loadu_ps(v + i + 24);
+    sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(v0, v0));
+    sum1 = _mm256_add_ps(sum1, _mm256_mul_ps(v1, v1));
+    sum2 = _mm256_add_ps(sum2, _mm256_mul_ps(v2, v2));
+    sum3 = _mm256_add_ps(sum3, _mm256_mul_ps(v3, v3));
   }
 
-  // Horizontal sum
-  float sum_sq = HorizontalSumAVX2(sum_vec);
+  for (; i + kVecSize <= n; i += kVecSize) {
+    __m256 v_vec = _mm256_loadu_ps(v + i);
+    sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(v_vec, v_vec));
+  }
 
-  // Remainder
+  sum0 = _mm256_add_ps(sum0, sum1);
+  sum2 = _mm256_add_ps(sum2, sum3);
+  sum0 = _mm256_add_ps(sum0, sum2);
+  float sum_sq = HorizontalSumAVX2(sum0);
+
   for (; i < n; ++i) {
     sum_sq += v[i] * v[i];
   }
@@ -122,23 +151,35 @@ inline float L2NormAVX2(const float* v, size_t n) {
  */
 inline float L2DistanceAVX2(const float* a, const float* b, size_t n) {
   constexpr size_t kVecSize = 8;
+  constexpr size_t kStride = kVecSize * 4;
 
-  __m256 sum_vec = _mm256_setzero_ps();
+  __m256 sum0 = _mm256_setzero_ps();
+  __m256 sum1 = _mm256_setzero_ps();
+  __m256 sum2 = _mm256_setzero_ps();
+  __m256 sum3 = _mm256_setzero_ps();
 
-  // Process 8 floats at a time
   size_t i = 0;
-  for (; i + kVecSize <= n; i += kVecSize) {
-    __m256 a_vec = _mm256_loadu_ps(a + i);
-    __m256 b_vec = _mm256_loadu_ps(b + i);
-    __m256 diff = _mm256_sub_ps(a_vec, b_vec);  // a[i] - b[i]
-    __m256 sq = _mm256_mul_ps(diff, diff);      // diff^2
-    sum_vec = _mm256_add_ps(sum_vec, sq);
+  for (; i + kStride <= n; i += kStride) {
+    __m256 d0 = _mm256_sub_ps(_mm256_loadu_ps(a + i),      _mm256_loadu_ps(b + i));
+    __m256 d1 = _mm256_sub_ps(_mm256_loadu_ps(a + i + 8),  _mm256_loadu_ps(b + i + 8));
+    __m256 d2 = _mm256_sub_ps(_mm256_loadu_ps(a + i + 16), _mm256_loadu_ps(b + i + 16));
+    __m256 d3 = _mm256_sub_ps(_mm256_loadu_ps(a + i + 24), _mm256_loadu_ps(b + i + 24));
+    sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(d0, d0));
+    sum1 = _mm256_add_ps(sum1, _mm256_mul_ps(d1, d1));
+    sum2 = _mm256_add_ps(sum2, _mm256_mul_ps(d2, d2));
+    sum3 = _mm256_add_ps(sum3, _mm256_mul_ps(d3, d3));
   }
 
-  // Horizontal sum
-  float sum_sq = HorizontalSumAVX2(sum_vec);
+  for (; i + kVecSize <= n; i += kVecSize) {
+    __m256 diff = _mm256_sub_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i));
+    sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(diff, diff));
+  }
 
-  // Remainder
+  sum0 = _mm256_add_ps(sum0, sum1);
+  sum2 = _mm256_add_ps(sum2, sum3);
+  sum0 = _mm256_add_ps(sum0, sum2);
+  float sum_sq = HorizontalSumAVX2(sum0);
+
   for (; i < n; ++i) {
     float diff = a[i] - b[i];
     sum_sq += diff * diff;

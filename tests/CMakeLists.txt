@@ -315,3 +315,6 @@ gtest_discover_tests(connection_acceptor_unix_test
 
 # Integration tests
 add_subdirectory(integration)
+
+# Benchmark tests (DISABLED by default, run with --gtest_also_run_disabled_tests)
+add_subdirectory(benchmark)

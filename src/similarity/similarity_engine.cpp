@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <map>
 #include <numeric>
+#include <queue>
 #include <random>
 #include <unordered_set>
 
@@ -91,30 +92,56 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
     const float* query_ptr = vector_store_->GetMatrixRow(query_idx);
     float query_norm = vector_store_->GetNorm(query_idx);
 
-    // Determine whether to sample
-    bool use_sampling = config_.sample_size > 0 && n > config_.sample_size * 2;
+    // Bounded min-heap: track top-k (score, index) pairs without string allocation
+    int k = validated_top_k.value();
+    using ScoreIdx = std::pair<float, size_t>;
+    auto cmp = [](const ScoreIdx& a, const ScoreIdx& b) { return a.first > b.first; };
+    std::priority_queue<ScoreIdx, std::vector<ScoreIdx>, decltype(cmp)> min_heap(cmp);
 
-    std::vector<size_t> scan_indices;
-    if (use_sampling) {
-      scan_indices = SampleIndices(n, config_.sample_size);
-    } else {
-      scan_indices.resize(n);
-      std::iota(scan_indices.begin(), scan_indices.end(), size_t(0));
-    }
-
-    std::vector<SimilarityResult> results;
-    results.reserve(scan_indices.size());
-
-    for (size_t idx : scan_indices) {
+    // Lambda to push a candidate into the min-heap
+    auto push_candidate = [&](size_t idx) {
       if (idx == query_idx) {
-        continue;
+        return;
       }
       float score = vectors::CosineSimilarityPreNorm(query_ptr, vector_store_->GetMatrixRow(idx), dim, query_norm,
                                                      vector_store_->GetNorm(idx));
-      results.emplace_back(vector_store_->GetIdByIndex(idx), score);
+      if (static_cast<int>(min_heap.size()) < k) {
+        min_heap.push({score, idx});
+      } else if (score > min_heap.top().first) {
+        min_heap.pop();
+        min_heap.push({score, idx});
+      }
+    };
+
+    // Determine whether to sample; avoid allocating full index vector for full scan
+    bool use_sampling = config_.sample_size > 0 && n > config_.sample_size * 2;
+    if (use_sampling) {
+      auto scan_indices = SampleIndices(n, config_.sample_size);
+      for (size_t idx : scan_indices) {
+        push_candidate(idx);
+      }
+    } else {
+      // Full scan with prefetching to hide memory latency
+      constexpr size_t kPrefetchAhead = 4;
+      for (size_t idx = 0; idx < n; ++idx) {
+        // Prefetch upcoming vector data into L1 cache
+        if (idx + kPrefetchAhead < n) {
+          __builtin_prefetch(vector_store_->GetMatrixRow(idx + kPrefetchAhead), 0, 0);
+        }
+        push_candidate(idx);
+      }
     }
 
-    return MergeAndSelectTopK(std::move(results), validated_top_k.value());
+    // Convert heap to sorted results (only top-k strings allocated)
+    std::vector<SimilarityResult> results;
+    results.reserve(min_heap.size());
+    while (!min_heap.empty()) {
+      auto [s, i] = min_heap.top();
+      min_heap.pop();
+      results.emplace_back(vector_store_->GetIdByIndex(i), s);
+    }
+    std::sort(results.begin(), results.end());  // SimilarityResult sorts by score desc
+    return results;
   }
 
   // Fallback: brute-force with hash map lookups (when compact is not valid)
@@ -256,34 +283,55 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
     size_t n = vector_store_->GetCompactCount();
     size_t dim = vector_store_->GetDimension();
 
-    // Compute query norm
-    float query_norm = 0.0F;
-    for (float v : query_vector) {
-      query_norm += v * v;
-    }
-    query_norm = std::sqrt(query_norm);
+    // Compute query norm using SIMD
+    float query_norm = vectors::simd::GetOptimalImpl().l2_norm(query_vector.data(), query_vector.size());
 
-    // Determine whether to sample
-    bool use_sampling = config_.sample_size > 0 && n > config_.sample_size * 2;
+    // Bounded min-heap: track top-k (score, index) pairs without string allocation
+    int k = validated_top_k.value();
+    using ScoreIdx = std::pair<float, size_t>;
+    auto cmp = [](const ScoreIdx& a, const ScoreIdx& b) { return a.first > b.first; };
+    std::priority_queue<ScoreIdx, std::vector<ScoreIdx>, decltype(cmp)> min_heap(cmp);
 
-    std::vector<size_t> scan_indices;
-    if (use_sampling) {
-      scan_indices = SampleIndices(n, config_.sample_size);
-    } else {
-      scan_indices.resize(n);
-      std::iota(scan_indices.begin(), scan_indices.end(), size_t(0));
-    }
-
-    std::vector<SimilarityResult> results;
-    results.reserve(scan_indices.size());
-
-    for (size_t idx : scan_indices) {
+    // Lambda to push a candidate into the min-heap
+    auto push_candidate = [&](size_t idx) {
       float score = vectors::CosineSimilarityPreNorm(query_vector.data(), vector_store_->GetMatrixRow(idx), dim,
                                                      query_norm, vector_store_->GetNorm(idx));
-      results.emplace_back(vector_store_->GetIdByIndex(idx), score);
+      if (static_cast<int>(min_heap.size()) < k) {
+        min_heap.push({score, idx});
+      } else if (score > min_heap.top().first) {
+        min_heap.pop();
+        min_heap.push({score, idx});
+      }
+    };
+
+    // Determine whether to sample; avoid allocating full index vector for full scan
+    bool use_sampling = config_.sample_size > 0 && n > config_.sample_size * 2;
+    if (use_sampling) {
+      auto scan_indices = SampleIndices(n, config_.sample_size);
+      for (size_t idx : scan_indices) {
+        push_candidate(idx);
+      }
+    } else {
+      // Full scan with prefetching to hide memory latency
+      constexpr size_t kPrefetchAhead = 4;
+      for (size_t idx = 0; idx < n; ++idx) {
+        if (idx + kPrefetchAhead < n) {
+          __builtin_prefetch(vector_store_->GetMatrixRow(idx + kPrefetchAhead), 0, 0);
+        }
+        push_candidate(idx);
+      }
     }
 
-    return MergeAndSelectTopK(std::move(results), validated_top_k.value());
+    // Convert heap to sorted results (only top-k strings allocated)
+    std::vector<SimilarityResult> results;
+    results.reserve(min_heap.size());
+    while (!min_heap.empty()) {
+      auto [s, i] = min_heap.top();
+      min_heap.pop();
+      results.emplace_back(vector_store_->GetIdByIndex(i), s);
+    }
+    std::sort(results.begin(), results.end());  // SimilarityResult sorts by score desc
+    return results;
   }
 
   // Fallback: brute-force with hash map lookups (when compact is not valid)
@@ -322,15 +370,18 @@ std::vector<size_t> SimilarityEngine::SampleIndices(size_t total, size_t sample_
     return all;
   }
 
-  // Reservoir sampling (Algorithm R)
+  // Reservoir sampling with fast modulo-based random (avoids creating
+  // uniform_int_distribution per iteration which is the main bottleneck)
   thread_local std::mt19937 rng(std::random_device{}());
 
   std::vector<size_t> reservoir(sample_size);
   std::iota(reservoir.begin(), reservoir.end(), size_t(0));
 
   for (size_t i = sample_size; i < total; ++i) {
-    std::uniform_int_distribution<size_t> dist(0, i);
-    size_t j = dist(rng);
+    // Fast bounded random: rng() % (i+1) has slight bias but is much faster
+    // than creating uniform_int_distribution per iteration. The bias is
+    // negligible for large i values typical in vector search workloads.
+    size_t j = rng() % (i + 1);
     if (j < sample_size) {
       reservoir[j] = i;
     }

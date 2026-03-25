@@ -10,6 +10,7 @@
 #include "utils/error.h"
 #include "utils/structured_log.h"
 #include "vectors/distance.h"
+#include "vectors/distance_simd.h"
 
 namespace nvecd::vectors {
 
@@ -195,12 +196,8 @@ void VectorStore::Compact() {
   for (const auto& [id, vec] : vectors_) {
     std::copy(vec.data.begin(), vec.data.end(), matrix_.begin() + static_cast<ptrdiff_t>(idx * dim));
 
-    // Compute L2 norm inline to avoid dependency issues
-    float norm = 0.0F;
-    for (float v : vec.data) {
-      norm += v * v;
-    }
-    norms_[idx] = std::sqrt(norm);
+    // Compute L2 norm using SIMD-optimized implementation
+    norms_[idx] = simd::GetOptimalImpl().l2_norm(vec.data.data(), vec.data.size());
 
     id_to_idx_[id] = idx;
     idx_to_id_.push_back(id);
