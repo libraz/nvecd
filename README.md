@@ -111,6 +111,64 @@ At 1M vectors with default sampling: **~0.12ms** per query, **64K QPS** on 8 thr
 - **CLI Tool** - `nvecd-cli` with tab completion and interactive mode
 - **Client Library** - C++ and C client libraries for language bindings
 
+## What Makes Nvecd Different
+
+Most vector search engines treat behavioral signals and vector similarity as separate concerns, leaving the integration to the application layer. Nvecd uniquely combines them at the engine level:
+
+### Adaptive Fusion — Automatic Cold-Start Handling
+
+Static weight blending breaks down when item maturity varies. Nvecd automatically adjusts the balance between vector similarity and behavioral co-occurrence based on each item's data density:
+
+```bash
+# New item (few events) → vector similarity weighted more heavily
+nvecd-cli -p 11017 SIM new_product 10 using=fusion adaptive=on
+
+# Mature item (many events) → co-occurrence weighted more heavily
+nvecd-cli -p 11017 SIM popular_product 10 using=fusion adaptive=on
+```
+
+No hand-tuning required. Configurable via `similarity.adaptive_min_alpha`, `adaptive_max_alpha`, and `adaptive_maturity_threshold`.
+
+### Temporal Co-occurrence — Trend-Aware Scoring
+
+Standard co-occurrence counts treat all events equally regardless of recency. Nvecd applies time-decay so recent interactions naturally outweigh older ones:
+
+```yaml
+# config.yaml
+events:
+  temporal_cooccurrence: true
+  temporal_half_life_sec: 86400  # 1 day — score halves per day of age
+```
+
+Trending items rise automatically; stale associations fade without manual intervention.
+
+### Negative Signals — Preference-Aware Filtering
+
+Co-occurrence alone cannot distinguish "viewed together and chose both" from "viewed together but rejected one." Nvecd's negative signal support suppresses items that users explicitly dismissed:
+
+```bash
+# User viewed item_a and item_b, then removed item_a
+nvecd-cli -p 11017 EVENT user1 DEL item_a
+# Future SIM queries for item_b will down-rank item_a
+```
+
+Configurable via `events.negative_signals` and `events.negative_weight`.
+
+### Feature Matrix — Similar Projects
+
+| | Nvecd | Qdrant | Milvus | Faiss |
+|--|--|--|--|--|
+| Vector search | Yes | Yes | Yes | Yes |
+| Behavioral co-occurrence | Engine-level | App-level | App-level | No |
+| Adaptive fusion | Built-in | No | No | No |
+| Temporal co-occurrence | Built-in | No | No | No |
+| Negative signal suppression | Built-in | No | No | No |
+| Cold-start handling | Automatic | Manual | Manual | N/A |
+| Distributed search | No | Yes | Yes | No |
+| Managed cloud service | No | Yes | Yes | No |
+| ANN indexing (HNSW, IVF, PQ) | IVF only | Yes | Yes | Yes |
+| Metadata filtering | No | Yes | Yes | No |
+
 ## Architecture
 
 ```mermaid

@@ -111,6 +111,64 @@ make test
 - **CLI ツール** - タブ補完とインタラクティブモードを備えた `nvecd-cli`
 - **クライアントライブラリ** - 言語バインディング用のC++/Cクライアントライブラリ
 
+## Nvecd の差別化ポイント
+
+多くのベクトル検索エンジンは行動シグナルとベクトル類似度を別のシステムとして扱い、統合はアプリケーション層に委ねています。Nvecd はこれらをエンジンレベルで統合します。
+
+### 適応型フュージョン — コールドスタート問題の自動解決
+
+静的な重み配分はアイテムの成熟度が異なる場合に破綻します。Nvecd はアイテムごとのデータ密度に基づいて、ベクトル類似度と行動共起のバランスを自動調整します。
+
+```bash
+# 新規アイテム（イベント少）→ ベクトル類似度を重視
+nvecd-cli -p 11017 SIM new_product 10 using=fusion adaptive=on
+
+# 成熟アイテム（イベント多）→ 共起スコアを重視
+nvecd-cli -p 11017 SIM popular_product 10 using=fusion adaptive=on
+```
+
+手動チューニング不要。`similarity.adaptive_min_alpha`、`adaptive_max_alpha`、`adaptive_maturity_threshold` で設定可能。
+
+### テンポラル共起 — トレンド追従型スコアリング
+
+標準的な共起カウントは全イベントを同等に扱いますが、Nvecd は時間減衰を適用し、最近のインタラクションが自然に古いものを上回ります。
+
+```yaml
+# config.yaml
+events:
+  temporal_cooccurrence: true
+  temporal_half_life_sec: 86400  # 1日 — スコアは1日ごとに半減
+```
+
+トレンドアイテムは自動的に浮上し、古い関連は手動介入なしにフェードします。
+
+### ネガティブシグナル — 選好を反映したフィルタリング
+
+共起だけでは「一緒に閲覧して両方購入した」と「一緒に閲覧したが片方を拒否した」を区別できません。Nvecd のネガティブシグナルは、ユーザーが明示的に除外したアイテムを抑制します。
+
+```bash
+# ユーザーが item_a と item_b を閲覧後、item_a を除外
+nvecd-cli -p 11017 EVENT user1 DEL item_a
+# 以降の SIM クエリで item_b の結果から item_a がダウンランクされる
+```
+
+`events.negative_signals` と `events.negative_weight` で設定可能。
+
+### 機能比較 — 類似プロジェクト
+
+| | Nvecd | Qdrant | Milvus | Faiss |
+|--|--|--|--|--|
+| ベクトル検索 | Yes | Yes | Yes | Yes |
+| 行動共起 | エンジンレベル | アプリ層 | アプリ層 | No |
+| 適応型フュージョン | 組み込み | No | No | No |
+| テンポラル共起 | 組み込み | No | No | No |
+| ネガティブシグナル | 組み込み | No | No | No |
+| コールドスタート対応 | 自動 | 手動 | 手動 | N/A |
+| 分散検索 | No | Yes | Yes | No |
+| マネージドクラウド | No | Yes | Yes | No |
+| ANNインデックス (HNSW, IVF, PQ) | IVFのみ | Yes | Yes | Yes |
+| メタデータフィルタリング | No | Yes | Yes | No |
+
 ## Nvecd が適しているケース
 
 **適している:**
