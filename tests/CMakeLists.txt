@@ -256,6 +256,24 @@ target_link_libraries(state_cache_test
 )
 gtest_discover_tests(state_cache_test)
 
+add_executable(co_occurrence_temporal_test
+  events/co_occurrence_temporal_test.cpp
+)
+target_link_libraries(co_occurrence_temporal_test
+  nvecd_events
+  gtest_main
+)
+gtest_discover_tests(co_occurrence_temporal_test)
+
+add_executable(co_occurrence_negative_test
+  events/co_occurrence_negative_test.cpp
+)
+target_link_libraries(co_occurrence_negative_test
+  nvecd_events
+  gtest_main
+)
+gtest_discover_tests(co_occurrence_negative_test)
+
 # Vectors tests
 add_executable(vector_store_test
   vectors/vector_store_test.cpp
@@ -311,6 +329,15 @@ target_link_libraries(similarity_engine_test
   gtest_main
 )
 gtest_discover_tests(similarity_engine_test)
+
+add_executable(adaptive_fusion_test
+  similarity/adaptive_fusion_test.cpp
+)
+target_link_libraries(adaptive_fusion_test
+  nvecd_similarity
+  gtest_main
+)
+gtest_discover_tests(adaptive_fusion_test)
 
 # Cache tests
 add_executable(result_compressor_test

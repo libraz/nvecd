@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
@@ -72,6 +73,44 @@ class CoOccurrenceIndex {
    * @param events Events from a single context
    */
   void UpdateFromEvents(const std::string& ctx, const std::vector<Event>& events);
+
+  /**
+   * @brief Update co-occurrence with temporal decay
+   * @param ctx Context identifier
+   * @param events Events from context
+   * @param temporal_enabled Enable temporal weighting
+   * @param half_life_sec Half-life in seconds for decay
+   */
+  void UpdateFromEvents(const std::string& ctx, const std::vector<Event>& events,
+                        bool temporal_enabled, double half_life_sec);
+
+  /**
+   * @brief Update co-occurrence under existing write lock
+   * @note Caller must hold write lock via AcquireWriteLock()
+   */
+  void UpdateFromEventsLocked(const std::string& ctx, const std::vector<Event>& events,
+                              bool temporal_enabled, double half_life_sec);
+
+  /**
+   * @brief Apply negative signal for a removed item under existing write lock
+   * @note Caller must hold write lock via AcquireWriteLock()
+   */
+  void ApplyNegativeSignalLocked(const std::string& removed_id,
+                                 const std::vector<Event>& context_events,
+                                 double negative_weight);
+
+  /**
+   * @brief Get the number of co-occurring neighbors for an item
+   * @param item_id Item ID
+   * @return Number of neighbors (0 if item not found)
+   */
+  size_t GetNeighborCount(const std::string& item_id) const;
+
+  /**
+   * @brief Get the generation counter (incremented on every write)
+   * @return Current generation value
+   */
+  uint64_t GetGeneration() const { return generation_.load(std::memory_order_acquire); }
 
   /**
    * @brief Get similar items based on co-occurrence scores
@@ -163,6 +202,11 @@ class CoOccurrenceIndex {
   // Stored as symmetric matrix (both id1->id2 and id2->id1)
   mutable std::shared_mutex mutex_;
   std::unordered_map<std::string, std::unordered_map<std::string, float>> co_scores_;
+  std::atomic<uint64_t> generation_{0};  ///< Generation counter for cache invalidation
+
+  /// @brief Internal implementation of UpdateFromEvents (no locking)
+  void UpdateFromEventsInternal(const std::string& ctx, const std::vector<Event>& events,
+                                bool temporal_enabled, double half_life_sec);
 };
 
 }  // namespace nvecd::events

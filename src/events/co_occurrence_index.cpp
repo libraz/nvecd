@@ -11,31 +11,105 @@
 
 namespace nvecd::events {
 
-void CoOccurrenceIndex::UpdateFromEvents(const std::string& ctx [[maybe_unused]], const std::vector<Event>& events) {
+void CoOccurrenceIndex::UpdateFromEvents(const std::string& ctx, const std::vector<Event>& events) {
   if (events.empty()) {
     return;
   }
+  std::unique_lock lock(mutex_);
+  UpdateFromEventsInternal(ctx, events, false, 0.0);
+}
+
+void CoOccurrenceIndex::UpdateFromEvents(const std::string& ctx, const std::vector<Event>& events,
+                                          bool temporal_enabled, double half_life_sec) {
+  if (events.empty()) {
+    return;
+  }
+  std::unique_lock lock(mutex_);
+  UpdateFromEventsInternal(ctx, events, temporal_enabled, half_life_sec);
+}
+
+void CoOccurrenceIndex::UpdateFromEventsLocked(const std::string& ctx, const std::vector<Event>& events,
+                                                bool temporal_enabled, double half_life_sec) {
+  if (events.empty()) {
+    return;
+  }
+  // Caller holds the lock
+  UpdateFromEventsInternal(ctx, events, temporal_enabled, half_life_sec);
+}
+
+void CoOccurrenceIndex::UpdateFromEventsInternal(const std::string& ctx [[maybe_unused]],
+                                                  const std::vector<Event>& events,
+                                                  bool temporal_enabled, double half_life_sec) {
+  // Pre-compute per-event decay weights
+  std::vector<float> decay_weights;
+  if (temporal_enabled && half_life_sec > 0.0) {
+    uint64_t max_ts = 0;
+    for (const auto& e : events) {
+      if (e.timestamp > max_ts) {
+        max_ts = e.timestamp;
+      }
+    }
+
+    decay_weights.resize(events.size());
+    const double inv_half_life = 1.0 / half_life_sec;
+    constexpr float kMinDecay = 1e-6F;
+    for (size_t i = 0; i < events.size(); ++i) {
+      double age = static_cast<double>(max_ts - events[i].timestamp);
+      auto decay = static_cast<float>(std::exp2(-age * inv_half_life));
+      decay_weights[i] = std::max(decay, kMinDecay);
+    }
+  }
 
   // Compute pairwise co-occurrence scores
-  std::unique_lock lock(mutex_);
-
   for (size_t i = 0; i < events.size(); ++i) {
     for (size_t j = i + 1; j < events.size(); ++j) {
       const auto& event1 = events[i];
       const auto& event2 = events[j];
 
       if (event1.item_id == event2.item_id) {
-        continue;  // Skip self-pairs
+        continue;
       }
 
-      // Calculate co-occurrence score: score1 * score2
       auto score = static_cast<float>(event1.score * event2.score);
 
-      // Store symmetric scores (both directions)
+      // Apply temporal decay if enabled
+      if (!decay_weights.empty()) {
+        score *= decay_weights[i] * decay_weights[j];
+      }
+
       co_scores_[event1.item_id][event2.item_id] += score;
       co_scores_[event2.item_id][event1.item_id] += score;
     }
   }
+
+  generation_.fetch_add(1, std::memory_order_release);
+}
+
+void CoOccurrenceIndex::ApplyNegativeSignalLocked(const std::string& removed_id,
+                                                   const std::vector<Event>& context_events,
+                                                   double negative_weight) {
+  for (const auto& event : context_events) {
+    if (event.item_id == removed_id) {
+      continue;
+    }
+
+    auto reduction = static_cast<float>(event.score * negative_weight);
+
+    // Symmetric reduction (both directions)
+    co_scores_[removed_id][event.item_id] -= reduction;
+    co_scores_[event.item_id][removed_id] -= reduction;
+  }
+
+  generation_.fetch_add(1, std::memory_order_release);
+}
+
+size_t CoOccurrenceIndex::GetNeighborCount(const std::string& item_id) const {
+  std::shared_lock lock(mutex_);
+  auto it = co_scores_.find(item_id);
+  if (it == co_scores_.end()) {
+    return 0;
+  }
+  return it->second.size();
 }
 
 std::vector<std::pair<std::string, float>> CoOccurrenceIndex::GetSimilar(const std::string& item_id, int top_k) const {
@@ -100,7 +174,7 @@ void CoOccurrenceIndex::ApplyDecay(double alpha) {
     auto& scores_map = outer_it->second;
     for (auto inner_it = scores_map.begin(); inner_it != scores_map.end();) {
       inner_it->second *= static_cast<float>(alpha);
-      if (inner_it->second < kDecayThreshold) {
+      if (std::abs(inner_it->second) < kDecayThreshold) {
         inner_it = scores_map.erase(inner_it);
       } else {
         ++inner_it;
@@ -114,6 +188,8 @@ void CoOccurrenceIndex::ApplyDecay(double alpha) {
       ++outer_it;
     }
   }
+
+  generation_.fetch_add(1, std::memory_order_release);
 }
 
 size_t CoOccurrenceIndex::GetItemCount() const {
@@ -138,11 +214,13 @@ void CoOccurrenceIndex::SetScore(const std::string& item1, const std::string& it
   std::unique_lock lock(mutex_);
   co_scores_[item1][item2] = score;
   co_scores_[item2][item1] = score;
+  generation_.fetch_add(1, std::memory_order_release);
 }
 
 void CoOccurrenceIndex::Clear() {
   std::unique_lock lock(mutex_);
   co_scores_.clear();
+  generation_.fetch_add(1, std::memory_order_release);
 }
 
 CoOccurrenceIndexStatistics CoOccurrenceIndex::GetStatistics() const {

@@ -18,7 +18,9 @@ namespace nvecd::server {
 
 namespace {
 
-constexpr size_t kUsingPrefixLength = 6;  // Length of "using=" prefix
+constexpr size_t kUsingPrefixLength = 6;      // Length of "using=" prefix
+constexpr size_t kTimestampPrefixLength = 10;  // Length of "timestamp=" prefix
+constexpr size_t kAdaptivePrefixLength = 9;    // Length of "adaptive=" prefix
 
 /**
  * @brief Split string_view by delimiter, returning owned strings
@@ -99,6 +101,29 @@ utils::Expected<float, utils::Error> ParseFloat(const std::string& str) {
   }
 }
 
+/**
+ * @brief Parse timestamp from "timestamp=<value>" string
+ */
+utils::Expected<uint64_t, utils::Error> ParseTimestamp(const std::string& str) {
+  if (str.rfind("timestamp=", 0) != 0) {
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandInvalidArgument,
+                                                  "Invalid option: " + str + " (expected timestamp=<value>)"));
+  }
+  std::string value_str = str.substr(kTimestampPrefixLength);
+  try {
+    size_t pos = 0;
+    unsigned long long value = std::stoull(value_str, &pos);
+    if (pos != value_str.length()) {
+      return utils::MakeUnexpected(
+          utils::MakeError(utils::ErrorCode::kCommandInvalidArgument, "Invalid timestamp value: " + value_str));
+    }
+    return static_cast<uint64_t>(value);
+  } catch (const std::exception& e) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kCommandInvalidArgument, "Failed to parse timestamp: " + value_str));
+  }
+}
+
 }  // namespace
 
 utils::Expected<std::vector<float>, utils::Error> ParseVector(const std::string& vec_str, int expected_dim) {
@@ -161,9 +186,10 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request) 
     std::string type_str = ToUpper(tokens[2]);
     if (type_str == "ADD") {
       cmd.event_type = events::EventType::ADD;
-      if (tokens.size() != 5) {
-        return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandSyntaxError,
-                                                      "EVENT ADD requires 4 arguments: <ctx> ADD <id> <score>"));
+      if (tokens.size() < 5 || tokens.size() > 6) {
+        return utils::MakeUnexpected(utils::MakeError(
+            utils::ErrorCode::kCommandSyntaxError,
+            "EVENT ADD requires 4-5 arguments: <ctx> ADD <id> <score> [timestamp=<value>]"));
       }
       cmd.id = tokens[3];
       auto score_result = ParseInt(tokens[4]);
@@ -171,12 +197,20 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request) 
         return utils::MakeUnexpected(score_result.error());
       }
       cmd.score = *score_result;
+      if (tokens.size() == 6) {
+        auto ts_result = ParseTimestamp(tokens[5]);
+        if (!ts_result) {
+          return utils::MakeUnexpected(ts_result.error());
+        }
+        cmd.timestamp = *ts_result;
+      }
 
     } else if (type_str == "SET") {
       cmd.event_type = events::EventType::SET;
-      if (tokens.size() != 5) {
-        return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandSyntaxError,
-                                                      "EVENT SET requires 4 arguments: <ctx> SET <id> <score>"));
+      if (tokens.size() < 5 || tokens.size() > 6) {
+        return utils::MakeUnexpected(utils::MakeError(
+            utils::ErrorCode::kCommandSyntaxError,
+            "EVENT SET requires 4-5 arguments: <ctx> SET <id> <score> [timestamp=<value>]"));
       }
       cmd.id = tokens[3];
       auto score_result = ParseInt(tokens[4]);
@@ -184,15 +218,29 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request) 
         return utils::MakeUnexpected(score_result.error());
       }
       cmd.score = *score_result;
+      if (tokens.size() == 6) {
+        auto ts_result = ParseTimestamp(tokens[5]);
+        if (!ts_result) {
+          return utils::MakeUnexpected(ts_result.error());
+        }
+        cmd.timestamp = *ts_result;
+      }
 
     } else if (type_str == "DEL") {
       cmd.event_type = events::EventType::DEL;
-      if (tokens.size() != 4) {
-        return utils::MakeUnexpected(
-            utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "EVENT DEL requires 3 arguments: <ctx> DEL <id>"));
+      if (tokens.size() < 4 || tokens.size() > 5) {
+        return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandSyntaxError,
+                                                      "EVENT DEL requires 3-4 arguments: <ctx> DEL <id> [timestamp=<value>]"));
       }
       cmd.id = tokens[3];
       cmd.score = 0;  // DEL doesn't use score
+      if (tokens.size() == 5) {
+        auto ts_result = ParseTimestamp(tokens[4]);
+        if (!ts_result) {
+          return utils::MakeUnexpected(ts_result.error());
+        }
+        cmd.timestamp = *ts_result;
+      }
 
     } else {
       return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandSyntaxError,
@@ -237,14 +285,23 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request) 
     }
     cmd.top_k = *top_k_result;
 
-    // Parse optional using=mode
-    if (tokens.size() >= 4) {
-      std::string mode_arg = tokens[3];
-      if (mode_arg.rfind("using=", 0) == 0) {
-        cmd.mode = mode_arg.substr(kUsingPrefixLength);  // Skip "using=" prefix
+    // Parse optional options (using=mode, adaptive=on|off)
+    for (size_t i = 3; i < tokens.size(); ++i) {
+      if (tokens[i].rfind("using=", 0) == 0) {
+        cmd.mode = tokens[i].substr(kUsingPrefixLength);
+      } else if (tokens[i].rfind("adaptive=", 0) == 0) {
+        std::string val = tokens[i].substr(kAdaptivePrefixLength);
+        if (val == "on") {
+          cmd.adaptive = true;
+        } else if (val == "off") {
+          cmd.adaptive = false;
+        } else {
+          return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandSyntaxError,
+                                                        "Invalid adaptive value: " + val + " (must be on or off)"));
+        }
       } else {
         return utils::MakeUnexpected(
-            utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "Invalid SIM option: " + mode_arg));
+            utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "Invalid SIM option: " + tokens[i]));
       }
     }
 

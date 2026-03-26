@@ -14,6 +14,7 @@
 #include <atomic>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_set>
@@ -114,7 +115,8 @@ class SimilarityEngine {
    * @param top_k Maximum number of results
    * @return Expected<vector<SimilarityResult>, Error> Results or error
    */
-  utils::Expected<std::vector<SimilarityResult>, utils::Error> SearchByIdFusion(const std::string& item_id, int top_k);
+  utils::Expected<std::vector<SimilarityResult>, utils::Error> SearchByIdFusion(
+      const std::string& item_id, int top_k, std::optional<bool> adaptive = std::nullopt);
 
   /**
    * @brief Search similar items using vector query (SIMV)
@@ -203,6 +205,13 @@ class SimilarityEngine {
   /// @brief Search vectors only among candidate IDs (pre-filtered)
   utils::Expected<std::vector<SimilarityResult>, utils::Error> SearchByIdVectorsFiltered(
       const std::string& item_id, const std::unordered_set<std::string>& candidate_ids, int top_k);
+
+  /**
+   * @brief Compute adaptive fusion weights based on item maturity
+   * @param neighbor_count Number of co-occurrence neighbors
+   * @return Pair of (alpha, beta) weights
+   */
+  std::pair<float, float> ComputeAdaptiveWeights(size_t neighbor_count) const;
 
   [[maybe_unused]] events::EventStore* event_store_;  ///< Event store (not owned)
   events::CoOccurrenceIndex* co_index_;               ///< Co-occurrence index (not owned)

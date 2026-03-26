@@ -219,7 +219,7 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
 // ============================================================================
 
 utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::SearchByIdFusion(
-    const std::string& item_id, int top_k) {
+    const std::string& item_id, int top_k, std::optional<bool> adaptive) {
   auto validated_top_k = ValidateTopK(top_k);
   if (!validated_top_k) {
     return utils::MakeUnexpected(validated_top_k.error());
@@ -229,6 +229,18 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
   int fetch_k = std::min(validated_top_k.value() * 3, static_cast<int>(config_.max_top_k));
 
   auto event_results = SearchByIdEvents(item_id, fetch_k);
+
+  // Determine adaptive fusion weights
+  bool use_adaptive = adaptive.value_or(config_.adaptive_fusion);
+  float alpha;
+  float beta;
+  if (use_adaptive && event_results) {
+    // Use event_results size as neighbor count proxy (avoids extra lock)
+    std::tie(alpha, beta) = ComputeAdaptiveWeights(event_results->size());
+  } else {
+    alpha = static_cast<float>(config_.fusion_alpha);
+    beta = static_cast<float>(config_.fusion_beta);
+  }
 
   // Pre-filtering: use event results as candidate set for vector search
   utils::Expected<std::vector<SimilarityResult>, utils::Error> vector_results;
@@ -259,18 +271,18 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
     NormalizeScores(*vector_results);
   }
 
-  // Merge scores with weights
+  // Merge scores with computed weights
   std::map<std::string, float> fusion_scores;
 
   if (event_results) {
     for (const auto& result : *event_results) {
-      fusion_scores[result.item_id] += static_cast<float>(config_.fusion_beta * result.score);
+      fusion_scores[result.item_id] += beta * result.score;
     }
   }
 
   if (vector_results) {
     for (const auto& result : *vector_results) {
-      fusion_scores[result.item_id] += static_cast<float>(config_.fusion_alpha * result.score);
+      fusion_scores[result.item_id] += alpha * result.score;
     }
   }
 
@@ -278,12 +290,25 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
   std::vector<SimilarityResult> results;
   results.reserve(fusion_scores.size());
 
-  for (const auto& [item_id, score] : fusion_scores) {
-    results.emplace_back(item_id, score);
+  for (const auto& [fused_id, score] : fusion_scores) {
+    results.emplace_back(fused_id, score);
   }
 
   // Sort and select top-k
   return MergeAndSelectTopK(std::move(results), validated_top_k.value());
+}
+
+std::pair<float, float> SimilarityEngine::ComputeAdaptiveWeights(size_t neighbor_count) const {
+  auto threshold = static_cast<double>(config_.adaptive_maturity_threshold);
+  double ratio = std::min(1.0, static_cast<double>(neighbor_count) / threshold);
+
+  // New items (ratio near 0) -> alpha near max (vectors weighted more)
+  // Mature items (ratio near 1) -> alpha near min (events weighted more)
+  auto alpha = static_cast<float>(config_.adaptive_max_alpha -
+                                  ratio * (config_.adaptive_max_alpha - config_.adaptive_min_alpha));
+  float beta = 1.0F - alpha;
+
+  return {alpha, beta};
 }
 
 // ============================================================================

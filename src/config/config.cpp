@@ -127,6 +127,18 @@ EventsConfig ParseEventsConfig(const YAML::Node& node) {
   if (node["dedup_cache_size"]) {
     config.dedup_cache_size = node["dedup_cache_size"].as<uint32_t>();
   }
+  if (node["temporal_cooccurrence"]) {
+    config.temporal_cooccurrence = node["temporal_cooccurrence"].as<bool>();
+  }
+  if (node["temporal_half_life_sec"]) {
+    config.temporal_half_life_sec = node["temporal_half_life_sec"].as<double>();
+  }
+  if (node["negative_signals"]) {
+    config.negative_signals = node["negative_signals"].as<bool>();
+  }
+  if (node["negative_weight"]) {
+    config.negative_weight = node["negative_weight"].as<double>();
+  }
 
   return config;
 }
@@ -167,6 +179,18 @@ SimilarityConfig ParseSimilarityConfig(const YAML::Node& node) {
   }
   if (node["sample_size"]) {
     config.sample_size = node["sample_size"].as<uint32_t>();
+  }
+  if (node["adaptive_fusion"]) {
+    config.adaptive_fusion = node["adaptive_fusion"].as<bool>();
+  }
+  if (node["adaptive_min_alpha"]) {
+    config.adaptive_min_alpha = node["adaptive_min_alpha"].as<double>();
+  }
+  if (node["adaptive_max_alpha"]) {
+    config.adaptive_max_alpha = node["adaptive_max_alpha"].as<double>();
+  }
+  if (node["adaptive_maturity_threshold"]) {
+    config.adaptive_maturity_threshold = node["adaptive_maturity_threshold"].as<uint32_t>();
   }
   if (node["ivf_enabled"]) {
     config.ivf_enabled = node["ivf_enabled"].as<bool>();
@@ -505,6 +529,14 @@ utils::Expected<void, utils::Error> ValidateConfig(const Config& config) {
     return utils::MakeUnexpected(
         utils::MakeError(utils::ErrorCode::kConfigInvalidValue, "events.decay_alpha must be between 0.0 and 1.0"));
   }
+  if (config.events.temporal_half_life_sec <= 0.0) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kConfigInvalidValue, "events.temporal_half_life_sec must be greater than 0"));
+  }
+  if (config.events.negative_weight < 0.0 || config.events.negative_weight > 1.0) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kConfigInvalidValue, "events.negative_weight must be between 0.0 and 1.0"));
+  }
 
   // Validate vectors configuration
   if (config.vectors.default_dimension == 0) {
@@ -534,6 +566,26 @@ utils::Expected<void, utils::Error> ValidateConfig(const Config& config) {
   if (config.similarity.fusion_beta < 0.0 || config.similarity.fusion_beta > 1.0) {
     return utils::MakeUnexpected(
         utils::MakeError(utils::ErrorCode::kConfigInvalidValue, "similarity.fusion_beta must be between 0.0 and 1.0"));
+  }
+  if (config.similarity.adaptive_min_alpha < 0.0 || config.similarity.adaptive_min_alpha > 1.0) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
+                         "similarity.adaptive_min_alpha must be between 0.0 and 1.0"));
+  }
+  if (config.similarity.adaptive_max_alpha < 0.0 || config.similarity.adaptive_max_alpha > 1.0) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
+                         "similarity.adaptive_max_alpha must be between 0.0 and 1.0"));
+  }
+  if (config.similarity.adaptive_min_alpha > config.similarity.adaptive_max_alpha) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
+                         "similarity.adaptive_min_alpha must be <= adaptive_max_alpha"));
+  }
+  if (config.similarity.adaptive_maturity_threshold == 0) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
+                         "similarity.adaptive_maturity_threshold must be greater than 0"));
   }
 
   // Validate IVF configuration

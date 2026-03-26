@@ -69,6 +69,10 @@ struct EventsConfig {
   double decay_alpha = defaults::kDecayAlpha;                 ///< Decay factor (0.0-1.0)
   uint32_t dedup_window_sec = defaults::kDedupWindowSec;      ///< Deduplication time window in seconds
   uint32_t dedup_cache_size = defaults::kDedupCacheSize;      ///< Deduplication cache size (LRU)
+  bool temporal_cooccurrence = false;       ///< Enable time-decay for co-occurrence updates
+  double temporal_half_life_sec = 86400.0;  ///< Half-life in seconds for temporal decay (default: 1 day)
+  bool negative_signals = false;            ///< Enable negative signal on DEL events
+  double negative_weight = 0.5;             ///< Reduction weight for negative signals (0.0-1.0)
 };
 
 /**
@@ -88,6 +92,10 @@ struct SimilarityConfig {
   double fusion_alpha = defaults::kFusionAlpha;     ///< Weight for vector similarity in fusion mode
   double fusion_beta = defaults::kFusionBeta;       ///< Weight for co-occurrence in fusion mode
   uint32_t sample_size = defaults::kSampleSize;     ///< Random sampling size for approximate search (0 = exact)
+  bool adaptive_fusion = false;              ///< Enable adaptive weight computation based on item maturity
+  double adaptive_min_alpha = 0.2;           ///< Min vector weight (for mature items with many co-occurrences)
+  double adaptive_max_alpha = 0.9;           ///< Max vector weight (for new items with few co-occurrences)
+  uint32_t adaptive_maturity_threshold = 50; ///< Co-occurrence neighbor count considered "mature"
 
   // IVF (Inverted File) index settings
   bool ivf_enabled = false;               ///< Enable IVF approximate search

@@ -196,7 +196,8 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleEvent(const 
     return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kInternalError, "EventStore not initialized"));
   }
 
-  auto result = ctx_.event_store->AddEvent(cmd.ctx, cmd.id, cmd.score, cmd.event_type);
+  auto result = ctx_.event_store->AddEvent(cmd.ctx, cmd.id, cmd.score, cmd.event_type,
+                                            cmd.timestamp.value_or(0));
   if (!result) {
     return utils::MakeUnexpected(result.error());
   }
@@ -204,7 +205,19 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleEvent(const 
   // Update co-occurrence index from the full event list for this context
   if (ctx_.co_index != nullptr) {
     auto events = ctx_.event_store->GetEvents(cmd.ctx);
-    ctx_.co_index->UpdateFromEvents(cmd.ctx, events);
+    if (ctx_.config->events.negative_signals && cmd.event_type == events::EventType::DEL) {
+      // Single lock scope for both operations (avoids intermediate state exposure)
+      auto lock = ctx_.co_index->AcquireWriteLock();
+      ctx_.co_index->UpdateFromEventsLocked(cmd.ctx, events,
+          ctx_.config->events.temporal_cooccurrence,
+          ctx_.config->events.temporal_half_life_sec);
+      ctx_.co_index->ApplyNegativeSignalLocked(cmd.id, events,
+          ctx_.config->events.negative_weight);
+    } else {
+      ctx_.co_index->UpdateFromEvents(cmd.ctx, events,
+          ctx_.config->events.temporal_cooccurrence,
+          ctx_.config->events.temporal_half_life_sec);
+    }
   }
 
   // Selective cache invalidation for mutated item
@@ -265,7 +278,9 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSim(const Co
   cache::CacheKey cache_key;
   bool cache_enabled = (cache_ptr != nullptr && cache_ptr->IsEnabled());
   if (cache_enabled) {
-    std::string key_str = "SIM:" + cmd.id + ":" + std::to_string(cmd.top_k) + ":" + cmd.mode;
+    auto gen = ctx_.co_index != nullptr ? ctx_.co_index->GetGeneration() : 0;
+    std::string key_str = "SIM:" + cmd.id + ":" + std::to_string(cmd.top_k) + ":" + cmd.mode +
+                           ":g" + std::to_string(gen);
     cache_key = cache::CacheKeyGenerator::Generate(key_str);
     auto cached = cache_ptr->Lookup(cache_key);
     if (cached.has_value()) {
@@ -287,7 +302,7 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSim(const Co
   } else if (cmd.mode == "vectors") {
     result = ctx_.similarity_engine->SearchByIdVectors(cmd.id, cmd.top_k);
   } else {  // fusion (default)
-    result = ctx_.similarity_engine->SearchByIdFusion(cmd.id, cmd.top_k);
+    result = ctx_.similarity_engine->SearchByIdFusion(cmd.id, cmd.top_k, cmd.adaptive);
   }
 
   if (!result) {

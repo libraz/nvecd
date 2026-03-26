@@ -25,7 +25,7 @@ EventStore::EventStore(const config::EventsConfig& config) : config_(config) {
 }
 
 utils::Expected<void, utils::Error> EventStore::AddEvent(const std::string& ctx, const std::string& id, int score,
-                                                         EventType type) {
+                                                         EventType type, uint64_t timestamp) {
   // Validate inputs
   if (ctx.empty()) {
     auto error = utils::MakeError(utils::ErrorCode::kInvalidArgument, "Context cannot be empty");
@@ -39,10 +39,12 @@ utils::Expected<void, utils::Error> EventStore::AddEvent(const std::string& ctx,
     return utils::MakeUnexpected(error);
   }
 
-  // Get current timestamp
-  auto now = std::chrono::system_clock::now();
-  auto timestamp = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
-  uint64_t ts = static_cast<uint64_t>(timestamp);
+  // Use provided timestamp or current time
+  uint64_t ts = timestamp;
+  if (ts == 0) {
+    auto now = std::chrono::system_clock::now();
+    ts = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count());
+  }
 
   // Increment total event count (includes duplicates)
   total_events_.fetch_add(1, std::memory_order_relaxed);

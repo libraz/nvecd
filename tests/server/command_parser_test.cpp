@@ -224,6 +224,80 @@ TEST(CommandParserTest, ParseEmpty) {
   EXPECT_EQ(result.error().code(), ErrorCode::kCommandSyntaxError);
 }
 
+// ============================================================================
+// EVENT timestamp parameter tests
+// ============================================================================
+
+TEST(CommandParserTest, EventAddWithTimestamp) {
+  auto result = ParseCommand("EVENT ctx1 ADD item1 10 timestamp=1711411200");
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->type, CommandType::kEvent);
+  EXPECT_EQ(result->ctx, "ctx1");
+  EXPECT_EQ(result->id, "item1");
+  EXPECT_EQ(result->score, 10);
+  ASSERT_TRUE(result->timestamp.has_value());
+  EXPECT_EQ(*result->timestamp, 1711411200u);
+}
+
+TEST(CommandParserTest, EventSetWithTimestamp) {
+  auto result = ParseCommand("EVENT ctx1 SET item1 10 timestamp=1234567890");
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->type, CommandType::kEvent);
+  ASSERT_TRUE(result->timestamp.has_value());
+  EXPECT_EQ(*result->timestamp, 1234567890u);
+}
+
+TEST(CommandParserTest, EventDelWithTimestamp) {
+  auto result = ParseCommand("EVENT ctx1 DEL item1 timestamp=9999");
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->type, CommandType::kEvent);
+  ASSERT_TRUE(result->timestamp.has_value());
+  EXPECT_EQ(*result->timestamp, 9999u);
+}
+
+TEST(CommandParserTest, EventWithoutTimestamp) {
+  auto result = ParseCommand("EVENT ctx1 ADD item1 10");
+  ASSERT_TRUE(result.has_value());
+  EXPECT_FALSE(result->timestamp.has_value());
+}
+
+TEST(CommandParserTest, EventInvalidTimestamp) {
+  auto result = ParseCommand("EVENT ctx1 ADD item1 10 timestamp=abc");
+  EXPECT_FALSE(result.has_value());
+}
+
+// ============================================================================
+// SIM adaptive parameter tests
+// ============================================================================
+
+TEST(CommandParserTest, SimWithAdaptiveOn) {
+  auto result = ParseCommand("SIM item1 10 adaptive=on");
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->type, CommandType::kSim);
+  ASSERT_TRUE(result->adaptive.has_value());
+  EXPECT_TRUE(*result->adaptive);
+}
+
+TEST(CommandParserTest, SimWithAdaptiveOff) {
+  auto result = ParseCommand("SIM item1 10 adaptive=off");
+  ASSERT_TRUE(result.has_value());
+  ASSERT_TRUE(result->adaptive.has_value());
+  EXPECT_FALSE(*result->adaptive);
+}
+
+TEST(CommandParserTest, SimWithUsingAndAdaptive) {
+  auto result = ParseCommand("SIM item1 10 using=fusion adaptive=on");
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->mode, "fusion");
+  ASSERT_TRUE(result->adaptive.has_value());
+  EXPECT_TRUE(*result->adaptive);
+}
+
+TEST(CommandParserTest, SimWithAdaptiveInvalid) {
+  auto result = ParseCommand("SIM item1 10 adaptive=maybe");
+  EXPECT_FALSE(result.has_value());
+}
+
 // Case insensitivity tests
 TEST(CommandParserTest, ParseCaseInsensitive) {
   auto result = ParseCommand("info");

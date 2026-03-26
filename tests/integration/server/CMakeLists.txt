@@ -210,3 +210,24 @@ gtest_discover_tests(tiktok_1m_scale_test
     TIMEOUT 1800
     LABELS integration
 )
+
+# Differentiation Features End-to-End Tests
+
+add_executable(differentiation_e2e_test
+  differentiation_e2e_test.cpp
+)
+
+target_link_libraries(differentiation_e2e_test
+  nvecd_server
+  nvecd_storage
+  gtest_main
+)
+
+gtest_discover_tests(differentiation_e2e_test
+  DISCOVERY_MODE POST_BUILD
+  DISCOVERY_TIMEOUT 30
+  PROPERTIES
+    RESOURCE_LOCK server_port
+    TIMEOUT 300
+    LABELS integration
+)

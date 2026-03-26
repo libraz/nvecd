@@ -110,12 +110,13 @@ class EventStore {
    * @param item_id Event ID (e.g., item ID)
    * @param score Event score/weight
    * @param type Event type (ADD/SET/DEL)
+   * @param timestamp Unix timestamp in seconds (0 = use current time)
    * @return Expected<void, Error> Success or error
    *
    * @throws None
    */
   utils::Expected<void, utils::Error> AddEvent(const std::string& ctx, const std::string& item_id, int score,
-                                               EventType type = EventType::ADD);
+                                               EventType type = EventType::ADD, uint64_t timestamp = 0);
 
   /**
    * @brief Get all events for a context

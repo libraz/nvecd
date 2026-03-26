@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -40,7 +41,9 @@ struct Command {
 
   // SIM/SIMV fields
   int top_k = 100;  // NOLINT(cppcoreguidelines-avoid-magic-numbers,readability-magic-numbers) Number of results
-  std::string mode = "fusion";  // Similarity mode: events, vectors, fusion
+  std::string mode = "fusion";          // Similarity mode: events, vectors, fusion
+  std::optional<uint64_t> timestamp;     // Optional timestamp for EVENT (epoch seconds)
+  std::optional<bool> adaptive;          // Optional adaptive flag for SIM
 
   // VECSET/SIMV fields
   int dimension = 0;          // Vector dimension
@@ -59,11 +62,11 @@ struct Command {
  * @brief Parse a command from request string
  *
  * Parses text-based protocol commands:
- * - EVENT <ctx> ADD <id> <score>
- * - EVENT <ctx> SET <id> <score>
- * - EVENT <ctx> DEL <id>
+ * - EVENT <ctx> ADD <id> <score> [timestamp=<epoch_sec>]
+ * - EVENT <ctx> SET <id> <score> [timestamp=<epoch_sec>]
+ * - EVENT <ctx> DEL <id> [timestamp=<epoch_sec>]
  * - VECSET <id> <dim> text\n<floats>
- * - SIM <id> <top_k> [using=mode]
+ * - SIM <id> <top_k> [using=mode] [adaptive=on|off]
  * - SIMV <dim> <top_k>\n<floats>
  * - INFO
  * - CONFIG HELP|SHOW|VERIFY [path]
