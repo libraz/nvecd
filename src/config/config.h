@@ -88,6 +88,12 @@ struct SimilarityConfig {
   double fusion_alpha = defaults::kFusionAlpha;     ///< Weight for vector similarity in fusion mode
   double fusion_beta = defaults::kFusionBeta;       ///< Weight for co-occurrence in fusion mode
   uint32_t sample_size = defaults::kSampleSize;     ///< Random sampling size for approximate search (0 = exact)
+
+  // IVF (Inverted File) index settings
+  bool ivf_enabled = false;               ///< Enable IVF approximate search
+  uint32_t ivf_nlist = 256;               ///< Number of Voronoi cells/clusters
+  uint32_t ivf_nprobe = 8;               ///< Number of clusters to probe at query time
+  uint32_t ivf_train_threshold = 10000;   ///< Minimum vectors before auto-training IVF index
 };
 
 /**

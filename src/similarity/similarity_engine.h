@@ -11,8 +11,11 @@
 
 #pragma once
 
+#include <atomic>
 #include <functional>
+#include <memory>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -23,6 +26,7 @@
 #include "utils/error.h"
 #include "utils/expected.h"
 #include "vectors/distance.h"
+#include "vectors/ivf_index.h"
 #include "vectors/vector_store.h"
 
 namespace nvecd::similarity {
@@ -66,6 +70,15 @@ class SimilarityEngine {
   SimilarityEngine(events::EventStore* event_store, events::CoOccurrenceIndex* co_index,
                    vectors::VectorStore* vector_store, const config::SimilarityConfig& config,
                    const config::VectorsConfig& vectors_config = config::VectorsConfig{});
+
+  /// @brief Destructor joins background training thread if running
+  ~SimilarityEngine();
+
+  // Non-copyable, non-movable (owns a thread)
+  SimilarityEngine(const SimilarityEngine&) = delete;
+  SimilarityEngine& operator=(const SimilarityEngine&) = delete;
+  SimilarityEngine(SimilarityEngine&&) = delete;
+  SimilarityEngine& operator=(SimilarityEngine&&) = delete;
 
   /**
    * @brief Search similar items using events (co-occurrence)
@@ -116,6 +129,38 @@ class SimilarityEngine {
   utils::Expected<std::vector<SimilarityResult>, utils::Error> SearchByVector(const std::vector<float>& query_vector,
                                                                               int top_k);
 
+  /**
+   * @brief Notify the engine that a vector was added or updated
+   *
+   * If IVF is enabled and trained, adds the vector to the IVF index.
+   * If IVF is enabled but not yet trained, checks if the training
+   * threshold has been reached and triggers training if so.
+   *
+   * @param compact_index Index in compact storage
+   * @param vector Pointer to vector data
+   */
+  void NotifyVectorAdded(size_t compact_index, const float* vector);
+
+  /**
+   * @brief Notify the engine that a vector was removed
+   * @param compact_index Index that was removed
+   */
+  void NotifyVectorRemoved(size_t compact_index);
+
+  /**
+   * @brief Check if IVF index is trained
+   * @return True if IVF is enabled and trained
+   */
+  bool IsIvfTrained() const;
+
+  /**
+   * @brief Force IVF index training/retraining now
+   *
+   * Triggers asynchronous training using current vector data.
+   * Does nothing if IVF is disabled or training is already in progress.
+   */
+  void ForceIvfTrain();
+
  private:
   /**
    * @brief Validate top_k parameter
@@ -165,6 +210,29 @@ class SimilarityEngine {
   config::SimilarityConfig config_;                   ///< Configuration
   DistanceFunc distance_func_;                        ///< Distance function for similarity
   bool use_prenorm_ = false;                          ///< Whether to use pre-computed norm optimization (cosine only)
+
+  /// IVF index for approximate nearest neighbor search (null if disabled)
+  std::unique_ptr<vectors::IvfIndex> ivf_index_;
+
+  /// Background thread for asynchronous IVF training
+  std::unique_ptr<std::thread> ivf_train_thread_;
+
+  /// True while IVF training is in progress (search falls back to brute-force)
+  std::atomic<bool> ivf_training_{false};
+
+  /**
+   * @brief Attempt to train the IVF index if threshold is met
+   *
+   * Launches training asynchronously in a background thread.
+   * While training is in progress, search falls back to brute-force.
+   * Called internally after vector additions.
+   */
+  void MaybeTrainIvfIndex();
+
+  /**
+   * @brief Join the background training thread if it is joinable
+   */
+  void JoinTrainThread();
 };
 
 }  // namespace nvecd::similarity

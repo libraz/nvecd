@@ -64,6 +64,7 @@ target_link_libraries(nvecd_events PUBLIC
 # Vectors library with SIMD support
 add_library(nvecd_vectors STATIC
   vectors/vector_store.cpp
+  vectors/ivf_index.cpp
   vectors/cpu_features.cpp
 )
 target_link_libraries(nvecd_vectors PUBLIC

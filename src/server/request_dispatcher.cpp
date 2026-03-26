@@ -226,6 +226,23 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleVecset(const
     return utils::MakeUnexpected(result.error());
   }
 
+  // Notify IVF index of the new/updated vector.
+  // Copy the vector data under a brief read lock, then notify without holding any lock.
+  // This avoids recursive shared_mutex acquisition (undefined behavior in C++17).
+  if (ctx_.similarity_engine != nullptr) {
+    auto compact_idx = ctx_.vector_store->GetCompactIndex(cmd.id);
+    if (compact_idx.has_value()) {
+      std::vector<float> vec_copy;
+      {
+        auto lock = ctx_.vector_store->AcquireReadLock();
+        const float* vec_ptr = ctx_.vector_store->GetMatrixRow(compact_idx.value());
+        uint32_t dim = ctx_.vector_store->GetDimension();
+        vec_copy.assign(vec_ptr, vec_ptr + dim);
+      }
+      ctx_.similarity_engine->NotifyVectorAdded(compact_idx.value(), vec_copy.data());
+    }
+  }
+
   // Selective cache invalidation for mutated item
   auto* cache_ptr = ctx_.cache.load(std::memory_order_acquire);
   if (cache_ptr != nullptr) {

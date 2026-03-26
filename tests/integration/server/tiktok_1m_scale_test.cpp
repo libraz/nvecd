@@ -1153,5 +1153,319 @@ TEST_F(TikTok1MScaleTest, DISABLED_MemoryProfile10M) {
               << bytes_per_video << "\n";
   }
 
-  std::cout << "\n  Memory profile complete.\n";
+  std::cout << "\n  Memory profile complete (10M).\n";
+}
+
+// ============================================================================
+// IVF-enabled Fixture
+// ============================================================================
+
+/**
+ * @brief Fixture with IVF ANN index enabled for comparison benchmarks
+ */
+class TikTok1MScaleIvfTest : public NvecdTestFixture {
+ protected:
+  void SetUp() override { SetUpServer(kVectorDimension); }
+  void TearDown() override { TearDownServer(); }
+
+  void SetUpServer(int dimension) {
+    NvecdTestFixture::SetUpServer(dimension);
+    if (server_) {
+      server_->Stop();
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    config_.perf.max_connections = 600;
+    config_.perf.max_connections_per_ip = 0;
+    config_.perf.thread_pool_size = 16;
+    config_.events.ctx_buffer_size = 1000;
+
+    // Enable IVF — train after bulk load completes
+    config_.similarity.ivf_enabled = true;
+    config_.similarity.ivf_nlist = 0;      // Auto: sqrt(n), capped at 1024
+    config_.similarity.ivf_nprobe = 10;
+    config_.similarity.ivf_train_threshold = 9500000;  // Only train after ~10M loaded
+
+    server_ = std::make_unique<nvecd::server::NvecdServer>(config_);
+    ASSERT_TRUE(server_->Start().has_value());
+
+    port_ = server_->GetPort();
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+
+  void ParallelBulkLoadVideos(size_t count, size_t num_loaders = 16) {
+    size_t per_loader = count / num_loaders;
+    size_t remainder = count % num_loaders;
+
+    std::cout << "  Loading " << count << " videos (IVF enabled)...\n";
+
+    double load_ms = MeasureMs([&]() {
+      std::vector<std::thread> threads;
+      threads.reserve(num_loaders);
+
+      size_t offset = 0;
+      for (size_t loader = 0; loader < num_loaders; ++loader) {
+        size_t chunk = per_loader + (loader < remainder ? 1 : 0);
+        size_t start = offset;
+        offset += chunk;
+
+        threads.emplace_back([&, start, chunk]() {
+          try {
+            TcpClient client("127.0.0.1", port_);
+            for (size_t i = 0; i < chunk; ++i) {
+              size_t global_idx = start + i;
+              size_t cat = global_idx % kNumCategories;
+              size_t vid_idx = global_idx / kNumCategories;
+              std::string id = VideoId(cat, vid_idx);
+              std::string vec = BuildCategoryVector(cat, vid_idx);
+              client.SendCommand("VECSET " + id + " " + vec);
+            }
+          } catch (const std::exception&) {
+          }
+        });
+      }
+
+      for (auto& t : threads) {
+        t.join();
+      }
+    });
+
+    std::cout << "  Loaded " << count << " in " << std::fixed
+              << std::setprecision(1) << load_ms << " ms ("
+              << (load_ms > 0 ? static_cast<double>(count) / load_ms * 1000.0 : 0.0)
+              << " ops/sec)\n";
+  }
+};
+
+// ============================================================================
+// Test 7: IVF Scaling Profile — compare with brute-force
+// ============================================================================
+
+TEST_F(TikTok1MScaleIvfTest, DISABLED_IvfScalingProfile) {
+  PrintHeader("IVF Scaling Profile: 10K -> 10M");
+
+  const std::vector<size_t> kScalePoints = {10000, 50000, 100000, 500000,
+                                            1000000, 5000000, 10000000};
+  const size_t kQueryCount = 100;
+  size_t loaded_so_far = 0;
+
+  std::cout << "\n  " << std::left << std::setw(12) << "Scale"
+            << std::setw(14) << "SIM-vec(ms)" << std::setw(14) << "SIM-fus(ms)"
+            << std::setw(14) << "SIMV(ms)" << std::setw(14) << "p99-vec"
+            << std::setw(14) << "p99-fus" << "\n";
+  std::cout << "  " << std::string(82, '-') << "\n";
+
+  for (size_t scale : kScalePoints) {
+    size_t delta = scale - loaded_so_far;
+    if (delta > 0) {
+      const size_t kLoaders = 16;
+      size_t per_loader = delta / kLoaders;
+      size_t rem = delta % kLoaders;
+      std::vector<std::thread> threads;
+      threads.reserve(kLoaders);
+
+      size_t offset = loaded_so_far;
+      for (size_t loader = 0; loader < kLoaders; ++loader) {
+        size_t chunk = per_loader + (loader < rem ? 1 : 0);
+        size_t start = offset;
+        offset += chunk;
+
+        threads.emplace_back([&, start, chunk]() {
+          try {
+            TcpClient client("127.0.0.1", port_);
+            for (size_t i = 0; i < chunk; ++i) {
+              size_t global_idx = start + i;
+              size_t cat = global_idx % kNumCategories;
+              size_t vid_idx = global_idx / kNumCategories;
+              std::string id = VideoId(cat, vid_idx);
+              std::string vec = BuildCategoryVector(cat, vid_idx);
+              client.SendCommand("VECSET " + id + " " + vec);
+            }
+          } catch (const std::exception&) {
+          }
+        });
+      }
+      for (auto& t : threads) {
+        t.join();
+      }
+      loaded_so_far = scale;
+
+      // Wait for IVF training after threshold crossing
+      if (scale >= 5000) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      }
+    }
+
+    TcpClient query_client("127.0.0.1", port_);
+
+    auto measure_latency =
+        [&](const std::string& mode) -> std::vector<double> {
+      std::vector<double> latencies;
+      latencies.reserve(kQueryCount);
+      std::mt19937 rng(static_cast<unsigned>(scale + 42));
+      for (size_t q = 0; q < kQueryCount; ++q) {
+        size_t cat = rng() % kNumCategories;
+        size_t vid_idx = rng() % (scale / kNumCategories);
+        std::string probe = VideoId(cat, vid_idx);
+        double lat = MeasureMs([&]() {
+          query_client.SendCommand("SIM " + probe + " 10 using=" + mode);
+        });
+        latencies.push_back(lat);
+      }
+      std::sort(latencies.begin(), latencies.end());
+      return latencies;
+    };
+
+    auto vec_lat = measure_latency("vectors");
+    auto fus_lat = measure_latency("fusion");
+
+    // SIMV
+    std::vector<double> simv_lat;
+    simv_lat.reserve(kQueryCount);
+    {
+      std::mt19937 rng(static_cast<unsigned>(scale + 99));
+      for (size_t q = 0; q < kQueryCount; ++q) {
+        size_t cat = rng() % kNumCategories;
+        std::string vec = BuildCategoryVector(cat, rng() % 10000);
+        double lat = MeasureMs([&]() {
+          query_client.SendCommand("SIMV 10 " + vec);
+        });
+        simv_lat.push_back(lat);
+      }
+      std::sort(simv_lat.begin(), simv_lat.end());
+    }
+
+    double vec_avg = std::accumulate(vec_lat.begin(), vec_lat.end(), 0.0) /
+                     static_cast<double>(vec_lat.size());
+    double fus_avg = std::accumulate(fus_lat.begin(), fus_lat.end(), 0.0) /
+                     static_cast<double>(fus_lat.size());
+    double simv_avg = std::accumulate(simv_lat.begin(), simv_lat.end(), 0.0) /
+                      static_cast<double>(simv_lat.size());
+
+    std::cout << "  " << std::left << std::setw(12) << scale << std::fixed
+              << std::setprecision(2) << std::setw(14) << vec_avg
+              << std::setw(14) << fus_avg << std::setw(14) << simv_avg
+              << std::setw(14) << Percentile(vec_lat, 99) << std::setw(14)
+              << Percentile(fus_lat, 99) << "\n";
+  }
+}
+
+// ============================================================================
+// Test 8: IVF 10M + 500 Viewers
+// ============================================================================
+
+TEST_F(TikTok1MScaleIvfTest, DISABLED_IvfTikTokLive10MWith500Viewers) {
+  PrintHeader("IVF: 10M Videos + 500 Concurrent Viewers");
+
+  std::cout << "\n  Phase 1: Data loading (10M videos, IVF enabled)\n";
+  double load_ms = MeasureMs([&]() { ParallelBulkLoadVideos(10000000, 16); });
+
+  // Wait for IVF training (async, k-means on 50K sample + 10M AddVector)
+  std::cout << "  Waiting for IVF training to complete...\n";
+  for (int wait = 0; wait < 60; ++wait) {
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    TcpClient probe("127.0.0.1", port_);
+    auto info = probe.SendCommand("INFO");
+    // Check if training completed by querying a SIM — if IVF is trained, it will be fast
+    if (wait > 5) break;  // Give at least 5 seconds
+  }
+
+  {
+    TcpClient info_client("127.0.0.1", port_);
+    auto info = info_client.SendCommand("INFO");
+    std::string vecs = ParseResponseField(info, "vector_count");
+    std::string mem = ParseResponseField(info, "used_memory_bytes");
+    std::cout << "  Vectors: " << vecs << ", Memory: "
+              << (mem.empty() ? 0.0 : std::stod(mem) / 1024.0 / 1024.0)
+              << " MB\n";
+  }
+
+  std::vector<std::string> popular_videos;
+  for (size_t cat = 0; cat < kNumCategories; ++cat) {
+    for (size_t idx = 0; idx < 5; ++idx) {
+      popular_videos.push_back(VideoId(cat, idx));
+    }
+  }
+
+  const size_t kViewers = 500;
+  const size_t kIterationsPerViewer = 20;
+
+  std::atomic<int> total_events{0};
+  std::atomic<int> total_sim_success{0};
+  std::atomic<int> total_sim_attempts{0};
+  std::vector<double> all_latencies;
+  std::mutex latency_mu;
+
+  std::cout << "\n  Phase 2: " << kViewers << " viewers x "
+            << kIterationsPerViewer << " iterations\n";
+
+  double viewer_ms = MeasureMs([&]() {
+    std::vector<std::thread> threads;
+    threads.reserve(kViewers);
+
+    for (size_t v = 0; v < kViewers; ++v) {
+      threads.emplace_back([&, v]() {
+        std::mt19937 rng(static_cast<unsigned>(v * 42 + 7));
+        std::vector<double> local_latencies;
+        local_latencies.reserve(kIterationsPerViewer);
+
+        try {
+          TcpClient client("127.0.0.1", port_);
+          std::string ctx = "viewer_" + std::to_string(v);
+          std::string current = popular_videos[rng() % popular_videos.size()];
+
+          for (size_t iter = 0; iter < kIterationsPerViewer; ++iter) {
+            auto ev = client.SendCommand(
+                "EVENT " + ctx + " ADD " + current + " " +
+                std::to_string(100 - static_cast<int>(iter)));
+            if (ContainsOK(ev)) {
+              total_events.fetch_add(1, std::memory_order_relaxed);
+            }
+
+            total_sim_attempts.fetch_add(1, std::memory_order_relaxed);
+            std::string resp;
+            double lat = MeasureMs([&]() {
+              resp = client.SendCommand("SIM " + current + " 10 using=fusion");
+            });
+            local_latencies.push_back(lat);
+
+            if (ContainsOK(resp)) {
+              total_sim_success.fetch_add(1, std::memory_order_relaxed);
+              auto results = ParseSimResults(resp);
+              if (!results.empty()) {
+                current = results[rng() % results.size()].first;
+              }
+            }
+          }
+        } catch (const std::exception&) {
+        }
+
+        std::lock_guard<std::mutex> lock(latency_mu);
+        all_latencies.insert(all_latencies.end(), local_latencies.begin(),
+                             local_latencies.end());
+      });
+    }
+
+    for (auto& t : threads) {
+      t.join();
+    }
+  });
+
+  int sim_ok = total_sim_success.load();
+  int sim_total = total_sim_attempts.load();
+  double rate = (sim_total > 0)
+                    ? (static_cast<double>(sim_ok) /
+                       static_cast<double>(sim_total) * 100.0)
+                    : 0.0;
+
+  std::cout << "\n  --- IVF Results (10M) ---\n";
+  std::cout << "  Load time:        " << std::fixed << std::setprecision(1)
+            << load_ms / 1000.0 << " sec\n";
+  std::cout << "  Viewer wall time: " << viewer_ms << " ms\n";
+  std::cout << "  SIM success:      " << rate << "% (" << sim_ok << "/"
+            << sim_total << ")\n";
+  PrintThroughput("SIM queries", sim_total, viewer_ms);
+  PrintLatency("SIM fusion (IVF)", all_latencies);
+
+  EXPECT_GT(rate, 90.0);
 }

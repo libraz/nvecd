@@ -266,6 +266,18 @@ target_link_libraries(vector_store_test
 )
 gtest_discover_tests(vector_store_test)
 
+# IVF index tests
+add_executable(ivf_index_test
+  vectors/ivf_index_test.cpp
+)
+target_link_libraries(ivf_index_test
+  nvecd_vectors
+  nvecd_utils
+  gtest
+  gtest_main
+)
+gtest_discover_tests(ivf_index_test)
+
 # SIMD correctness tests
 add_executable(distance_simd_test
   vectors/distance_simd_test.cpp

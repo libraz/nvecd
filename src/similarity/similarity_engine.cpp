@@ -15,6 +15,7 @@
 #include "utils/error.h"
 #include "utils/structured_log.h"
 #include "vectors/distance.h"
+#include "vectors/ivf_index.h"
 
 namespace nvecd::similarity {
 
@@ -26,7 +27,31 @@ SimilarityEngine::SimilarityEngine(events::EventStore* event_store, events::CoOc
       vector_store_(vector_store),
       config_(config),
       distance_func_(SelectDistanceFunction(vectors_config.distance_metric)),
-      use_prenorm_(vectors_config.distance_metric.empty() || vectors_config.distance_metric == "cosine") {}
+      use_prenorm_(vectors_config.distance_metric.empty() || vectors_config.distance_metric == "cosine") {
+  if (config_.ivf_enabled) {
+    vectors::IvfIndex::Config ivf_config;
+    ivf_config.nlist = config_.ivf_nlist;
+    ivf_config.nprobe = config_.ivf_nprobe;
+    ivf_config.train_threshold = config_.ivf_train_threshold;
+    ivf_index_ = std::make_unique<vectors::IvfIndex>(
+        vectors_config.default_dimension, ivf_config);
+    utils::StructuredLog()
+        .Event("ivf_index_created")
+        .Field("nlist", static_cast<int64_t>(config_.ivf_nlist))
+        .Field("nprobe", static_cast<int64_t>(config_.ivf_nprobe))
+        .Field("train_threshold", static_cast<int64_t>(config_.ivf_train_threshold))
+        .Info();
+  }
+}
+
+SimilarityEngine::~SimilarityEngine() { JoinTrainThread(); }
+
+void SimilarityEngine::JoinTrainThread() {
+  if (ivf_train_thread_ && ivf_train_thread_->joinable()) {
+    ivf_train_thread_->join();
+  }
+  ivf_train_thread_.reset();
+}
 
 SimilarityEngine::DistanceFunc SimilarityEngine::SelectDistanceFunction(const std::string& metric) {
   if (metric == "dot") {
@@ -92,6 +117,31 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
   size_t query_idx = query_it->second;
   const float* query_ptr = snap.matrix + query_idx * snap.dim;
   float query_norm = snap.norms[query_idx];
+
+  // IVF accelerated path: use IVF index if enabled and trained
+  if (ivf_index_ && ivf_index_->IsTrained() && use_prenorm_) {
+    auto ivf_results = ivf_index_->Search(
+        query_ptr, query_norm, snap.matrix, snap.norms,
+        snap.count, static_cast<uint32_t>(snap.dim),
+        static_cast<size_t>(validated_top_k.value()) + 1);  // +1 to exclude self
+
+    std::vector<SimilarityResult> results;
+    results.reserve(ivf_results.size());
+    for (const auto& [score, idx] : ivf_results) {
+      if (idx == query_idx) {
+        continue;  // Exclude self
+      }
+      if (vector_store_->IsDeleted(idx)) {
+        continue;
+      }
+      results.emplace_back((*snap.idx_to_id)[idx], score);
+      if (static_cast<int>(results.size()) >= validated_top_k.value()) {
+        break;
+      }
+    }
+    std::sort(results.begin(), results.end());
+    return results;
+  }
 
   // For non-cosine metrics, build query vector once
   std::vector<float> query_vec_data;
@@ -265,6 +315,25 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
 
   // Compute query norm using SIMD
   float query_norm = vectors::simd::GetOptimalImpl().l2_norm(query_vector.data(), query_vector.size());
+
+  // IVF accelerated path: use IVF index if enabled and trained
+  if (ivf_index_ && ivf_index_->IsTrained() && use_prenorm_) {
+    auto ivf_results = ivf_index_->Search(
+        query_vector.data(), query_norm, snap.matrix, snap.norms,
+        snap.count, static_cast<uint32_t>(snap.dim),
+        static_cast<size_t>(validated_top_k.value()));
+
+    std::vector<SimilarityResult> results;
+    results.reserve(ivf_results.size());
+    for (const auto& [score, idx] : ivf_results) {
+      if (vector_store_->IsDeleted(idx)) {
+        continue;
+      }
+      results.emplace_back((*snap.idx_to_id)[idx], score);
+    }
+    std::sort(results.begin(), results.end());
+    return results;
+  }
 
   // Bounded min-heap: track top-k (score, index) pairs without string allocation
   int k = validated_top_k.value();
@@ -489,6 +558,168 @@ std::vector<SimilarityResult> SimilarityEngine::MergeAndSelectTopK(std::vector<S
   results.resize(static_cast<size_t>(top_k));
 
   return results;
+}
+
+// ============================================================================
+// IVF Index Integration
+// ============================================================================
+
+void SimilarityEngine::NotifyVectorAdded(size_t compact_index, const float* vector) {
+  if (!ivf_index_) {
+    return;
+  }
+
+  if (ivf_index_->IsTrained()) {
+    ivf_index_->AddVector(compact_index, vector);
+
+    // No automatic re-training during AddVector.
+    // Re-training would be triggered by explicit command or scheduled task.
+  } else {
+    MaybeTrainIvfIndex();
+  }
+}
+
+void SimilarityEngine::NotifyVectorRemoved(size_t compact_index) {
+  if (!ivf_index_ || !ivf_index_->IsTrained()) {
+    return;
+  }
+  ivf_index_->RemoveVector(compact_index);
+}
+
+bool SimilarityEngine::IsIvfTrained() const {
+  return ivf_index_ && ivf_index_->IsTrained();
+}
+
+void SimilarityEngine::ForceIvfTrain() {
+  if (!ivf_index_) {
+    return;
+  }
+  // Reset trained state to allow re-training with current data size
+  if (ivf_index_->IsTrained()) {
+    ivf_index_->ResetTrained();
+  }
+  MaybeTrainIvfIndex();
+}
+
+void SimilarityEngine::MaybeTrainIvfIndex() {
+  if (!ivf_index_ || ivf_index_->IsTrained()) {
+    return;
+  }
+
+  // Prevent concurrent training launches
+  bool expected = false;
+  if (!ivf_training_.compare_exchange_strong(expected, true)) {
+    return;  // Training already in progress
+  }
+
+  size_t vec_count = vector_store_->GetVectorCount();
+  if (vec_count < config_.ivf_train_threshold) {
+    ivf_training_.store(false);
+    return;
+  }
+
+  // Take a snapshot and copy only a sample of vectors for k-means training.
+  // After centroids are learned, all existing vectors are assigned via AddVector
+  // in a second pass (cheaper than copying the entire matrix).
+  auto snap = vector_store_->GetCompactSnapshot();
+  if (snap.count == 0 || snap.matrix == nullptr) {
+    ivf_training_.store(false);
+    return;
+  }
+
+  uint32_t dim = static_cast<uint32_t>(snap.dim);
+
+  // Build valid indices array (non-deleted entries)
+  std::vector<size_t> valid_indices;
+  valid_indices.reserve(snap.count);
+  for (size_t i = 0; i < snap.count; ++i) {
+    if (!vector_store_->IsDeleted(i)) {
+      valid_indices.push_back(i);
+    }
+  }
+
+  if (valid_indices.empty()) {
+    ivf_training_.store(false);
+    return;
+  }
+
+  // Copy only the vectors we need for training (sample up to 10K).
+  // IvfIndex::Train internally subsamples, but we copy the full set of
+  // valid vectors up to a cap to keep memory usage bounded.
+  constexpr size_t kMaxCopyForTrain = 50000;
+  std::vector<size_t> train_indices;
+  if (valid_indices.size() <= kMaxCopyForTrain) {
+    train_indices = valid_indices;
+  } else {
+    // Reservoir sample
+    train_indices.resize(kMaxCopyForTrain);
+    std::copy(valid_indices.begin(), valid_indices.begin() + kMaxCopyForTrain,
+              train_indices.begin());
+    std::mt19937 rng(42);
+    for (size_t i = kMaxCopyForTrain; i < valid_indices.size(); ++i) {
+      size_t j = rng() % (i + 1);
+      if (j < kMaxCopyForTrain) {
+        train_indices[j] = valid_indices[i];
+      }
+    }
+  }
+
+  // Copy sample vectors into a compact matrix (contiguous, re-indexed 0..N-1)
+  auto sample_matrix = std::make_shared<std::vector<float>>(train_indices.size() * dim);
+  std::vector<size_t> sample_indices(train_indices.size());
+  for (size_t i = 0; i < train_indices.size(); ++i) {
+    size_t src_idx = train_indices[i];
+    std::copy(snap.matrix + src_idx * dim,
+              snap.matrix + (src_idx + 1) * dim,
+              sample_matrix->data() + i * dim);
+    sample_indices[i] = i;  // Re-index to [0, N)
+  }
+
+  // Save valid_indices for post-training bulk assignment
+  auto all_valid = std::make_shared<std::vector<size_t>>(std::move(valid_indices));
+
+  utils::StructuredLog()
+      .Event("ivf_training_start_async")
+      .Field("vector_count", static_cast<int64_t>(all_valid->size()))
+      .Field("sample_size", static_cast<int64_t>(train_indices.size()))
+      .Info();
+
+  // Join any previous training thread before launching a new one
+  JoinTrainThread();
+
+  // Launch training in a background thread.
+  // Phase 2 reads VectorStore matrix directly under a brief read lock
+  // rather than copying the entire matrix (saves ~1.2GB at 10M scale).
+  auto* vs = vector_store_;
+  ivf_train_thread_ = std::make_unique<std::thread>(
+      [this, sample_matrix, sample_indices = std::move(sample_indices),
+       all_valid, dim, vs]() {
+        // Phase 1: Train centroids on the sample (no vector assignment)
+        ivf_index_->Train(sample_matrix->data(), sample_indices.data(),
+                          sample_indices.size(), dim, false);
+
+        // Phase 2: Bulk-assign all vectors using VectorStore matrix directly.
+        // Hold read lock for the duration to ensure matrix pointer validity.
+        {
+          auto lock = vs->AcquireReadLock();
+          auto snap2 = vs->GetCompactSnapshot();
+          if (snap2.matrix != nullptr && snap2.count > 0) {
+            for (size_t idx : *all_valid) {
+              if (idx < snap2.count) {
+                ivf_index_->AddVector(idx, snap2.matrix + idx * dim);
+              }
+            }
+          }
+        }
+
+        utils::StructuredLog()
+            .Event("ivf_training_complete_async")
+            .Field("trained", ivf_index_->IsTrained())
+            .Field("indexed_count", static_cast<int64_t>(ivf_index_->GetIndexedCount()))
+            .Info();
+
+        ivf_training_.store(false);
+      });
 }
 
 }  // namespace nvecd::similarity

@@ -168,6 +168,18 @@ SimilarityConfig ParseSimilarityConfig(const YAML::Node& node) {
   if (node["sample_size"]) {
     config.sample_size = node["sample_size"].as<uint32_t>();
   }
+  if (node["ivf_enabled"]) {
+    config.ivf_enabled = node["ivf_enabled"].as<bool>();
+  }
+  if (node["ivf_nlist"]) {
+    config.ivf_nlist = node["ivf_nlist"].as<uint32_t>();
+  }
+  if (node["ivf_nprobe"]) {
+    config.ivf_nprobe = node["ivf_nprobe"].as<uint32_t>();
+  }
+  if (node["ivf_train_threshold"]) {
+    config.ivf_train_threshold = node["ivf_train_threshold"].as<uint32_t>();
+  }
 
   return config;
 }
@@ -519,6 +531,24 @@ utils::Expected<void, utils::Error> ValidateConfig(const Config& config) {
   if (config.similarity.fusion_beta < 0.0 || config.similarity.fusion_beta > 1.0) {
     return utils::MakeUnexpected(
         utils::MakeError(utils::ErrorCode::kConfigInvalidValue, "similarity.fusion_beta must be between 0.0 and 1.0"));
+  }
+
+  // Validate IVF configuration
+  if (config.similarity.ivf_enabled) {
+    if (config.similarity.ivf_nprobe == 0) {
+      return utils::MakeUnexpected(
+          utils::MakeError(utils::ErrorCode::kConfigInvalidValue, "similarity.ivf_nprobe must be greater than 0"));
+    }
+    if (config.similarity.ivf_train_threshold == 0) {
+      return utils::MakeUnexpected(
+          utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
+                           "similarity.ivf_train_threshold must be greater than 0"));
+    }
+    if (config.similarity.ivf_nlist > 0 && config.similarity.ivf_nprobe > config.similarity.ivf_nlist) {
+      return utils::MakeUnexpected(
+          utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
+                           "similarity.ivf_nprobe must be <= similarity.ivf_nlist"));
+    }
   }
 
   // Validate snapshot configuration
