@@ -1184,7 +1184,7 @@ class TikTok1MScaleIvfTest : public NvecdTestFixture {
     config_.similarity.ivf_enabled = true;
     config_.similarity.ivf_nlist = 0;      // Auto: sqrt(n), capped at 1024
     config_.similarity.ivf_nprobe = 10;
-    config_.similarity.ivf_train_threshold = 950000;  // Train after ~1M loaded
+    config_.similarity.ivf_train_threshold = 9900000;  // Train after ~10M loaded
 
     server_ = std::make_unique<nvecd::server::NvecdServer>(config_);
     ASSERT_TRUE(server_->Start().has_value());
@@ -1360,14 +1360,15 @@ TEST_F(TikTok1MScaleIvfTest, DISABLED_IvfTikTokLive10MWith500Viewers) {
   std::cout << "\n  Phase 1: Data loading (10M videos, IVF enabled)\n";
   double load_ms = MeasureMs([&]() { ParallelBulkLoadVideos(10000000, 16); });
 
-  // Wait for IVF training (async, k-means on 50K sample + 10M AddVector)
+  // Wait for IVF training to complete (async).
+  // With threshold=9.9M, training starts during the last ~100K VECSETs.
+  // k-means on 50K sample + BulkAddVectors for 10M chunks takes ~30-60 sec.
   std::cout << "  Waiting for IVF training to complete...\n";
-  for (int wait = 0; wait < 60; ++wait) {
+  for (int wait = 0; wait < 120; ++wait) {
     std::this_thread::sleep_for(std::chrono::seconds(1));
-    TcpClient probe("127.0.0.1", port_);
-    auto info = probe.SendCommand("INFO");
-    // Check if training completed by querying a SIM — if IVF is trained, it will be fast
-    if (wait > 5) break;  // Give at least 5 seconds
+    if (wait % 10 == 0) {
+      std::cout << "    ... " << wait << "s\n" << std::flush;
+    }
   }
 
   {

@@ -6,6 +6,7 @@
 #pragma once
 
 #include <arpa/inet.h>
+#include <csignal>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -22,6 +23,9 @@
 class TcpClient {
  public:
   TcpClient(const std::string& host, uint16_t port) {
+    // Ignore SIGPIPE globally (safe for test processes)
+    signal(SIGPIPE, SIG_IGN);  // NOLINT(cert-err33-c)
+
     sock_ = socket(AF_INET, SOCK_STREAM, 0);
     if (sock_ < 0) {
       throw std::runtime_error("Failed to create socket");

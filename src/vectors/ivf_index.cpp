@@ -162,11 +162,11 @@ void IvfIndex::AddVector(size_t compact_index, const float* vector) {
   inverted_lists_[cluster].push_back(compact_index);
 }
 
-void IvfIndex::BulkAddVectors(const size_t* compact_indices, const float* matrix,
+void IvfIndex::BulkAddVectors(const size_t* compact_indices, const float* vectors,
                                size_t count, uint32_t dimension) {
   std::unique_lock lock(mutex_);
 
-  if (!trained_ || compact_indices == nullptr || matrix == nullptr || count == 0) {
+  if (!trained_ || compact_indices == nullptr || vectors == nullptr || count == 0) {
     return;
   }
 
@@ -175,7 +175,7 @@ void IvfIndex::BulkAddVectors(const size_t* compact_indices, const float* matrix
 
   for (size_t i = 0; i < count; ++i) {
     size_t idx = compact_indices[i];
-    const float* vec = matrix + idx * dimension;
+    const float* vec = vectors + i * dimension;  // Row i of the contiguous array
     float vec_norm = simd_impl.l2_norm(vec, dimension);
 
     size_t best = 0;

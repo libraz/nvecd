@@ -100,12 +100,12 @@ class IvfIndex {
 
   /**
    * @brief Bulk-add vectors to the index (single lock acquisition)
-   * @param compact_indices Array of compact indices
-   * @param matrix Pointer to contiguous matrix
+   * @param compact_indices Array of compact indices to register
+   * @param vectors Contiguous array of vectors: row i is the vector for compact_indices[i]
    * @param count Number of vectors to add
    * @param dimension Vector dimension
    */
-  void BulkAddVectors(const size_t* compact_indices, const float* matrix,
+  void BulkAddVectors(const size_t* compact_indices, const float* vectors,
                        size_t count, uint32_t dimension);
 
   /**

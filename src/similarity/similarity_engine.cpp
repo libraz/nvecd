@@ -698,16 +698,36 @@ void SimilarityEngine::MaybeTrainIvfIndex() {
         ivf_index_->Train(sample_matrix->data(), sample_indices.data(),
                           sample_indices.size(), dim, false);
 
-        // Phase 2: Bulk-assign all vectors (single lock acquisition).
-        // Hold VectorStore read lock to keep matrix pointer valid.
-        {
-          auto lock = vs->AcquireReadLock();
-          const float* mat = vs->GetMatrixData();
-          size_t mat_count = vs->GetMatrixCount();
-          if (mat != nullptr && mat_count > 0) {
-            ivf_index_->BulkAddVectors(all_valid->data(), mat,
-                                        all_valid->size(), dim);
+        // Phase 2: Bulk-assign all vectors in chunks.
+        // Copy each chunk under a brief VectorStore read lock, then
+        // assign to IVF without holding VectorStore's lock. This avoids
+        // blocking concurrent VECSET writes for the entire duration.
+        constexpr size_t kChunkSize = 100000;
+        for (size_t offset = 0; offset < all_valid->size(); offset += kChunkSize) {
+          size_t chunk_end = std::min(offset + kChunkSize, all_valid->size());
+          size_t chunk_len = chunk_end - offset;
+
+          // Copy chunk's vector data under brief read lock into a
+          // contiguous matrix where row i = vector for all_valid[offset+i]
+          std::vector<float> chunk_matrix(chunk_len * dim);
+          std::vector<size_t> chunk_compact_indices(chunk_len);
+          {
+            auto lock = vs->AcquireReadLock();
+            const float* mat = vs->GetMatrixData();
+            if (mat == nullptr) break;
+            for (size_t i = 0; i < chunk_len; ++i) {
+              size_t idx = (*all_valid)[offset + i];
+              chunk_compact_indices[i] = idx;
+              std::copy(mat + idx * dim, mat + (idx + 1) * dim,
+                        chunk_matrix.data() + i * dim);
+            }
           }
+          // VectorStore lock released here — VECSET can proceed
+
+          // Assign chunk to IVF (uses IvfIndex's own lock internally)
+          ivf_index_->BulkAddVectors(chunk_compact_indices.data(),
+                                      chunk_matrix.data(),
+                                      chunk_len, dim);
         }
 
         utils::StructuredLog()
