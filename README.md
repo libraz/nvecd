@@ -85,15 +85,15 @@ make test
 
 ## Performance
 
-100K vectors (dim=128, cosine, Apple M4 Max NEON):
+Measured on Apple M4 Max (NEON), dim=128, cosine, top_k=10:
 
-| Query | Latency | Throughput |
+| Vectors | SIM Latency | SIMV Latency |
 |---|---|---|
-| SIM (cold) | **1.12ms** | 900 QPS/thread |
-| SIMV (cold) | **0.98ms** | 1,000 QPS/thread |
-| Cache hit | **0.00025ms** | 4M ops/sec |
+| 1K | 0.012ms | 0.012ms |
+| 10K | 0.12ms | 0.12ms |
+| 100K | **1.03ms** | **1.05ms** |
 
-At 1M vectors with default sampling: **~0.12ms** per query, **64K QPS** on 8 threads. See [Benchmarks](docs/en/benchmarks.md) for details.
+Cache hit: **0.25us** (4M ops/sec). See [Benchmarks](docs/en/benchmarks.md) for methodology and detailed breakdown.
 
 ## Features
 

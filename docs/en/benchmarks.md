@@ -17,41 +17,31 @@ This document presents measured performance benchmarks for nvecd's similarity se
 
 ### End-to-End Query (SIM, dim=128, top_k=10, cosine)
 
-| Dataset Size | SearchByIdVectors | SearchByVector (SIMV) | Cache Hit |
+| Dataset Size | SearchByIdVectors (SIM) | SearchByVector (SIMV) | Cache Hit |
 |---|---|---|---|
-| 1K vectors | 0.015ms | 0.012ms | 0.00025ms |
-| 10K vectors | 0.13ms | 0.12ms | 0.00025ms |
-| 50K vectors | 0.64ms | 0.66ms | 0.00025ms |
-| 100K vectors | **1.12ms** | **0.98ms** | **0.00025ms** |
+| 1K vectors | 0.012ms | 0.012ms | 0.25us |
+| 10K vectors | 0.12ms | 0.12ms | 0.25us |
+| 50K vectors | 0.62ms | 0.64ms | 0.25us |
+| 100K vectors | **1.03ms** | **1.05ms** | **0.25us** |
 
 **Key findings:**
 
 - Sub-millisecond latency up to 50K vectors without sampling
-- 100K vectors: ~1ms per query (**900-1000 QPS per thread**)
+- 100K vectors: ~1ms per query (**~970 QPS per thread**)
 - Cache hit latency: 250 nanoseconds (**4 million ops/sec**)
 - Cache provides **4,000x** speedup over cold queries at 100K scale
-
-### Projected Latency at 1M Vectors
-
-| Mode | Latency | QPS (1 thread) | QPS (8 threads) |
-|---|---|---|---|
-| Full scan (sample_size=0) | ~11ms | ~90 | ~720 |
-| **Sampling (sample_size=10K)** | **~0.12ms** | **~8,000** | **~64,000** |
-| Cache hit | 0.00025ms | 4,000,000 | 32,000,000 |
-
-With default sampling (10K) enabled, 1M vectors achieves **sub-millisecond latency**.
 
 ## Pipeline Breakdown (100K vectors, dim=128)
 
 | Component | Time | % of E2E |
 |---|---|---|
-| NEON dot product scan (100K cosine) | 0.81ms | 73% |
-| Min-heap top-k selection | 0.06ms | 5% |
+| NEON cosine scan (brute-force) | 0.80ms | 78% |
+| Min-heap top-k selection | 0.05ms | 5% |
 | Lock acquisition + index lookup | 0.03ms | 3% |
 | Result string construction (k=10) | 0.02ms | 2% |
-| **Total (SearchByIdVectors)** | **1.12ms** | **100%** |
+| **Total (SearchByIdVectors)** | **1.03ms** | **100%** |
 
-The scan (SIMD dot product) dominates at 73%. The min-heap approach avoids allocating 100K result strings, reducing overhead from ~0.22ms (partial_sort) to ~0.06ms.
+The scan (SIMD dot product) dominates at 78%. The min-heap approach avoids allocating 100K result strings, reducing overhead from ~0.22ms (partial_sort) to ~0.05ms.
 
 ## SIMD Performance
 
@@ -85,9 +75,9 @@ The dot product loop uses 4 independent SIMD accumulators to hide FMA latency:
 | Compact contiguous storage | 2.83ms | 1.86x | 1.86x |
 | Min-heap top-k (no string alloc) | 1.66ms | 1.71x | 3.17x |
 | 4x SIMD multi-accumulator | 1.25ms | 1.33x | 4.22x |
-| Unified storage (no dual map) | **1.12ms** | 1.12x | **4.71x** |
+| Unified storage (no dual map) | **1.03ms** | 1.21x | **5.12x** |
 
-**Total: 4.71x faster** from baseline to current.
+**Total: 5.12x faster** from baseline to current.
 
 ## Compact Storage vs Dual Storage
 
@@ -150,9 +140,9 @@ After `DeleteVector()`, tombstoned slots accumulate. `Defragment()` runs automat
 | Dataset Size | Defragment Time (25% tombstones) |
 |---|---|
 | 1K vectors | 0.04ms |
-| 10K vectors | 0.34ms |
-| 50K vectors | 1.65ms |
-| 100K vectors | 3.45ms |
+| 10K vectors | 0.33ms |
+| 50K vectors | 1.69ms |
+| 100K vectors | 3.39ms |
 
 Defragment acquires an exclusive lock briefly for the pointer swap. The rebuild phase itself is fast due to contiguous memory access patterns.
 
