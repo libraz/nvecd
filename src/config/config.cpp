@@ -180,6 +180,9 @@ SimilarityConfig ParseSimilarityConfig(const YAML::Node& node) {
   if (node["ivf_train_threshold"]) {
     config.ivf_train_threshold = node["ivf_train_threshold"].as<uint32_t>();
   }
+  if (node["ivf_seal_threshold"]) {
+    config.ivf_seal_threshold = node["ivf_seal_threshold"].as<uint32_t>();
+  }
 
   return config;
 }

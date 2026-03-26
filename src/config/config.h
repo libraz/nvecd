@@ -94,6 +94,7 @@ struct SimilarityConfig {
   uint32_t ivf_nlist = 256;               ///< Number of Voronoi cells/clusters
   uint32_t ivf_nprobe = 8;               ///< Number of clusters to probe at query time
   uint32_t ivf_train_threshold = 10000;   ///< Minimum vectors before auto-training IVF index
+  uint32_t ivf_seal_threshold = 100000;   ///< Seal write buffer when it reaches this size
 };
 
 /**

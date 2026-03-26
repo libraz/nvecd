@@ -4,6 +4,7 @@
  *
  * K-means training uses Lloyd's algorithm with random initialization.
  * Search uses bounded min-heap for top-k selection.
+ * Two-tier architecture: write buffer (brute-force) + sealed IVF index.
  */
 
 #include "vectors/ivf_index.h"
@@ -13,6 +14,7 @@
 #include <numeric>
 #include <queue>
 #include <random>
+#include <unordered_set>
 
 #include "utils/structured_log.h"
 #include "vectors/distance.h"
@@ -201,6 +203,29 @@ void IvfIndex::BulkAddVectors(const size_t* compact_indices, const float* vector
 }
 
 void IvfIndex::RemoveVector(size_t compact_index) {
+  // First check the write buffer
+  {
+    std::unique_lock buf_lock(buffer_mutex_);
+    for (size_t i = 0; i < buffer_indices_.size(); ++i) {
+      if (buffer_indices_[i] == compact_index) {
+        // Swap with last and pop for O(1) removal
+        size_t last = buffer_indices_.size() - 1;
+        if (i != last) {
+          buffer_indices_[i] = buffer_indices_[last];
+          // Swap vector data
+          std::copy(
+              buffer_vectors_.data() + last * dimension_,
+              buffer_vectors_.data() + (last + 1) * dimension_,
+              buffer_vectors_.data() + i * dimension_);
+        }
+        buffer_indices_.pop_back();
+        buffer_vectors_.resize(buffer_indices_.size() * dimension_);
+        return;
+      }
+    }
+  }
+
+  // Then check IVF inverted lists
   std::unique_lock lock(mutex_);
 
   if (!trained_) {
@@ -224,68 +249,130 @@ std::vector<std::pair<float, size_t>> IvfIndex::Search(
     const float* matrix, const float* norms,
     size_t total_count, uint32_t dimension,
     size_t top_k) const {
-  std::shared_lock lock(mutex_);
+  // Search the write buffer first (independent lock)
+  auto buffer_results = SearchBuffer(query_vec, query_norm, dimension, top_k);
 
-  if (!trained_ || query_vec == nullptr || matrix == nullptr ||
-      norms == nullptr || total_count == 0) {
-    return {};
-  }
+  // Search the IVF inverted lists
+  std::vector<std::pair<float, size_t>> ivf_results;
+  {
+    std::shared_lock lock(mutex_);
 
-  // Find nprobe nearest centroids
-  uint32_t nprobe = std::min(config_.nprobe, config_.nlist);
-  auto probe_clusters = FindNearestCentroids(query_vec, nprobe);
+    if (trained_ && query_vec != nullptr && matrix != nullptr &&
+        norms != nullptr && total_count > 0) {
+      // Find nprobe nearest centroids
+      uint32_t nprobe = std::min(config_.nprobe, config_.nlist);
+      auto probe_clusters = FindNearestCentroids(query_vec, nprobe);
 
-  // Bounded min-heap for top-k selection
-  using ScoreIdx = std::pair<float, size_t>;
-  auto cmp = [](const ScoreIdx& a, const ScoreIdx& b) {
-    return a.first > b.first;
-  };
-  std::priority_queue<ScoreIdx, std::vector<ScoreIdx>, decltype(cmp)> min_heap(cmp);
+      // Bounded min-heap for top-k selection
+      using ScoreIdx = std::pair<float, size_t>;
+      auto cmp = [](const ScoreIdx& a, const ScoreIdx& b) {
+        return a.first > b.first;
+      };
+      std::priority_queue<ScoreIdx, std::vector<ScoreIdx>, decltype(cmp)>
+          min_heap(cmp);
 
-  const auto& simd_impl = simd::GetOptimalImpl();
+      const auto& simd_impl = simd::GetOptimalImpl();
 
-  // Scan vectors in the selected clusters
-  for (size_t cluster_id : probe_clusters) {
-    const auto& list = inverted_lists_[cluster_id];
+      // Scan vectors in the selected clusters
+      for (size_t cluster_id : probe_clusters) {
+        const auto& list = inverted_lists_[cluster_id];
 
-    for (size_t li = 0; li < list.size(); ++li) {
-      // Prefetch upcoming vector data
-      if (li + kPrefetchAhead < list.size()) {
-        size_t prefetch_idx = list[li + kPrefetchAhead];
-        if (prefetch_idx < total_count) {
-          __builtin_prefetch(matrix + prefetch_idx * dimension, 0, 0);
+        for (size_t li = 0; li < list.size(); ++li) {
+          // Prefetch upcoming vector data
+          if (li + kPrefetchAhead < list.size()) {
+            size_t prefetch_idx = list[li + kPrefetchAhead];
+            if (prefetch_idx < total_count) {
+              __builtin_prefetch(
+                  matrix + prefetch_idx * dimension, 0, 0);
+            }
+          }
+
+          size_t idx = list[li];
+          if (idx >= total_count) {
+            continue;  // Stale index after defragmentation
+          }
+
+          float cand_norm = norms[idx];
+          if (cand_norm < kNormEpsilon || query_norm < kNormEpsilon) {
+            continue;
+          }
+
+          float dot = simd_impl.dot_product(
+              query_vec, matrix + idx * dimension, dimension);
+          float score = dot / (query_norm * cand_norm);
+
+          if (min_heap.size() < top_k) {
+            min_heap.push({score, idx});
+          } else if (score > min_heap.top().first) {
+            min_heap.pop();
+            min_heap.push({score, idx});
+          }
         }
       }
 
-      size_t idx = list[li];
-      if (idx >= total_count) {
-        continue;  // Stale index after defragmentation
-      }
-
-      float cand_norm = norms[idx];
-      if (cand_norm < kNormEpsilon || query_norm < kNormEpsilon) {
-        continue;
-      }
-
-      float dot = simd_impl.dot_product(
-          query_vec, matrix + idx * dimension, dimension);
-      float score = dot / (query_norm * cand_norm);
-
-      if (min_heap.size() < top_k) {
-        min_heap.push({score, idx});
-      } else if (score > min_heap.top().first) {
+      // Extract IVF results
+      ivf_results.reserve(min_heap.size());
+      while (!min_heap.empty()) {
+        ivf_results.push_back(min_heap.top());
         min_heap.pop();
-        min_heap.push({score, idx});
       }
     }
   }
 
-  // Extract results sorted by score descending
+  // If only one source has results, skip merge
+  if (buffer_results.empty()) {
+    std::sort(ivf_results.begin(), ivf_results.end(),
+              [](const std::pair<float, size_t>& a,
+                 const std::pair<float, size_t>& b) {
+                return a.first > b.first;
+              });
+    return ivf_results;
+  }
+  if (ivf_results.empty()) {
+    // buffer_results is already sorted descending from SearchBuffer
+    return buffer_results;
+  }
+
+  // Merge and deduplicate: keep highest score per compact_index
+  std::unordered_set<size_t> seen;
+  seen.reserve(ivf_results.size() + buffer_results.size());
+
+  using ScoreIdx = std::pair<float, size_t>;
+  auto cmp = [](const ScoreIdx& a, const ScoreIdx& b) {
+    return a.first > b.first;
+  };
+  std::priority_queue<ScoreIdx, std::vector<ScoreIdx>, decltype(cmp)>
+      merge_heap(cmp);
+
+  // Buffer results are typically from more recent data; add them first
+  for (const auto& [score, idx] : buffer_results) {
+    if (seen.insert(idx).second) {
+      if (merge_heap.size() < top_k) {
+        merge_heap.push({score, idx});
+      } else if (score > merge_heap.top().first) {
+        merge_heap.pop();
+        merge_heap.push({score, idx});
+      }
+    }
+  }
+
+  for (const auto& [score, idx] : ivf_results) {
+    if (seen.insert(idx).second) {
+      if (merge_heap.size() < top_k) {
+        merge_heap.push({score, idx});
+      } else if (score > merge_heap.top().first) {
+        merge_heap.pop();
+        merge_heap.push({score, idx});
+      }
+    }
+  }
+
+  // Extract merged results sorted by score descending
   std::vector<std::pair<float, size_t>> results;
-  results.reserve(min_heap.size());
-  while (!min_heap.empty()) {
-    results.push_back(min_heap.top());
-    min_heap.pop();
+  results.reserve(merge_heap.size());
+  while (!merge_heap.empty()) {
+    results.push_back(merge_heap.top());
+    merge_heap.pop();
   }
   std::sort(results.begin(), results.end(),
             [](const ScoreIdx& a, const ScoreIdx& b) {
@@ -328,6 +415,156 @@ void IvfIndex::SetNprobe(uint32_t nprobe) {
 uint32_t IvfIndex::GetNprobe() const {
   std::shared_lock lock(mutex_);
   return config_.nprobe;
+}
+
+void IvfIndex::SetNlist(uint32_t nlist) {
+  config_.nlist = nlist;
+}
+
+// ============================================================================
+// Write Buffer Operations
+// ============================================================================
+
+void IvfIndex::AppendToBuffer(size_t compact_index, const float* vector) {
+  if (vector == nullptr) {
+    return;
+  }
+
+  std::unique_lock lock(buffer_mutex_);
+  buffer_indices_.push_back(compact_index);
+  buffer_vectors_.insert(buffer_vectors_.end(), vector, vector + dimension_);
+}
+
+size_t IvfIndex::GetBufferSize() const {
+  std::shared_lock lock(buffer_mutex_);
+  return buffer_indices_.size();
+}
+
+bool IvfIndex::NeedsSeal() const {
+  std::shared_lock lock(buffer_mutex_);
+  return buffer_indices_.size() >= config_.seal_threshold;
+}
+
+void IvfIndex::SealBuffer() {
+  // Phase 1: Swap buffer contents out under brief lock (fast, unblocks writers)
+  std::vector<size_t> seal_indices;
+  std::vector<float> seal_vectors;
+  {
+    std::unique_lock buf_lock(buffer_mutex_);
+    if (buffer_indices_.empty()) {
+      return;
+    }
+    seal_indices.swap(buffer_indices_);
+    seal_vectors.swap(buffer_vectors_);
+  }
+  // Buffer lock released: AppendToBuffer can proceed immediately
+
+  // Phase 2: Assign extracted entries to IVF clusters (expensive, lock-free on buffer)
+  std::unique_lock ivf_lock(mutex_);
+
+  if (!trained_) {
+    // IVF not trained: put entries back in buffer
+    std::unique_lock buf_lock(buffer_mutex_);
+    buffer_indices_.insert(buffer_indices_.end(),
+                           seal_indices.begin(), seal_indices.end());
+    buffer_vectors_.insert(buffer_vectors_.end(),
+                           seal_vectors.begin(), seal_vectors.end());
+    return;
+  }
+
+  const auto& simd_impl = simd::GetOptimalImpl();
+  const uint32_t nlist = config_.nlist;
+  size_t sealed_count = seal_indices.size();
+
+  for (size_t i = 0; i < sealed_count; ++i) {
+    const float* vec = seal_vectors.data() + i * dimension_;
+    float vec_norm = simd_impl.l2_norm(vec, dimension_);
+
+    size_t best = 0;
+    float best_sim = -2.0F;
+
+    for (uint32_t c = 0; c < nlist; ++c) {
+      float cn = centroid_norms_[c];
+      if (cn < kNormEpsilon || vec_norm < kNormEpsilon) {
+        continue;
+      }
+      float dot = simd_impl.dot_product(
+          vec, centroids_.data() + static_cast<size_t>(c) * dimension_,
+          dimension_);
+      float sim = dot / (vec_norm * cn);
+      if (sim > best_sim) {
+        best_sim = sim;
+        best = c;
+      }
+    }
+
+    inverted_lists_[best].push_back(seal_indices[i]);
+  }
+
+  utils::StructuredLog()
+      .Event("ivf_buffer_sealed")
+      .Field("sealed_count", static_cast<int64_t>(sealed_count))
+      .Info();
+}
+
+std::vector<std::pair<float, size_t>> IvfIndex::SearchBuffer(
+    const float* query_vec, float query_norm,
+    uint32_t dimension, size_t top_k) const {
+  std::shared_lock lock(buffer_mutex_);
+
+  if (buffer_indices_.empty() || query_vec == nullptr ||
+      query_norm < kNormEpsilon) {
+    return {};
+  }
+
+  const auto& simd_impl = simd::GetOptimalImpl();
+
+  // Bounded min-heap for top-k selection
+  using ScoreIdx = std::pair<float, size_t>;
+  auto cmp = [](const ScoreIdx& a, const ScoreIdx& b) {
+    return a.first > b.first;
+  };
+  std::priority_queue<ScoreIdx, std::vector<ScoreIdx>, decltype(cmp)>
+      min_heap(cmp);
+
+  for (size_t i = 0; i < buffer_indices_.size(); ++i) {
+    // Prefetch upcoming buffer vector data
+    if (i + kPrefetchAhead < buffer_indices_.size()) {
+      __builtin_prefetch(
+          buffer_vectors_.data() + (i + kPrefetchAhead) * dimension, 0, 0);
+    }
+
+    const float* vec = buffer_vectors_.data() + i * dimension;
+    float vec_norm = simd_impl.l2_norm(vec, dimension);
+
+    if (vec_norm < kNormEpsilon) {
+      continue;
+    }
+
+    float dot = simd_impl.dot_product(query_vec, vec, dimension);
+    float score = dot / (query_norm * vec_norm);
+
+    if (min_heap.size() < top_k) {
+      min_heap.push({score, buffer_indices_[i]});
+    } else if (score > min_heap.top().first) {
+      min_heap.pop();
+      min_heap.push({score, buffer_indices_[i]});
+    }
+  }
+
+  // Extract results sorted by score descending
+  std::vector<std::pair<float, size_t>> results;
+  results.reserve(min_heap.size());
+  while (!min_heap.empty()) {
+    results.push_back(min_heap.top());
+    min_heap.pop();
+  }
+  std::sort(results.begin(), results.end(),
+            [](const ScoreIdx& a, const ScoreIdx& b) {
+              return a.first > b.first;
+            });
+
+  return results;
 }
 
 // ============================================================================

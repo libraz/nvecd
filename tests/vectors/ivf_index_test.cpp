@@ -85,6 +85,7 @@ TEST_F(IvfIndexTest, DefaultConfig) {
   EXPECT_FALSE(index.IsTrained());
   EXPECT_EQ(index.GetIndexedCount(), 0);
   EXPECT_EQ(index.GetClusterCount(), 0);
+  EXPECT_EQ(index.GetBufferSize(), 0);
 }
 
 TEST_F(IvfIndexTest, TrainBasic) {
@@ -268,7 +269,7 @@ TEST_F(IvfIndexTest, SearchBeforeTraining) {
   auto results = index.Search(query, query_norm, matrix_.data(), norms_.data(),
                               kNumVectors, kDim, 10);
 
-  // Should return empty results before training
+  // Should return empty results before training (no buffer entries either)
   EXPECT_TRUE(results.empty());
 }
 
@@ -339,6 +340,256 @@ TEST_F(IvfIndexTest, SearchQualityWithLowNprobe) {
     }
   }
   EXPECT_TRUE(found_self) << "Query vector should be in its own cluster";
+}
+
+// ============================================================================
+// Write Buffer Tests
+// ============================================================================
+
+TEST_F(IvfIndexTest, AppendToBufferBasic) {
+  IvfIndex index(kDim);
+
+  EXPECT_EQ(index.GetBufferSize(), 0);
+
+  // Append a few vectors to the buffer
+  for (size_t i = 0; i < 10; ++i) {
+    index.AppendToBuffer(i, vectors_[i].data());
+  }
+
+  EXPECT_EQ(index.GetBufferSize(), 10);
+}
+
+TEST_F(IvfIndexTest, AppendToBufferNullVector) {
+  IvfIndex index(kDim);
+
+  // Appending null should be a no-op
+  index.AppendToBuffer(0, nullptr);
+  EXPECT_EQ(index.GetBufferSize(), 0);
+}
+
+TEST_F(IvfIndexTest, SearchBufferOnly) {
+  IvfIndex index(kDim);
+
+  // Append vectors to buffer (no training)
+  for (size_t i = 0; i < 50; ++i) {
+    index.AppendToBuffer(i, vectors_[i].data());
+  }
+  EXPECT_EQ(index.GetBufferSize(), 50);
+
+  // Search the buffer via the unified Search path
+  const float* query = vectors_[0].data();
+  float query_norm = norms_[0];
+
+  auto results = index.Search(query, query_norm, matrix_.data(),
+                              norms_.data(), kNumVectors, kDim, 5);
+
+  // Should get results from buffer brute-force search
+  EXPECT_GT(results.size(), 0);
+  EXPECT_LE(results.size(), 5);
+
+  // Results should be sorted by score descending
+  for (size_t i = 1; i < results.size(); ++i) {
+    EXPECT_GE(results[i - 1].first, results[i].first);
+  }
+
+  // The query vector itself should be the top result
+  EXPECT_EQ(results[0].second, 0);
+  EXPECT_NEAR(results[0].first, 1.0F, 0.01F);
+}
+
+TEST_F(IvfIndexTest, SearchBufferDirectly) {
+  IvfIndex index(kDim);
+
+  // Append vectors to buffer
+  for (size_t i = 0; i < 50; ++i) {
+    index.AppendToBuffer(i, vectors_[i].data());
+  }
+
+  // Search buffer directly
+  const float* query = vectors_[0].data();
+  float query_norm = norms_[0];
+
+  auto results = index.SearchBuffer(query, query_norm, kDim, 5);
+
+  EXPECT_GT(results.size(), 0);
+  EXPECT_LE(results.size(), 5);
+
+  // Top result should be the query itself
+  EXPECT_EQ(results[0].second, 0);
+  EXPECT_NEAR(results[0].first, 1.0F, 0.01F);
+}
+
+TEST_F(IvfIndexTest, NeedsSealThreshold) {
+  IvfIndex::Config config;
+  config.seal_threshold = 20;  // Low threshold for testing
+
+  IvfIndex index(kDim, config);
+
+  // Below threshold
+  for (size_t i = 0; i < 19; ++i) {
+    index.AppendToBuffer(i, vectors_[i].data());
+  }
+  EXPECT_FALSE(index.NeedsSeal());
+
+  // At threshold
+  index.AppendToBuffer(19, vectors_[19].data());
+  EXPECT_TRUE(index.NeedsSeal());
+}
+
+TEST_F(IvfIndexTest, SealBufferMovesToIvf) {
+  IvfIndex::Config config;
+  config.nlist = 8;
+  config.nprobe = 8;
+  config.seal_threshold = 50;
+
+  IvfIndex index(kDim, config);
+
+  // Train with first 400 vectors
+  std::vector<size_t> initial_indices(400);
+  std::iota(initial_indices.begin(), initial_indices.end(), size_t{0});
+  index.Train(matrix_.data(), initial_indices.data(), 400, kDim);
+
+  size_t initial_indexed = index.GetIndexedCount();
+  EXPECT_EQ(initial_indexed, 400);
+
+  // Append 50 vectors to buffer
+  for (size_t i = 400; i < 450; ++i) {
+    index.AppendToBuffer(i, vectors_[i].data());
+  }
+  EXPECT_EQ(index.GetBufferSize(), 50);
+
+  // Seal: buffer entries move to IVF inverted lists
+  index.SealBuffer();
+
+  EXPECT_EQ(index.GetBufferSize(), 0);
+  EXPECT_EQ(index.GetIndexedCount(), 450);
+}
+
+TEST_F(IvfIndexTest, SealBufferWhenNotTrained) {
+  IvfIndex index(kDim);
+
+  // Append vectors to buffer without training
+  for (size_t i = 0; i < 20; ++i) {
+    index.AppendToBuffer(i, vectors_[i].data());
+  }
+
+  // Seal should be a no-op (not trained)
+  index.SealBuffer();
+
+  // Buffer should remain intact
+  EXPECT_EQ(index.GetBufferSize(), 20);
+  EXPECT_EQ(index.GetIndexedCount(), 0);
+}
+
+TEST_F(IvfIndexTest, SealEmptyBuffer) {
+  IvfIndex::Config config;
+  config.nlist = 8;
+  config.nprobe = 4;
+
+  IvfIndex index(kDim, config);
+  index.Train(matrix_.data(), valid_indices_.data(),
+              valid_indices_.size(), kDim);
+
+  // Seal empty buffer is a no-op
+  size_t count_before = index.GetIndexedCount();
+  index.SealBuffer();
+  EXPECT_EQ(index.GetIndexedCount(), count_before);
+}
+
+TEST_F(IvfIndexTest, TwoTierSearchMergesResults) {
+  IvfIndex::Config config;
+  config.nlist = 8;
+  config.nprobe = 8;  // Search all clusters for determinism
+
+  IvfIndex index(kDim, config);
+
+  // Train with first 400 vectors
+  std::vector<size_t> initial_indices(400);
+  std::iota(initial_indices.begin(), initial_indices.end(), size_t{0});
+  index.Train(matrix_.data(), initial_indices.data(), 400, kDim);
+
+  // Append remaining 100 vectors to buffer (not sealed)
+  for (size_t i = 400; i < kNumVectors; ++i) {
+    index.AppendToBuffer(i, vectors_[i].data());
+  }
+
+  EXPECT_EQ(index.GetIndexedCount(), 400);
+  EXPECT_EQ(index.GetBufferSize(), 100);
+
+  // Search should merge results from both tiers
+  const float* query = vectors_[0].data();
+  float query_norm = norms_[0];
+
+  auto results = index.Search(query, query_norm, matrix_.data(),
+                              norms_.data(), kNumVectors, kDim, 10);
+
+  EXPECT_GT(results.size(), 0);
+  EXPECT_LE(results.size(), 10);
+
+  // Results should be sorted by score descending
+  for (size_t i = 1; i < results.size(); ++i) {
+    EXPECT_GE(results[i - 1].first, results[i].first);
+  }
+
+  // Self should be found (it's in the IVF tier)
+  EXPECT_EQ(results[0].second, 0);
+  EXPECT_NEAR(results[0].first, 1.0F, 0.01F);
+}
+
+TEST_F(IvfIndexTest, TwoTierSearchDeduplicates) {
+  IvfIndex::Config config;
+  config.nlist = 8;
+  config.nprobe = 8;
+
+  IvfIndex index(kDim, config);
+
+  // Train with all vectors (assigns them to IVF)
+  index.Train(matrix_.data(), valid_indices_.data(),
+              valid_indices_.size(), kDim);
+
+  // Also add some of the same vectors to the buffer (duplicates)
+  for (size_t i = 0; i < 10; ++i) {
+    index.AppendToBuffer(i, vectors_[i].data());
+  }
+
+  const float* query = vectors_[0].data();
+  float query_norm = norms_[0];
+
+  auto results = index.Search(query, query_norm, matrix_.data(),
+                              norms_.data(), kNumVectors, kDim, 10);
+
+  // Check no duplicate compact_indices in results
+  std::vector<size_t> result_indices;
+  for (const auto& [score, idx] : results) {
+    result_indices.push_back(idx);
+  }
+  std::sort(result_indices.begin(), result_indices.end());
+  auto unique_end = std::unique(result_indices.begin(), result_indices.end());
+  EXPECT_EQ(unique_end, result_indices.end())
+      << "Search results should not contain duplicate compact indices";
+}
+
+TEST_F(IvfIndexTest, RemoveVectorFromBuffer) {
+  IvfIndex index(kDim);
+
+  // Append vectors to buffer
+  for (size_t i = 0; i < 10; ++i) {
+    index.AppendToBuffer(i, vectors_[i].data());
+  }
+  EXPECT_EQ(index.GetBufferSize(), 10);
+
+  // Remove a vector from the buffer
+  index.RemoveVector(5);
+  EXPECT_EQ(index.GetBufferSize(), 9);
+
+  // Search buffer should not return the removed vector
+  const float* query = vectors_[5].data();
+  float query_norm = norms_[5];
+
+  auto results = index.SearchBuffer(query, query_norm, kDim, 10);
+  for (const auto& [score, idx] : results) {
+    EXPECT_NE(idx, 5) << "Removed vector should not appear in buffer search";
+  }
 }
 
 }  // namespace

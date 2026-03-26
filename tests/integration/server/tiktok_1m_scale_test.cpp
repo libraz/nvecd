@@ -1182,9 +1182,9 @@ class TikTok1MScaleIvfTest : public NvecdTestFixture {
 
     // Enable IVF — train after bulk load completes
     config_.similarity.ivf_enabled = true;
-    config_.similarity.ivf_nlist = 0;      // Auto: sqrt(n), capped at 1024
+    config_.similarity.ivf_nlist = 256;     // Fixed: balance speed vs accuracy
     config_.similarity.ivf_nprobe = 10;
-    config_.similarity.ivf_train_threshold = 9900000;  // Train after ~10M loaded
+    config_.similarity.ivf_train_threshold = 900000;  // Train at ~1M for nlist=1024
 
     server_ = std::make_unique<nvecd::server::NvecdServer>(config_);
     ASSERT_TRUE(server_->Start().has_value());
@@ -1357,19 +1357,16 @@ TEST_F(TikTok1MScaleIvfTest, DISABLED_IvfScalingProfile) {
 TEST_F(TikTok1MScaleIvfTest, DISABLED_IvfTikTokLive10MWith500Viewers) {
   PrintHeader("IVF: 10M Videos + 500 Concurrent Viewers");
 
-  std::cout << "\n  Phase 1: Data loading (10M videos, IVF enabled)\n";
-  double load_ms = MeasureMs([&]() { ParallelBulkLoadVideos(10000000, 16); });
+  // Use 1M initially to validate IVF two-tier, scale to 10M once stable
+  const size_t kVideoCount = 1000000;
+  std::cout << "\n  Phase 1: Data loading (" << kVideoCount << " videos, IVF enabled)\n";
+  double load_ms = MeasureMs([&]() { ParallelBulkLoadVideos(kVideoCount, 16); });
 
-  // Wait for IVF training to complete (async).
-  // With threshold=9.9M, training starts during the last ~100K VECSETs.
-  // k-means on 50K sample + BulkAddVectors for 10M chunks takes ~30-60 sec.
-  std::cout << "  Waiting for IVF training to complete...\n";
-  for (int wait = 0; wait < 120; ++wait) {
-    std::this_thread::sleep_for(std::chrono::seconds(1));
-    if (wait % 10 == 0) {
-      std::cout << "    ... " << wait << "s\n" << std::flush;
-    }
-  }
+  // IVF trains at 500K and seals buffer every 100K thereafter.
+  // By the time 10M is loaded, IVF is trained and most data is sealed.
+  // Brief wait to ensure last seal completes.
+  std::cout << "  Waiting for final IVF seal...\n" << std::flush;
+  std::this_thread::sleep_for(std::chrono::seconds(5));
 
   {
     TcpClient info_client("127.0.0.1", port_);

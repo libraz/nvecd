@@ -33,6 +33,7 @@ SimilarityEngine::SimilarityEngine(events::EventStore* event_store, events::CoOc
     ivf_config.nlist = config_.ivf_nlist;
     ivf_config.nprobe = config_.ivf_nprobe;
     ivf_config.train_threshold = config_.ivf_train_threshold;
+    ivf_config.seal_threshold = config_.ivf_seal_threshold;
     ivf_index_ = std::make_unique<vectors::IvfIndex>(
         vectors_config.default_dimension, ivf_config);
     utils::StructuredLog()
@@ -40,6 +41,7 @@ SimilarityEngine::SimilarityEngine(events::EventStore* event_store, events::CoOc
         .Field("nlist", static_cast<int64_t>(config_.ivf_nlist))
         .Field("nprobe", static_cast<int64_t>(config_.ivf_nprobe))
         .Field("train_threshold", static_cast<int64_t>(config_.ivf_train_threshold))
+        .Field("seal_threshold", static_cast<int64_t>(config_.ivf_seal_threshold))
         .Info();
   }
 }
@@ -119,6 +121,7 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
   float query_norm = snap.norms[query_idx];
 
   // IVF accelerated path: use IVF index if enabled and trained
+  // IvfIndex::Search internally handles both IVF + buffer tiers
   if (ivf_index_ && ivf_index_->IsTrained() && use_prenorm_) {
     auto ivf_results = ivf_index_->Search(
         query_ptr, query_norm, snap.matrix, snap.norms,
@@ -317,6 +320,7 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
   float query_norm = vectors::simd::GetOptimalImpl().l2_norm(query_vector.data(), query_vector.size());
 
   // IVF accelerated path: use IVF index if enabled and trained
+  // IvfIndex::Search internally handles both IVF + buffer tiers
   if (ivf_index_ && ivf_index_->IsTrained() && use_prenorm_) {
     auto ivf_results = ivf_index_->Search(
         query_vector.data(), query_norm, snap.matrix, snap.norms,
@@ -569,20 +573,33 @@ void SimilarityEngine::NotifyVectorAdded(size_t compact_index, const float* vect
     return;
   }
 
-  if (ivf_index_->IsTrained()) {
-    ivf_index_->AddVector(compact_index, vector);
+  // Always append to write buffer (fast path, minimal locking)
+  ivf_index_->AppendToBuffer(compact_index, vector);
 
-    // No automatic re-training during AddVector.
-    // Re-training would be triggered by explicit command or scheduled task.
-  } else {
+  if (!ivf_index_->IsTrained()) {
+    // Not yet trained: check if we should trigger initial training
     MaybeTrainIvfIndex();
+  } else if (ivf_index_->NeedsSeal()) {
+    // Buffer reached seal threshold: seal asynchronously.
+    // SealBuffer swaps buffer out quickly then does expensive centroid
+    // assignment without blocking AppendToBuffer.
+    // Use ivf_training_ flag to prevent concurrent seals.
+    bool expected = false;
+    if (ivf_training_.compare_exchange_strong(expected, true)) {
+      JoinTrainThread();
+      ivf_train_thread_ = std::make_unique<std::thread>([this]() {
+        ivf_index_->SealBuffer();
+        ivf_training_.store(false);
+      });
+    }
   }
 }
 
 void SimilarityEngine::NotifyVectorRemoved(size_t compact_index) {
-  if (!ivf_index_ || !ivf_index_->IsTrained()) {
+  if (!ivf_index_) {
     return;
   }
+  // RemoveVector searches both buffer and IVF inverted lists
   ivf_index_->RemoveVector(compact_index);
 }
 
@@ -619,8 +636,8 @@ void SimilarityEngine::MaybeTrainIvfIndex() {
   }
 
   // Take a snapshot and copy only a sample of vectors for k-means training.
-  // After centroids are learned, all existing vectors are assigned via AddVector
-  // in a second pass (cheaper than copying the entire matrix).
+  // After centroids are learned, the write buffer is sealed to assign
+  // buffered entries to clusters.
   auto snap = vector_store_->GetCompactSnapshot();
   if (snap.count == 0 || snap.matrix == nullptr) {
     ivf_training_.store(false);
@@ -643,9 +660,7 @@ void SimilarityEngine::MaybeTrainIvfIndex() {
     return;
   }
 
-  // Copy only the vectors we need for training (sample up to 10K).
-  // IvfIndex::Train internally subsamples, but we copy the full set of
-  // valid vectors up to a cap to keep memory usage bounded.
+  // Copy only the vectors we need for training (sample up to 50K).
   constexpr size_t kMaxCopyForTrain = 50000;
   std::vector<size_t> train_indices;
   if (valid_indices.size() <= kMaxCopyForTrain) {
@@ -675,12 +690,18 @@ void SimilarityEngine::MaybeTrainIvfIndex() {
     sample_indices[i] = i;  // Re-index to [0, N)
   }
 
-  // Save valid_indices for post-training bulk assignment
-  auto all_valid = std::make_shared<std::vector<size_t>>(std::move(valid_indices));
+  // Pre-compute nlist based on TOTAL vector count (not sample size).
+  // This ensures the number of clusters scales with the full dataset.
+  if (config_.ivf_nlist == 0) {
+    auto sqrt_n = static_cast<uint32_t>(
+        std::max(1.0, std::sqrt(static_cast<double>(valid_indices.size()))));
+    uint32_t nlist = std::min(sqrt_n, vectors::IvfIndex::kMaxAutoNlist);
+    ivf_index_->SetNlist(nlist);
+  }
 
   utils::StructuredLog()
       .Event("ivf_training_start_async")
-      .Field("vector_count", static_cast<int64_t>(all_valid->size()))
+      .Field("vector_count", static_cast<int64_t>(valid_indices.size()))
       .Field("sample_size", static_cast<int64_t>(train_indices.size()))
       .Info();
 
@@ -688,52 +709,24 @@ void SimilarityEngine::MaybeTrainIvfIndex() {
   JoinTrainThread();
 
   // Launch training in a background thread.
-  // Phase 2 reads VectorStore matrix directly under a brief read lock
-  // rather than copying the entire matrix (saves ~1.2GB at 10M scale).
-  auto* vs = vector_store_;
+  // After training, seal the write buffer to move buffered entries into IVF.
   ivf_train_thread_ = std::make_unique<std::thread>(
       [this, sample_matrix, sample_indices = std::move(sample_indices),
-       all_valid, dim, vs]() {
-        // Phase 1: Train centroids on the sample (no vector assignment)
+       dim]() {
+        // Phase 1: Train centroids on the sample (no vector assignment
+        // since all data is already in the write buffer)
         ivf_index_->Train(sample_matrix->data(), sample_indices.data(),
                           sample_indices.size(), dim, false);
 
-        // Phase 2: Bulk-assign all vectors in chunks.
-        // Copy each chunk under a brief VectorStore read lock, then
-        // assign to IVF without holding VectorStore's lock. This avoids
-        // blocking concurrent VECSET writes for the entire duration.
-        constexpr size_t kChunkSize = 100000;
-        for (size_t offset = 0; offset < all_valid->size(); offset += kChunkSize) {
-          size_t chunk_end = std::min(offset + kChunkSize, all_valid->size());
-          size_t chunk_len = chunk_end - offset;
-
-          // Copy chunk's vector data under brief read lock into a
-          // contiguous matrix where row i = vector for all_valid[offset+i]
-          std::vector<float> chunk_matrix(chunk_len * dim);
-          std::vector<size_t> chunk_compact_indices(chunk_len);
-          {
-            auto lock = vs->AcquireReadLock();
-            const float* mat = vs->GetMatrixData();
-            if (mat == nullptr) break;
-            for (size_t i = 0; i < chunk_len; ++i) {
-              size_t idx = (*all_valid)[offset + i];
-              chunk_compact_indices[i] = idx;
-              std::copy(mat + idx * dim, mat + (idx + 1) * dim,
-                        chunk_matrix.data() + i * dim);
-            }
-          }
-          // VectorStore lock released here — VECSET can proceed
-
-          // Assign chunk to IVF (uses IvfIndex's own lock internally)
-          ivf_index_->BulkAddVectors(chunk_compact_indices.data(),
-                                      chunk_matrix.data(),
-                                      chunk_len, dim);
-        }
+        // Phase 2: Seal the write buffer to assign buffered entries to
+        // the newly-trained IVF clusters
+        ivf_index_->SealBuffer();
 
         utils::StructuredLog()
             .Event("ivf_training_complete_async")
             .Field("trained", ivf_index_->IsTrained())
             .Field("indexed_count", static_cast<int64_t>(ivf_index_->GetIndexedCount()))
+            .Field("buffer_size", static_cast<int64_t>(ivf_index_->GetBufferSize()))
             .Info();
 
         ivf_training_.store(false);
