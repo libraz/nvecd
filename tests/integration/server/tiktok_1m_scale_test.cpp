@@ -1182,9 +1182,10 @@ class TikTok1MScaleIvfTest : public NvecdTestFixture {
 
     // Enable IVF — train after bulk load completes
     config_.similarity.ivf_enabled = true;
-    config_.similarity.ivf_nlist = 256;     // Fixed: balance speed vs accuracy
+    config_.similarity.ivf_nlist = 256;     // Fixed: good balance for 1M-10M
     config_.similarity.ivf_nprobe = 10;
-    config_.similarity.ivf_train_threshold = 900000;  // Train at ~1M for nlist=1024
+    config_.similarity.ivf_train_threshold = 100000;   // Train early at 100K
+    config_.similarity.ivf_seal_threshold = 10000;     // Small buffer: fast seal + fast brute-force
 
     server_ = std::make_unique<nvecd::server::NvecdServer>(config_);
     ASSERT_TRUE(server_->Start().has_value());
@@ -1357,16 +1358,15 @@ TEST_F(TikTok1MScaleIvfTest, DISABLED_IvfScalingProfile) {
 TEST_F(TikTok1MScaleIvfTest, DISABLED_IvfTikTokLive10MWith500Viewers) {
   PrintHeader("IVF: 10M Videos + 500 Concurrent Viewers");
 
-  // Use 1M initially to validate IVF two-tier, scale to 10M once stable
-  const size_t kVideoCount = 1000000;
+  const size_t kVideoCount = 10000000;
   std::cout << "\n  Phase 1: Data loading (" << kVideoCount << " videos, IVF enabled)\n";
   double load_ms = MeasureMs([&]() { ParallelBulkLoadVideos(kVideoCount, 16); });
 
-  // IVF trains at 500K and seals buffer every 100K thereafter.
-  // By the time 10M is loaded, IVF is trained and most data is sealed.
-  // Brief wait to ensure last seal completes.
+  // IVF trains at 100K and seals buffer every 10K thereafter.
+  // By the time 10M is loaded, most data is already sealed into IVF.
+  // Brief wait for the last async seal to complete.
   std::cout << "  Waiting for final IVF seal...\n" << std::flush;
-  std::this_thread::sleep_for(std::chrono::seconds(5));
+  std::this_thread::sleep_for(std::chrono::seconds(3));
 
   {
     TcpClient info_client("127.0.0.1", port_);
