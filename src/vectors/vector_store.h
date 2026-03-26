@@ -177,6 +177,18 @@ class VectorStore {
   const float* GetMatrixRow(size_t idx) const;
 
   /**
+   * @brief Get raw pointer to contiguous matrix data (caller must hold read lock)
+   * @return Pointer to matrix data, or nullptr if empty
+   */
+  const float* GetMatrixData() const;
+
+  /**
+   * @brief Get number of rows in the matrix (caller must hold read lock)
+   * @return Row count (includes tombstones)
+   */
+  size_t GetMatrixCount() const;
+
+  /**
    * @brief Get pre-computed L2 norm for vector at given index
    *
    * Caller MUST hold read lock via AcquireReadLock().

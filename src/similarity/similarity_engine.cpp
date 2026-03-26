@@ -698,17 +698,15 @@ void SimilarityEngine::MaybeTrainIvfIndex() {
         ivf_index_->Train(sample_matrix->data(), sample_indices.data(),
                           sample_indices.size(), dim, false);
 
-        // Phase 2: Bulk-assign all vectors using VectorStore matrix directly.
-        // Hold read lock for the duration to ensure matrix pointer validity.
+        // Phase 2: Bulk-assign all vectors (single lock acquisition).
+        // Hold VectorStore read lock to keep matrix pointer valid.
         {
           auto lock = vs->AcquireReadLock();
-          auto snap2 = vs->GetCompactSnapshot();
-          if (snap2.matrix != nullptr && snap2.count > 0) {
-            for (size_t idx : *all_valid) {
-              if (idx < snap2.count) {
-                ivf_index_->AddVector(idx, snap2.matrix + idx * dim);
-              }
-            }
+          const float* mat = vs->GetMatrixData();
+          size_t mat_count = vs->GetMatrixCount();
+          if (mat != nullptr && mat_count > 0) {
+            ivf_index_->BulkAddVectors(all_valid->data(), mat,
+                                        all_valid->size(), dim);
           }
         }
 

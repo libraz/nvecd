@@ -1184,7 +1184,7 @@ class TikTok1MScaleIvfTest : public NvecdTestFixture {
     config_.similarity.ivf_enabled = true;
     config_.similarity.ivf_nlist = 0;      // Auto: sqrt(n), capped at 1024
     config_.similarity.ivf_nprobe = 10;
-    config_.similarity.ivf_train_threshold = 9500000;  // Only train after ~10M loaded
+    config_.similarity.ivf_train_threshold = 950000;  // Train after ~1M loaded
 
     server_ = std::make_unique<nvecd::server::NvecdServer>(config_);
     ASSERT_TRUE(server_->Start().has_value());

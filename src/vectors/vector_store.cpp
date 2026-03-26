@@ -247,6 +247,15 @@ const float* VectorStore::GetMatrixRow(size_t idx) const {
   return matrix_.data() + idx * dim;
 }
 
+const float* VectorStore::GetMatrixData() const {
+  return matrix_.empty() ? nullptr : matrix_.data();
+}
+
+size_t VectorStore::GetMatrixCount() const {
+  size_t dim = dimension_.load(std::memory_order_relaxed);
+  return dim > 0 ? matrix_.size() / dim : 0;
+}
+
 float VectorStore::GetNorm(size_t idx) const {
   return norms_[idx];
 }
