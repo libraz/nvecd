@@ -26,9 +26,7 @@
 namespace nvecd::server {
 
 namespace {
-constexpr int kShutdownTimeoutMs = 5000;  // Wait up to 5s for connections to close
 constexpr int kShutdownCheckIntervalMs = 100;
-constexpr int kDefaultTimeoutSec = 5;              // Default HTTP read/write timeout
 constexpr size_t kBytesPerMegabyte = 1024 * 1024;  // Bytes in a megabyte
 }  // namespace
 
@@ -67,6 +65,7 @@ utils::Expected<void, utils::Error> NvecdServer::Start() {
   server_config.host = config_.api.tcp.bind;
   server_config.port = static_cast<uint16_t>(config_.api.tcp.port);
   server_config.max_connections = config_.perf.max_connections;
+  server_config.max_connections_per_ip = config_.perf.max_connections_per_ip;
   server_config.worker_threads = worker_threads;
 
   // Parse allowed CIDRs
@@ -123,8 +122,8 @@ utils::Expected<void, utils::Error> NvecdServer::Start() {
     HttpServerConfig http_config;
     http_config.bind = config_.api.http.bind;
     http_config.port = config_.api.http.port;
-    http_config.read_timeout_sec = kDefaultTimeoutSec;
-    http_config.write_timeout_sec = kDefaultTimeoutSec;
+    http_config.read_timeout_sec = config_.api.http.timeout_sec;
+    http_config.write_timeout_sec = config_.api.http.timeout_sec;
     http_config.enable_cors = config_.api.http.enable_cors;
     http_config.cors_allow_origin = config_.api.http.cors_allow_origin;
     http_config.allow_cidrs = config_.network.allow_cidrs;
@@ -185,7 +184,7 @@ void NvecdServer::Stop() {
   auto start_time = std::chrono::steady_clock::now();
   while (stats_.active_connections.load() > 0) {
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start_time);
-    if (elapsed.count() > kShutdownTimeoutMs) {
+    if (elapsed.count() > config_.perf.shutdown_timeout_ms) {
       spdlog::warn("Shutdown timeout reached with {} active connections", stats_.active_connections.load());
       break;
     }
@@ -343,9 +342,9 @@ void NvecdServer::HandleConnection(int client_fd) {
 
     // Create I/O configuration
     IOConfig io_config;
-    io_config.recv_buffer_size = kDefaultIORecvBufferSize;
-    io_config.max_query_length = kDefaultMaxQueryLength;
-    io_config.max_accumulated_bytes = kDefaultMaxAccumulatedBytes;
+    io_config.recv_buffer_size = static_cast<size_t>(config_.perf.recv_buffer_size);
+    io_config.max_query_length = static_cast<size_t>(config_.perf.max_query_length);
+    io_config.max_accumulated_bytes = static_cast<size_t>(config_.perf.max_query_length) * 2;
     io_config.recv_timeout_sec = config_.perf.connection_timeout_sec;
 
     // Create request processor

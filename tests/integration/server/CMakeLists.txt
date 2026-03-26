@@ -168,3 +168,45 @@ gtest_discover_tests(adversarial_e2e_test
     TIMEOUT 120
     LABELS integration
 )
+
+# TikTok Scenario End-to-End Tests
+
+add_executable(tiktok_scenario_e2e_test
+  tiktok_scenario_e2e_test.cpp
+)
+
+target_link_libraries(tiktok_scenario_e2e_test
+  nvecd_server
+  nvecd_storage
+  gtest_main
+)
+
+gtest_discover_tests(tiktok_scenario_e2e_test
+  DISCOVERY_MODE POST_BUILD
+  DISCOVERY_TIMEOUT 30
+  PROPERTIES
+    RESOURCE_LOCK server_port
+    TIMEOUT 900
+    LABELS integration
+)
+
+# TikTok 1M Scale Benchmark Tests
+
+add_executable(tiktok_1m_scale_test
+  tiktok_1m_scale_test.cpp
+)
+
+target_link_libraries(tiktok_1m_scale_test
+  nvecd_server
+  nvecd_storage
+  gtest_main
+)
+
+gtest_discover_tests(tiktok_1m_scale_test
+  DISCOVERY_MODE POST_BUILD
+  DISCOVERY_TIMEOUT 30
+  PROPERTIES
+    RESOURCE_LOCK server_port
+    TIMEOUT 1800
+    LABELS integration
+)

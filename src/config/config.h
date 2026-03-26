@@ -50,6 +50,13 @@ constexpr int kHttpPort = 8080;
 constexpr int kThreadPoolSize = 8;
 constexpr int kMaxConnections = 1000;
 constexpr int kConnectionTimeoutSec = 300;
+constexpr int kRecvBufferSize = 4096;
+constexpr int kSendBufferSize = 65536;
+constexpr int kMaxQueryLength = 1024 * 1024;   // 1MB
+constexpr int kShutdownTimeoutMs = 5000;
+
+// HTTP defaults
+constexpr int kHttpTimeoutSec = 5;
 
 }  // namespace defaults
 
@@ -100,7 +107,12 @@ struct SnapshotConfig {
 struct PerformanceConfig {
   int thread_pool_size = defaults::kThreadPoolSize;              ///< Worker thread pool size
   int max_connections = defaults::kMaxConnections;               ///< Maximum concurrent connections
+  int max_connections_per_ip = 100;                              ///< Maximum connections per IP (0 = unlimited)
   int connection_timeout_sec = defaults::kConnectionTimeoutSec;  ///< Connection timeout
+  int recv_buffer_size = defaults::kRecvBufferSize;              ///< TCP receive buffer size in bytes
+  int send_buffer_size = defaults::kSendBufferSize;              ///< TCP send buffer size in bytes
+  int max_query_length = defaults::kMaxQueryLength;              ///< Maximum query length in bytes
+  int shutdown_timeout_ms = defaults::kShutdownTimeoutMs;        ///< Graceful shutdown timeout in milliseconds
 };
 
 /**
@@ -123,6 +135,7 @@ struct ApiConfig {
     int port = defaults::kHttpPort;
     bool enable_cors = false;
     std::string cors_allow_origin;
+    int timeout_sec = defaults::kHttpTimeoutSec;  ///< HTTP read/write timeout in seconds
   } http;
 
   struct {

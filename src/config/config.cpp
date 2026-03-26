@@ -209,8 +209,23 @@ PerformanceConfig ParsePerformanceConfig(const YAML::Node& node) {
   if (node["max_connections"]) {
     config.max_connections = node["max_connections"].as<int>();
   }
+  if (node["max_connections_per_ip"]) {
+    config.max_connections_per_ip = node["max_connections_per_ip"].as<int>();
+  }
   if (node["connection_timeout_sec"]) {
     config.connection_timeout_sec = node["connection_timeout_sec"].as<int>();
+  }
+  if (node["recv_buffer_size"]) {
+    config.recv_buffer_size = node["recv_buffer_size"].as<int>();
+  }
+  if (node["send_buffer_size"]) {
+    config.send_buffer_size = node["send_buffer_size"].as<int>();
+  }
+  if (node["max_query_length"]) {
+    config.max_query_length = node["max_query_length"].as<int>();
+  }
+  if (node["shutdown_timeout_ms"]) {
+    config.shutdown_timeout_ms = node["shutdown_timeout_ms"].as<int>();
   }
 
   return config;
@@ -250,6 +265,9 @@ ApiConfig ParseApiConfig(const YAML::Node& node) {
     }
     if (http_node["cors_allow_origin"]) {
       config.http.cors_allow_origin = http_node["cors_allow_origin"].as<std::string>();
+    }
+    if (http_node["timeout_sec"]) {
+      config.http.timeout_sec = http_node["timeout_sec"].as<int>();
     }
   }
 
@@ -530,6 +548,22 @@ utils::Expected<void, utils::Error> ValidateConfig(const Config& config) {
     return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
                                                   "performance.connection_timeout_sec must be greater than 0"));
   }
+  if (config.perf.recv_buffer_size < 1024 || config.perf.recv_buffer_size > 1048576) {
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
+                                                  "performance.recv_buffer_size must be between 1024 and 1048576"));
+  }
+  if (config.perf.send_buffer_size < 1024 || config.perf.send_buffer_size > 16777216) {
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
+                                                  "performance.send_buffer_size must be between 1024 and 16777216"));
+  }
+  if (config.perf.max_query_length < 1024 || config.perf.max_query_length > 16777216) {
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
+                                                  "performance.max_query_length must be between 1024 and 16777216"));
+  }
+  if (config.perf.shutdown_timeout_ms < 100 || config.perf.shutdown_timeout_ms > 60000) {
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
+                                                  "performance.shutdown_timeout_ms must be between 100 and 60000"));
+  }
 
   // Validate API configuration
   if (config.api.tcp.port <= 0 || config.api.tcp.port > kMaxPortNumber) {
@@ -539,6 +573,10 @@ utils::Expected<void, utils::Error> ValidateConfig(const Config& config) {
   if (config.api.http.enable && (config.api.http.port <= 0 || config.api.http.port > kMaxPortNumber)) {
     return utils::MakeUnexpected(
         utils::MakeError(utils::ErrorCode::kConfigInvalidValue, "api.http.port must be between 1 and 65535"));
+  }
+  if (config.api.http.timeout_sec < 1 || config.api.http.timeout_sec > 300) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kConfigInvalidValue, "api.http.timeout_sec must be between 1 and 300"));
   }
   if (config.api.rate_limiting.enable) {
     if (config.api.rate_limiting.capacity <= 0) {

@@ -83,7 +83,15 @@ static const std::map<std::string, bool> kVariableMutability = {
     // Performance (all immutable)
     {"perf.thread_pool_size", false},
     {"perf.max_connections", false},
+    {"perf.max_connections_per_ip", false},
     {"perf.connection_timeout_sec", false},
+    {"perf.recv_buffer_size", false},
+    {"perf.send_buffer_size", false},
+    {"perf.max_query_length", false},
+    {"perf.shutdown_timeout_ms", false},
+
+    // API HTTP timeout (immutable)
+    {"api.http.timeout_sec", false},
 };
 
 RuntimeVariableManager::RuntimeVariableManager(ConstructorTag) {}
@@ -404,8 +412,28 @@ std::string RuntimeVariableManager::GetVariableInternal(const std::string& varia
   if (variable_name == "perf.max_connections") {
     return std::to_string(base_config_.perf.max_connections);
   }
+  if (variable_name == "perf.max_connections_per_ip") {
+    return std::to_string(base_config_.perf.max_connections_per_ip);
+  }
   if (variable_name == "perf.connection_timeout_sec") {
     return std::to_string(base_config_.perf.connection_timeout_sec);
+  }
+  if (variable_name == "perf.recv_buffer_size") {
+    return std::to_string(base_config_.perf.recv_buffer_size);
+  }
+  if (variable_name == "perf.send_buffer_size") {
+    return std::to_string(base_config_.perf.send_buffer_size);
+  }
+  if (variable_name == "perf.max_query_length") {
+    return std::to_string(base_config_.perf.max_query_length);
+  }
+  if (variable_name == "perf.shutdown_timeout_ms") {
+    return std::to_string(base_config_.perf.shutdown_timeout_ms);
+  }
+
+  // API HTTP timeout
+  if (variable_name == "api.http.timeout_sec") {
+    return std::to_string(base_config_.api.http.timeout_sec);
   }
 
   return "";  // Unknown variable

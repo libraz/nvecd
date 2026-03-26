@@ -165,12 +165,47 @@
           "minimum": 1,
           "maximum": 100000
         },
+        "max_connections_per_ip": {
+          "type": "integer",
+          "description": "Maximum connections per IP address (0 = unlimited)",
+          "default": 100,
+          "minimum": 0,
+          "maximum": 100000
+        },
         "connection_timeout_sec": {
           "type": "integer",
           "description": "Connection timeout in seconds",
           "default": 300,
           "minimum": 1,
           "maximum": 3600
+        },
+        "recv_buffer_size": {
+          "type": "integer",
+          "description": "TCP receive buffer size in bytes",
+          "default": 4096,
+          "minimum": 1024,
+          "maximum": 1048576
+        },
+        "send_buffer_size": {
+          "type": "integer",
+          "description": "TCP send buffer size in bytes",
+          "default": 65536,
+          "minimum": 1024,
+          "maximum": 16777216
+        },
+        "max_query_length": {
+          "type": "integer",
+          "description": "Maximum query length in bytes",
+          "default": 1048576,
+          "minimum": 1024,
+          "maximum": 16777216
+        },
+        "shutdown_timeout_ms": {
+          "type": "integer",
+          "description": "Graceful shutdown timeout in milliseconds",
+          "default": 5000,
+          "minimum": 100,
+          "maximum": 60000
         }
       }
     },
@@ -229,6 +264,13 @@
               "type": "string",
               "description": "Value for Access-Control-Allow-Origin header when CORS is enabled",
               "default": ""
+            },
+            "timeout_sec": {
+              "type": "integer",
+              "description": "HTTP read/write timeout in seconds",
+              "default": 5,
+              "minimum": 1,
+              "maximum": 300
             }
           }
         },

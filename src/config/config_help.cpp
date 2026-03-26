@@ -99,7 +99,12 @@ nlohmann::json ConfigToJson(const Config& config) {
   json["performance"] = {
       {"thread_pool_size", config.perf.thread_pool_size},
       {"max_connections", config.perf.max_connections},
+      {"max_connections_per_ip", config.perf.max_connections_per_ip},
       {"connection_timeout_sec", config.perf.connection_timeout_sec},
+      {"recv_buffer_size", config.perf.recv_buffer_size},
+      {"send_buffer_size", config.perf.send_buffer_size},
+      {"max_query_length", config.perf.max_query_length},
+      {"shutdown_timeout_ms", config.perf.shutdown_timeout_ms},
   };
 
   // API configuration
@@ -116,6 +121,7 @@ nlohmann::json ConfigToJson(const Config& config) {
            {"port", config.api.http.port},
            {"enable_cors", config.api.http.enable_cors},
            {"cors_allow_origin", config.api.http.cors_allow_origin},
+           {"timeout_sec", config.api.http.timeout_sec},
        }},
       {"rate_limiting",
        {
