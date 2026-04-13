@@ -52,6 +52,12 @@ nvecd-cli -p 11017 SIM product123 10 using=fusion
 
 # Search by query vector
 nvecd-cli -p 11017 SIMV 10 0.5 0.3 0.2 0.1
+
+# Filter by metadata
+nvecd-cli -p 11017 SIM product123 10 filter=category:electronics
+
+# Set minimum score threshold
+nvecd-cli -p 11017 SIM product123 10 min_score=0.5
 ```
 
 ### Interactive Mode
@@ -110,6 +116,11 @@ Cache hit: **0.25us** (4M ops/sec). See [Benchmarks](docs/en/benchmarks.md) for 
 - **Authentication** - Optional password-based AUTH for write commands
 - **CLI Tool** - `nvecd-cli` with tab completion and interactive mode
 - **Client Library** - C++ and C client libraries for language bindings
+- **Metadata Filtering** - Attribute-based post-filtering for SIM/SIMV queries (`filter=key:value`)
+- **Score Thresholding** - Minimum score cutoff (`min_score=0.5`) to filter low-confidence results
+- **Write-Ahead Log** - CRC32-verified operation log for crash recovery
+- **Tiered Vector Store** - Two-tier architecture with delta buffer and background merge
+- **Co-occurrence Pruning** - Configurable max neighbors and minimum support thresholds
 
 ## What Makes Nvecd Different
 
@@ -166,8 +177,8 @@ Configurable via `events.negative_signals` and `events.negative_weight`.
 | Cold-start handling | Automatic | Manual | Manual | N/A |
 | Distributed search | No | Yes | Yes | No |
 | Managed cloud service | No | Yes | Yes | No |
-| ANN indexing (HNSW, IVF, PQ) | IVF only | Yes | Yes | Yes |
-| Metadata filtering | No | Yes | Yes | No |
+| ANN indexing (HNSW, IVF, PQ) | HNSW + IVF | Yes | Yes | Yes |
+| Metadata filtering | Yes (post-filter) | Yes | Yes | No |
 
 ## Architecture
 
@@ -179,9 +190,12 @@ graph LR
 
     subgraph Nvecd Engine
         Events[Event Store] --> CoOcc[Co-occurrence Index]
-        Vectors[Vector Store] --> Sim[Similarity Engine]
+        Vectors[Tiered Vector Store] --> ANN[HNSW / IVF Index]
+        ANN --> Sim[Similarity Engine]
         CoOcc --> Sim
         Sim --> Cache[Query Cache]
+        WAL[Write-Ahead Log] -.->|Recovery| Events
+        WAL -.->|Recovery| Vectors
     end
 ```
 

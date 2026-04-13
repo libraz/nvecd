@@ -52,6 +52,12 @@ nvecd-cli -p 11017 SIM product123 10 using=fusion
 
 # クエリベクトルで検索
 nvecd-cli -p 11017 SIMV 10 0.5 0.3 0.2 0.1
+
+# メタデータでフィルタリング
+nvecd-cli -p 11017 SIM product123 10 filter=category:electronics
+
+# 最小スコア閾値を設定
+nvecd-cli -p 11017 SIM product123 10 min_score=0.5
 ```
 
 ### インタラクティブモード
@@ -110,6 +116,11 @@ Apple M4 Max (NEON) で計測、dim=128、cosine、top_k=10:
 - **認証** - 書き込みコマンド用のオプションパスワード認証
 - **CLI ツール** - タブ補完とインタラクティブモードを備えた `nvecd-cli`
 - **クライアントライブラリ** - 言語バインディング用のC++/Cクライアントライブラリ
+- **メタデータフィルタリング** - SIM/SIMV クエリの属性ベースポストフィルタ (`filter=key:value`)
+- **スコア閾値フィルタ** - 低信頼度の結果を除外する最小スコア (`min_score=0.5`)
+- **Write-Ahead Log** - CRC32 検証付き操作ログによるクラッシュリカバリ
+- **階層型ベクトルストア** - デルタバッファとバックグラウンドマージによる二層アーキテクチャ
+- **共起プルーニング** - 最大隣接数と最小サポート閾値の設定
 
 ## Nvecd の差別化ポイント
 
@@ -166,8 +177,8 @@ nvecd-cli -p 11017 EVENT user1 DEL item_a
 | コールドスタート対応 | 自動 | 手動 | 手動 | N/A |
 | 分散検索 | No | Yes | Yes | No |
 | マネージドクラウド | No | Yes | Yes | No |
-| ANNインデックス (HNSW, IVF, PQ) | IVFのみ | Yes | Yes | Yes |
-| メタデータフィルタリング | No | Yes | Yes | No |
+| ANNインデックス (HNSW, IVF, PQ) | HNSW + IVF | Yes | Yes | Yes |
+| メタデータフィルタリング | Yes (ポストフィルタ) | Yes | Yes | No |
 
 ## Nvecd が適しているケース
 

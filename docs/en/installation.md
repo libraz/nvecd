@@ -64,7 +64,7 @@ cd nvecd
 # Build (automatically configures CMake and builds in parallel)
 make
 
-# Run tests (218 tests)
+# Run tests
 make test
 
 # View all available commands
@@ -227,7 +227,7 @@ sudo cmake --build build --target uninstall
 
 ## Running Tests
 
-nvecd includes comprehensive test coverage (218 tests).
+nvecd includes comprehensive test coverage (950+ tests across 63 test binaries).
 
 ### Using Makefile
 
@@ -258,16 +258,18 @@ cd build
 
 ### Test Coverage
 
-- **Event Store**: 35 tests
-- **Vector Store**: 28 tests
-- **Co-occurrence Index**: 22 tests
-- **Similarity Search**: 31 tests
-- **Configuration Parser**: 18 tests
-- **Server & Handlers**: 45 tests
-- **Cache System**: 24 tests
-- **Client Library**: 15 tests
+- **Event Processing**: EventStore, CoOccurrenceIndex, StateCache, DedupCache (90+ tests)
+- **Vector Search**: VectorStore, TieredVectorStore, HNSW, IVF, distance functions (180+ tests)
+- **Similarity Engine**: Fusion search, adaptive fusion, metadata filtering (45+ tests)
+- **Cache System**: SimilarityCache, cache policies, key generation, compression (100+ tests)
+- **Server & Protocol**: Command parser, handlers, HTTP server, networking (130+ tests)
+- **Storage**: Snapshots, WAL, format versioning (50+ tests)
+- **Configuration**: Config parser, runtime variables (45+ tests)
+- **Utilities**: Expected, string utils, MD5, path utils (100+ tests)
+- **Client Library**: C++ and C client tests (22+ tests)
+- **Integration (E2E)**: End-to-end, concurrency, adversarial, performance, TikTok scenarios (90+ tests)
 
-**Total**: 218 tests, 100% passing ✅
+**Total**: 950+ tests across 63 test binaries
 
 ---
 
