@@ -14,6 +14,7 @@
 #pragma once
 
 #include <cstdint>
+#include <mutex>
 #include <shared_mutex>
 #include <vector>
 
