@@ -97,12 +97,21 @@ struct SimilarityConfig {
   double adaptive_max_alpha = 0.9;           ///< Max vector weight (for new items with few co-occurrences)
   uint32_t adaptive_maturity_threshold = 50; ///< Co-occurrence neighbor count considered "mature"
 
+  // ANN index settings
+  std::string index_type = "flat";        ///< Index type: "hnsw", "ivf", or "flat" (brute-force)
+
   // IVF (Inverted File) index settings
-  bool ivf_enabled = false;               ///< Enable IVF approximate search
+  bool ivf_enabled = false;               ///< Enable IVF approximate search (legacy, use index_type="ivf")
   uint32_t ivf_nlist = 256;               ///< Number of Voronoi cells/clusters
   uint32_t ivf_nprobe = 8;               ///< Number of clusters to probe at query time
   uint32_t ivf_train_threshold = 10000;   ///< Minimum vectors before auto-training IVF index
   uint32_t ivf_seal_threshold = 100000;   ///< Seal write buffer when it reaches this size
+
+  // HNSW index settings
+  uint32_t hnsw_m = 16;                   ///< Number of connections per node
+  uint32_t hnsw_ef_construction = 200;    ///< Search width during construction
+  uint32_t hnsw_ef_search = 50;           ///< Search width during query
+  uint32_t hnsw_max_elements = 0;         ///< Pre-allocate capacity (0 = dynamic)
 };
 
 /**

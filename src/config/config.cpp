@@ -192,6 +192,9 @@ SimilarityConfig ParseSimilarityConfig(const YAML::Node& node) {
   if (node["adaptive_maturity_threshold"]) {
     config.adaptive_maturity_threshold = node["adaptive_maturity_threshold"].as<uint32_t>();
   }
+  if (node["index_type"]) {
+    config.index_type = node["index_type"].as<std::string>();
+  }
   if (node["ivf_enabled"]) {
     config.ivf_enabled = node["ivf_enabled"].as<bool>();
   }
@@ -206,6 +209,18 @@ SimilarityConfig ParseSimilarityConfig(const YAML::Node& node) {
   }
   if (node["ivf_seal_threshold"]) {
     config.ivf_seal_threshold = node["ivf_seal_threshold"].as<uint32_t>();
+  }
+  if (node["hnsw_m"]) {
+    config.hnsw_m = node["hnsw_m"].as<uint32_t>();
+  }
+  if (node["hnsw_ef_construction"]) {
+    config.hnsw_ef_construction = node["hnsw_ef_construction"].as<uint32_t>();
+  }
+  if (node["hnsw_ef_search"]) {
+    config.hnsw_ef_search = node["hnsw_ef_search"].as<uint32_t>();
+  }
+  if (node["hnsw_max_elements"]) {
+    config.hnsw_max_elements = node["hnsw_max_elements"].as<uint32_t>();
   }
 
   return config;
@@ -588,8 +603,16 @@ utils::Expected<void, utils::Error> ValidateConfig(const Config& config) {
                          "similarity.adaptive_maturity_threshold must be greater than 0"));
   }
 
+  // Validate index_type
+  const auto& idx_type = config.similarity.index_type;
+  if (idx_type != "flat" && idx_type != "ivf" && idx_type != "hnsw") {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
+                         "similarity.index_type must be 'flat', 'ivf', or 'hnsw' (got: " + idx_type + ")"));
+  }
+
   // Validate IVF configuration
-  if (config.similarity.ivf_enabled) {
+  if (config.similarity.ivf_enabled || idx_type == "ivf") {
     if (config.similarity.ivf_nprobe == 0) {
       return utils::MakeUnexpected(
           utils::MakeError(utils::ErrorCode::kConfigInvalidValue, "similarity.ivf_nprobe must be greater than 0"));
@@ -603,6 +626,25 @@ utils::Expected<void, utils::Error> ValidateConfig(const Config& config) {
       return utils::MakeUnexpected(
           utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
                            "similarity.ivf_nprobe must be <= similarity.ivf_nlist"));
+    }
+  }
+
+  // Validate HNSW configuration
+  if (idx_type == "hnsw") {
+    if (config.similarity.hnsw_m < 2) {
+      return utils::MakeUnexpected(
+          utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
+                           "similarity.hnsw_m must be >= 2"));
+    }
+    if (config.similarity.hnsw_ef_construction == 0) {
+      return utils::MakeUnexpected(
+          utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
+                           "similarity.hnsw_ef_construction must be greater than 0"));
+    }
+    if (config.similarity.hnsw_ef_search == 0) {
+      return utils::MakeUnexpected(
+          utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
+                           "similarity.hnsw_ef_search must be greater than 0"));
     }
   }
 

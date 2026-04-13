@@ -15,6 +15,8 @@
 #include "utils/error.h"
 #include "utils/structured_log.h"
 #include "vectors/distance.h"
+#include "vectors/hnsw_index.h"
+#include "vectors/ivf_ann_adapter.h"
 #include "vectors/ivf_index.h"
 
 namespace nvecd::similarity {
@@ -28,14 +30,46 @@ SimilarityEngine::SimilarityEngine(events::EventStore* event_store, events::CoOc
       config_(config),
       distance_func_(SelectDistanceFunction(vectors_config.distance_metric)),
       use_prenorm_(vectors_config.distance_metric.empty() || vectors_config.distance_metric == "cosine") {
-  if (config_.ivf_enabled) {
+  // Determine effective index type: support legacy ivf_enabled flag
+  std::string effective_type = config_.index_type;
+  if (effective_type == "flat" && config_.ivf_enabled) {
+    effective_type = "ivf";
+  }
+  // Store back for consistent behavior
+  config_.index_type = effective_type;
+
+  if (effective_type == "hnsw") {
+    vectors::HnswIndex::Config hnsw_config;
+    hnsw_config.m = config_.hnsw_m;
+    hnsw_config.ef_construction = config_.hnsw_ef_construction;
+    hnsw_config.ef_search = config_.hnsw_ef_search;
+    hnsw_config.max_elements = config_.hnsw_max_elements;
+
+    auto distance_func = vectors::GetDistanceFunc(vectors_config.distance_metric);
+    ann_index_ = std::make_unique<vectors::HnswIndex>(
+        vectors_config.default_dimension, distance_func, hnsw_config);
+
+    utils::StructuredLog()
+        .Event("hnsw_index_created")
+        .Field("m", static_cast<int64_t>(config_.hnsw_m))
+        .Field("ef_construction", static_cast<int64_t>(config_.hnsw_ef_construction))
+        .Field("ef_search", static_cast<int64_t>(config_.hnsw_ef_search))
+        .Info();
+  } else if (effective_type == "ivf") {
     vectors::IvfIndex::Config ivf_config;
     ivf_config.nlist = config_.ivf_nlist;
     ivf_config.nprobe = config_.ivf_nprobe;
     ivf_config.train_threshold = config_.ivf_train_threshold;
     ivf_config.seal_threshold = config_.ivf_seal_threshold;
-    ivf_index_ = std::make_unique<vectors::IvfIndex>(
+
+    auto ivf = std::make_unique<vectors::IvfIndex>(
         vectors_config.default_dimension, ivf_config);
+    auto* raw = ivf.get();
+
+    ann_index_ = std::make_unique<vectors::IvfAnnAdapter>(
+        std::move(ivf), vector_store, vectors_config.default_dimension);
+    ivf_index_raw_ = raw;
+
     utils::StructuredLog()
         .Event("ivf_index_created")
         .Field("nlist", static_cast<int64_t>(config_.ivf_nlist))
@@ -44,6 +78,7 @@ SimilarityEngine::SimilarityEngine(events::EventStore* event_store, events::CoOc
         .Field("seal_threshold", static_cast<int64_t>(config_.ivf_seal_threshold))
         .Info();
   }
+  // else: flat (no index), brute-force search
 }
 
 SimilarityEngine::~SimilarityEngine() { JoinTrainThread(); }
@@ -120,24 +155,21 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
   const float* query_ptr = snap.matrix + query_idx * snap.dim;
   float query_norm = snap.norms[query_idx];
 
-  // IVF accelerated path: use IVF index if enabled and trained
-  // IvfIndex::Search internally handles both IVF + buffer tiers
-  if (ivf_index_ && ivf_index_->IsTrained() && use_prenorm_) {
-    auto ivf_results = ivf_index_->Search(
-        query_ptr, query_norm, snap.matrix, snap.norms,
-        snap.count, static_cast<uint32_t>(snap.dim),
-        static_cast<size_t>(validated_top_k.value()) + 1);  // +1 to exclude self
+  // ANN accelerated path (HNSW or IVF)
+  if (ann_index_ && IsAnnIndexReady()) {
+    auto ann_results = ann_index_->Search(
+        query_ptr, static_cast<uint32_t>(validated_top_k.value()) + 1);
 
     std::vector<SimilarityResult> results;
-    results.reserve(ivf_results.size());
-    for (const auto& [score, idx] : ivf_results) {
-      if (idx == query_idx) {
+    results.reserve(ann_results.size());
+    for (const auto& [compact_idx, score] : ann_results) {
+      if (static_cast<size_t>(compact_idx) == query_idx) {
         continue;  // Exclude self
       }
-      if (vector_store_->IsDeleted(idx)) {
+      if (vector_store_->IsDeleted(compact_idx)) {
         continue;
       }
-      results.emplace_back((*snap.idx_to_id)[idx], score);
+      results.emplace_back((*snap.idx_to_id)[compact_idx], score);
       if (static_cast<int>(results.size()) >= validated_top_k.value()) {
         break;
       }
@@ -344,21 +376,18 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
   // Compute query norm using SIMD
   float query_norm = vectors::simd::GetOptimalImpl().l2_norm(query_vector.data(), query_vector.size());
 
-  // IVF accelerated path: use IVF index if enabled and trained
-  // IvfIndex::Search internally handles both IVF + buffer tiers
-  if (ivf_index_ && ivf_index_->IsTrained() && use_prenorm_) {
-    auto ivf_results = ivf_index_->Search(
-        query_vector.data(), query_norm, snap.matrix, snap.norms,
-        snap.count, static_cast<uint32_t>(snap.dim),
-        static_cast<size_t>(validated_top_k.value()));
+  // ANN accelerated path (HNSW or IVF)
+  if (ann_index_ && IsAnnIndexReady()) {
+    auto ann_results = ann_index_->Search(
+        query_vector.data(), static_cast<uint32_t>(validated_top_k.value()));
 
     std::vector<SimilarityResult> results;
-    results.reserve(ivf_results.size());
-    for (const auto& [score, idx] : ivf_results) {
-      if (vector_store_->IsDeleted(idx)) {
+    results.reserve(ann_results.size());
+    for (const auto& [compact_idx, score] : ann_results) {
+      if (vector_store_->IsDeleted(compact_idx)) {
         continue;
       }
-      results.emplace_back((*snap.idx_to_id)[idx], score);
+      results.emplace_back((*snap.idx_to_id)[compact_idx], score);
     }
     std::sort(results.begin(), results.end());
     return results;
@@ -594,57 +623,82 @@ std::vector<SimilarityResult> SimilarityEngine::MergeAndSelectTopK(std::vector<S
 // ============================================================================
 
 void SimilarityEngine::NotifyVectorAdded(size_t compact_index, const float* vector) {
-  if (!ivf_index_) {
+  if (!ann_index_) {
     return;
   }
 
-  // Always append to write buffer (fast path, minimal locking)
-  ivf_index_->AppendToBuffer(compact_index, vector);
+  if (config_.index_type == "hnsw") {
+    // HNSW: direct incremental insertion
+    ann_index_->Add(static_cast<uint32_t>(compact_index), vector);
+  } else if (config_.index_type == "ivf") {
+    // IVF: append to write buffer (fast path)
+    auto* adapter = static_cast<vectors::IvfAnnAdapter*>(ann_index_.get());
+    adapter->GetIvfIndex()->AppendToBuffer(compact_index, vector);
 
-  if (!ivf_index_->IsTrained()) {
-    // Not yet trained: check if we should trigger initial training
-    MaybeTrainIvfIndex();
-  } else if (ivf_index_->NeedsSeal()) {
-    // Buffer reached seal threshold: seal asynchronously.
-    // SealBuffer swaps buffer out quickly then does expensive centroid
-    // assignment without blocking AppendToBuffer.
-    // Use ivf_training_ flag to prevent concurrent seals.
-    bool expected = false;
-    if (ivf_training_.compare_exchange_strong(expected, true)) {
-      JoinTrainThread();
-      ivf_train_thread_ = std::make_unique<std::thread>([this]() {
-        ivf_index_->SealBuffer();
-        ivf_training_.store(false);
-      });
+    if (!adapter->IsTrained()) {
+      MaybeTrainIvfIndex();
+    } else if (adapter->NeedsSeal()) {
+      bool expected = false;
+      if (ivf_training_.compare_exchange_strong(expected, true)) {
+        JoinTrainThread();
+        ivf_train_thread_ = std::make_unique<std::thread>([this, adapter]() {
+          adapter->SealBuffer();
+          ivf_training_.store(false);
+        });
+      }
     }
   }
 }
 
 void SimilarityEngine::NotifyVectorRemoved(size_t compact_index) {
-  if (!ivf_index_) {
+  if (!ann_index_) {
     return;
   }
-  // RemoveVector searches both buffer and IVF inverted lists
-  ivf_index_->RemoveVector(compact_index);
+  ann_index_->MarkDeleted(static_cast<uint32_t>(compact_index));
 }
 
 bool SimilarityEngine::IsIvfTrained() const {
-  return ivf_index_ && ivf_index_->IsTrained();
+  if (config_.index_type == "ivf" && ann_index_) {
+    auto* adapter = static_cast<const vectors::IvfAnnAdapter*>(ann_index_.get());
+    return adapter->IsTrained();
+  }
+  return false;
+}
+
+bool SimilarityEngine::IsAnnIndexReady() const {
+  if (!ann_index_) {
+    return false;
+  }
+  if (config_.index_type == "hnsw") {
+    return ann_index_->Size() > 0;
+  }
+  if (config_.index_type == "ivf") {
+    auto* adapter = static_cast<const vectors::IvfAnnAdapter*>(ann_index_.get());
+    return adapter->IsTrained();
+  }
+  return false;
 }
 
 void SimilarityEngine::ForceIvfTrain() {
-  if (!ivf_index_) {
+  if (config_.index_type != "ivf" || !ann_index_) {
     return;
   }
-  // Reset trained state to allow re-training with current data size
-  if (ivf_index_->IsTrained()) {
-    ivf_index_->ResetTrained();
+  auto* adapter = static_cast<vectors::IvfAnnAdapter*>(ann_index_.get());
+  if (adapter->IsTrained()) {
+    adapter->GetIvfIndex()->ResetTrained();
   }
   MaybeTrainIvfIndex();
 }
 
 void SimilarityEngine::MaybeTrainIvfIndex() {
-  if (!ivf_index_ || ivf_index_->IsTrained()) {
+  if (config_.index_type != "ivf" || !ann_index_) {
+    return;
+  }
+
+  auto* adapter = static_cast<vectors::IvfAnnAdapter*>(ann_index_.get());
+  auto* ivf_index = adapter->GetIvfIndex();
+
+  if (ivf_index->IsTrained()) {
     return;
   }
 
@@ -721,7 +775,7 @@ void SimilarityEngine::MaybeTrainIvfIndex() {
     auto sqrt_n = static_cast<uint32_t>(
         std::max(1.0, std::sqrt(static_cast<double>(valid_indices.size()))));
     uint32_t nlist = std::min(sqrt_n, vectors::IvfIndex::kMaxAutoNlist);
-    ivf_index_->SetNlist(nlist);
+    ivf_index->SetNlist(nlist);
   }
 
   utils::StructuredLog()
@@ -736,22 +790,22 @@ void SimilarityEngine::MaybeTrainIvfIndex() {
   // Launch training in a background thread.
   // After training, seal the write buffer to move buffered entries into IVF.
   ivf_train_thread_ = std::make_unique<std::thread>(
-      [this, sample_matrix, sample_indices = std::move(sample_indices),
-       dim]() {
+      [this, ivf_index, adapter, sample_matrix,
+       sample_indices = std::move(sample_indices), dim]() {
         // Phase 1: Train centroids on the sample (no vector assignment
         // since all data is already in the write buffer)
-        ivf_index_->Train(sample_matrix->data(), sample_indices.data(),
-                          sample_indices.size(), dim, false);
+        ivf_index->Train(sample_matrix->data(), sample_indices.data(),
+                         sample_indices.size(), dim, false);
 
         // Phase 2: Seal the write buffer to assign buffered entries to
         // the newly-trained IVF clusters
-        ivf_index_->SealBuffer();
+        adapter->SealBuffer();
 
         utils::StructuredLog()
             .Event("ivf_training_complete_async")
-            .Field("trained", ivf_index_->IsTrained())
-            .Field("indexed_count", static_cast<int64_t>(ivf_index_->GetIndexedCount()))
-            .Field("buffer_size", static_cast<int64_t>(ivf_index_->GetBufferSize()))
+            .Field("trained", ivf_index->IsTrained())
+            .Field("indexed_count", static_cast<int64_t>(ivf_index->GetIndexedCount()))
+            .Field("buffer_size", static_cast<int64_t>(ivf_index->GetBufferSize()))
             .Info();
 
         ivf_training_.store(false);

@@ -296,6 +296,18 @@ target_link_libraries(ivf_index_test
 )
 gtest_discover_tests(ivf_index_test)
 
+# HNSW index tests
+add_executable(hnsw_index_test
+  vectors/hnsw_index_test.cpp
+)
+target_link_libraries(hnsw_index_test
+  nvecd_vectors
+  nvecd_utils
+  gtest
+  gtest_main
+)
+gtest_discover_tests(hnsw_index_test)
+
 # SIMD correctness tests
 add_executable(distance_simd_test
   vectors/distance_simd_test.cpp
@@ -413,6 +425,7 @@ target_link_libraries(nvecdclient_test
   gtest_main
 )
 gtest_discover_tests(nvecdclient_test
+  DISCOVERY_TIMEOUT 30
   PROPERTIES LABELS "client"
 )
 
@@ -431,6 +444,7 @@ target_link_libraries(nvecdclient_c_test
   gtest_main
 )
 gtest_discover_tests(nvecdclient_c_test
+  DISCOVERY_TIMEOUT 30
   PROPERTIES LABELS "client"
 )
 

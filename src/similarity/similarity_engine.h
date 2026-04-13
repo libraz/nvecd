@@ -26,6 +26,7 @@
 #include "similarity/similarity_result.h"
 #include "utils/error.h"
 #include "utils/expected.h"
+#include "vectors/ann_index.h"
 #include "vectors/distance.h"
 #include "vectors/ivf_index.h"
 #include "vectors/vector_store.h"
@@ -163,6 +164,18 @@ class SimilarityEngine {
    */
   void ForceIvfTrain();
 
+  /**
+   * @brief Check if ANN index is available and ready
+   * @return True if an ANN index exists (HNSW or IVF)
+   */
+  bool IsAnnIndexReady() const;
+
+  /**
+   * @brief Get the configured index type
+   * @return "hnsw", "ivf", or "flat"
+   */
+  const std::string& GetIndexType() const { return config_.index_type; }
+
  private:
   /**
    * @brief Validate top_k parameter
@@ -220,8 +233,11 @@ class SimilarityEngine {
   DistanceFunc distance_func_;                        ///< Distance function for similarity
   bool use_prenorm_ = false;                          ///< Whether to use pre-computed norm optimization (cosine only)
 
-  /// IVF index for approximate nearest neighbor search (null if disabled)
-  std::unique_ptr<vectors::IvfIndex> ivf_index_;
+  /// ANN index (HNSW or IVF adapter; null for flat/brute-force)
+  std::unique_ptr<vectors::AnnIndex> ann_index_;
+
+  /// Legacy direct IVF pointer (non-owning, null if index_type != "ivf")
+  vectors::IvfIndex* ivf_index_raw_ = nullptr;
 
   /// Background thread for asynchronous IVF training
   std::unique_ptr<std::thread> ivf_train_thread_;

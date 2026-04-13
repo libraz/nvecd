@@ -14,11 +14,71 @@
 #pragma once
 
 #include <cmath>
+#include <string>
 #include <vector>
 
+#include "vectors/ann_index.h"
 #include "vectors/distance_simd.h"
 
 namespace nvecd::vectors {
+
+// ============================================================================
+// Raw-pointer distance functions (for AnnIndex / DistanceFunc)
+// ============================================================================
+
+/**
+ * @brief Cosine similarity using pre-computed norms (raw pointers)
+ *
+ * Computes dot(a,b) / (||a|| * ||b||) using SIMD.
+ * Both norms are computed on the fly.
+ */
+inline float CosineDistanceRaw(const float* a, const float* b, uint32_t dim) {
+  const auto& impl = simd::GetOptimalImpl();
+  float dot = impl.dot_product(a, b, dim);
+  float norm_a = impl.l2_norm(a, dim);
+  float norm_b = impl.l2_norm(b, dim);
+  constexpr float kEps = 1e-7F;
+  if (norm_a < kEps || norm_b < kEps) {
+    return 0.0F;
+  }
+  return dot / (norm_a * norm_b);
+}
+
+/**
+ * @brief Dot product similarity (raw pointers)
+ */
+inline float DotProductRaw(const float* a, const float* b, uint32_t dim) {
+  return simd::GetOptimalImpl().dot_product(a, b, dim);
+}
+
+/**
+ * @brief L2 distance converted to similarity (raw pointers)
+ *
+ * Returns 1 / (1 + L2_distance) so higher values mean more similar.
+ */
+inline float L2SimilarityRaw(const float* a, const float* b, uint32_t dim) {
+  float dist = simd::GetOptimalImpl().l2_distance(a, b, dim);
+  return 1.0F / (1.0F + dist);
+}
+
+/**
+ * @brief Get a DistanceFunc for the given metric name
+ * @param metric "cosine", "dot", or "l2"
+ * @return Function pointer for the requested metric (defaults to cosine)
+ */
+inline DistanceFunc GetDistanceFunc(const std::string& metric) {
+  if (metric == "dot") {
+    return DotProductRaw;
+  }
+  if (metric == "l2") {
+    return L2SimilarityRaw;
+  }
+  return CosineDistanceRaw;
+}
+
+// ============================================================================
+// std::vector<float> distance functions (existing API)
+// ============================================================================
 
 /**
  * @brief Calculate dot product between two vectors
