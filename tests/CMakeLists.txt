@@ -347,6 +347,30 @@ gtest_discover_tests(tiered_vector_store_test
   PROPERTIES TIMEOUT 30
 )
 
+# ID mapper tests
+add_executable(id_mapper_test
+  vectors/id_mapper_test.cpp
+)
+target_link_libraries(id_mapper_test
+  nvecd_vectors
+  nvecd_utils
+  gtest
+  gtest_main
+)
+gtest_discover_tests(id_mapper_test)
+
+# Quantizer tests
+add_executable(quantizer_test
+  vectors/quantizer_test.cpp
+)
+target_link_libraries(quantizer_test
+  nvecd_vectors
+  nvecd_utils
+  gtest
+  gtest_main
+)
+gtest_discover_tests(quantizer_test)
+
 # SIMD correctness tests
 add_executable(distance_simd_test
   vectors/distance_simd_test.cpp

@@ -70,6 +70,8 @@ add_library(nvecd_vectors STATIC
   vectors/metadata_store.cpp
   vectors/tiered_vector_store.cpp
   vectors/merge_scheduler.cpp
+  vectors/id_mapper.cpp
+  vectors/quantizer.cpp
   vectors/cpu_features.cpp
 )
 target_link_libraries(nvecd_vectors PUBLIC
