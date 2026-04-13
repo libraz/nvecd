@@ -333,6 +333,20 @@ target_link_libraries(metadata_store_test
 )
 gtest_discover_tests(metadata_store_test)
 
+# Tiered vector store tests
+add_executable(tiered_vector_store_test
+  vectors/tiered_vector_store_test.cpp
+)
+target_link_libraries(tiered_vector_store_test
+  nvecd_vectors
+  nvecd_utils
+  gtest
+  gtest_main
+)
+gtest_discover_tests(tiered_vector_store_test
+  PROPERTIES TIMEOUT 30
+)
+
 # SIMD correctness tests
 add_executable(distance_simd_test
   vectors/distance_simd_test.cpp
