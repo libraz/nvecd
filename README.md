@@ -91,15 +91,15 @@ make test
 
 ## Performance
 
-Measured on Apple M4 Max (NEON), dim=128, cosine, top_k=10:
+Measured on Apple M5 Max (NEON), dim=128, cosine, top_k=10:
 
 | Vectors | SIM Latency | SIMV Latency |
 |---|---|---|
-| 1K | 0.012ms | 0.012ms |
-| 10K | 0.12ms | 0.12ms |
-| 100K | **1.03ms** | **1.05ms** |
+| 1K | 0.019ms | 0.018ms |
+| 10K | 0.18ms | 0.18ms |
+| 100K | **1.84ms** | **1.77ms** |
 
-Cache hit: **0.25us** (4M ops/sec). See [Benchmarks](docs/en/benchmarks.md) for methodology and detailed breakdown.
+Cache hit: **0.42us** (2.4M ops/sec). See [Benchmarks](docs/en/benchmarks.md) for methodology and detailed breakdown.
 
 ## Features
 

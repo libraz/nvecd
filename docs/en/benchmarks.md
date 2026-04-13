@@ -4,7 +4,7 @@ This document presents measured performance benchmarks for nvecd's similarity se
 
 ## Benchmark Environment
 
-- **Hardware**: Apple M4 Max (arm64), 128GB unified memory
+- **Hardware**: Apple M5 Max (arm64), 128GB unified memory
 - **SIMD**: NEON (4-wide, 128-bit), 4x multi-accumulator unrolled
 - **Build**: Release (`-O2`), Clang 16
 - **Configuration**: Default (`distance_metric: cosine`, `sample_size: 10000`)
@@ -19,27 +19,27 @@ This document presents measured performance benchmarks for nvecd's similarity se
 
 | Dataset Size | SearchByIdVectors (SIM) | SearchByVector (SIMV) | Cache Hit |
 |---|---|---|---|
-| 1K vectors | 0.012ms | 0.012ms | 0.25us |
-| 10K vectors | 0.12ms | 0.12ms | 0.25us |
-| 50K vectors | 0.62ms | 0.64ms | 0.25us |
-| 100K vectors | **1.03ms** | **1.05ms** | **0.25us** |
+| 1K vectors | 0.019ms | 0.018ms | 0.42us |
+| 10K vectors | 0.18ms | 0.18ms | 0.42us |
+| 50K vectors | 1.33ms | 1.36ms | 0.42us |
+| 100K vectors | **1.84ms** | **1.77ms** | **0.42us** |
 
 **Key findings:**
 
-- Sub-millisecond latency up to 50K vectors without sampling
-- 100K vectors: ~1ms per query (**~970 QPS per thread**)
-- Cache hit latency: 250 nanoseconds (**4 million ops/sec**)
-- Cache provides **4,000x** speedup over cold queries at 100K scale
+- Sub-millisecond latency up to 10K vectors without sampling
+- 100K vectors: ~1.8ms per query (**~540 QPS per thread**)
+- Cache hit latency: 417 nanoseconds (**2.4 million ops/sec**)
+- Cache provides **4,300x** speedup over cold queries at 100K scale
 
 ## Pipeline Breakdown (100K vectors, dim=128)
 
 | Component | Time | % of E2E |
 |---|---|---|
-| NEON cosine scan (brute-force) | 0.80ms | 78% |
-| Min-heap top-k selection | 0.05ms | 5% |
-| Lock acquisition + index lookup | 0.03ms | 3% |
-| Result string construction (k=10) | 0.02ms | 2% |
-| **Total (SearchByIdVectors)** | **1.03ms** | **100%** |
+| NEON cosine scan (brute-force) | 1.45ms | 79% |
+| Min-heap top-k selection | 0.09ms | 5% |
+| Lock acquisition + index lookup | 0.05ms | 3% |
+| Result string construction (k=10) | 0.03ms | 2% |
+| **Total (SearchByIdVectors)** | **1.84ms** | **100%** |
 
 The scan (SIMD dot product) dominates at 78%. The min-heap approach avoids allocating 100K result strings, reducing overhead from ~0.22ms (partial_sort) to ~0.05ms.
 
@@ -108,8 +108,8 @@ Selective invalidation uses a reverse index (`item_id -> set<CacheKey>`) to inva
 
 | Operation | Latency | Ops/sec |
 |---|---|---|
-| Cache miss (key not found) | 42-83ns | 12-24M |
-| Cache hit (decompress + return) | 250ns | 4M |
+| Cache miss (key not found) | 84-125ns | 8-12M |
+| Cache hit (decompress + return) | 417ns | 2.4M |
 
 Cache overhead is negligible compared to search latency.
 

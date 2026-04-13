@@ -91,15 +91,15 @@ make test
 
 ## パフォーマンス
 
-Apple M4 Max (NEON) で計測、dim=128、cosine、top_k=10:
+Apple M5 Max (NEON) で計測、dim=128、cosine、top_k=10:
 
 | ベクトル数 | SIM レイテンシ | SIMV レイテンシ |
 |---|---|---|
-| 1K | 0.012ms | 0.012ms |
-| 10K | 0.12ms | 0.12ms |
-| 100K | **1.03ms** | **1.05ms** |
+| 1K | 0.019ms | 0.018ms |
+| 10K | 0.18ms | 0.18ms |
+| 100K | **1.84ms** | **1.77ms** |
 
-キャッシュヒット: **0.25us** (400万 ops/秒)。詳細は[ベンチマーク](docs/ja/benchmarks.md)を参照。
+キャッシュヒット: **0.42us** (240万 ops/秒)。詳細は[ベンチマーク](docs/ja/benchmarks.md)を参照。
 
 ## 主な機能
 
