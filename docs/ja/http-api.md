@@ -129,6 +129,9 @@ Content-Type: application/json
 | `id` | string | Yes | - | クエリアイテム ID |
 | `top_k` | integer | No | 10 | 返す結果数 |
 | `mode` | string | No | "vectors" | 検索モード: "vectors", "events", または "fusion" |
+| `filter` | string | No | - | メタデータフィルタ (例: "category:electronics,type:laptop") |
+| `min_score` | float | No | 0.0 | 最小スコア閾値 (この値未満の結果は除外) |
+| `adaptive` | boolean | No | false | 適応型 fusion (データ密度に基づき重みを自動調整) |
 
 **検索モード:**
 
@@ -201,6 +204,8 @@ Content-Type: application/json
 | `vector` | array of floats | Yes | - | クエリベクトル |
 | `top_k` | integer | No | 10 | 返す結果数 |
 | `mode` | string | No | "vectors" | 検索モード（通常は "vectors"） |
+| `filter` | string | No | - | メタデータフィルタ (例: "type:article") |
+| `min_score` | float | No | 0.0 | 最小スコア閾値 |
 
 **レスポンス（200 OK）:**
 
@@ -721,6 +726,20 @@ curl -X POST http://localhost:8080/sim \
     "id": "product123",
     "top_k": 10,
     "mode": "fusion"
+  }'
+```
+
+**フィルタと min_score 付き検索:**
+
+```bash
+curl -X POST http://localhost:8080/sim \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "product123",
+    "top_k": 10,
+    "mode": "fusion",
+    "filter": "category:electronics",
+    "min_score": 0.5
   }'
 ```
 

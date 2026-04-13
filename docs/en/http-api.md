@@ -129,6 +129,9 @@ Content-Type: application/json
 | `id` | string | Yes | - | Query item ID |
 | `top_k` | integer | No | 10 | Number of results to return |
 | `mode` | string | No | "vectors" | Search mode: "vectors", "events", or "fusion" |
+| `filter` | string | No | - | Metadata filter (e.g., "category:electronics,type:laptop") |
+| `min_score` | float | No | 0.0 | Minimum score threshold (results below this are excluded) |
+| `adaptive` | boolean | No | false | Enable adaptive fusion (auto-adjusts weights by data density) |
 
 **Search Modes:**
 
@@ -201,6 +204,8 @@ Content-Type: application/json
 | `vector` | array of floats | Yes | - | Query vector |
 | `top_k` | integer | No | 10 | Number of results to return |
 | `mode` | string | No | "vectors" | Search mode (typically "vectors") |
+| `filter` | string | No | - | Metadata filter (e.g., "type:article") |
+| `min_score` | float | No | 0.0 | Minimum score threshold |
 
 **Response (200 OK):**
 
@@ -721,6 +726,20 @@ curl -X POST http://localhost:8080/sim \
     "id": "product123",
     "top_k": 10,
     "mode": "fusion"
+  }'
+```
+
+**Search with filter and min_score:**
+
+```bash
+curl -X POST http://localhost:8080/sim \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "product123",
+    "top_k": 10,
+    "mode": "fusion",
+    "filter": "category:electronics",
+    "min_score": 0.5
   }'
 ```
 

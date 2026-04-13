@@ -193,7 +193,7 @@ Find similar items based on an existing item's vector and co-occurrence data.
 
 **Syntax**:
 ```
-SIM <id> <top_k> [using=events|vectors|fusion]
+SIM <id> <top_k> [using=events|vectors|fusion] [filter=<expr>] [min_score=<float>] [adaptive=on|off]
 ```
 
 **Parameters**:
@@ -203,6 +203,9 @@ SIM <id> <top_k> [using=events|vectors|fusion]
   - `events`: Co-occurrence-based (event data only)
   - `vectors`: Vector distance-based (vector data only)
   - `fusion` (default): Hybrid co-occurrence × vector
+- `filter=` (optional): Metadata filter expression. Format: `key:value` for single condition, `key1:value1,key2:value2` for AND conditions. Values are auto-typed (string, int, float, bool). Only items whose metadata matches all conditions are returned.
+- `min_score=` (optional, default: 0.0): Minimum score threshold. Results with score < min_score are excluded from the response.
+- `adaptive=` (optional): Adaptive fusion mode. When `on`, automatically adjusts the vector/co-occurrence weight balance based on item data density. Only applicable in fusion mode. Configurable via `similarity.adaptive_*` settings.
 
 **Response Format**:
 ```
@@ -238,6 +241,31 @@ item202 0.8932
 item555 0.8567
 ```
 
+**Example (with filter)**:
+```
+SIM item456 10 filter=category:electronics
+→ OK RESULTS 2
+item789 0.9245
+item101 0.8932
+```
+
+**Example (with min_score)**:
+```
+SIM item456 10 min_score=0.85
+→ OK RESULTS 2
+item789 0.9245
+item101 0.8932
+```
+
+**Example (adaptive fusion)**:
+```
+SIM new_item 10 using=fusion adaptive=on
+→ OK RESULTS 3
+item789 0.9245
+item101 0.8932
+item202 0.8567
+```
+
 **Error Responses**:
 - `(error) Item not found: item456`
 - `(error) Invalid mode: must be events, vectors, or fusion`
@@ -256,11 +284,13 @@ Find similar items based on a query vector.
 
 **Syntax**:
 ```
-SIMV <top_k> <f1> <f2> ... <fN>
+SIMV <top_k> [filter=<expr>] [min_score=<float>] <f1> <f2> ... <fN>
 ```
 
 **Parameters**:
 - `<top_k>`: Number of results to return (integer)
+- `filter=` (optional): Same as SIM filter. Metadata filter expression.
+- `min_score=` (optional, default: 0.0): Minimum score threshold.
 - `<f1> <f2> ... <fN>`: Query vector components (floats)
 
 **Response Format**:
@@ -277,6 +307,13 @@ SIMV 5 0.1 0.9 -0.2 0.5
 → OK RESULTS 2
 item789 0.98
 item101 0.82
+```
+
+**Example (with filter and min_score)**:
+```
+SIMV 5 filter=type:article min_score=0.7 0.1 0.9 -0.2 0.5
+→ OK RESULTS 1
+item789 0.98
 ```
 
 **Error Responses**:

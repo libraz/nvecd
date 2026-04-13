@@ -193,7 +193,7 @@ VECSET item789 0.11 0.98 -0.22 0.44 ... (768 個の値)
 
 **構文**:
 ```
-SIM <id> <top_k> [using=events|vectors|fusion]
+SIM <id> <top_k> [using=events|vectors|fusion] [filter=<expr>] [min_score=<float>] [adaptive=on|off]
 ```
 
 **パラメータ**:
@@ -203,6 +203,9 @@ SIM <id> <top_k> [using=events|vectors|fusion]
   - `events`: 共起ベース（イベントデータのみ）
   - `vectors`: ベクトル距離ベース（ベクトルデータのみ）
   - `fusion`（デフォルト）: 共起 x ベクトルのハイブリッド
+- `filter=`（省略可能）: メタデータフィルタ式。形式: `key:value`（単一条件）、`key1:value1,key2:value2`（AND条件）。値は自動型判定（文字列、整数、浮動小数点、真偽値）。メタデータが全条件に一致するアイテムのみ返されます。
+- `min_score=`（省略可能、デフォルト: 0.0）: 最小スコア閾値。score < min_score の結果はレスポンスから除外されます。
+- `adaptive=`（省略可能）: 適応型 fusion モード。`on` にすると、アイテムのデータ密度に基づいてベクトル/共起の重みバランスを自動調整します。fusion モードでのみ有効。`similarity.adaptive_*` 設定で調整可能。
 
 **レスポンス形式**:
 ```
@@ -238,6 +241,31 @@ item202 0.8932
 item555 0.8567
 ```
 
+**例（フィルタ付き）**:
+```
+SIM item456 10 filter=category:electronics
+→ OK RESULTS 2
+item789 0.9245
+item101 0.8932
+```
+
+**例（min_score 付き）**:
+```
+SIM item456 10 min_score=0.85
+→ OK RESULTS 2
+item789 0.9245
+item101 0.8932
+```
+
+**例（adaptive fusion）**:
+```
+SIM new_item 10 using=fusion adaptive=on
+→ OK RESULTS 3
+item789 0.9245
+item101 0.8932
+item202 0.8567
+```
+
 **エラーレスポンス**:
 - `(error) Item not found: item456`
 - `(error) Invalid mode: must be events, vectors, or fusion`
@@ -256,11 +284,13 @@ item555 0.8567
 
 **構文**:
 ```
-SIMV <top_k> <f1> <f2> ... <fN>
+SIMV <top_k> [filter=<expr>] [min_score=<float>] <f1> <f2> ... <fN>
 ```
 
 **パラメータ**:
 - `<top_k>`: 返す結果数（整数）
+- `filter=`（省略可能）: SIM と同じメタデータフィルタ式。
+- `min_score=`（省略可能、デフォルト: 0.0）: 最小スコア閾値。
 - `<f1> <f2> ... <fN>`: クエリベクトル成分（浮動小数点数）
 
 **レスポンス形式**:
@@ -277,6 +307,13 @@ SIMV 5 0.1 0.9 -0.2 0.5
 → OK RESULTS 2
 item789 0.98
 item101 0.82
+```
+
+**例（フィルタと min_score 付き）**:
+```
+SIMV 5 filter=type:article min_score=0.7 0.1 0.9 -0.2 0.5
+→ OK RESULTS 1
+item789 0.98
 ```
 
 **エラーレスポンス**:
