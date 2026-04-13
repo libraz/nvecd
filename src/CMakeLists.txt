@@ -180,6 +180,7 @@ add_library(nvecd_storage STATIC
   storage/snapshot_format_v1.cpp
   storage/snapshot_fork.cpp
   storage/snapshot_lock.cpp
+  storage/wal.cpp
 )
 target_link_libraries(nvecd_storage PUBLIC
   nvecd_config

@@ -110,6 +110,14 @@ enum class ErrorCode : std::uint16_t {
   kSnapshotForkFailed = 5020,          ///< fork() system call failed
   kSnapshotAlreadyInProgress = 5021,   ///< Background snapshot already running
   kSnapshotChildFailed = 5022,         ///< Fork child process exited with error
+  kWalWriteError = 5030,               ///< WAL write failed
+  kWalReadError = 5031,                ///< WAL read failed
+  kWalCRCMismatch = 5032,              ///< WAL record CRC mismatch
+  kWalCorrupted = 5033,                ///< WAL file corrupted
+  kWalRotationFailed = 5034,           ///< WAL file rotation failed
+  kWalReplayFailed = 5035,             ///< WAL replay failed
+  kWalTruncateFailed = 5036,           ///< WAL truncate failed
+  kWalNotOpen = 5037,                  ///< WAL not open
 
   // ===== Network/Server Errors (6000-6999) =====
   kNetworkBindFailed = 6000,             ///< Failed to bind to port
@@ -299,6 +307,22 @@ inline const char* ErrorCodeToString(ErrorCode code) {
       return "Snapshot already in progress";
     case ErrorCode::kSnapshotChildFailed:
       return "Snapshot child process failed";
+    case ErrorCode::kWalWriteError:
+      return "WAL write error";
+    case ErrorCode::kWalReadError:
+      return "WAL read error";
+    case ErrorCode::kWalCRCMismatch:
+      return "WAL CRC mismatch";
+    case ErrorCode::kWalCorrupted:
+      return "WAL corrupted";
+    case ErrorCode::kWalRotationFailed:
+      return "WAL rotation failed";
+    case ErrorCode::kWalReplayFailed:
+      return "WAL replay failed";
+    case ErrorCode::kWalTruncateFailed:
+      return "WAL truncate failed";
+    case ErrorCode::kWalNotOpen:
+      return "WAL not open";
 
     // Network
     case ErrorCode::kNetworkBindFailed:

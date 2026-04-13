@@ -555,6 +555,22 @@ target_link_libraries(snapshot_lock_test
 )
 gtest_discover_tests(snapshot_lock_test)
 
+add_executable(wal_test
+  storage/wal_test.cpp
+)
+target_link_libraries(wal_test
+  nvecd_storage
+  nvecd_events
+  nvecd_vectors
+  nvecd_config
+  nvecd_utils
+  gtest
+  gtest_main
+)
+gtest_discover_tests(wal_test
+  PROPERTIES TIMEOUT 30
+)
+
 add_executable(snapshot_fork_test
   storage/snapshot_fork_test.cpp
 )
