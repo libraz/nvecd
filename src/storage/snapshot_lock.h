@@ -41,11 +41,8 @@ namespace nvecd::storage {
  * @return Expected<void, Error> Success or error
  */
 utils::Expected<void, utils::Error> WriteSnapshotWithLock(
-    const std::string& filepath, const config::Config& config,
-    events::EventStore& event_store, events::CoOccurrenceIndex& co_index,
-    vectors::VectorStore& vector_store,
-    const SnapshotStatistics* stats = nullptr,
-    const std::unordered_map<std::string, StoreStatistics>*
-        store_stats = nullptr);
+    const std::string& filepath, const config::Config& config, events::EventStore& event_store,
+    events::CoOccurrenceIndex& co_index, vectors::VectorStore& vector_store, const SnapshotStatistics* stats = nullptr,
+    const std::unordered_map<std::string, StoreStatistics>* store_stats = nullptr);
 
 }  // namespace nvecd::storage

@@ -78,20 +78,17 @@ TEST_F(ApiExtensionE2ETest, SimWithMinScoreFiltersLowScores) {
 
   // Verify results are sorted descending by score
   for (size_t i = 1; i < all_parsed.size(); ++i) {
-    EXPECT_GE(all_parsed[i - 1].second, all_parsed[i].second)
-        << "Results should be sorted by score descending";
+    EXPECT_GE(all_parsed[i - 1].second, all_parsed[i].second) << "Results should be sorted by score descending";
   }
 
   // Find a threshold between the highest and lowest scores
   float highest_score = all_parsed.front().second;
   float lowest_score = all_parsed.back().second;
-  ASSERT_GT(highest_score, lowest_score)
-      << "Need distinct scores to test min_score filtering";
+  ASSERT_GT(highest_score, lowest_score) << "Need distinct scores to test min_score filtering";
 
   // Set min_score to midpoint — should exclude the lowest-scored items
   float threshold = (highest_score + lowest_score) / 2.0F;
-  std::string cmd =
-      "SIM item1 10 min_score=" + std::to_string(threshold);
+  std::string cmd = "SIM item1 10 min_score=" + std::to_string(threshold);
   auto filtered_response = client.SendCommand(cmd);
   EXPECT_TRUE(ContainsOK(filtered_response));
   auto filtered_parsed = ParseSimResults(filtered_response);
@@ -103,19 +100,15 @@ TEST_F(ApiExtensionE2ETest, SimWithMinScoreFiltersLowScores) {
 
   // All returned results must have score >= threshold
   for (const auto& [id, score] : filtered_parsed) {
-    EXPECT_GE(score, threshold)
-        << "Item " << id << " has score " << score
-        << " which is below min_score=" << threshold;
+    EXPECT_GE(score, threshold) << "Item " << id << " has score " << score << " which is below min_score=" << threshold;
   }
 
   // Verify that the lowest-scored item from the unfiltered results is absent
   const std::string& lowest_id = all_parsed.back().first;
-  bool lowest_found = std::any_of(
-      filtered_parsed.begin(), filtered_parsed.end(),
-      [&lowest_id](const auto& p) { return p.first == lowest_id; });
-  EXPECT_FALSE(lowest_found)
-      << "Item " << lowest_id << " (score=" << lowest_score
-      << ") should have been filtered out by min_score=" << threshold;
+  bool lowest_found = std::any_of(filtered_parsed.begin(), filtered_parsed.end(),
+                                  [&lowest_id](const auto& p) { return p.first == lowest_id; });
+  EXPECT_FALSE(lowest_found) << "Item " << lowest_id << " (score=" << lowest_score
+                             << ") should have been filtered out by min_score=" << threshold;
 }
 
 TEST_F(ApiExtensionE2ETest, SimWithMinScoreZeroReturnsAll) {
@@ -164,8 +157,7 @@ TEST_F(ApiExtensionE2ETest, SimWithMinScoreAboveMaxReturnsNone) {
   auto response = client.SendCommand("SIM item1 10 min_score=1.01");
   EXPECT_TRUE(ContainsOK(response));
   auto results = ParseSimResults(response);
-  EXPECT_EQ(results.size(), 0U)
-      << "min_score=1.01 should return no results since scores are in [0, 1]";
+  EXPECT_EQ(results.size(), 0U) << "min_score=1.01 should return no results since scores are in [0, 1]";
 }
 
 // --- SIMV basic ---
@@ -214,9 +206,9 @@ TEST_F(ApiExtensionE2ETest, SimvWithMinScoreFiltersLowScores) {
   TcpClient client("127.0.0.1", port_);
 
   // Register vectors at varying distances from query [1.0, 0.0, 0.0]
-  EXPECT_TRUE(ContainsOK(client.SendCommand("VECSET item1 1.0 0.0 0.0")));   // identical
-  EXPECT_TRUE(ContainsOK(client.SendCommand("VECSET item2 0.9 0.1 0.0")));   // close
-  EXPECT_TRUE(ContainsOK(client.SendCommand("VECSET item3 0.0 0.0 1.0")));   // orthogonal
+  EXPECT_TRUE(ContainsOK(client.SendCommand("VECSET item1 1.0 0.0 0.0")));  // identical
+  EXPECT_TRUE(ContainsOK(client.SendCommand("VECSET item2 0.9 0.1 0.0")));  // close
+  EXPECT_TRUE(ContainsOK(client.SendCommand("VECSET item3 0.0 0.0 1.0")));  // orthogonal
 
   // Get all results without min_score
   auto all_response = client.SendCommand("SIMV 10 1.0 0.0 0.0");
@@ -226,19 +218,16 @@ TEST_F(ApiExtensionE2ETest, SimvWithMinScoreFiltersLowScores) {
 
   // Verify results are sorted descending by score
   for (size_t i = 1; i < all_parsed.size(); ++i) {
-    EXPECT_GE(all_parsed[i - 1].second, all_parsed[i].second)
-        << "Results should be sorted by score descending";
+    EXPECT_GE(all_parsed[i - 1].second, all_parsed[i].second) << "Results should be sorted by score descending";
   }
 
   float highest_score = all_parsed.front().second;
   float lowest_score = all_parsed.back().second;
-  ASSERT_GT(highest_score, lowest_score)
-      << "Need distinct scores to test min_score filtering";
+  ASSERT_GT(highest_score, lowest_score) << "Need distinct scores to test min_score filtering";
 
   // Set threshold between highest and lowest
   float threshold = (highest_score + lowest_score) / 2.0F;
-  std::string cmd =
-      "SIMV 10 min_score=" + std::to_string(threshold) + " 1.0 0.0 0.0";
+  std::string cmd = "SIMV 10 min_score=" + std::to_string(threshold) + " 1.0 0.0 0.0";
   auto filtered_response = client.SendCommand(cmd);
   EXPECT_TRUE(ContainsOK(filtered_response));
   auto filtered_parsed = ParseSimResults(filtered_response);
@@ -250,19 +239,15 @@ TEST_F(ApiExtensionE2ETest, SimvWithMinScoreFiltersLowScores) {
 
   // All returned results must have score >= threshold
   for (const auto& [id, score] : filtered_parsed) {
-    EXPECT_GE(score, threshold)
-        << "Item " << id << " has score " << score
-        << " which is below min_score=" << threshold;
+    EXPECT_GE(score, threshold) << "Item " << id << " has score " << score << " which is below min_score=" << threshold;
   }
 
   // Verify the lowest-scored item is absent
   const std::string& lowest_id = all_parsed.back().first;
-  bool lowest_found = std::any_of(
-      filtered_parsed.begin(), filtered_parsed.end(),
-      [&lowest_id](const auto& p) { return p.first == lowest_id; });
-  EXPECT_FALSE(lowest_found)
-      << "Item " << lowest_id << " (score=" << lowest_score
-      << ") should have been filtered out by min_score=" << threshold;
+  bool lowest_found = std::any_of(filtered_parsed.begin(), filtered_parsed.end(),
+                                  [&lowest_id](const auto& p) { return p.first == lowest_id; });
+  EXPECT_FALSE(lowest_found) << "Item " << lowest_id << " (score=" << lowest_score
+                             << ") should have been filtered out by min_score=" << threshold;
 }
 
 // --- Backward compatibility ---

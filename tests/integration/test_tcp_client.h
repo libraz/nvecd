@@ -6,11 +6,11 @@
 #pragma once
 
 #include <arpa/inet.h>
-#include <csignal>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <csignal>
 #include <sstream>
 #include <stdexcept>
 #include <string>

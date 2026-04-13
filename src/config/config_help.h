@@ -142,7 +142,6 @@ std::string MaskSensitiveValue(const std::string& path, const std::string& value
  * @param path Optional path to show only specific section
  * @return Formatted YAML string with sensitive fields masked, or Error if path is invalid
  */
-utils::Expected<std::string, utils::Error> FormatConfigForDisplay(const Config& config,
-                                                                   const std::string& path = "");
+utils::Expected<std::string, utils::Error> FormatConfigForDisplay(const Config& config, const std::string& path = "");
 
 }  // namespace nvecd::config

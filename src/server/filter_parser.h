@@ -33,7 +33,6 @@ namespace nvecd::server {
  * @param expr Filter expression string
  * @return MetadataFilter or error if parsing fails
  */
-utils::Expected<vectors::MetadataFilter, utils::Error> ParseSimpleFilter(
-    const std::string& expr);
+utils::Expected<vectors::MetadataFilter, utils::Error> ParseSimpleFilter(const std::string& expr);
 
 }  // namespace nvecd::server

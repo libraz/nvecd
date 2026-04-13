@@ -41,15 +41,13 @@ inline Expected<std::string, Error> ValidateDumpPath(const std::string& filepath
   // Use canonical() for dump_dir (must exist) to resolve symlinks
   std::filesystem::path dump_canonical = std::filesystem::canonical(dump_dir, ec);
   if (ec) {
-    return MakeUnexpected(
-        MakeError(ErrorCode::kInvalidArgument, "Invalid dump directory: " + ec.message()));
+    return MakeUnexpected(MakeError(ErrorCode::kInvalidArgument, "Invalid dump directory: " + ec.message()));
   }
 
   // Use weakly_canonical for the target path (may not exist yet)
   std::filesystem::path resolved_canonical = std::filesystem::weakly_canonical(resolved, ec);
   if (ec) {
-    return MakeUnexpected(
-        MakeError(ErrorCode::kInvalidArgument, "Invalid filepath: " + ec.message()));
+    return MakeUnexpected(MakeError(ErrorCode::kInvalidArgument, "Invalid filepath: " + ec.message()));
   }
 
   // Verify resolved path resides within dump directory

@@ -3,12 +3,12 @@
  * @brief Unit tests for high-level distance/similarity functions in distance.h
  */
 
-#include "vectors/distance.h"
-
 #include <gtest/gtest.h>
 
 #include <cmath>
 #include <vector>
+
+#include "vectors/distance.h"
 
 namespace nvecd::vectors {
 

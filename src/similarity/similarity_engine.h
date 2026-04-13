@@ -111,8 +111,7 @@ class SimilarityEngine {
    * @return Expected<vector<SimilarityResult>, Error> Results or error
    */
   utils::Expected<std::vector<SimilarityResult>, utils::Error> SearchByIdVectors(
-      const std::string& item_id, int top_k,
-      const vectors::MetadataFilter& filter = {});
+      const std::string& item_id, int top_k, const vectors::MetadataFilter& filter = {});
 
   /**
    * @brief Search similar items using fusion (events + vectors)
@@ -139,8 +138,7 @@ class SimilarityEngine {
    * @return Expected<vector<SimilarityResult>, Error> Results or error
    */
   utils::Expected<std::vector<SimilarityResult>, utils::Error> SearchByVector(
-      const std::vector<float>& query_vector, int top_k,
-      const vectors::MetadataFilter& filter = {});
+      const std::vector<float>& query_vector, int top_k, const vectors::MetadataFilter& filter = {});
 
   /**
    * @brief Notify the engine that a vector was added or updated
@@ -239,7 +237,7 @@ class SimilarityEngine {
   [[maybe_unused]] events::EventStore* event_store_;  ///< Event store (not owned)
   events::CoOccurrenceIndex* co_index_;               ///< Co-occurrence index (not owned)
   vectors::VectorStore* vector_store_;                ///< Vector store (not owned)
-  vectors::MetadataStore* metadata_store_;             ///< Metadata store (not owned, may be null)
+  vectors::MetadataStore* metadata_store_;            ///< Metadata store (not owned, may be null)
   config::SimilarityConfig config_;                   ///< Configuration
   DistanceFunc distance_func_;                        ///< Distance function for similarity
   bool use_prenorm_ = false;                          ///< Whether to use pre-computed norm optimization (cosine only)

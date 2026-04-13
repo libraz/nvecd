@@ -36,7 +36,9 @@ SnapshotScheduler::SnapshotScheduler(config::SnapshotConfig config, storage::For
       vector_store_(vector_store),
       read_only_(read_only) {}
 
-SnapshotScheduler::~SnapshotScheduler() { Stop(); }
+SnapshotScheduler::~SnapshotScheduler() {
+  Stop();
+}
 
 void SnapshotScheduler::Start() {
   if (running_) {
@@ -134,8 +136,8 @@ void SnapshotScheduler::TakeSnapshot() {
     utils::StructuredLog().Event("snapshot_taking").Field("path", snapshot_path.string()).Info();
 
     // Start background fork-based snapshot
-    auto result =
-        fork_writer_->StartBackgroundSave(snapshot_path.string(), *full_config_, *event_store_, *co_index_, *vector_store_);
+    auto result = fork_writer_->StartBackgroundSave(snapshot_path.string(), *full_config_, *event_store_, *co_index_,
+                                                    *vector_store_);
 
     if (result) {
       utils::StructuredLog().Event("snapshot_started").Field("path", snapshot_path.string()).Info();

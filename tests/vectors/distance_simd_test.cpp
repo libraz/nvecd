@@ -237,9 +237,9 @@ TEST_F(DistanceSIMDTest, PublicAPIUsesOptimalImpl) {
   float cosine = CosineSimilarity(a, b);
 
   // Verify results are reasonable
-  EXPECT_GT(dot, 0.0f);      // Positive dot product
-  EXPECT_GT(norm, 0.0f);     // Positive norm
-  EXPECT_GE(dist, 0.0f);     // Non-negative distance
+  EXPECT_GT(dot, 0.0f);              // Positive dot product
+  EXPECT_GT(norm, 0.0f);             // Positive norm
+  EXPECT_GE(dist, 0.0f);             // Non-negative distance
   EXPECT_GE(cosine, -1.0f - 1e-6f);  // Cosine similarity in [-1, 1] (with FP tolerance)
   EXPECT_LE(cosine, 1.0f + 1e-6f);
 }

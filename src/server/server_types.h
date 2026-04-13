@@ -62,7 +62,7 @@ struct ServerConfig {
   uint16_t port = kDefaultPort;
   int max_connections = kDefaultMaxConnections;
   int max_connections_per_ip = 100;  ///< Maximum connections per IP (0 = unlimited)
-  int worker_threads = 0;  // Number of worker threads (0 = CPU count)
+  int worker_threads = 0;            // Number of worker threads (0 = CPU count)
   int recv_buffer_size = kDefaultRecvBufferSize;
   int send_buffer_size = kDefaultSendBufferSize;
   std::vector<std::string> allow_cidrs;
@@ -75,9 +75,9 @@ struct ServerConfig {
  */
 struct ConnectionContext {
   int client_fd = -1;
-  bool debug_mode = false;      ///< Debug mode flag
-  bool authenticated = false;   ///< Whether client has authenticated
-  std::string client_ip;        ///< Client IP address (for rate limiting and logging)
+  bool debug_mode = false;     ///< Debug mode flag
+  bool authenticated = false;  ///< Whether client has authenticated
+  std::string client_ip;       ///< Client IP address (for rate limiting and logging)
 };
 
 /**

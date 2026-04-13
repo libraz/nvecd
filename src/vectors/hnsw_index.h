@@ -44,10 +44,10 @@ class HnswIndex : public AnnIndex {
    * @brief HNSW configuration parameters
    */
   struct Config {
-    uint32_t m = 16;                ///< Number of connections per node (upper layers)
-    uint32_t ef_construction = 200; ///< Search width during construction
-    uint32_t ef_search = 50;        ///< Search width during query (higher = better recall)
-    uint32_t max_elements = 0;      ///< Pre-allocate capacity (0 = grow dynamically)
+    uint32_t m = 16;                 ///< Number of connections per node (upper layers)
+    uint32_t ef_construction = 200;  ///< Search width during construction
+    uint32_t ef_search = 50;         ///< Search width during query (higher = better recall)
+    uint32_t max_elements = 0;       ///< Pre-allocate capacity (0 = grow dynamically)
   };
 
   /**
@@ -56,8 +56,7 @@ class HnswIndex : public AnnIndex {
    * @param distance_func Distance function (higher = more similar)
    * @param config HNSW configuration
    */
-  HnswIndex(uint32_t dimension, DistanceFunc distance_func,
-            const Config& config);
+  HnswIndex(uint32_t dimension, DistanceFunc distance_func, const Config& config);
 
   ~HnswIndex() override = default;
 
@@ -75,13 +74,10 @@ class HnswIndex : public AnnIndex {
 
   void Add(uint32_t compact_index, const float* vector) override;
   void MarkDeleted(uint32_t compact_index) override;
-  std::vector<std::pair<uint32_t, float>> Search(
-      const float* query, uint32_t top_k) const override;
-  void Rebuild(const float* all_vectors, uint32_t count,
-               uint32_t dimension) override;
+  std::vector<std::pair<uint32_t, float>> Search(const float* query, uint32_t top_k) const override;
+  void Rebuild(const float* all_vectors, uint32_t count, uint32_t dimension) override;
   uint32_t Size() const override;
-  utils::Expected<void, utils::Error> Serialize(
-      std::ostream& out) const override;
+  utils::Expected<void, utils::Error> Serialize(std::ostream& out) const override;
   utils::Expected<void, utils::Error> Deserialize(std::istream& in) override;
 
   // =========================================================================
@@ -138,9 +134,8 @@ class HnswIndex : public AnnIndex {
    * @param ef Number of candidates to track
    * @return Vector of (distance, internal_node_id) pairs, sorted ascending by distance
    */
-  std::vector<std::pair<float, uint32_t>> SearchLayer(
-      const float* query, uint32_t entry_node, uint32_t layer,
-      uint32_t ef) const;
+  std::vector<std::pair<float, uint32_t>> SearchLayer(const float* query, uint32_t entry_node, uint32_t layer,
+                                                      uint32_t ef) const;
 
   /**
    * @brief Select neighbors using simple heuristic
@@ -152,9 +147,8 @@ class HnswIndex : public AnnIndex {
    * @param max_count Maximum number of neighbors to select
    * @return Selected neighbor node IDs
    */
-  std::vector<uint32_t> SelectNeighbors(
-      const std::vector<std::pair<float, uint32_t>>& candidates,
-      uint32_t max_count) const;
+  std::vector<uint32_t> SelectNeighbors(const std::vector<std::pair<float, uint32_t>>& candidates,
+                                        uint32_t max_count) const;
 
   /**
    * @brief Get the vector data for an internal node

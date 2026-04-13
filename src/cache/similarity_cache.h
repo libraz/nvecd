@@ -44,8 +44,8 @@ static constexpr size_t kSearchTypeCount = 3;
  * @brief Per-search-type cache policy
  */
 struct CachePolicy {
-  bool enabled = true;     ///< Whether caching is enabled for this type
-  int ttl_seconds = 0;     ///< TTL override (0 = use global TTL)
+  bool enabled = true;  ///< Whether caching is enabled for this type
+  int ttl_seconds = 0;  ///< TTL override (0 = use global TTL)
 };
 
 /**

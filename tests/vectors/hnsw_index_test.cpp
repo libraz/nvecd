@@ -5,14 +5,14 @@
 
 #include "vectors/hnsw_index.h"
 
+#include <gtest/gtest.h>
+
 #include <algorithm>
 #include <cmath>
 #include <random>
 #include <sstream>
 #include <unordered_set>
 #include <vector>
-
-#include <gtest/gtest.h>
 
 #include "vectors/distance.h"
 
@@ -174,8 +174,7 @@ TEST_F(HnswIndexTest, RecallAtK10) {
       float score = CosineDistanceRaw(query.data(), vecs[i].data(), kDim);
       bf_results.push_back({score, i});
     }
-    std::sort(bf_results.begin(), bf_results.end(),
-              [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::sort(bf_results.begin(), bf_results.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
 
     std::unordered_set<uint32_t> gt_set;
     for (uint32_t i = 0; i < kTopK && i < kCount; ++i) {
@@ -196,9 +195,7 @@ TEST_F(HnswIndexTest, RecallAtK10) {
   }
 
   float avg_recall = total_recall / static_cast<float>(kQueries);
-  EXPECT_GE(avg_recall, 0.80F)
-      << "Average recall@" << kTopK << " = " << avg_recall
-      << " (expected >= 0.80)";
+  EXPECT_GE(avg_recall, 0.80F) << "Average recall@" << kTopK << " = " << avg_recall << " (expected >= 0.80)";
 }
 
 // ============================================================================

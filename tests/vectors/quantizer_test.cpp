@@ -19,8 +19,7 @@ namespace {
 // Helpers
 // ============================================================================
 
-std::vector<float> MakeRandomVectors(uint32_t count, uint32_t dim,
-                                     std::mt19937& rng, float min_val = -1.0F,
+std::vector<float> MakeRandomVectors(uint32_t count, uint32_t dim, std::mt19937& rng, float min_val = -1.0F,
                                      float max_val = 1.0F) {
   std::uniform_real_distribution<float> dist(min_val, max_val);
   std::vector<float> data(static_cast<size_t>(count) * dim);
@@ -99,8 +98,7 @@ TEST(ScalarQuantizerTest, QuantizeDequantizeRoundtrip) {
   // Single vector: min=max per dimension, so dequantized should be exact midpoint
   // With only 1 vector, range is 0, all quantized to 128 -> restored to original
   for (uint32_t d = 0; d < kDim; ++d) {
-    EXPECT_NEAR(restored[d], data[d], 0.01F)
-        << "Dimension " << d << " mismatch";
+    EXPECT_NEAR(restored[d], data[d], 0.01F) << "Dimension " << d << " mismatch";
   }
 }
 
@@ -144,17 +142,14 @@ TEST(ScalarQuantizerTest, QuantizeBatchMatchesSingle) {
 
   // Batch quantize
   std::vector<uint8_t> batch_result(static_cast<size_t>(kCount) * kDim);
-  ScalarQuantizer::QuantizeBatch(data.data(), batch_result.data(), kCount, kDim,
-                                 stats);
+  ScalarQuantizer::QuantizeBatch(data.data(), batch_result.data(), kCount, kDim, stats);
 
   // Single quantize
   for (uint32_t i = 0; i < kCount; ++i) {
     std::vector<uint8_t> single_result(kDim);
-    ScalarQuantizer::Quantize(data.data() + static_cast<size_t>(i) * kDim,
-                              single_result.data(), kDim, stats);
+    ScalarQuantizer::Quantize(data.data() + static_cast<size_t>(i) * kDim, single_result.data(), kDim, stats);
     for (uint32_t d = 0; d < kDim; ++d) {
-      EXPECT_EQ(batch_result[static_cast<size_t>(i) * kDim + d],
-                single_result[d]);
+      EXPECT_EQ(batch_result[static_cast<size_t>(i) * kDim + d], single_result[d]);
     }
   }
 }
@@ -172,20 +167,18 @@ TEST(ScalarQuantizerTest, QuantizedDotProductAccuracy) {
 
   // Quantize all vectors
   std::vector<uint8_t> quantized(static_cast<size_t>(kCount) * kDim);
-  ScalarQuantizer::QuantizeBatch(data.data(), quantized.data(), kCount, kDim,
-                                 stats);
+  ScalarQuantizer::QuantizeBatch(data.data(), quantized.data(), kCount, kDim, stats);
 
   // Compare quantized dot product vs float32 dot product for random pairs
   float max_rel_error = 0.0F;
   int pairs_tested = 0;
   for (uint32_t i = 0; i < kCount; ++i) {
     for (uint32_t j = i + 1; j < std::min(kCount, i + 10); ++j) {
-      float exact = FloatDotProduct(
-          data.data() + static_cast<size_t>(i) * kDim,
-          data.data() + static_cast<size_t>(j) * kDim, kDim);
-      float approx = ScalarQuantizer::QuantizedDotProduct(
-          quantized.data() + static_cast<size_t>(i) * kDim,
-          quantized.data() + static_cast<size_t>(j) * kDim, kDim, stats);
+      float exact = FloatDotProduct(data.data() + static_cast<size_t>(i) * kDim,
+                                    data.data() + static_cast<size_t>(j) * kDim, kDim);
+      float approx =
+          ScalarQuantizer::QuantizedDotProduct(quantized.data() + static_cast<size_t>(i) * kDim,
+                                               quantized.data() + static_cast<size_t>(j) * kDim, kDim, stats);
 
       // Only check relative error for non-trivial dot products
       // Random vectors in [-1,1] with dim=128 have typical |dot| ~ 3-5
@@ -199,8 +192,7 @@ TEST(ScalarQuantizerTest, QuantizedDotProductAccuracy) {
 
   EXPECT_GT(pairs_tested, 100);
   // Relative error should be small (typically < 5% for SQ8)
-  EXPECT_LT(max_rel_error, 0.10F)
-      << "Quantized dot product relative error too large";
+  EXPECT_LT(max_rel_error, 0.10F) << "Quantized dot product relative error too large";
 }
 
 TEST(ScalarQuantizerTest, AsymmetricCosineAccuracy) {
@@ -212,19 +204,16 @@ TEST(ScalarQuantizerTest, AsymmetricCosineAccuracy) {
 
   // Quantize all vectors
   std::vector<uint8_t> quantized(static_cast<size_t>(kCount) * kDim);
-  ScalarQuantizer::QuantizeBatch(data.data(), quantized.data(), kCount, kDim,
-                                 stats);
+  ScalarQuantizer::QuantizeBatch(data.data(), quantized.data(), kCount, kDim, stats);
 
   // Compare asymmetric cosine vs float32 cosine
   float max_abs_error = 0.0F;
   for (uint32_t i = 0; i < 10; ++i) {
     const float* query = data.data() + static_cast<size_t>(i) * kDim;
     for (uint32_t j = 10; j < kCount; ++j) {
-      float exact = FloatCosineSimilarity(
-          query, data.data() + static_cast<size_t>(j) * kDim, kDim);
-      float approx = ScalarQuantizer::AsymmetricCosine(
-          query, quantized.data() + static_cast<size_t>(j) * kDim, kDim,
-          stats);
+      float exact = FloatCosineSimilarity(query, data.data() + static_cast<size_t>(j) * kDim, kDim);
+      float approx =
+          ScalarQuantizer::AsymmetricCosine(query, quantized.data() + static_cast<size_t>(j) * kDim, kDim, stats);
 
       float abs_error = std::abs(approx - exact);
       max_abs_error = std::max(max_abs_error, abs_error);
@@ -232,8 +221,7 @@ TEST(ScalarQuantizerTest, AsymmetricCosineAccuracy) {
   }
 
   // Cosine similarity error should be very small (< 0.05)
-  EXPECT_LT(max_abs_error, 0.05F)
-      << "Asymmetric cosine error too large";
+  EXPECT_LT(max_abs_error, 0.05F) << "Asymmetric cosine error too large";
 }
 
 // ============================================================================
@@ -253,8 +241,7 @@ TEST(ScalarQuantizerTest, RecallAt10WithQuantization) {
 
   // Quantize all database vectors
   std::vector<uint8_t> quantized(static_cast<size_t>(kCount) * kDim);
-  ScalarQuantizer::QuantizeBatch(data.data(), quantized.data(), kCount, kDim,
-                                 stats);
+  ScalarQuantizer::QuantizeBatch(data.data(), quantized.data(), kCount, kDim, stats);
 
   float total_recall = 0.0F;
 
@@ -264,24 +251,20 @@ TEST(ScalarQuantizerTest, RecallAt10WithQuantization) {
     // Exact top-k using float32 cosine
     std::vector<std::pair<float, uint32_t>> exact_scores;
     for (uint32_t i = 0; i < kCount; ++i) {
-      float score = FloatCosineSimilarity(
-          query, data.data() + static_cast<size_t>(i) * kDim, kDim);
+      float score = FloatCosineSimilarity(query, data.data() + static_cast<size_t>(i) * kDim, kDim);
       exact_scores.push_back({score, i});
     }
-    std::partial_sort(exact_scores.begin(), exact_scores.begin() + kTopK,
-                      exact_scores.end(),
+    std::partial_sort(exact_scores.begin(), exact_scores.begin() + kTopK, exact_scores.end(),
                       [](auto& a, auto& b) { return a.first > b.first; });
 
     // Approximate top-k using asymmetric cosine (float32 query, uint8 db)
     std::vector<std::pair<float, uint32_t>> approx_scores;
     for (uint32_t i = 0; i < kCount; ++i) {
-      float score = ScalarQuantizer::AsymmetricCosine(
-          query, quantized.data() + static_cast<size_t>(i) * kDim, kDim,
-          stats);
+      float score =
+          ScalarQuantizer::AsymmetricCosine(query, quantized.data() + static_cast<size_t>(i) * kDim, kDim, stats);
       approx_scores.push_back({score, i});
     }
-    std::partial_sort(approx_scores.begin(), approx_scores.begin() + kTopK,
-                      approx_scores.end(),
+    std::partial_sort(approx_scores.begin(), approx_scores.begin() + kTopK, approx_scores.end(),
                       [](auto& a, auto& b) { return a.first > b.first; });
 
     // Compute recall: how many of the exact top-k appear in approx top-k
@@ -302,8 +285,7 @@ TEST(ScalarQuantizerTest, RecallAt10WithQuantization) {
   float avg_recall = total_recall / static_cast<float>(kQueries);
 
   // SQ8 should have recall@10 > 0.98 (< 2% degradation)
-  EXPECT_GE(avg_recall, 0.98F)
-      << "Recall@10 degradation exceeds 2% threshold";
+  EXPECT_GE(avg_recall, 0.98F) << "Recall@10 degradation exceeds 2% threshold";
 }
 
 // ============================================================================

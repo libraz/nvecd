@@ -5,16 +5,16 @@
 
 #include "storage/wal.h"
 
+#include <dirent.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <zlib.h>
 
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
-#include <dirent.h>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 #include "utils/structured_log.h"
 
@@ -31,10 +31,7 @@ uint32_t CalcCRC32(const void* data, size_t length) {
 /// Get current time in microseconds
 uint64_t NowMicros() {
   auto now = std::chrono::system_clock::now();
-  return static_cast<uint64_t>(
-      std::chrono::duration_cast<std::chrono::microseconds>(
-          now.time_since_epoch())
-          .count());
+  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count());
 }
 
 /// Write exactly n bytes to fd
@@ -45,7 +42,8 @@ bool WriteAll(int fd, const void* buf, size_t n) {
   while (remaining > 0) {
     auto written = ::write(fd, ptr, remaining);
     if (written < 0) {
-      if (errno == EINTR) continue;
+      if (errno == EINTR)
+        continue;
       return false;
     }
     ptr += written;
@@ -62,10 +60,12 @@ bool ReadAll(int fd, void* buf, size_t n) {
   while (remaining > 0) {
     auto bytes_read = ::read(fd, ptr, remaining);
     if (bytes_read < 0) {
-      if (errno == EINTR) continue;
+      if (errno == EINTR)
+        continue;
       return false;
     }
-    if (bytes_read == 0) return false;  // EOF
+    if (bytes_read == 0)
+      return false;  // EOF
     ptr += bytes_read;
     remaining -= static_cast<size_t>(bytes_read);
   }
@@ -102,7 +102,9 @@ uint64_t ReadU64(const uint8_t* buf) {
 // WriteAheadLog
 // ---------------------------------------------------------------------------
 
-WriteAheadLog::~WriteAheadLog() { Close(); }
+WriteAheadLog::~WriteAheadLog() {
+  Close();
+}
 
 Expected<void, Error> WriteAheadLog::Open(const Config& config) {
   std::lock_guard<std::mutex> lock(mutex_);
@@ -114,10 +116,9 @@ Expected<void, Error> WriteAheadLog::Open(const Config& config) {
 
   // Ensure directory exists
   if (::mkdir(config_.directory.c_str(), 0755) != 0 && errno != EEXIST) {
-    return utils::MakeUnexpected(utils::MakeError(
-        utils::ErrorCode::kWalWriteError,
-        "Failed to create WAL directory: " + std::string(std::strerror(errno)),
-        config_.directory));
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kWalWriteError,
+                         "Failed to create WAL directory: " + std::string(std::strerror(errno)), config_.directory));
   }
 
   // Scan existing files to recover state
@@ -169,13 +170,10 @@ void WriteAheadLog::Close() {
   open_ = false;
 }
 
-Expected<uint64_t, Error> WriteAheadLog::Append(WalOpType op,
-                                                 const void* payload,
-                                                 uint32_t payload_size) {
+Expected<uint64_t, Error> WriteAheadLog::Append(WalOpType op, const void* payload, uint32_t payload_size) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (!open_ || current_fd_ < 0) {
-    return utils::MakeUnexpected(
-        utils::MakeError(utils::ErrorCode::kWalNotOpen, "WAL is not open"));
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kWalNotOpen, "WAL is not open"));
   }
 
   // Check if rotation is needed
@@ -183,8 +181,7 @@ Expected<uint64_t, Error> WriteAheadLog::Append(WalOpType op,
   uint32_t total_record_size = sizeof(uint32_t) + sizeof(uint32_t) + record_body_size;
   // length(4) + crc32(4) + record_header(17) + payload
 
-  if (current_file_size_ + total_record_size > config_.max_file_size &&
-      current_file_size_ > kWalFileHeaderSize) {
+  if (current_file_size_ + total_record_size > config_.max_file_size && current_file_size_ > kWalFileHeaderSize) {
     // Finalize current file info
     if (!files_.empty()) {
       files_.back().max_sequence = current_sequence_;
@@ -219,13 +216,11 @@ Expected<uint64_t, Error> WriteAheadLog::Append(WalOpType op,
 
   if (!WriteAll(current_fd_, header, sizeof(header))) {
     return utils::MakeUnexpected(utils::MakeError(
-        utils::ErrorCode::kWalWriteError,
-        "Failed to write record header: " + std::string(std::strerror(errno))));
+        utils::ErrorCode::kWalWriteError, "Failed to write record header: " + std::string(std::strerror(errno))));
   }
   if (!WriteAll(current_fd_, body.data(), body.size())) {
-    return utils::MakeUnexpected(utils::MakeError(
-        utils::ErrorCode::kWalWriteError,
-        "Failed to write record body: " + std::string(std::strerror(errno))));
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kWalWriteError,
+                                                  "Failed to write record body: " + std::string(std::strerror(errno))));
   }
 
   current_file_size_ += total_record_size;
@@ -245,9 +240,8 @@ Expected<uint64_t, Error> WriteAheadLog::Append(WalOpType op,
   return seq;
 }
 
-Expected<uint64_t, Error> WriteAheadLog::Replay(
-    uint64_t from_sequence,
-    const std::function<void(const WalRecord&)>& callback) const {
+Expected<uint64_t, Error> WriteAheadLog::Replay(uint64_t from_sequence,
+                                                const std::function<void(const WalRecord&)>& callback) const {
   std::lock_guard<std::mutex> lock(mutex_);
 
   uint64_t count = 0;
@@ -263,7 +257,8 @@ Expected<uint64_t, Error> WriteAheadLog::Replay(
 
   for (const auto& path : paths) {
     int fd = ::open(path.c_str(), O_RDONLY);
-    if (fd < 0) continue;
+    if (fd < 0)
+      continue;
 
     // Validate file header
     auto header_result = ValidateFileHeader(fd, path);
@@ -340,8 +335,7 @@ Expected<void, Error> WriteAheadLog::Truncate(uint64_t up_to_sequence) {
   for (auto& f : files_) {
     // Delete files where ALL records are <= up_to_sequence
     // (i.e., max_sequence <= up_to_sequence AND it's not the current file)
-    if (f.max_sequence <= up_to_sequence && f.max_sequence > 0 &&
-        f.file_number != current_file_number_) {
+    if (f.max_sequence <= up_to_sequence && f.max_sequence > 0 && f.file_number != current_file_number_) {
       if (::unlink(f.path.c_str()) == 0) {
         ++deleted_count;
       }
@@ -392,9 +386,7 @@ Expected<void, Error> WriteAheadLog::RotateFile() {
   int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (fd < 0) {
     return utils::MakeUnexpected(utils::MakeError(
-        utils::ErrorCode::kWalRotationFailed,
-        "Failed to create WAL file: " + std::string(std::strerror(errno)),
-        path));
+        utils::ErrorCode::kWalRotationFailed, "Failed to create WAL file: " + std::string(std::strerror(errno)), path));
   }
 
   current_fd_ = fd;
@@ -425,34 +417,29 @@ Expected<void, Error> WriteAheadLog::WriteFileHeader() {
   WriteU32(header + 4, kWalVersion);
 
   if (!WriteAll(current_fd_, header, sizeof(header))) {
-    return utils::MakeUnexpected(utils::MakeError(
-        utils::ErrorCode::kWalWriteError, "Failed to write WAL file header"));
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kWalWriteError, "Failed to write WAL file header"));
   }
 
   current_file_size_ = kWalFileHeaderSize;
   return {};
 }
 
-Expected<void, Error> WriteAheadLog::ValidateFileHeader(
-    int fd, const std::string& path) {
+Expected<void, Error> WriteAheadLog::ValidateFileHeader(int fd, const std::string& path) {
   uint8_t header[kWalFileHeaderSize];
   if (!ReadAll(fd, header, sizeof(header))) {
-    return utils::MakeUnexpected(utils::MakeError(
-        utils::ErrorCode::kWalReadError, "Failed to read WAL file header",
-        path));
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kWalReadError, "Failed to read WAL file header", path));
   }
 
   uint32_t magic = ReadU32(header);
   uint32_t version = ReadU32(header + 4);
 
   if (magic != kWalMagic) {
-    return utils::MakeUnexpected(utils::MakeError(
-        utils::ErrorCode::kWalCorrupted, "Invalid WAL magic number", path));
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kWalCorrupted, "Invalid WAL magic number", path));
   }
   if (version != kWalVersion) {
-    return utils::MakeUnexpected(utils::MakeError(
-        utils::ErrorCode::kWalCorrupted,
-        "Unsupported WAL version: " + std::to_string(version), path));
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kWalCorrupted, "Unsupported WAL version: " + std::to_string(version), path));
   }
 
   return {};
@@ -473,8 +460,7 @@ Expected<void, Error> WriteAheadLog::ScanExistingFiles() {
   while ((entry = ::readdir(dir)) != nullptr) {
     std::string name(entry->d_name);
     // Match wal-NNNNNN.log
-    if (name.size() == 14 && name.substr(0, 4) == "wal-" &&
-        name.substr(10, 4) == ".log") {
+    if (name.size() == 14 && name.substr(0, 4) == "wal-" && name.substr(10, 4) == ".log") {
       std::string num_str = name.substr(4, 6);
       try {
         auto num = static_cast<uint32_t>(std::stoul(num_str));
@@ -493,7 +479,8 @@ Expected<void, Error> WriteAheadLog::ScanExistingFiles() {
   for (uint32_t num : file_numbers) {
     std::string path = MakeFilePath(num);
     int fd = ::open(path.c_str(), O_RDONLY);
-    if (fd < 0) continue;
+    if (fd < 0)
+      continue;
 
     auto header_result = ValidateFileHeader(fd, path);
     if (!header_result) {
@@ -510,18 +497,23 @@ Expected<void, Error> WriteAheadLog::ScanExistingFiles() {
     // Scan records to find min/max sequence
     while (true) {
       uint8_t rec_header[8];
-      if (!ReadAll(fd, rec_header, sizeof(rec_header))) break;
+      if (!ReadAll(fd, rec_header, sizeof(rec_header)))
+        break;
 
       uint32_t body_length = ReadU32(rec_header);
-      if (body_length < kWalRecordHeaderSize) break;
+      if (body_length < kWalRecordHeaderSize)
+        break;
 
       // Read just enough for sequence number
       std::vector<uint8_t> body(body_length);
-      if (!ReadAll(fd, body.data(), body_length)) break;
+      if (!ReadAll(fd, body.data(), body_length))
+        break;
 
       uint64_t seq = ReadU64(body.data());
-      if (seq < wf.min_sequence) wf.min_sequence = seq;
-      if (seq > wf.max_sequence) wf.max_sequence = seq;
+      if (seq < wf.min_sequence)
+        wf.min_sequence = seq;
+      if (seq > wf.max_sequence)
+        wf.max_sequence = seq;
     }
 
     struct stat st {};
@@ -556,10 +548,10 @@ std::string WriteAheadLog::MakeFilePath(uint32_t file_number) const {
 void WriteAheadLog::SyncLoop() {
   while (sync_running_.load()) {
     std::unique_lock<std::mutex> lock(sync_mutex_);
-    sync_cv_.wait_for(lock,
-                      std::chrono::milliseconds(config_.sync_interval_ms));
+    sync_cv_.wait_for(lock, std::chrono::milliseconds(config_.sync_interval_ms));
 
-    if (!sync_running_.load()) break;
+    if (!sync_running_.load())
+      break;
 
     if (needs_sync_.exchange(false)) {
       std::lock_guard<std::mutex> wal_lock(mutex_);

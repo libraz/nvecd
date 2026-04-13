@@ -14,7 +14,9 @@ MergeScheduler::MergeScheduler() = default;
 
 MergeScheduler::MergeScheduler(const Config& config) : config_(config) {}
 
-MergeScheduler::~MergeScheduler() { Stop(); }
+MergeScheduler::~MergeScheduler() {
+  Stop();
+}
 
 void MergeScheduler::Start(TieredVectorStore* store) {
   if (running_.load(std::memory_order_acquire)) {
@@ -47,9 +49,7 @@ void MergeScheduler::CheckLoop() {
     // Wait for check_interval or until stopped
     {
       std::unique_lock lock(cv_mutex_);
-      cv_.wait_for(lock, config_.check_interval, [this] {
-        return !running_.load(std::memory_order_acquire);
-      });
+      cv_.wait_for(lock, config_.check_interval, [this] { return !running_.load(std::memory_order_acquire); });
     }
 
     if (!running_.load(std::memory_order_acquire)) {
@@ -78,8 +78,7 @@ void MergeScheduler::CheckLoop() {
       utils::StructuredLog()
           .Event("rebuild_triggered")
           .Field("component", "merge_scheduler")
-          .Field("deleted_count",
-                 static_cast<uint64_t>(store_->DeletedCount()))
+          .Field("deleted_count", static_cast<uint64_t>(store_->DeletedCount()))
           .Info();
       auto result = store_->RebuildMain();
       if (!result) {

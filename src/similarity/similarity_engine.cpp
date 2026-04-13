@@ -23,8 +23,7 @@ namespace nvecd::similarity {
 
 SimilarityEngine::SimilarityEngine(events::EventStore* event_store, events::CoOccurrenceIndex* co_index,
                                    vectors::VectorStore* vector_store, const config::SimilarityConfig& config,
-                                   const config::VectorsConfig& vectors_config,
-                                   vectors::MetadataStore* metadata_store)
+                                   const config::VectorsConfig& vectors_config, vectors::MetadataStore* metadata_store)
     : event_store_(event_store),
       co_index_(co_index),
       vector_store_(vector_store),
@@ -48,8 +47,7 @@ SimilarityEngine::SimilarityEngine(events::EventStore* event_store, events::CoOc
     hnsw_config.max_elements = config_.hnsw_max_elements;
 
     auto distance_func = vectors::GetDistanceFunc(vectors_config.distance_metric);
-    ann_index_ = std::make_unique<vectors::HnswIndex>(
-        vectors_config.default_dimension, distance_func, hnsw_config);
+    ann_index_ = std::make_unique<vectors::HnswIndex>(vectors_config.default_dimension, distance_func, hnsw_config);
 
     utils::StructuredLog()
         .Event("hnsw_index_created")
@@ -64,12 +62,11 @@ SimilarityEngine::SimilarityEngine(events::EventStore* event_store, events::CoOc
     ivf_config.train_threshold = config_.ivf_train_threshold;
     ivf_config.seal_threshold = config_.ivf_seal_threshold;
 
-    auto ivf = std::make_unique<vectors::IvfIndex>(
-        vectors_config.default_dimension, ivf_config);
+    auto ivf = std::make_unique<vectors::IvfIndex>(vectors_config.default_dimension, ivf_config);
     auto* raw = ivf.get();
 
-    ann_index_ = std::make_unique<vectors::IvfAnnAdapter>(
-        std::move(ivf), vector_store, vectors_config.default_dimension);
+    ann_index_ =
+        std::make_unique<vectors::IvfAnnAdapter>(std::move(ivf), vector_store, vectors_config.default_dimension);
     ivf_index_raw_ = raw;
 
     utils::StructuredLog()
@@ -83,7 +80,9 @@ SimilarityEngine::SimilarityEngine(events::EventStore* event_store, events::CoOc
   // else: flat (no index), brute-force search
 }
 
-SimilarityEngine::~SimilarityEngine() { JoinTrainThread(); }
+SimilarityEngine::~SimilarityEngine() {
+  JoinTrainThread();
+}
 
 void SimilarityEngine::JoinTrainThread() {
   if (ivf_train_thread_ && ivf_train_thread_->joinable()) {
@@ -160,13 +159,11 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
   // Oversampling factor for post-filter: fetch more candidates then filter
   bool has_filter = !filter.Empty() && metadata_store_ != nullptr;
   constexpr int kOversamplingFactor = 3;
-  int fetch_k = has_filter ? validated_top_k.value() * kOversamplingFactor
-                           : validated_top_k.value();
+  int fetch_k = has_filter ? validated_top_k.value() * kOversamplingFactor : validated_top_k.value();
 
   // ANN accelerated path (HNSW or IVF)
   if (ann_index_ && IsAnnIndexReady()) {
-    auto ann_results = ann_index_->Search(
-        query_ptr, static_cast<uint32_t>(fetch_k) + 1);
+    auto ann_results = ann_index_->Search(query_ptr, static_cast<uint32_t>(fetch_k) + 1);
 
     std::vector<SimilarityResult> results;
     results.reserve(ann_results.size());
@@ -209,8 +206,7 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
     if (vector_store_->IsDeleted(idx)) {
       return;
     }
-    if (has_filter &&
-        !metadata_store_->Matches(static_cast<uint32_t>(idx), filter)) {
+    if (has_filter && !metadata_store_->Matches(static_cast<uint32_t>(idx), filter)) {
       return;
     }
     float score;
@@ -266,8 +262,7 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
 // ============================================================================
 
 utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::SearchByIdFusion(
-    const std::string& item_id, int top_k, std::optional<bool> adaptive,
-    const vectors::MetadataFilter& filter) {
+    const std::string& item_id, int top_k, std::optional<bool> adaptive, const vectors::MetadataFilter& filter) {
   auto validated_top_k = ValidateTopK(top_k);
   if (!validated_top_k) {
     return utils::MakeUnexpected(validated_top_k.error());
@@ -364,8 +359,7 @@ std::pair<float, float> SimilarityEngine::ComputeAdaptiveWeights(size_t neighbor
 // ============================================================================
 
 utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::SearchByVector(
-    const std::vector<float>& query_vector, int top_k,
-    const vectors::MetadataFilter& filter) {
+    const std::vector<float>& query_vector, int top_k, const vectors::MetadataFilter& filter) {
   auto validated_top_k = ValidateTopK(top_k);
   if (!validated_top_k) {
     return utils::MakeUnexpected(validated_top_k.error());
@@ -395,13 +389,11 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
 
   bool has_filter = !filter.Empty() && metadata_store_ != nullptr;
   constexpr int kOversamplingFactor = 3;
-  int fetch_k = has_filter ? validated_top_k.value() * kOversamplingFactor
-                           : validated_top_k.value();
+  int fetch_k = has_filter ? validated_top_k.value() * kOversamplingFactor : validated_top_k.value();
 
   // ANN accelerated path (HNSW or IVF)
   if (ann_index_ && IsAnnIndexReady()) {
-    auto ann_results = ann_index_->Search(
-        query_vector.data(), static_cast<uint32_t>(fetch_k));
+    auto ann_results = ann_index_->Search(query_vector.data(), static_cast<uint32_t>(fetch_k));
 
     std::vector<SimilarityResult> results;
     results.reserve(ann_results.size());
@@ -432,14 +424,13 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
     if (vector_store_->IsDeleted(idx)) {
       return;
     }
-    if (has_filter &&
-        !metadata_store_->Matches(static_cast<uint32_t>(idx), filter)) {
+    if (has_filter && !metadata_store_->Matches(static_cast<uint32_t>(idx), filter)) {
       return;
     }
     float score;
     if (use_prenorm_) {
-      score = vectors::CosineSimilarityPreNorm(query_vector.data(), snap.matrix + idx * snap.dim, snap.dim,
-                                               query_norm, snap.norms[idx]);
+      score = vectors::CosineSimilarityPreNorm(query_vector.data(), snap.matrix + idx * snap.dim, snap.dim, query_norm,
+                                               snap.norms[idx]);
     } else {
       const float* cand_ptr = snap.matrix + idx * snap.dim;
       std::vector<float> cand_data(cand_ptr, cand_ptr + snap.dim);
@@ -779,8 +770,7 @@ void SimilarityEngine::MaybeTrainIvfIndex() {
   } else {
     // Reservoir sample
     train_indices.resize(kMaxCopyForTrain);
-    std::copy(valid_indices.begin(), valid_indices.begin() + kMaxCopyForTrain,
-              train_indices.begin());
+    std::copy(valid_indices.begin(), valid_indices.begin() + kMaxCopyForTrain, train_indices.begin());
     std::mt19937 rng(42);
     for (size_t i = kMaxCopyForTrain; i < valid_indices.size(); ++i) {
       size_t j = rng() % (i + 1);
@@ -795,17 +785,14 @@ void SimilarityEngine::MaybeTrainIvfIndex() {
   std::vector<size_t> sample_indices(train_indices.size());
   for (size_t i = 0; i < train_indices.size(); ++i) {
     size_t src_idx = train_indices[i];
-    std::copy(snap.matrix + src_idx * dim,
-              snap.matrix + (src_idx + 1) * dim,
-              sample_matrix->data() + i * dim);
+    std::copy(snap.matrix + src_idx * dim, snap.matrix + (src_idx + 1) * dim, sample_matrix->data() + i * dim);
     sample_indices[i] = i;  // Re-index to [0, N)
   }
 
   // Pre-compute nlist based on TOTAL vector count (not sample size).
   // This ensures the number of clusters scales with the full dataset.
   if (config_.ivf_nlist == 0) {
-    auto sqrt_n = static_cast<uint32_t>(
-        std::max(1.0, std::sqrt(static_cast<double>(valid_indices.size()))));
+    auto sqrt_n = static_cast<uint32_t>(std::max(1.0, std::sqrt(static_cast<double>(valid_indices.size()))));
     uint32_t nlist = std::min(sqrt_n, vectors::IvfIndex::kMaxAutoNlist);
     ivf_index->SetNlist(nlist);
   }
@@ -822,12 +809,10 @@ void SimilarityEngine::MaybeTrainIvfIndex() {
   // Launch training in a background thread.
   // After training, seal the write buffer to move buffered entries into IVF.
   ivf_train_thread_ = std::make_unique<std::thread>(
-      [this, ivf_index, adapter, sample_matrix,
-       sample_indices = std::move(sample_indices), dim]() {
+      [this, ivf_index, adapter, sample_matrix, sample_indices = std::move(sample_indices), dim]() {
         // Phase 1: Train centroids on the sample (no vector assignment
         // since all data is already in the write buffer)
-        ivf_index->Train(sample_matrix->data(), sample_indices.data(),
-                         sample_indices.size(), dim, false);
+        ivf_index->Train(sample_matrix->data(), sample_indices.data(), sample_indices.size(), dim, false);
 
         // Phase 2: Seal the write buffer to assign buffered entries to
         // the newly-trained IVF clusters

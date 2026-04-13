@@ -18,20 +18,22 @@ int CompareValues(const MetadataValue& lhs, const MetadataValue& rhs) {
   // Type mismatch: try numeric promotion (int64 vs double)
   if (lhs.index() != rhs.index()) {
     // int64 vs double
-    if (std::holds_alternative<int64_t>(lhs) &&
-        std::holds_alternative<double>(rhs)) {
+    if (std::holds_alternative<int64_t>(lhs) && std::holds_alternative<double>(rhs)) {
       auto l = static_cast<double>(std::get<int64_t>(lhs));
       double r = std::get<double>(rhs);
-      if (l < r) return -1;
-      if (l > r) return 1;
+      if (l < r)
+        return -1;
+      if (l > r)
+        return 1;
       return 0;
     }
-    if (std::holds_alternative<double>(lhs) &&
-        std::holds_alternative<int64_t>(rhs)) {
+    if (std::holds_alternative<double>(lhs) && std::holds_alternative<int64_t>(rhs)) {
       double l = std::get<double>(lhs);
       auto r = static_cast<double>(std::get<int64_t>(rhs));
-      if (l < r) return -1;
-      if (l > r) return 1;
+      if (l < r)
+        return -1;
+      if (l > r)
+        return 1;
       return 0;
     }
     // Other type mismatches: not comparable
@@ -43,8 +45,10 @@ int CompareValues(const MetadataValue& lhs, const MetadataValue& rhs) {
         using L = std::decay_t<decltype(l)>;
         using R = std::decay_t<decltype(r)>;
         if constexpr (std::is_same_v<L, R>) {
-          if (l < r) return -1;
-          if (r < l) return 1;
+          if (l < r)
+            return -1;
+          if (r < l)
+            return 1;
           return 0;
         }
         return -2;  // Different types (shouldn't reach here due to index check)
@@ -82,9 +86,7 @@ bool FilterCondition::Match(const MetadataValue& meta_value) const {
     }
     case FilterOp::kIn: {
       return std::any_of(values.begin(), values.end(),
-                         [&meta_value](const MetadataValue& v) {
-                           return CompareValues(meta_value, v) == 0;
-                         });
+                         [&meta_value](const MetadataValue& v) { return CompareValues(meta_value, v) == 0; });
     }
   }
   return false;

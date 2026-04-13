@@ -59,8 +59,7 @@ class AnnIndex {
    * @param top_k Number of results to return
    * @return Vector of (compact_index, score) pairs, sorted by score descending
    */
-  virtual std::vector<std::pair<uint32_t, float>> Search(
-      const float* query, uint32_t top_k) const = 0;
+  virtual std::vector<std::pair<uint32_t, float>> Search(const float* query, uint32_t top_k) const = 0;
 
   /**
    * @brief Rebuild the index from scratch
@@ -68,8 +67,7 @@ class AnnIndex {
    * @param count Number of vectors
    * @param dimension Vector dimension
    */
-  virtual void Rebuild(const float* all_vectors, uint32_t count,
-                       uint32_t dimension) = 0;
+  virtual void Rebuild(const float* all_vectors, uint32_t count, uint32_t dimension) = 0;
 
   /**
    * @brief Get the number of vectors in the index (excluding deleted)
@@ -82,16 +80,14 @@ class AnnIndex {
    * @param out Output stream
    * @return Success or error
    */
-  virtual utils::Expected<void, utils::Error> Serialize(
-      std::ostream& out) const = 0;
+  virtual utils::Expected<void, utils::Error> Serialize(std::ostream& out) const = 0;
 
   /**
    * @brief Deserialize index from input stream
    * @param in Input stream
    * @return Success or error
    */
-  virtual utils::Expected<void, utils::Error> Deserialize(
-      std::istream& in) = 0;
+  virtual utils::Expected<void, utils::Error> Deserialize(std::istream& in) = 0;
 };
 
 }  // namespace nvecd::vectors

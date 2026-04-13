@@ -11,14 +11,10 @@
 namespace nvecd::storage {
 
 utils::Expected<void, utils::Error> WriteSnapshotWithLock(
-    const std::string& filepath, const config::Config& config,
-    events::EventStore& event_store, events::CoOccurrenceIndex& co_index,
-    vectors::VectorStore& vector_store,
-    const SnapshotStatistics* stats,
-    const std::unordered_map<std::string, StoreStatistics>*
-        store_stats) {
-  utils::LogStorageInfo("snapshot_lock",
-                        "Acquiring write locks as barrier for consistent snapshot");
+    const std::string& filepath, const config::Config& config, events::EventStore& event_store,
+    events::CoOccurrenceIndex& co_index, vectors::VectorStore& vector_store, const SnapshotStatistics* stats,
+    const std::unordered_map<std::string, StoreStatistics>* store_stats) {
+  utils::LogStorageInfo("snapshot_lock", "Acquiring write locks as barrier for consistent snapshot");
 
   // Write lock barrier: drain all in-flight writes by acquiring exclusive
   // locks on all stores, then release them immediately. This ensures a
@@ -35,21 +31,16 @@ utils::Expected<void, utils::Error> WriteSnapshotWithLock(
     // All writes drained. Release write locks.
   }
 
-  utils::LogStorageInfo("snapshot_lock",
-                        "Write barrier complete, serializing snapshot");
+  utils::LogStorageInfo("snapshot_lock", "Write barrier complete, serializing snapshot");
 
   // Serialize stores — each const getter acquires its own read lock
-  auto result = snapshot_v1::WriteSnapshotV1(filepath, config, event_store,
-                                             co_index, vector_store, stats,
-                                             store_stats);
+  auto result = snapshot_v1::WriteSnapshotV1(filepath, config, event_store, co_index, vector_store, stats, store_stats);
 
   // Locks released by RAII when function returns
   if (result) {
-    utils::LogStorageInfo("snapshot_lock",
-                          "Lock-mode snapshot completed: " + filepath);
+    utils::LogStorageInfo("snapshot_lock", "Lock-mode snapshot completed: " + filepath);
   } else {
-    utils::LogStorageError("snapshot_lock", filepath,
-                           result.error().message());
+    utils::LogStorageError("snapshot_lock", filepath, result.error().message());
   }
 
   return result;

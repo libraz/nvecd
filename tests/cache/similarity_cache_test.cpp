@@ -267,9 +267,8 @@ TEST(SimilarityCacheTest, Eviction_LRUPolicy) {
   auto still_there_3 = cache.Lookup(key3);
   if (still_there_2.has_value() || still_there_3.has_value()) {
     // If less-recently-used items survived, the most-recently-used must too
-    EXPECT_TRUE(still_there_1.has_value())
-        << "LRU violation: item2 or item3 survived eviction but item1 "
-           "(most recently accessed) did not";
+    EXPECT_TRUE(still_there_1.has_value()) << "LRU violation: item2 or item3 survived eviction but item1 "
+                                              "(most recently accessed) did not";
   }
 }
 
@@ -705,8 +704,7 @@ TEST(SimilarityCacheTest, ConcurrentMarkInvalidatedAndLookup) {
   EXPECT_GT(stats.cache_misses, 0);
   // cache_misses_invalidated should be > 0 since invalidators ran continuously
   EXPECT_GT(stats.cache_misses_invalidated, 0);
-  EXPECT_LE(stats.cache_misses_invalidated, stats.cache_misses)
-      << "Invalidated misses should not exceed total misses";
+  EXPECT_LE(stats.cache_misses_invalidated, stats.cache_misses) << "Invalidated misses should not exceed total misses";
 }
 
 TEST(SimilarityCacheTest, EvictForSpaceFailsGracefully) {
@@ -799,8 +797,7 @@ TEST(SimilarityCacheTest, RegisterAndInvalidateByItemId) {
   SimilarityCache cache(1024 * 1024, 0.0);
 
   auto key1 = MakeKey("query1", 10);
-  std::vector<similarity::SimilarityResult> results = {
-      {"A", 0.95f}, {"B", 0.90f}, {"C", 0.85f}};
+  std::vector<similarity::SimilarityResult> results = {{"A", 0.95f}, {"B", 0.90f}, {"C", 0.85f}};
 
   cache.Insert(key1, results, 1.0);
   cache.RegisterResultItems(key1, {"A", "B", "C"});
@@ -930,9 +927,8 @@ TEST(SimilarityCacheTest, ConcurrentRegisterAndInvalidate) {
       int i = 0;
       while (!stop.load(std::memory_order_relaxed)) {
         auto key = MakeKey("query" + std::to_string(i % entry_count), 10);
-        std::vector<std::string> items = {
-            "item_" + std::to_string(t) + "_" + std::to_string(i),
-            "shared_item_" + std::to_string(i % 10)};
+        std::vector<std::string> items = {"item_" + std::to_string(t) + "_" + std::to_string(i),
+                                          "shared_item_" + std::to_string(i % 10)};
         cache.RegisterResultItems(key, items);
         ++i;
         std::this_thread::yield();

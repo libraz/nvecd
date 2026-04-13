@@ -545,8 +545,8 @@ utils::Expected<void, utils::Error> ValidateConfig(const Config& config) {
         utils::MakeError(utils::ErrorCode::kConfigInvalidValue, "events.decay_alpha must be between 0.0 and 1.0"));
   }
   if (config.events.temporal_half_life_sec <= 0.0) {
-    return utils::MakeUnexpected(
-        utils::MakeError(utils::ErrorCode::kConfigInvalidValue, "events.temporal_half_life_sec must be greater than 0"));
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
+                                                  "events.temporal_half_life_sec must be greater than 0"));
   }
   if (config.events.negative_weight < 0.0 || config.events.negative_weight > 1.0) {
     return utils::MakeUnexpected(
@@ -583,24 +583,20 @@ utils::Expected<void, utils::Error> ValidateConfig(const Config& config) {
         utils::MakeError(utils::ErrorCode::kConfigInvalidValue, "similarity.fusion_beta must be between 0.0 and 1.0"));
   }
   if (config.similarity.adaptive_min_alpha < 0.0 || config.similarity.adaptive_min_alpha > 1.0) {
-    return utils::MakeUnexpected(
-        utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
-                         "similarity.adaptive_min_alpha must be between 0.0 and 1.0"));
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
+                                                  "similarity.adaptive_min_alpha must be between 0.0 and 1.0"));
   }
   if (config.similarity.adaptive_max_alpha < 0.0 || config.similarity.adaptive_max_alpha > 1.0) {
-    return utils::MakeUnexpected(
-        utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
-                         "similarity.adaptive_max_alpha must be between 0.0 and 1.0"));
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
+                                                  "similarity.adaptive_max_alpha must be between 0.0 and 1.0"));
   }
   if (config.similarity.adaptive_min_alpha > config.similarity.adaptive_max_alpha) {
-    return utils::MakeUnexpected(
-        utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
-                         "similarity.adaptive_min_alpha must be <= adaptive_max_alpha"));
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
+                                                  "similarity.adaptive_min_alpha must be <= adaptive_max_alpha"));
   }
   if (config.similarity.adaptive_maturity_threshold == 0) {
-    return utils::MakeUnexpected(
-        utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
-                         "similarity.adaptive_maturity_threshold must be greater than 0"));
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
+                                                  "similarity.adaptive_maturity_threshold must be greater than 0"));
   }
 
   // Validate index_type
@@ -618,14 +614,12 @@ utils::Expected<void, utils::Error> ValidateConfig(const Config& config) {
           utils::MakeError(utils::ErrorCode::kConfigInvalidValue, "similarity.ivf_nprobe must be greater than 0"));
     }
     if (config.similarity.ivf_train_threshold == 0) {
-      return utils::MakeUnexpected(
-          utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
-                           "similarity.ivf_train_threshold must be greater than 0"));
+      return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
+                                                    "similarity.ivf_train_threshold must be greater than 0"));
     }
     if (config.similarity.ivf_nlist > 0 && config.similarity.ivf_nprobe > config.similarity.ivf_nlist) {
-      return utils::MakeUnexpected(
-          utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
-                           "similarity.ivf_nprobe must be <= similarity.ivf_nlist"));
+      return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
+                                                    "similarity.ivf_nprobe must be <= similarity.ivf_nlist"));
     }
   }
 
@@ -633,18 +627,15 @@ utils::Expected<void, utils::Error> ValidateConfig(const Config& config) {
   if (idx_type == "hnsw") {
     if (config.similarity.hnsw_m < 2) {
       return utils::MakeUnexpected(
-          utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
-                           "similarity.hnsw_m must be >= 2"));
+          utils::MakeError(utils::ErrorCode::kConfigInvalidValue, "similarity.hnsw_m must be >= 2"));
     }
     if (config.similarity.hnsw_ef_construction == 0) {
-      return utils::MakeUnexpected(
-          utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
-                           "similarity.hnsw_ef_construction must be greater than 0"));
+      return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
+                                                    "similarity.hnsw_ef_construction must be greater than 0"));
     }
     if (config.similarity.hnsw_ef_search == 0) {
       return utils::MakeUnexpected(
-          utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
-                           "similarity.hnsw_ef_search must be greater than 0"));
+          utils::MakeError(utils::ErrorCode::kConfigInvalidValue, "similarity.hnsw_ef_search must be greater than 0"));
     }
   }
 
@@ -658,8 +649,9 @@ utils::Expected<void, utils::Error> ValidateConfig(const Config& config) {
         utils::MakeError(utils::ErrorCode::kConfigInvalidValue, "snapshot.retain must be >= 0"));
   }
   if (config.snapshot.mode != "fork" && config.snapshot.mode != "lock") {
-    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
-        "snapshot.mode must be 'fork' or 'lock' (got: " + config.snapshot.mode + ")"));
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
+                         "snapshot.mode must be 'fork' or 'lock' (got: " + config.snapshot.mode + ")"));
   }
 
   // Validate performance configuration

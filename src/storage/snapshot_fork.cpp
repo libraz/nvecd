@@ -6,6 +6,7 @@
 #include "storage/snapshot_fork.h"
 
 #include <signal.h>
+#include <spdlog/spdlog.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -13,8 +14,6 @@
 #include <ctime>
 #include <filesystem>
 #include <thread>
-
-#include <spdlog/spdlog.h>
 
 #include "storage/snapshot_format_v1.h"
 #include "utils/structured_log.h"
@@ -27,8 +26,7 @@
 namespace nvecd::storage {
 
 namespace {
-constexpr int kMinInheritedFD =
-    3;  // Close FDs >= 3 (preserve stdin/stdout/stderr)
+constexpr int kMinInheritedFD = 3;  // Close FDs >= 3 (preserve stdin/stdout/stderr)
 constexpr int kChildExitSuccess = 0;
 constexpr int kChildExitFailure = 1;
 }  // namespace
@@ -37,22 +35,21 @@ ForkSnapshotWriter::~ForkSnapshotWriter() {
   WaitForChild(5000);  // NOLINT(cppcoreguidelines-avoid-magic-numbers)
 }
 
-utils::Expected<void, utils::Error> ForkSnapshotWriter::StartBackgroundSave(
-    const std::string& filepath, const config::Config& config,
-    events::EventStore& event_store, events::CoOccurrenceIndex& co_index,
-    vectors::VectorStore& vector_store) {
+utils::Expected<void, utils::Error> ForkSnapshotWriter::StartBackgroundSave(const std::string& filepath,
+                                                                            const config::Config& config,
+                                                                            events::EventStore& event_store,
+                                                                            events::CoOccurrenceIndex& co_index,
+                                                                            vectors::VectorStore& vector_store) {
   {
     std::lock_guard lock(status_mutex_);
     if (current_result_.status == SnapshotStatus::kInProgress) {
       return utils::MakeUnexpected(utils::MakeError(
           utils::ErrorCode::kSnapshotAlreadyInProgress,
-          "Background snapshot already in progress (pid: " +
-              std::to_string(current_result_.child_pid) + ")"));
+          "Background snapshot already in progress (pid: " + std::to_string(current_result_.child_pid) + ")"));
     }
   }
 
-  utils::LogStorageInfo("snapshot_fork",
-                        "Acquiring write locks for pre-fork barrier");
+  utils::LogStorageInfo("snapshot_fork", "Acquiring write locks for pre-fork barrier");
 
   // Pre-fork barrier: acquire all write locks to ensure consistent mutex state
   auto lock_es = event_store.AcquireWriteLock();
@@ -62,8 +59,7 @@ utils::Expected<void, utils::Error> ForkSnapshotWriter::StartBackgroundSave(
   // Ensure SIGCHLD is not SIG_IGN (macOS auto-reaps children when ignored)
   signal(SIGCHLD, SIG_DFL);  // NOLINT(cppcoreguidelines-pro-type-cstyle-cast)
 
-  utils::LogStorageInfo("snapshot_fork",
-                        "Forking child process for snapshot: " + filepath);
+  utils::LogStorageInfo("snapshot_fork", "Forking child process for snapshot: " + filepath);
 
   pid_t pid = fork();
 
@@ -71,8 +67,7 @@ utils::Expected<void, utils::Error> ForkSnapshotWriter::StartBackgroundSave(
     // fork failed — locks released by RAII
     std::string err = "fork() failed: " + std::string(strerror(errno));
     utils::LogStorageError("snapshot_fork", filepath, err);
-    return utils::MakeUnexpected(
-        utils::MakeError(utils::ErrorCode::kSnapshotForkFailed, err));
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kSnapshotForkFailed, err));
   }
 
   if (pid == 0) {
@@ -106,18 +101,14 @@ utils::Expected<void, utils::Error> ForkSnapshotWriter::StartBackgroundSave(
     current_result_.end_time = 0;
   }
 
-  utils::LogStorageInfo(
-      "snapshot_fork",
-      "Fork snapshot started (child pid: " + std::to_string(pid) + ")");
+  utils::LogStorageInfo("snapshot_fork", "Fork snapshot started (child pid: " + std::to_string(pid) + ")");
 
   return {};
 }
 
-void ForkSnapshotWriter::ChildProcess(
-    const std::string& filepath, const config::Config& config,
-    const events::EventStore& event_store,
-    const events::CoOccurrenceIndex& co_index,
-    const vectors::VectorStore& vector_store) {
+void ForkSnapshotWriter::ChildProcess(const std::string& filepath, const config::Config& config,
+                                      const events::EventStore& event_store, const events::CoOccurrenceIndex& co_index,
+                                      const vectors::VectorStore& vector_store) {
   // 1. Close inherited file descriptors (server sockets, log files, etc.)
   CloseInheritedFDs(kMinInheritedFD);
 
@@ -130,8 +121,7 @@ void ForkSnapshotWriter::ChildProcess(
   signal(SIGTERM, SIG_DFL);  // NOLINT(cppcoreguidelines-pro-type-cstyle-cast)
 
   // 4. Write snapshot — data is a frozen COW copy from parent
-  auto result = snapshot_v1::WriteSnapshotV1(filepath, config, event_store,
-                                             co_index, vector_store);
+  auto result = snapshot_v1::WriteSnapshotV1(filepath, config, event_store, co_index, vector_store);
 
   // 5. Exit (never call exit() — use _exit() to avoid atexit handlers)
   _exit(result ? kChildExitSuccess : kChildExitFailure);
@@ -179,21 +169,16 @@ void ForkSnapshotWriter::CheckChild() {
       // Determine success by checking if the snapshot file exists.
       if (std::filesystem::exists(current_result_.filepath)) {
         current_result_.status = SnapshotStatus::kCompleted;
-        utils::LogStorageInfo(
-            "snapshot_fork",
-            "Fork snapshot completed (auto-reaped): " + current_result_.filepath);
+        utils::LogStorageInfo("snapshot_fork", "Fork snapshot completed (auto-reaped): " + current_result_.filepath);
       } else {
         current_result_.status = SnapshotStatus::kFailed;
         current_result_.error_message = "Child was auto-reaped and snapshot file not found";
-        utils::LogStorageError("snapshot_fork", current_result_.filepath,
-                               current_result_.error_message);
+        utils::LogStorageError("snapshot_fork", current_result_.filepath, current_result_.error_message);
       }
     } else {
       current_result_.status = SnapshotStatus::kFailed;
-      current_result_.error_message =
-          "waitpid failed: " + std::string(strerror(errno));
-      utils::LogStorageError("snapshot_fork", current_result_.filepath,
-                             current_result_.error_message);
+      current_result_.error_message = "waitpid failed: " + std::string(strerror(errno));
+      utils::LogStorageError("snapshot_fork", current_result_.filepath, current_result_.error_message);
     }
     return;
   }
@@ -203,23 +188,17 @@ void ForkSnapshotWriter::CheckChild() {
     int exit_code = WEXITSTATUS(status);
     if (exit_code == kChildExitSuccess) {
       current_result_.status = SnapshotStatus::kCompleted;
-      utils::LogStorageInfo(
-          "snapshot_fork",
-          "Fork snapshot completed: " + current_result_.filepath);
+      utils::LogStorageInfo("snapshot_fork", "Fork snapshot completed: " + current_result_.filepath);
     } else {
       current_result_.status = SnapshotStatus::kFailed;
-      current_result_.error_message =
-          "Child exited with code " + std::to_string(exit_code);
-      utils::LogStorageError("snapshot_fork", current_result_.filepath,
-                             current_result_.error_message);
+      current_result_.error_message = "Child exited with code " + std::to_string(exit_code);
+      utils::LogStorageError("snapshot_fork", current_result_.filepath, current_result_.error_message);
     }
   } else if (WIFSIGNALED(status)) {
     int sig = WTERMSIG(status);
     current_result_.status = SnapshotStatus::kFailed;
-    current_result_.error_message =
-        "Child killed by signal " + std::to_string(sig);
-    utils::LogStorageError("snapshot_fork", current_result_.filepath,
-                           current_result_.error_message);
+    current_result_.error_message = "Child killed by signal " + std::to_string(sig);
+    utils::LogStorageError("snapshot_fork", current_result_.filepath, current_result_.error_message);
   }
 }
 
@@ -260,10 +239,7 @@ void ForkSnapshotWriter::WaitForChild(uint32_t timeout_ms) {
 
   // Timeout — send SIGTERM
   kill(child_pid, SIGTERM);
-  utils::LogStorageInfo(
-      "snapshot_fork",
-      "Sent SIGTERM to snapshot child (pid: " + std::to_string(child_pid) +
-          ")");
+  utils::LogStorageInfo("snapshot_fork", "Sent SIGTERM to snapshot child (pid: " + std::to_string(child_pid) + ")");
 
   // Wait a bit more, then reap
   std::this_thread::sleep_for(std::chrono::milliseconds(kPollIntervalMs));

@@ -6,22 +6,22 @@
  * Reusability: 75% (similar dispatch pattern, different handlers)
  */
 
+#include <spdlog/spdlog.h>
+
 #include <chrono>
 #include <sstream>
-
-#include <spdlog/spdlog.h>
 
 // Include concrete types before request_dispatcher.h to resolve forward declarations
 #include "cache/cache_key.h"
 #include "cache/similarity_cache.h"
 #include "events/co_occurrence_index.h"
 #include "events/event_store.h"
+#include "server/filter_parser.h"
 #include "server/handlers/admin_handler.h"
 #include "server/handlers/cache_handler.h"
 #include "server/handlers/debug_handler.h"
 #include "server/handlers/dump_handler.h"
 #include "server/handlers/info_handler.h"
-#include "server/filter_parser.h"
 #include "server/handlers/variable_handler.h"
 #include "server/request_dispatcher.h"
 #include "similarity/similarity_engine.h"
@@ -197,8 +197,7 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleEvent(const 
     return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kInternalError, "EventStore not initialized"));
   }
 
-  auto result = ctx_.event_store->AddEvent(cmd.ctx, cmd.id, cmd.score, cmd.event_type,
-                                            cmd.timestamp.value_or(0));
+  auto result = ctx_.event_store->AddEvent(cmd.ctx, cmd.id, cmd.score, cmd.event_type, cmd.timestamp.value_or(0));
   if (!result) {
     return utils::MakeUnexpected(result.error());
   }
@@ -209,15 +208,12 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleEvent(const 
     if (ctx_.config->events.negative_signals && cmd.event_type == events::EventType::DEL) {
       // Single lock scope for both operations (avoids intermediate state exposure)
       auto lock = ctx_.co_index->AcquireWriteLock();
-      ctx_.co_index->UpdateFromEventsLocked(cmd.ctx, events,
-          ctx_.config->events.temporal_cooccurrence,
-          ctx_.config->events.temporal_half_life_sec);
-      ctx_.co_index->ApplyNegativeSignalLocked(cmd.id, events,
-          ctx_.config->events.negative_weight);
+      ctx_.co_index->UpdateFromEventsLocked(cmd.ctx, events, ctx_.config->events.temporal_cooccurrence,
+                                            ctx_.config->events.temporal_half_life_sec);
+      ctx_.co_index->ApplyNegativeSignalLocked(cmd.id, events, ctx_.config->events.negative_weight);
     } else {
-      ctx_.co_index->UpdateFromEvents(cmd.ctx, events,
-          ctx_.config->events.temporal_cooccurrence,
-          ctx_.config->events.temporal_half_life_sec);
+      ctx_.co_index->UpdateFromEvents(cmd.ctx, events, ctx_.config->events.temporal_cooccurrence,
+                                      ctx_.config->events.temporal_half_life_sec);
     }
   }
 
@@ -293,8 +289,8 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSim(const Co
 
   if (cache_enabled) {
     auto gen = ctx_.co_index != nullptr ? ctx_.co_index->GetGeneration() : 0;
-    std::string key_str = "SIM:" + cmd.id + ":" + std::to_string(cmd.top_k) + ":" + cmd.mode +
-                           ":g" + std::to_string(gen);
+    std::string key_str =
+        "SIM:" + cmd.id + ":" + std::to_string(cmd.top_k) + ":" + cmd.mode + ":g" + std::to_string(gen);
     if (!cmd.filter_expr.empty()) {
       key_str += ":f" + cmd.filter_expr;
     }

@@ -38,8 +38,7 @@ std::vector<float> BuildMatrix(const std::vector<std::vector<float>>& vecs) {
   size_t dim = vecs[0].size();
   std::vector<float> matrix(vecs.size() * dim);
   for (size_t i = 0; i < vecs.size(); ++i) {
-    std::copy(vecs[i].begin(), vecs[i].end(),
-              matrix.begin() + static_cast<ptrdiff_t>(i * dim));
+    std::copy(vecs[i].begin(), vecs[i].end(), matrix.begin() + static_cast<ptrdiff_t>(i * dim));
   }
   return matrix;
 }
@@ -96,8 +95,7 @@ TEST_F(IvfIndexTest, TrainBasic) {
 
   IvfIndex index(kDim, config);
 
-  index.Train(matrix_.data(), valid_indices_.data(),
-              valid_indices_.size(), kDim);
+  index.Train(matrix_.data(), valid_indices_.data(), valid_indices_.size(), kDim);
 
   EXPECT_TRUE(index.IsTrained());
   EXPECT_EQ(index.GetIndexedCount(), kNumVectors);
@@ -111,8 +109,7 @@ TEST_F(IvfIndexTest, TrainWithAutoNlist) {
 
   IvfIndex index(kDim, config);
 
-  index.Train(matrix_.data(), valid_indices_.data(),
-              valid_indices_.size(), kDim);
+  index.Train(matrix_.data(), valid_indices_.data(), valid_indices_.size(), kDim);
 
   EXPECT_TRUE(index.IsTrained());
   // sqrt(500) ~= 22
@@ -127,8 +124,7 @@ TEST_F(IvfIndexTest, TrainClampsNlistToVectorCount) {
 
   IvfIndex index(kDim, config);
 
-  index.Train(matrix_.data(), valid_indices_.data(),
-              valid_indices_.size(), kDim);
+  index.Train(matrix_.data(), valid_indices_.data(), valid_indices_.size(), kDim);
 
   EXPECT_TRUE(index.IsTrained());
   // nlist should be clamped to kNumVectors
@@ -141,15 +137,13 @@ TEST_F(IvfIndexTest, SearchReturnsResults) {
   config.nprobe = 4;
 
   IvfIndex index(kDim, config);
-  index.Train(matrix_.data(), valid_indices_.data(),
-              valid_indices_.size(), kDim);
+  index.Train(matrix_.data(), valid_indices_.data(), valid_indices_.size(), kDim);
 
   // Search using the first vector as query
   const float* query = matrix_.data();
   float query_norm = norms_[0];
 
-  auto results = index.Search(query, query_norm, matrix_.data(), norms_.data(),
-                              kNumVectors, kDim, 10);
+  auto results = index.Search(query, query_norm, matrix_.data(), norms_.data(), kNumVectors, kDim, 10);
 
   // Should get results
   EXPECT_GT(results.size(), 0);
@@ -171,24 +165,20 @@ TEST_F(IvfIndexTest, SearchWithHighNprobeMatchesBruteForce) {
   config.nprobe = 16;  // Search all clusters = brute force
 
   IvfIndex index(kDim, config);
-  index.Train(matrix_.data(), valid_indices_.data(),
-              valid_indices_.size(), kDim);
+  index.Train(matrix_.data(), valid_indices_.data(), valid_indices_.size(), kDim);
 
   const float* query = matrix_.data();
   float query_norm = norms_[0];
 
-  auto ivf_results = index.Search(query, query_norm, matrix_.data(),
-                                  norms_.data(), kNumVectors, kDim, 5);
+  auto ivf_results = index.Search(query, query_norm, matrix_.data(), norms_.data(), kNumVectors, kDim, 5);
 
   // Brute-force: compute all similarities
   std::vector<std::pair<float, size_t>> brute_results;
   for (size_t i = 0; i < kNumVectors; ++i) {
-    float score = CosineSimilarityPreNorm(
-        query, matrix_.data() + i * kDim, kDim, query_norm, norms_[i]);
+    float score = CosineSimilarityPreNorm(query, matrix_.data() + i * kDim, kDim, query_norm, norms_[i]);
     brute_results.push_back({score, i});
   }
-  std::sort(brute_results.begin(), brute_results.end(),
-            [](const auto& a, const auto& b) { return a.first > b.first; });
+  std::sort(brute_results.begin(), brute_results.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
   brute_results.resize(5);
 
   // With nprobe == nlist, IVF should match brute force exactly
@@ -226,8 +216,7 @@ TEST_F(IvfIndexTest, RemoveVector) {
   config.nprobe = 4;
 
   IvfIndex index(kDim, config);
-  index.Train(matrix_.data(), valid_indices_.data(),
-              valid_indices_.size(), kDim);
+  index.Train(matrix_.data(), valid_indices_.data(), valid_indices_.size(), kDim);
 
   size_t initial_count = index.GetIndexedCount();
 
@@ -252,8 +241,7 @@ TEST_F(IvfIndexTest, SetNprobe) {
   EXPECT_EQ(index.GetNprobe(), 8);
 
   // Train first to have nlist set
-  index.Train(matrix_.data(), valid_indices_.data(),
-              valid_indices_.size(), kDim);
+  index.Train(matrix_.data(), valid_indices_.data(), valid_indices_.size(), kDim);
 
   // Nprobe clamped to nlist
   index.SetNprobe(100);
@@ -266,8 +254,7 @@ TEST_F(IvfIndexTest, SearchBeforeTraining) {
   const float* query = matrix_.data();
   float query_norm = norms_[0];
 
-  auto results = index.Search(query, query_norm, matrix_.data(), norms_.data(),
-                              kNumVectors, kDim, 10);
+  auto results = index.Search(query, query_norm, matrix_.data(), norms_.data(), kNumVectors, kDim, 10);
 
   // Should return empty results before training (no buffer entries either)
   EXPECT_TRUE(results.empty());
@@ -294,8 +281,7 @@ TEST_F(IvfIndexTest, SearchWithDeletedIndices) {
   config.nprobe = 8;  // Search all to ensure deterministic results
 
   IvfIndex index(kDim, config);
-  index.Train(matrix_.data(), valid_indices_.data(),
-              valid_indices_.size(), kDim);
+  index.Train(matrix_.data(), valid_indices_.data(), valid_indices_.size(), kDim);
 
   // Remove first vector
   index.RemoveVector(0);
@@ -304,8 +290,7 @@ TEST_F(IvfIndexTest, SearchWithDeletedIndices) {
   const float* query = matrix_.data();
   float query_norm = norms_[0];
 
-  auto results = index.Search(query, query_norm, matrix_.data(), norms_.data(),
-                              kNumVectors, kDim, 10);
+  auto results = index.Search(query, query_norm, matrix_.data(), norms_.data(), kNumVectors, kDim, 10);
 
   for (const auto& [score, idx] : results) {
     EXPECT_NE(idx, 0) << "Removed vector should not appear in results";
@@ -319,14 +304,12 @@ TEST_F(IvfIndexTest, SearchQualityWithLowNprobe) {
   config.nprobe = 1;
 
   IvfIndex index(kDim, config);
-  index.Train(matrix_.data(), valid_indices_.data(),
-              valid_indices_.size(), kDim);
+  index.Train(matrix_.data(), valid_indices_.data(), valid_indices_.size(), kDim);
 
   const float* query = matrix_.data();
   float query_norm = norms_[0];
 
-  auto results = index.Search(query, query_norm, matrix_.data(), norms_.data(),
-                              kNumVectors, kDim, 5);
+  auto results = index.Search(query, query_norm, matrix_.data(), norms_.data(), kNumVectors, kDim, 5);
 
   // Should still return results (the query's own cluster)
   EXPECT_GT(results.size(), 0);
@@ -380,8 +363,7 @@ TEST_F(IvfIndexTest, SearchBufferOnly) {
   const float* query = vectors_[0].data();
   float query_norm = norms_[0];
 
-  auto results = index.Search(query, query_norm, matrix_.data(),
-                              norms_.data(), kNumVectors, kDim, 5);
+  auto results = index.Search(query, query_norm, matrix_.data(), norms_.data(), kNumVectors, kDim, 5);
 
   // Should get results from buffer brute-force search
   EXPECT_GT(results.size(), 0);
@@ -487,8 +469,7 @@ TEST_F(IvfIndexTest, SealEmptyBuffer) {
   config.nprobe = 4;
 
   IvfIndex index(kDim, config);
-  index.Train(matrix_.data(), valid_indices_.data(),
-              valid_indices_.size(), kDim);
+  index.Train(matrix_.data(), valid_indices_.data(), valid_indices_.size(), kDim);
 
   // Seal empty buffer is a no-op
   size_t count_before = index.GetIndexedCount();
@@ -520,8 +501,7 @@ TEST_F(IvfIndexTest, TwoTierSearchMergesResults) {
   const float* query = vectors_[0].data();
   float query_norm = norms_[0];
 
-  auto results = index.Search(query, query_norm, matrix_.data(),
-                              norms_.data(), kNumVectors, kDim, 10);
+  auto results = index.Search(query, query_norm, matrix_.data(), norms_.data(), kNumVectors, kDim, 10);
 
   EXPECT_GT(results.size(), 0);
   EXPECT_LE(results.size(), 10);
@@ -544,8 +524,7 @@ TEST_F(IvfIndexTest, TwoTierSearchDeduplicates) {
   IvfIndex index(kDim, config);
 
   // Train with all vectors (assigns them to IVF)
-  index.Train(matrix_.data(), valid_indices_.data(),
-              valid_indices_.size(), kDim);
+  index.Train(matrix_.data(), valid_indices_.data(), valid_indices_.size(), kDim);
 
   // Also add some of the same vectors to the buffer (duplicates)
   for (size_t i = 0; i < 10; ++i) {
@@ -555,8 +534,7 @@ TEST_F(IvfIndexTest, TwoTierSearchDeduplicates) {
   const float* query = vectors_[0].data();
   float query_norm = norms_[0];
 
-  auto results = index.Search(query, query_norm, matrix_.data(),
-                              norms_.data(), kNumVectors, kDim, 10);
+  auto results = index.Search(query, query_norm, matrix_.data(), norms_.data(), kNumVectors, kDim, 10);
 
   // Check no duplicate compact_indices in results
   std::vector<size_t> result_indices;
@@ -565,8 +543,7 @@ TEST_F(IvfIndexTest, TwoTierSearchDeduplicates) {
   }
   std::sort(result_indices.begin(), result_indices.end());
   auto unique_end = std::unique(result_indices.begin(), result_indices.end());
-  EXPECT_EQ(unique_end, result_indices.end())
-      << "Search results should not contain duplicate compact indices";
+  EXPECT_EQ(unique_end, result_indices.end()) << "Search results should not contain duplicate compact indices";
 }
 
 TEST_F(IvfIndexTest, RemoveVectorFromBuffer) {

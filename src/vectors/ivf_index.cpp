@@ -35,14 +35,12 @@ constexpr float kNormEpsilon = 1e-7F;
 
 }  // namespace
 
-IvfIndex::IvfIndex(uint32_t dimension)
-    : config_(), dimension_(dimension) {}
+IvfIndex::IvfIndex(uint32_t dimension) : config_(), dimension_(dimension) {}
 
-IvfIndex::IvfIndex(uint32_t dimension, const Config& config)
-    : config_(config), dimension_(dimension) {}
+IvfIndex::IvfIndex(uint32_t dimension, const Config& config) : config_(config), dimension_(dimension) {}
 
-void IvfIndex::Train(const float* matrix, const size_t* valid_indices,
-                     size_t num_valid, uint32_t dimension, bool assign_vectors) {
+void IvfIndex::Train(const float* matrix, const size_t* valid_indices, size_t num_valid, uint32_t dimension,
+                     bool assign_vectors) {
   // Prevent concurrent training attempts
   bool expected = false;
   if (!training_in_progress_.compare_exchange_strong(expected, true)) {
@@ -65,8 +63,7 @@ void IvfIndex::Train(const float* matrix, const size_t* valid_indices,
 
   // Auto-scale nlist if set to 0: use sqrt(n), capped at kMaxAutoNlist
   if (config_.nlist == 0) {
-    auto sqrt_n = static_cast<uint32_t>(
-        std::max(1.0, std::sqrt(static_cast<double>(num_valid))));
+    auto sqrt_n = static_cast<uint32_t>(std::max(1.0, std::sqrt(static_cast<double>(num_valid))));
     config_.nlist = std::min(sqrt_n, kMaxAutoNlist);
   }
 
@@ -83,8 +80,7 @@ void IvfIndex::Train(const float* matrix, const size_t* valid_indices,
   if (num_valid > kMaxTrainingSamples) {
     // Random sample using reservoir sampling
     train_indices.resize(kMaxTrainingSamples);
-    std::copy(valid_indices, valid_indices + kMaxTrainingSamples,
-              train_indices.begin());
+    std::copy(valid_indices, valid_indices + kMaxTrainingSamples, train_indices.begin());
 
     thread_local std::mt19937 rng(std::random_device{}());
     for (size_t i = kMaxTrainingSamples; i < num_valid; ++i) {
@@ -123,9 +119,7 @@ void IvfIndex::Train(const float* matrix, const size_t* valid_indices,
         if (cn < kNormEpsilon || vec_norm < kNormEpsilon) {
           continue;
         }
-        float dot = simd_impl.dot_product(
-            vec, centroids_.data() + static_cast<size_t>(c) * dimension,
-            dimension);
+        float dot = simd_impl.dot_product(vec, centroids_.data() + static_cast<size_t>(c) * dimension, dimension);
         float sim = dot / (vec_norm * cn);
         if (sim > best_sim) {
           best_sim = sim;
@@ -164,8 +158,7 @@ void IvfIndex::AddVector(size_t compact_index, const float* vector) {
   inverted_lists_[cluster].push_back(compact_index);
 }
 
-void IvfIndex::BulkAddVectors(const size_t* compact_indices, const float* vectors,
-                               size_t count, uint32_t dimension) {
+void IvfIndex::BulkAddVectors(const size_t* compact_indices, const float* vectors, size_t count, uint32_t dimension) {
   std::unique_lock lock(mutex_);
 
   if (!trained_ || compact_indices == nullptr || vectors == nullptr || count == 0) {
@@ -188,9 +181,7 @@ void IvfIndex::BulkAddVectors(const size_t* compact_indices, const float* vector
       if (cn < kNormEpsilon || vec_norm < kNormEpsilon) {
         continue;
       }
-      float dot = simd_impl.dot_product(
-          vec, centroids_.data() + static_cast<size_t>(c) * dimension,
-          dimension);
+      float dot = simd_impl.dot_product(vec, centroids_.data() + static_cast<size_t>(c) * dimension, dimension);
       float sim = dot / (vec_norm * cn);
       if (sim > best_sim) {
         best_sim = sim;
@@ -213,10 +204,8 @@ void IvfIndex::RemoveVector(size_t compact_index) {
         if (i != last) {
           buffer_indices_[i] = buffer_indices_[last];
           // Swap vector data
-          std::copy(
-              buffer_vectors_.data() + last * dimension_,
-              buffer_vectors_.data() + (last + 1) * dimension_,
-              buffer_vectors_.data() + i * dimension_);
+          std::copy(buffer_vectors_.data() + last * dimension_, buffer_vectors_.data() + (last + 1) * dimension_,
+                    buffer_vectors_.data() + i * dimension_);
         }
         buffer_indices_.pop_back();
         buffer_vectors_.resize(buffer_indices_.size() * dimension_);
@@ -244,11 +233,9 @@ void IvfIndex::RemoveVector(size_t compact_index) {
   }
 }
 
-std::vector<std::pair<float, size_t>> IvfIndex::Search(
-    const float* query_vec, float query_norm,
-    const float* matrix, const float* norms,
-    size_t total_count, uint32_t dimension,
-    size_t top_k) const {
+std::vector<std::pair<float, size_t>> IvfIndex::Search(const float* query_vec, float query_norm, const float* matrix,
+                                                       const float* norms, size_t total_count, uint32_t dimension,
+                                                       size_t top_k) const {
   // Search the write buffer first (independent lock)
   auto buffer_results = SearchBuffer(query_vec, query_norm, dimension, top_k);
 
@@ -257,19 +244,15 @@ std::vector<std::pair<float, size_t>> IvfIndex::Search(
   {
     std::shared_lock lock(mutex_);
 
-    if (trained_ && query_vec != nullptr && matrix != nullptr &&
-        norms != nullptr && total_count > 0) {
+    if (trained_ && query_vec != nullptr && matrix != nullptr && norms != nullptr && total_count > 0) {
       // Find nprobe nearest centroids
       uint32_t nprobe = std::min(config_.nprobe, config_.nlist);
       auto probe_clusters = FindNearestCentroids(query_vec, nprobe);
 
       // Bounded min-heap for top-k selection
       using ScoreIdx = std::pair<float, size_t>;
-      auto cmp = [](const ScoreIdx& a, const ScoreIdx& b) {
-        return a.first > b.first;
-      };
-      std::priority_queue<ScoreIdx, std::vector<ScoreIdx>, decltype(cmp)>
-          min_heap(cmp);
+      auto cmp = [](const ScoreIdx& a, const ScoreIdx& b) { return a.first > b.first; };
+      std::priority_queue<ScoreIdx, std::vector<ScoreIdx>, decltype(cmp)> min_heap(cmp);
 
       const auto& simd_impl = simd::GetOptimalImpl();
 
@@ -282,8 +265,7 @@ std::vector<std::pair<float, size_t>> IvfIndex::Search(
           if (li + kPrefetchAhead < list.size()) {
             size_t prefetch_idx = list[li + kPrefetchAhead];
             if (prefetch_idx < total_count) {
-              __builtin_prefetch(
-                  matrix + prefetch_idx * dimension, 0, 0);
+              __builtin_prefetch(matrix + prefetch_idx * dimension, 0, 0);
             }
           }
 
@@ -297,8 +279,7 @@ std::vector<std::pair<float, size_t>> IvfIndex::Search(
             continue;
           }
 
-          float dot = simd_impl.dot_product(
-              query_vec, matrix + idx * dimension, dimension);
+          float dot = simd_impl.dot_product(query_vec, matrix + idx * dimension, dimension);
           float score = dot / (query_norm * cand_norm);
 
           if (min_heap.size() < top_k) {
@@ -322,10 +303,7 @@ std::vector<std::pair<float, size_t>> IvfIndex::Search(
   // If only one source has results, skip merge
   if (buffer_results.empty()) {
     std::sort(ivf_results.begin(), ivf_results.end(),
-              [](const std::pair<float, size_t>& a,
-                 const std::pair<float, size_t>& b) {
-                return a.first > b.first;
-              });
+              [](const std::pair<float, size_t>& a, const std::pair<float, size_t>& b) { return a.first > b.first; });
     return ivf_results;
   }
   if (ivf_results.empty()) {
@@ -338,11 +316,8 @@ std::vector<std::pair<float, size_t>> IvfIndex::Search(
   seen.reserve(ivf_results.size() + buffer_results.size());
 
   using ScoreIdx = std::pair<float, size_t>;
-  auto cmp = [](const ScoreIdx& a, const ScoreIdx& b) {
-    return a.first > b.first;
-  };
-  std::priority_queue<ScoreIdx, std::vector<ScoreIdx>, decltype(cmp)>
-      merge_heap(cmp);
+  auto cmp = [](const ScoreIdx& a, const ScoreIdx& b) { return a.first > b.first; };
+  std::priority_queue<ScoreIdx, std::vector<ScoreIdx>, decltype(cmp)> merge_heap(cmp);
 
   // Buffer results are typically from more recent data; add them first
   for (const auto& [score, idx] : buffer_results) {
@@ -374,10 +349,7 @@ std::vector<std::pair<float, size_t>> IvfIndex::Search(
     results.push_back(merge_heap.top());
     merge_heap.pop();
   }
-  std::sort(results.begin(), results.end(),
-            [](const ScoreIdx& a, const ScoreIdx& b) {
-              return a.first > b.first;
-            });
+  std::sort(results.begin(), results.end(), [](const ScoreIdx& a, const ScoreIdx& b) { return a.first > b.first; });
 
   return results;
 }
@@ -465,10 +437,8 @@ void IvfIndex::SealBuffer() {
   if (!trained_) {
     // IVF not trained: put entries back in buffer
     std::unique_lock buf_lock(buffer_mutex_);
-    buffer_indices_.insert(buffer_indices_.end(),
-                           seal_indices.begin(), seal_indices.end());
-    buffer_vectors_.insert(buffer_vectors_.end(),
-                           seal_vectors.begin(), seal_vectors.end());
+    buffer_indices_.insert(buffer_indices_.end(), seal_indices.begin(), seal_indices.end());
+    buffer_vectors_.insert(buffer_vectors_.end(), seal_vectors.begin(), seal_vectors.end());
     return;
   }
 
@@ -488,9 +458,7 @@ void IvfIndex::SealBuffer() {
       if (cn < kNormEpsilon || vec_norm < kNormEpsilon) {
         continue;
       }
-      float dot = simd_impl.dot_product(
-          vec, centroids_.data() + static_cast<size_t>(c) * dimension_,
-          dimension_);
+      float dot = simd_impl.dot_product(vec, centroids_.data() + static_cast<size_t>(c) * dimension_, dimension_);
       float sim = dot / (vec_norm * cn);
       if (sim > best_sim) {
         best_sim = sim;
@@ -501,19 +469,14 @@ void IvfIndex::SealBuffer() {
     inverted_lists_[best].push_back(seal_indices[i]);
   }
 
-  utils::StructuredLog()
-      .Event("ivf_buffer_sealed")
-      .Field("sealed_count", static_cast<int64_t>(sealed_count))
-      .Info();
+  utils::StructuredLog().Event("ivf_buffer_sealed").Field("sealed_count", static_cast<int64_t>(sealed_count)).Info();
 }
 
-std::vector<std::pair<float, size_t>> IvfIndex::SearchBuffer(
-    const float* query_vec, float query_norm,
-    uint32_t dimension, size_t top_k) const {
+std::vector<std::pair<float, size_t>> IvfIndex::SearchBuffer(const float* query_vec, float query_norm,
+                                                             uint32_t dimension, size_t top_k) const {
   std::shared_lock lock(buffer_mutex_);
 
-  if (buffer_indices_.empty() || query_vec == nullptr ||
-      query_norm < kNormEpsilon) {
+  if (buffer_indices_.empty() || query_vec == nullptr || query_norm < kNormEpsilon) {
     return {};
   }
 
@@ -521,17 +484,13 @@ std::vector<std::pair<float, size_t>> IvfIndex::SearchBuffer(
 
   // Bounded min-heap for top-k selection
   using ScoreIdx = std::pair<float, size_t>;
-  auto cmp = [](const ScoreIdx& a, const ScoreIdx& b) {
-    return a.first > b.first;
-  };
-  std::priority_queue<ScoreIdx, std::vector<ScoreIdx>, decltype(cmp)>
-      min_heap(cmp);
+  auto cmp = [](const ScoreIdx& a, const ScoreIdx& b) { return a.first > b.first; };
+  std::priority_queue<ScoreIdx, std::vector<ScoreIdx>, decltype(cmp)> min_heap(cmp);
 
   for (size_t i = 0; i < buffer_indices_.size(); ++i) {
     // Prefetch upcoming buffer vector data
     if (i + kPrefetchAhead < buffer_indices_.size()) {
-      __builtin_prefetch(
-          buffer_vectors_.data() + (i + kPrefetchAhead) * dimension, 0, 0);
+      __builtin_prefetch(buffer_vectors_.data() + (i + kPrefetchAhead) * dimension, 0, 0);
     }
 
     const float* vec = buffer_vectors_.data() + i * dimension;
@@ -559,10 +518,7 @@ std::vector<std::pair<float, size_t>> IvfIndex::SearchBuffer(
     results.push_back(min_heap.top());
     min_heap.pop();
   }
-  std::sort(results.begin(), results.end(),
-            [](const ScoreIdx& a, const ScoreIdx& b) {
-              return a.first > b.first;
-            });
+  std::sort(results.begin(), results.end(), [](const ScoreIdx& a, const ScoreIdx& b) { return a.first > b.first; });
 
   return results;
 }
@@ -571,8 +527,7 @@ std::vector<std::pair<float, size_t>> IvfIndex::SearchBuffer(
 // K-Means Training (Lloyd's Algorithm)
 // ============================================================================
 
-void IvfIndex::KMeansTrain(const float* matrix, const size_t* sample_indices,
-                           size_t sample_size, uint32_t dim) {
+void IvfIndex::KMeansTrain(const float* matrix, const size_t* sample_indices, size_t sample_size, uint32_t dim) {
   const uint32_t nlist = config_.nlist;
 
   // Random initialization: pick nlist random vectors as initial centroids
@@ -599,8 +554,7 @@ void IvfIndex::KMeansTrain(const float* matrix, const size_t* sample_indices,
   // Compute initial centroid norms before first iteration
   centroid_norms_.resize(nlist);
   for (uint32_t c = 0; c < nlist; ++c) {
-    centroid_norms_[c] = simd_impl.l2_norm(
-        centroids_.data() + static_cast<size_t>(c) * dim, dim);
+    centroid_norms_[c] = simd_impl.l2_norm(centroids_.data() + static_cast<size_t>(c) * dim, dim);
   }
 
   for (uint32_t iter = 0; iter < config_.max_iterations; ++iter) {
@@ -645,10 +599,8 @@ void IvfIndex::KMeansTrain(const float* matrix, const size_t* sample_indices,
     // Check convergence: maximum centroid movement
     float max_delta = 0.0F;
     for (uint32_t c = 0; c < nlist; ++c) {
-      float delta = simd_impl.l2_distance(
-          centroids_.data() + static_cast<size_t>(c) * dim,
-          new_centroids.data() + static_cast<size_t>(c) * dim,
-          dim);
+      float delta = simd_impl.l2_distance(centroids_.data() + static_cast<size_t>(c) * dim,
+                                          new_centroids.data() + static_cast<size_t>(c) * dim, dim);
       max_delta = std::max(max_delta, delta);
     }
 
@@ -656,8 +608,7 @@ void IvfIndex::KMeansTrain(const float* matrix, const size_t* sample_indices,
 
     // Recompute centroid norms for next iteration's FindNearestCentroid
     for (uint32_t c = 0; c < nlist; ++c) {
-      centroid_norms_[c] = simd_impl.l2_norm(
-          centroids_.data() + static_cast<size_t>(c) * dim, dim);
+      centroid_norms_[c] = simd_impl.l2_norm(centroids_.data() + static_cast<size_t>(c) * dim, dim);
     }
 
     if (max_delta < config_.convergence_threshold) {
@@ -685,9 +636,7 @@ size_t IvfIndex::FindNearestCentroid(const float* vec) const {
     if (cn < kNormEpsilon || vec_norm < kNormEpsilon) {
       continue;
     }
-    float dot = simd_impl.dot_product(
-        vec, centroids_.data() + static_cast<size_t>(c) * dimension_,
-        dimension_);
+    float dot = simd_impl.dot_product(vec, centroids_.data() + static_cast<size_t>(c) * dimension_, dimension_);
     float sim = dot / (vec_norm * cn);
     if (sim > best_sim) {
       best_sim = sim;
@@ -698,8 +647,7 @@ size_t IvfIndex::FindNearestCentroid(const float* vec) const {
   return best;
 }
 
-std::vector<size_t> IvfIndex::FindNearestCentroids(const float* vec,
-                                                    uint32_t nprobe) const {
+std::vector<size_t> IvfIndex::FindNearestCentroids(const float* vec, uint32_t nprobe) const {
   const auto& simd_impl = simd::GetOptimalImpl();
   float vec_norm = simd_impl.l2_norm(vec, dimension_);
 
@@ -709,9 +657,7 @@ std::vector<size_t> IvfIndex::FindNearestCentroids(const float* vec,
     float cn = centroid_norms_[c];
     float sim = 0.0F;
     if (cn >= kNormEpsilon && vec_norm >= kNormEpsilon) {
-      float dot = simd_impl.dot_product(
-          vec, centroids_.data() + static_cast<size_t>(c) * dimension_,
-          dimension_);
+      float dot = simd_impl.dot_product(vec, centroids_.data() + static_cast<size_t>(c) * dimension_, dimension_);
       sim = dot / (vec_norm * cn);
     }
     centroid_sims[c] = {sim, c};
@@ -719,14 +665,10 @@ std::vector<size_t> IvfIndex::FindNearestCentroids(const float* vec,
 
   // Partial sort to find nprobe nearest
   uint32_t actual_nprobe = std::min(nprobe, config_.nlist);
-  std::partial_sort(
-      centroid_sims.begin(),
-      centroid_sims.begin() + actual_nprobe,
-      centroid_sims.end(),
-      [](const std::pair<float, size_t>& a,
-         const std::pair<float, size_t>& b) {
-        return a.first > b.first;  // Higher similarity first
-      });
+  std::partial_sort(centroid_sims.begin(), centroid_sims.begin() + actual_nprobe, centroid_sims.end(),
+                    [](const std::pair<float, size_t>& a, const std::pair<float, size_t>& b) {
+                      return a.first > b.first;  // Higher similarity first
+                    });
 
   std::vector<size_t> result(actual_nprobe);
   for (uint32_t i = 0; i < actual_nprobe; ++i) {

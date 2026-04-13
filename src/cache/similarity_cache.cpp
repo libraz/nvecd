@@ -492,7 +492,7 @@ bool SimilarityCache::EvictForSpace(size_t required_bytes) {
 }
 
 std::optional<std::vector<similarity::SimilarityResult>> SimilarityCache::Lookup(const CacheKey& key,
-                                                                                SearchType search_type) {
+                                                                                 SearchType search_type) {
   auto idx = static_cast<size_t>(search_type);
 
   // Check per-type policy

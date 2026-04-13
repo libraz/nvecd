@@ -33,9 +33,8 @@ void MetadataStore::Delete(uint32_t compact_index) {
   }
 }
 
-std::vector<uint32_t> MetadataStore::Filter(
-    const MetadataFilter& filter,
-    const std::vector<uint32_t>& candidates) const {
+std::vector<uint32_t> MetadataStore::Filter(const MetadataFilter& filter,
+                                            const std::vector<uint32_t>& candidates) const {
   std::shared_lock lock(mutex_);
   std::vector<uint32_t> result;
 
@@ -74,8 +73,7 @@ std::vector<uint32_t> MetadataStore::Filter(
   return result;
 }
 
-bool MetadataStore::Matches(uint32_t compact_index,
-                             const MetadataFilter& filter) const {
+bool MetadataStore::Matches(uint32_t compact_index, const MetadataFilter& filter) const {
   std::shared_lock lock(mutex_);
   if (filter.Empty()) {
     return true;

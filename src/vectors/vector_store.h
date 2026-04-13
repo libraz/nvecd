@@ -226,10 +226,10 @@ class VectorStore {
    * The caller should hold a read lock while using this snapshot.
    */
   struct CompactSnapshot {
-    const float* matrix = nullptr;   ///< Pointer to contiguous matrix
-    const float* norms = nullptr;    ///< Pointer to norm array
-    size_t count = 0;                ///< Number of vectors (including tombstones)
-    size_t dim = 0;                  ///< Vector dimension
+    const float* matrix = nullptr;  ///< Pointer to contiguous matrix
+    const float* norms = nullptr;   ///< Pointer to norm array
+    size_t count = 0;               ///< Number of vectors (including tombstones)
+    size_t dim = 0;                 ///< Vector dimension
     const std::unordered_map<std::string, size_t>* id_to_idx = nullptr;
     const std::vector<std::string>* idx_to_id = nullptr;
   };
@@ -274,8 +274,8 @@ class VectorStore {
   size_t MemoryUsageLocked() const;
   config::VectorsConfig config_;  ///< Configuration
 
-  mutable std::shared_mutex mutex_;    ///< Reader-writer lock
-  std::atomic<size_t> dimension_{0};   ///< Fixed dimension (0 = not set)
+  mutable std::shared_mutex mutex_;   ///< Reader-writer lock
+  std::atomic<size_t> dimension_{0};  ///< Fixed dimension (0 = not set)
 
   // Compact storage (single source of truth)
   std::vector<float> matrix_;                          ///< [n x dim] contiguous float array
@@ -284,9 +284,9 @@ class VectorStore {
   std::vector<std::string> idx_to_id_;                 ///< row index -> ID
 
   // Tombstone tracking
-  std::vector<bool> deleted_;       ///< Tombstone flags per slot
-  size_t active_count_ = 0;        ///< Number of non-deleted vectors
-  size_t tombstone_count_ = 0;     ///< Number of deleted slots
+  std::vector<bool> deleted_;   ///< Tombstone flags per slot
+  size_t active_count_ = 0;     ///< Number of non-deleted vectors
+  size_t tombstone_count_ = 0;  ///< Number of deleted slots
 };
 
 }  // namespace nvecd::vectors

@@ -13,8 +13,7 @@ TEST(CoOccurrenceNegativeTest, NegativeDisabledByDefault) {
   CoOccurrenceIndex index;
 
   // Add events to build co-occurrence
-  std::vector<Event> events = {Event("a", 10, 1000), Event("b", 10, 1000),
-                               Event("c", 10, 1000)};
+  std::vector<Event> events = {Event("a", 10, 1000), Event("b", 10, 1000), Event("c", 10, 1000)};
   index.UpdateFromEvents("ctx", events);
 
   float score_before = index.GetScore("a", "b");
@@ -27,8 +26,7 @@ TEST(CoOccurrenceNegativeTest, NegativeDisabledByDefault) {
 TEST(CoOccurrenceNegativeTest, ReducesCooccurrence) {
   CoOccurrenceIndex index;
 
-  std::vector<Event> events = {Event("a", 10, 1000), Event("b", 10, 1000),
-                               Event("c", 10, 1000)};
+  std::vector<Event> events = {Event("a", 10, 1000), Event("b", 10, 1000), Event("c", 10, 1000)};
   index.UpdateFromEvents("ctx", events);
 
   float score_ab_before = index.GetScore("a", "b");
@@ -90,8 +88,7 @@ TEST(CoOccurrenceNegativeTest, SymmetricReduction) {
 TEST(CoOccurrenceNegativeTest, OnlyAffectsDeletedItem) {
   CoOccurrenceIndex index;
 
-  std::vector<Event> events = {Event("a", 10, 1000), Event("b", 10, 1000),
-                               Event("c", 10, 1000)};
+  std::vector<Event> events = {Event("a", 10, 1000), Event("b", 10, 1000), Event("c", 10, 1000)};
   index.UpdateFromEvents("ctx", events);
 
   float score_bc_before = index.GetScore("b", "c");

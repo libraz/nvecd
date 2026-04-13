@@ -85,8 +85,7 @@ TEST_F(AdversarialE2ETest, VeryLargePayload) {
   // Should reject due to dimension mismatch or accept if dimension is ignored.
   // Must not crash.
   EXPECT_FALSE(resp.empty()) << "Server should respond (not crash) to very large payload";
-  EXPECT_TRUE(ContainsOK(resp) || ContainsError(resp))
-      << "Response should be OK or ERROR, got: " + resp;
+  EXPECT_TRUE(ContainsOK(resp) || ContainsError(resp)) << "Response should be OK or ERROR, got: " + resp;
 
   // Verify server health
   auto health = client.SendCommand("INFO");
@@ -107,8 +106,7 @@ TEST_F(AdversarialE2ETest, RapidFireCommands) {
   server_addr.sin_port = htons(port_);
   inet_pton(AF_INET, "127.0.0.1", &server_addr.sin_addr);
 
-  int ret = connect(sock, reinterpret_cast<struct sockaddr*>(&server_addr),
-                    sizeof(server_addr));
+  int ret = connect(sock, reinterpret_cast<struct sockaddr*>(&server_addr), sizeof(server_addr));
   ASSERT_EQ(ret, 0) << "Failed to connect for rapid-fire test";
 
   // Set recv timeout
@@ -120,8 +118,7 @@ TEST_F(AdversarialE2ETest, RapidFireCommands) {
   // Send 1000 EVENT ADD commands without reading responses
   static constexpr int kCommandCount = 1000;
   for (int i = 0; i < kCommandCount; ++i) {
-    std::string cmd = "EVENT ctx_rf ADD item_" + std::to_string(i) +
-                      " " + std::to_string(i) + "\r\n";
+    std::string cmd = "EVENT ctx_rf ADD item_" + std::to_string(i) + " " + std::to_string(i) + "\r\n";
     send(sock, cmd.c_str(), cmd.length(), 0);
   }
 
@@ -182,8 +179,7 @@ TEST_F(AdversarialE2ETest, RapidFireCommands) {
   }
 
   // We should have gotten responses for most commands
-  EXPECT_GT(ok_count + err_count, 0)
-      << "Server should have responded to at least some rapid-fire commands";
+  EXPECT_GT(ok_count + err_count, 0) << "Server should have responded to at least some rapid-fire commands";
 
   // Verify server is still healthy via a fresh connection
   TcpClient health_client("127.0.0.1", port_);
@@ -201,8 +197,7 @@ TEST_F(AdversarialE2ETest, EmptyAndWhitespaceOnlyCommands) {
   // Send empty line (just \r\n is appended by SendCommand)
   auto resp = client.SendCommand("");
   // Server may ignore empty lines (timeout/empty response) or return error
-  EXPECT_TRUE(resp.empty() || ContainsError(resp) || ContainsOK(resp))
-      << "Empty command: unexpected response: " + resp;
+  EXPECT_TRUE(resp.empty() || ContainsError(resp) || ContainsOK(resp)) << "Empty command: unexpected response: " + resp;
 
   // Send whitespace-only commands
   resp = client.SendCommand("   ");
@@ -210,8 +205,7 @@ TEST_F(AdversarialE2ETest, EmptyAndWhitespaceOnlyCommands) {
       << "Whitespace command: unexpected response: " + resp;
 
   resp = client.SendCommand("\t");
-  EXPECT_TRUE(resp.empty() || ContainsError(resp) || ContainsOK(resp))
-      << "Tab command: unexpected response: " + resp;
+  EXPECT_TRUE(resp.empty() || ContainsError(resp) || ContainsOK(resp)) << "Tab command: unexpected response: " + resp;
 
   // Server must remain functional
   auto health = client.SendCommand("INFO");
@@ -229,18 +223,15 @@ TEST_F(AdversarialE2ETest, SpecialCharactersInIds) {
   auto resp = client.SendCommand("VECSET item 1 1.0 0.0 0.0");
   // "item" becomes the ID, "1" becomes the first float value.
   // This will likely be a dimension mismatch (4 values for 3-dim).
-  EXPECT_TRUE(ContainsOK(resp) || ContainsError(resp))
-      << "ID with space: unexpected response: " + resp;
+  EXPECT_TRUE(ContainsOK(resp) || ContainsError(resp)) << "ID with space: unexpected response: " + resp;
 
   // ID with equals sign
   resp = client.SendCommand("VECSET item=1 1.0 0.0 0.0");
-  EXPECT_TRUE(ContainsOK(resp) || ContainsError(resp))
-      << "ID with equals: unexpected response: " + resp;
+  EXPECT_TRUE(ContainsOK(resp) || ContainsError(resp)) << "ID with equals: unexpected response: " + resp;
 
   // ID with backslash
   resp = client.SendCommand("VECSET item\\1 1.0 0.0 0.0");
-  EXPECT_TRUE(ContainsOK(resp) || ContainsError(resp))
-      << "ID with backslash: unexpected response: " + resp;
+  EXPECT_TRUE(ContainsOK(resp) || ContainsError(resp)) << "ID with backslash: unexpected response: " + resp;
 
   // Verify server health
   auto health = client.SendCommand("INFO");
@@ -256,8 +247,7 @@ TEST_F(AdversarialE2ETest, NegativeTopK) {
   PopulateBasicData(client);
 
   auto resp = client.SendCommand("SIM item1 -5 using=cosine");
-  EXPECT_TRUE(ContainsError(resp))
-      << "Negative top-K should return error, got: " + resp;
+  EXPECT_TRUE(ContainsError(resp)) << "Negative top-K should return error, got: " + resp;
 
   // Server must remain functional
   auto health = client.SendCommand("INFO");
@@ -273,8 +263,7 @@ TEST_F(AdversarialE2ETest, ZeroDimensionVector) {
 
   // VECSET with no float values at all
   auto resp = client.SendCommand("VECSET item_empty");
-  EXPECT_TRUE(ContainsError(resp))
-      << "VECSET with no values should return error, got: " + resp;
+  EXPECT_TRUE(ContainsError(resp)) << "VECSET with no values should return error, got: " + resp;
 
   // VECSET with ID only, trailing space
   resp = client.SendCommand("VECSET item_empty2 ");
@@ -296,8 +285,7 @@ TEST_F(AdversarialE2ETest, ExtremelyLargeTopK) {
 
   auto resp = client.SendCommand("SIM item1 999999999 using=vectors");
   // Should either be capped to max_top_k (100) and succeed, or return error
-  EXPECT_TRUE(ContainsOK(resp) || ContainsError(resp))
-      << "Extremely large top-K should be handled, got: " + resp;
+  EXPECT_TRUE(ContainsOK(resp) || ContainsError(resp)) << "Extremely large top-K should be handled, got: " + resp;
 
   if (ContainsOK(resp)) {
     int count = GetResultCount(resp);
@@ -331,8 +319,7 @@ TEST_F(AdversarialE2ETest, VecsetOverwriteUpdatesSimilarity) {
   ASSERT_TRUE(ContainsOK(resp));
   auto results_before = ParseSimResults(resp);
   ASSERT_GE(results_before.size(), 2u);
-  EXPECT_EQ(results_before[0].first, "item2")
-      << "Before overwrite: item2 should be most similar to item1";
+  EXPECT_EQ(results_before[0].first, "item2") << "Before overwrite: item2 should be most similar to item1";
 
   // Overwrite item2 to be orthogonal to item1
   ASSERT_TRUE(ContainsOK(client.SendCommand("VECSET item2 0.0 0.0 1.0")));
@@ -434,19 +421,16 @@ TEST_F(AdversarialE2ETest, DeleteAllItemsThenSearch) {
   // Setup: add 5 items with events and vectors
   for (int i = 1; i <= 5; ++i) {
     std::string id = "del_item" + std::to_string(i);
-    ASSERT_TRUE(ContainsOK(client.SendCommand(
-        "EVENT ctx_del ADD " + id + " " + std::to_string(i * 10))));
+    ASSERT_TRUE(ContainsOK(client.SendCommand("EVENT ctx_del ADD " + id + " " + std::to_string(i * 10))));
     float x = static_cast<float>(i) / 5.0f;
     float y = 1.0f - x;
-    ASSERT_TRUE(ContainsOK(client.SendCommand(
-        "VECSET " + id + " " + std::to_string(x) + " " +
-        std::to_string(y) + " 0.0")));
+    ASSERT_TRUE(
+        ContainsOK(client.SendCommand("VECSET " + id + " " + std::to_string(x) + " " + std::to_string(y) + " 0.0")));
   }
 
   // Verify we have data
   auto info = client.SendCommand("INFO");
-  EXPECT_TRUE(info.find("vector_count: 5") != std::string::npos)
-      << "Should have 5 vectors before deletion";
+  EXPECT_TRUE(info.find("vector_count: 5") != std::string::npos) << "Should have 5 vectors before deletion";
 
   // Overwrite all vectors to zero vectors (effectively "delete" by replacing)
   for (int i = 1; i <= 5; ++i) {
@@ -498,8 +482,8 @@ TEST_F(AdversarialE2ETest, ConcurrentWriteAndQuery) {
     for (int i = 0; i < 100; ++i) {
       float x = static_cast<float>(i) / 100.0f;
       float y = 1.0f - x;
-      std::string cmd = "VECSET cw_item_" + std::to_string(i) + " " +
-                         std::to_string(x) + " " + std::to_string(y) + " 0.0";
+      std::string cmd =
+          "VECSET cw_item_" + std::to_string(i) + " " + std::to_string(x) + " " + std::to_string(y) + " 0.0";
       auto resp = client.SendCommand(cmd);
       if (ContainsOK(resp)) {
         write_ok.fetch_add(1, std::memory_order_relaxed);
@@ -538,8 +522,7 @@ TEST_F(AdversarialE2ETest, ConcurrentWriteAndQuery) {
 
   // Reader should always get valid responses (OK or valid error, no corruption)
   EXPECT_GT(read_ok.load(), 0) << "Reader should have succeeded for some queries";
-  EXPECT_EQ(read_err.load(), 0)
-      << "Reader should not get invalid responses during concurrent writes";
+  EXPECT_EQ(read_err.load(), 0) << "Reader should not get invalid responses during concurrent writes";
 
   // Verify server is still healthy
   TcpClient health_client("127.0.0.1", port_);
@@ -597,8 +580,7 @@ TEST_F(AdversarialE2ETest, CacheInvalidatedOnVecsetMutation) {
   //    ci_item1, the cache entry may still be valid (a hit)
   // Either behavior is acceptable. The key assertion is no crash and valid data.
   int hits_after = std::stoi(ParseResponseField(stats_after, "cache_hits"));
-  EXPECT_GE(hits_after, hits_before)
-      << "Cache hits should be non-decreasing (or reset after invalidation)";
+  EXPECT_GE(hits_after, hits_before) << "Cache hits should be non-decreasing (or reset after invalidation)";
 }
 
 // ---------------------------------------------------------------------------
@@ -651,9 +633,8 @@ TEST_F(AdversarialE2ETest, CacheInvalidatedOnEventMutation) {
   // ev_item4 was added after ev_item2 was deleted, so it should appear
   // if the results reflect current state (not stale cache)
   if (!results.empty()) {
-    EXPECT_TRUE(ev_item4_found)
-        << "After event mutation, ev_item4 should appear in results "
-           "(verifying cache does not serve stale data)";
+    EXPECT_TRUE(ev_item4_found) << "After event mutation, ev_item4 should appear in results "
+                                   "(verifying cache does not serve stale data)";
   }
 }
 
@@ -692,8 +673,7 @@ TEST_F(AdversarialE2ETest, CacheClearResetsEverything) {
   ASSERT_TRUE(ContainsOK(stats_after));
   int entries_after = std::stoi(ParseResponseField(stats_after, "cache_entries"));
   EXPECT_EQ(entries_after, 0) << "CACHE CLEAR should reset entries to 0";
-  EXPECT_LE(entries_after, entries_before)
-      << "Entries after clear should not exceed entries before";
+  EXPECT_LE(entries_after, entries_before) << "Entries after clear should not exceed entries before";
 
   // Run same queries again: they should all be misses (not hits)
   client.SendCommand("SIM item1 10 using=vectors");
@@ -709,6 +689,5 @@ TEST_F(AdversarialE2ETest, CacheClearResetsEverything) {
   // Since cache was just cleared, the re-queries are all misses. Hits should
   // be 0 or remain at whatever baseline the CACHE CLEAR reset to.
   // Document: CACHE CLEAR resets stats in some implementations.
-  EXPECT_GE(hits_post_clear, 0)
-      << "Post-clear hits should be non-negative";
+  EXPECT_GE(hits_post_clear, 0) << "Post-clear hits should be non-negative";
 }

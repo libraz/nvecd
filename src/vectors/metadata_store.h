@@ -55,9 +55,7 @@ class MetadataStore {
    * @param candidates If non-empty, only check these compact_indices
    * @return Compact indices that match all conditions
    */
-  std::vector<uint32_t> Filter(
-      const MetadataFilter& filter,
-      const std::vector<uint32_t>& candidates = {}) const;
+  std::vector<uint32_t> Filter(const MetadataFilter& filter, const std::vector<uint32_t>& candidates = {}) const;
 
   /**
    * @brief Check if a single item matches the filter

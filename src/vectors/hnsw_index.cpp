@@ -21,12 +21,8 @@ namespace nvecd::vectors {
 // Construction / Move
 // ============================================================================
 
-HnswIndex::HnswIndex(uint32_t dimension, DistanceFunc distance_func,
-                       const Config& config)
-    : config_(config),
-      dimension_(dimension),
-      distance_func_(distance_func),
-      rng_(std::random_device{}()) {
+HnswIndex::HnswIndex(uint32_t dimension, DistanceFunc distance_func, const Config& config)
+    : config_(config), dimension_(dimension), distance_func_(distance_func), rng_(std::random_device{}()) {
   level_mult_ = 1.0 / std::log(static_cast<double>(std::max(config_.m, 2U)));
 
   if (config_.max_elements > 0) {
@@ -93,37 +89,29 @@ const float* HnswIndex::GetNodeVector(uint32_t internal_id) const {
   return vectors_.data() + static_cast<size_t>(internal_id) * dimension_;
 }
 
-float HnswIndex::ComputeDistance(const float* query,
-                                  uint32_t internal_id) const {
+float HnswIndex::ComputeDistance(const float* query, uint32_t internal_id) const {
   return distance_func_(query, GetNodeVector(internal_id), dimension_);
 }
 
-std::vector<std::pair<float, uint32_t>> HnswIndex::SearchLayer(
-    const float* query, uint32_t entry_node, uint32_t layer,
-    uint32_t ef) const {
+std::vector<std::pair<float, uint32_t>> HnswIndex::SearchLayer(const float* query, uint32_t entry_node, uint32_t layer,
+                                                               uint32_t ef) const {
   // Max-heap for candidates (worst candidate on top for easy eviction)
   // Min-heap for visited-but-not-yet-expanded (best candidate on top)
   float entry_dist = ComputeDistance(query, entry_node);
 
   // candidates: max-heap (worst first) — the result set W
-  auto cmp_max = [](const std::pair<float, uint32_t>& a,
-                    const std::pair<float, uint32_t>& b) {
+  auto cmp_max = [](const std::pair<float, uint32_t>& a, const std::pair<float, uint32_t>& b) {
     return a.first > b.first;
   };
-  std::priority_queue<std::pair<float, uint32_t>,
-                      std::vector<std::pair<float, uint32_t>>,
-                      decltype(cmp_max)>
+  std::priority_queue<std::pair<float, uint32_t>, std::vector<std::pair<float, uint32_t>>, decltype(cmp_max)>
       candidates(cmp_max);
 
   // to_visit: min-heap (best first) — the candidate set C
-  auto cmp_min = [](const std::pair<float, uint32_t>& a,
-                    const std::pair<float, uint32_t>& b) {
+  auto cmp_min = [](const std::pair<float, uint32_t>& a, const std::pair<float, uint32_t>& b) {
     return a.first < b.first;
   };
-  std::priority_queue<std::pair<float, uint32_t>,
-                      std::vector<std::pair<float, uint32_t>>,
-                      decltype(cmp_min)>
-      to_visit(cmp_min);
+  std::priority_queue<std::pair<float, uint32_t>, std::vector<std::pair<float, uint32_t>>, decltype(cmp_min)> to_visit(
+      cmp_min);
 
   std::unordered_set<uint32_t> visited;
   visited.insert(entry_node);
@@ -175,14 +163,12 @@ std::vector<std::pair<float, uint32_t>> HnswIndex::SearchLayer(
     candidates.pop();
   }
   // Sort by distance descending (highest similarity first)
-  std::sort(result.begin(), result.end(),
-            [](const auto& a, const auto& b) { return a.first > b.first; });
+  std::sort(result.begin(), result.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
   return result;
 }
 
-std::vector<uint32_t> HnswIndex::SelectNeighbors(
-    const std::vector<std::pair<float, uint32_t>>& candidates,
-    uint32_t max_count) const {
+std::vector<uint32_t> HnswIndex::SelectNeighbors(const std::vector<std::pair<float, uint32_t>>& candidates,
+                                                 uint32_t max_count) const {
   // Simple selection: take the closest max_count neighbors
   // Candidates are sorted by distance descending (highest similarity first)
   std::vector<uint32_t> selected;
@@ -213,8 +199,7 @@ void HnswIndex::Add(uint32_t compact_index, const float* vector) {
   // Store vector data
   size_t offset = vectors_.size();
   vectors_.resize(offset + dimension_);
-  std::memcpy(vectors_.data() + offset, vector,
-              static_cast<size_t>(dimension_) * sizeof(float));
+  std::memcpy(vectors_.data() + offset, vector, static_cast<size_t>(dimension_) * sizeof(float));
 
   // Create node with random level
   uint32_t level = RandomLevel();
@@ -288,9 +273,7 @@ void HnswIndex::Add(uint32_t compact_index, const float* vector) {
           neighbor_candidates.push_back({d, nid});
         }
         std::sort(neighbor_candidates.begin(), neighbor_candidates.end(),
-                  [](const auto& a, const auto& b) {
-                    return a.first > b.first;
-                  });
+                  [](const auto& a, const auto& b) { return a.first > b.first; });
         auto pruned = SelectNeighbors(neighbor_candidates, max_conn);
         neighbor_links[layer] = std::move(pruned);
       }
@@ -325,8 +308,7 @@ void HnswIndex::MarkDeleted(uint32_t compact_index) {
   }
 }
 
-std::vector<std::pair<uint32_t, float>> HnswIndex::Search(
-    const float* query, uint32_t top_k) const {
+std::vector<std::pair<uint32_t, float>> HnswIndex::Search(const float* query, uint32_t top_k) const {
   std::shared_lock lock(mutex_);
 
   if (entry_point_ == UINT32_MAX || active_count_ == 0) {
@@ -376,8 +358,7 @@ std::vector<std::pair<uint32_t, float>> HnswIndex::Search(
   return results;
 }
 
-void HnswIndex::Rebuild(const float* all_vectors, uint32_t count,
-                          uint32_t dimension) {
+void HnswIndex::Rebuild(const float* all_vectors, uint32_t count, uint32_t dimension) {
   std::unique_lock lock(mutex_);
 
   // Clear existing state
@@ -415,8 +396,7 @@ uint32_t HnswIndex::Size() const {
 // Serialization
 // ============================================================================
 
-utils::Expected<void, utils::Error> HnswIndex::Serialize(
-    std::ostream& out) const {
+utils::Expected<void, utils::Error> HnswIndex::Serialize(std::ostream& out) const {
   std::shared_lock lock(mutex_);
 
   // Header
@@ -427,10 +407,8 @@ utils::Expected<void, utils::Error> HnswIndex::Serialize(
 
   // Config
   out.write(reinterpret_cast<const char*>(&config_.m), sizeof(config_.m));
-  out.write(reinterpret_cast<const char*>(&config_.ef_construction),
-            sizeof(config_.ef_construction));
-  out.write(reinterpret_cast<const char*>(&config_.ef_search),
-            sizeof(config_.ef_search));
+  out.write(reinterpret_cast<const char*>(&config_.ef_construction), sizeof(config_.ef_construction));
+  out.write(reinterpret_cast<const char*>(&config_.ef_search), sizeof(config_.ef_search));
 
   // Dimensions and counts
   out.write(reinterpret_cast<const char*>(&dimension_), sizeof(dimension_));
@@ -438,8 +416,7 @@ utils::Expected<void, utils::Error> HnswIndex::Serialize(
   out.write(reinterpret_cast<const char*>(&node_count), sizeof(node_count));
   out.write(reinterpret_cast<const char*>(&entry_point_), sizeof(entry_point_));
   out.write(reinterpret_cast<const char*>(&max_level_), sizeof(max_level_));
-  out.write(reinterpret_cast<const char*>(&active_count_),
-            sizeof(active_count_));
+  out.write(reinterpret_cast<const char*>(&active_count_), sizeof(active_count_));
 
   // Vector data
   out.write(reinterpret_cast<const char*>(vectors_.data()),
@@ -447,22 +424,18 @@ utils::Expected<void, utils::Error> HnswIndex::Serialize(
 
   // Nodes
   for (const auto& node : nodes_) {
-    out.write(reinterpret_cast<const char*>(&node.compact_index),
-              sizeof(node.compact_index));
+    out.write(reinterpret_cast<const char*>(&node.compact_index), sizeof(node.compact_index));
     out.write(reinterpret_cast<const char*>(&node.level), sizeof(node.level));
     auto deleted_byte = static_cast<uint8_t>(node.deleted ? 1 : 0);
-    out.write(reinterpret_cast<const char*>(&deleted_byte),
-              sizeof(deleted_byte));
+    out.write(reinterpret_cast<const char*>(&deleted_byte), sizeof(deleted_byte));
 
     // Neighbors per level
     for (uint32_t l = 0; l <= node.level; ++l) {
       auto neighbor_count = static_cast<uint32_t>(node.neighbors[l].size());
-      out.write(reinterpret_cast<const char*>(&neighbor_count),
-                sizeof(neighbor_count));
+      out.write(reinterpret_cast<const char*>(&neighbor_count), sizeof(neighbor_count));
       if (neighbor_count > 0) {
-        out.write(
-            reinterpret_cast<const char*>(node.neighbors[l].data()),
-            static_cast<std::streamsize>(neighbor_count * sizeof(uint32_t)));
+        out.write(reinterpret_cast<const char*>(node.neighbors[l].data()),
+                  static_cast<std::streamsize>(neighbor_count * sizeof(uint32_t)));
       }
     }
   }
@@ -476,16 +449,13 @@ utils::Expected<void, utils::Error> HnswIndex::Serialize(
   }
 
   if (!out.good()) {
-    return utils::MakeUnexpected(
-        utils::MakeError(utils::ErrorCode::kSnapshotSaveFailed,
-                         "Failed to write HNSW index"));
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kSnapshotSaveFailed, "Failed to write HNSW index"));
   }
 
   return {};
 }
 
-utils::Expected<void, utils::Error> HnswIndex::Deserialize(
-    std::istream& in) {
+utils::Expected<void, utils::Error> HnswIndex::Deserialize(std::istream& in) {
   std::unique_lock lock(mutex_);
 
   // Header
@@ -495,17 +465,13 @@ utils::Expected<void, utils::Error> HnswIndex::Deserialize(
   in.read(reinterpret_cast<char*>(&version), sizeof(version));
 
   if (magic != 0x48534E57 || version != 1) {
-    return utils::MakeUnexpected(
-        utils::MakeError(utils::ErrorCode::kSnapshotLoadFailed,
-                         "Invalid HNSW index format"));
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kSnapshotLoadFailed, "Invalid HNSW index format"));
   }
 
   // Config
   in.read(reinterpret_cast<char*>(&config_.m), sizeof(config_.m));
-  in.read(reinterpret_cast<char*>(&config_.ef_construction),
-          sizeof(config_.ef_construction));
-  in.read(reinterpret_cast<char*>(&config_.ef_search),
-          sizeof(config_.ef_search));
+  in.read(reinterpret_cast<char*>(&config_.ef_construction), sizeof(config_.ef_construction));
+  in.read(reinterpret_cast<char*>(&config_.ef_search), sizeof(config_.ef_search));
 
   // Dimensions and counts
   in.read(reinterpret_cast<char*>(&dimension_), sizeof(dimension_));
@@ -520,15 +486,13 @@ utils::Expected<void, utils::Error> HnswIndex::Deserialize(
 
   // Vector data
   vectors_.resize(static_cast<size_t>(node_count) * dimension_);
-  in.read(reinterpret_cast<char*>(vectors_.data()),
-          static_cast<std::streamsize>(vectors_.size() * sizeof(float)));
+  in.read(reinterpret_cast<char*>(vectors_.data()), static_cast<std::streamsize>(vectors_.size() * sizeof(float)));
 
   // Nodes
   nodes_.resize(node_count);
   for (uint32_t i = 0; i < node_count; ++i) {
     auto& node = nodes_[i];
-    in.read(reinterpret_cast<char*>(&node.compact_index),
-            sizeof(node.compact_index));
+    in.read(reinterpret_cast<char*>(&node.compact_index), sizeof(node.compact_index));
     in.read(reinterpret_cast<char*>(&node.level), sizeof(node.level));
     uint8_t deleted_byte = 0;
     in.read(reinterpret_cast<char*>(&deleted_byte), sizeof(deleted_byte));
@@ -537,13 +501,11 @@ utils::Expected<void, utils::Error> HnswIndex::Deserialize(
     node.neighbors.resize(node.level + 1);
     for (uint32_t l = 0; l <= node.level; ++l) {
       uint32_t neighbor_count = 0;
-      in.read(reinterpret_cast<char*>(&neighbor_count),
-              sizeof(neighbor_count));
+      in.read(reinterpret_cast<char*>(&neighbor_count), sizeof(neighbor_count));
       node.neighbors[l].resize(neighbor_count);
       if (neighbor_count > 0) {
-        in.read(
-            reinterpret_cast<char*>(node.neighbors[l].data()),
-            static_cast<std::streamsize>(neighbor_count * sizeof(uint32_t)));
+        in.read(reinterpret_cast<char*>(node.neighbors[l].data()),
+                static_cast<std::streamsize>(neighbor_count * sizeof(uint32_t)));
       }
     }
   }
@@ -559,8 +521,7 @@ utils::Expected<void, utils::Error> HnswIndex::Deserialize(
 
   if (!in.good()) {
     return utils::MakeUnexpected(
-        utils::MakeError(utils::ErrorCode::kSnapshotLoadFailed,
-                         "Failed to read HNSW index data"));
+        utils::MakeError(utils::ErrorCode::kSnapshotLoadFailed, "Failed to read HNSW index data"));
   }
 
   return {};

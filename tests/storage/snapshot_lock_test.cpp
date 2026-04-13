@@ -37,9 +37,7 @@ class SnapshotLockTest : public ::testing::Test {
     snapshot_path_ = "/tmp/nvecd_lock_test_snapshot.dmp";
   }
 
-  void TearDown() override {
-    std::filesystem::remove(snapshot_path_);
-  }
+  void TearDown() override { std::filesystem::remove(snapshot_path_); }
 
   config::Config config_;
   std::unique_ptr<events::EventStore> event_store_;
@@ -49,16 +47,15 @@ class SnapshotLockTest : public ::testing::Test {
 };
 
 TEST_F(SnapshotLockTest, WritesValidSnapshot) {
-  auto result = storage::WriteSnapshotWithLock(
-      snapshot_path_, config_, *event_store_, *co_index_, *vector_store_);
+  auto result = storage::WriteSnapshotWithLock(snapshot_path_, config_, *event_store_, *co_index_, *vector_store_);
 
   ASSERT_TRUE(result) << result.error().message();
   EXPECT_TRUE(std::filesystem::exists(snapshot_path_));
 }
 
 TEST_F(SnapshotLockTest, SnapshotCanBeReadBack) {
-  auto write_result = storage::WriteSnapshotWithLock(
-      snapshot_path_, config_, *event_store_, *co_index_, *vector_store_);
+  auto write_result =
+      storage::WriteSnapshotWithLock(snapshot_path_, config_, *event_store_, *co_index_, *vector_store_);
   ASSERT_TRUE(write_result) << write_result.error().message();
 
   // Read back
@@ -67,8 +64,8 @@ TEST_F(SnapshotLockTest, SnapshotCanBeReadBack) {
   events::CoOccurrenceIndex loaded_co;
   vectors::VectorStore loaded_vs(config_.vectors);
 
-  auto read_result = storage::snapshot_v1::ReadSnapshotV1(
-      snapshot_path_, loaded_config, loaded_es, loaded_co, loaded_vs);
+  auto read_result =
+      storage::snapshot_v1::ReadSnapshotV1(snapshot_path_, loaded_config, loaded_es, loaded_co, loaded_vs);
   ASSERT_TRUE(read_result) << read_result.error().message();
 
   // Verify data
@@ -82,7 +79,6 @@ TEST_F(SnapshotLockTest, EmptyStoresWork) {
   events::CoOccurrenceIndex empty_co;
   vectors::VectorStore empty_vs(config_.vectors);
 
-  auto result = storage::WriteSnapshotWithLock(
-      snapshot_path_, config_, empty_es, empty_co, empty_vs);
+  auto result = storage::WriteSnapshotWithLock(snapshot_path_, config_, empty_es, empty_co, empty_vs);
   ASSERT_TRUE(result) << result.error().message();
 }

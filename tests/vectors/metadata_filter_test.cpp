@@ -111,8 +111,7 @@ TEST(FilterConditionTest, InString) {
   FilterCondition cond;
   cond.field = "category";
   cond.op = FilterOp::kIn;
-  cond.values = {MetadataValue(std::string("news")),
-                 MetadataValue(std::string("blog"))};
+  cond.values = {MetadataValue(std::string("news")), MetadataValue(std::string("blog"))};
 
   EXPECT_TRUE(cond.Match(MetadataValue(std::string("news"))));
   EXPECT_TRUE(cond.Match(MetadataValue(std::string("blog"))));

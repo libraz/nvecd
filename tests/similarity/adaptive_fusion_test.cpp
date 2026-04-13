@@ -40,9 +40,8 @@ class AdaptiveFusionTest : public ::testing::Test {
   }
 
   void CreateEngine() {
-    engine_ = std::make_unique<SimilarityEngine>(
-        event_store_.get(), co_index_.get(), vector_store_.get(), sim_config_,
-        vectors_config_);
+    engine_ = std::make_unique<SimilarityEngine>(event_store_.get(), co_index_.get(), vector_store_.get(), sim_config_,
+                                                 vectors_config_);
   }
 
   void PopulateData() {
@@ -117,8 +116,7 @@ TEST_F(AdaptiveFusionTest, GenerationCounter) {
   uint64_t gen1 = co_index_->GetGeneration();
   EXPECT_GT(gen1, gen0);
 
-  std::vector<events::Event> events = {events::Event("c", 10, 1000),
-                                       events::Event("d", 10, 1000)};
+  std::vector<events::Event> events = {events::Event("c", 10, 1000), events::Event("d", 10, 1000)};
   co_index_->UpdateFromEvents("ctx", events);
   uint64_t gen2 = co_index_->GetGeneration();
   EXPECT_GT(gen2, gen1);

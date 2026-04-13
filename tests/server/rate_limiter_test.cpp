@@ -3,13 +3,13 @@
  * @brief Unit tests for RateLimiter (token bucket per-client rate limiting)
  */
 
+#include "server/rate_limiter.h"
+
 #include <gtest/gtest.h>
 
 #include <string>
 #include <thread>
 #include <vector>
-
-#include "server/rate_limiter.h"
 
 using nvecd::server::RateLimiter;
 

@@ -20,8 +20,7 @@ TEST(CoOccurrenceTemporalTest, TemporalDisabledByDefault) {
   CoOccurrenceIndex index;
 
   // Without temporal (existing behavior)
-  std::vector<Event> events1 = {MakeEvent("a", 10, 1000),
-                                MakeEvent("b", 10, 1000)};
+  std::vector<Event> events1 = {MakeEvent("a", 10, 1000), MakeEvent("b", 10, 1000)};
   index.UpdateFromEvents("ctx", events1, false, 0.0);
 
   float score_no_temporal = index.GetScore("a", "b");
@@ -40,8 +39,8 @@ TEST(CoOccurrenceTemporalTest, RecentEventsScoreHigher) {
   CoOccurrenceIndex index;
 
   // Old events
-  std::vector<Event> events = {MakeEvent("a", 10, 1000), MakeEvent("b", 10, 1000),
-                               MakeEvent("c", 10, 9000), MakeEvent("d", 10, 9000)};
+  std::vector<Event> events = {MakeEvent("a", 10, 1000), MakeEvent("b", 10, 1000), MakeEvent("c", 10, 9000),
+                               MakeEvent("d", 10, 9000)};
 
   index.UpdateFromEvents("ctx", events, true, 3600.0);  // 1 hour half-life
 
@@ -63,8 +62,7 @@ TEST(CoOccurrenceTemporalTest, HalfLifeCorrectness) {
   double half_life = 100.0;  // 100 seconds
 
   // Both events at same time (no decay)
-  std::vector<Event> events_same = {MakeEvent("a", 10, 1000),
-                                    MakeEvent("b", 10, 1000)};
+  std::vector<Event> events_same = {MakeEvent("a", 10, 1000), MakeEvent("b", 10, 1000)};
   index1.UpdateFromEvents("ctx", events_same, true, half_life);
   float score_same = index1.GetScore("a", "b");
 
@@ -72,8 +70,7 @@ TEST(CoOccurrenceTemporalTest, HalfLifeCorrectness) {
   // max_ts = 1100, event a age = 100, event b age = 0
   // decay_a = exp2(-100/100) = 0.5, decay_b = exp2(0) = 1.0
   // score = 10*10 * 0.5 * 1.0 = 50
-  std::vector<Event> events_apart = {MakeEvent("c", 10, 1000),
-                                     MakeEvent("d", 10, 1100)};
+  std::vector<Event> events_apart = {MakeEvent("c", 10, 1000), MakeEvent("d", 10, 1100)};
   index2.UpdateFromEvents("ctx", events_apart, true, half_life);
   float score_apart = index2.GetScore("c", "d");
 
@@ -86,8 +83,7 @@ TEST(CoOccurrenceTemporalTest, VeryOldEventsNearZero) {
 
   double half_life = 10.0;  // 10 seconds
   // Event a at time 0, event b at time 1000 (100 half-lives apart)
-  std::vector<Event> events = {MakeEvent("a", 10, 0),
-                               MakeEvent("b", 10, 1000)};
+  std::vector<Event> events = {MakeEvent("a", 10, 0), MakeEvent("b", 10, 1000)};
 
   index.UpdateFromEvents("ctx", events, true, half_life);
 
@@ -103,8 +99,7 @@ TEST(CoOccurrenceTemporalTest, SameTimestampNoDecay) {
   CoOccurrenceIndex index2;
 
   // All same timestamps
-  std::vector<Event> events = {MakeEvent("a", 10, 5000),
-                               MakeEvent("b", 10, 5000)};
+  std::vector<Event> events = {MakeEvent("a", 10, 5000), MakeEvent("b", 10, 5000)};
 
   index1.UpdateFromEvents("ctx", events, true, 86400.0);
   index2.UpdateFromEvents("ctx", events, false, 0.0);

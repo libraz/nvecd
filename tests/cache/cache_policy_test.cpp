@@ -3,13 +3,13 @@
  * @brief Tests for per-search-type cache policies
  */
 
-#include "cache/similarity_cache.h"
-
 #include <gtest/gtest.h>
 
 #include <string>
 #include <thread>
 #include <vector>
+
+#include "cache/similarity_cache.h"
 
 namespace nvecd::cache {
 namespace {
@@ -17,10 +17,9 @@ namespace {
 class CachePolicyTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    cache_ = std::make_unique<SimilarityCache>(
-        1024 * 1024,  // 1MB
-        0.0,          // no min query cost
-        300            // 5 min TTL
+    cache_ = std::make_unique<SimilarityCache>(1024 * 1024,  // 1MB
+                                               0.0,          // no min query cost
+                                               300           // 5 min TTL
     );
   }
 

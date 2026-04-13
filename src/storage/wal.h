@@ -59,8 +59,8 @@ enum class WalOpType : uint8_t {
  * @brief WAL record (deserialized)
  */
 struct WalRecord {
-  uint64_t sequence = 0;       ///< Monotonically increasing sequence number
-  uint64_t timestamp_us = 0;   ///< Microsecond timestamp
+  uint64_t sequence = 0;      ///< Monotonically increasing sequence number
+  uint64_t timestamp_us = 0;  ///< Microsecond timestamp
   WalOpType op = WalOpType::kVecSet;
   std::vector<uint8_t> payload;  ///< Variable-length payload
 };
@@ -76,9 +76,9 @@ class WriteAheadLog {
   struct Config {
     std::string directory;
     uint64_t max_file_size = 64ULL * 1024 * 1024;  ///< 64MB per file
-    bool sync_on_write = false;         ///< fsync every write (high durability)
-    uint32_t sync_interval_ms = 100;    ///< Batch fsync interval
-    bool include_vectors = true;        ///< Include vector bodies in VECSET
+    bool sync_on_write = false;                    ///< fsync every write (high durability)
+    uint32_t sync_interval_ms = 100;               ///< Batch fsync interval
+    bool include_vectors = true;                   ///< Include vector bodies in VECSET
   };
 
   WriteAheadLog() = default;
@@ -109,8 +109,7 @@ class WriteAheadLog {
    * @param payload_size Payload size in bytes
    * @return Sequence number of the appended record, or error
    */
-  Expected<uint64_t, Error> Append(WalOpType op, const void* payload,
-                                   uint32_t payload_size);
+  Expected<uint64_t, Error> Append(WalOpType op, const void* payload, uint32_t payload_size);
 
   /**
    * @brief Replay records from a given sequence number
@@ -118,9 +117,7 @@ class WriteAheadLog {
    * @param callback Called for each replayed record
    * @return Number of records replayed, or error
    */
-  Expected<uint64_t, Error> Replay(
-      uint64_t from_sequence,
-      const std::function<void(const WalRecord&)>& callback) const;
+  Expected<uint64_t, Error> Replay(uint64_t from_sequence, const std::function<void(const WalRecord&)>& callback) const;
 
   /**
    * @brief Delete WAL files containing only records up to the given sequence
@@ -156,8 +153,7 @@ class WriteAheadLog {
   Expected<void, Error> WriteFileHeader();
 
   /// Read and validate file header
-  static Expected<void, Error> ValidateFileHeader(int fd,
-                                                  const std::string& path);
+  static Expected<void, Error> ValidateFileHeader(int fd, const std::string& path);
 
   /// Scan existing WAL files in the directory
   Expected<void, Error> ScanExistingFiles();

@@ -16,7 +16,8 @@ using namespace nvecd::cache;
 namespace {
 
 /// Convert 16-byte digest to hex string
-std::string DigestToHex(const uint8_t digest[16]) {  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+std::string DigestToHex(
+    const uint8_t digest[16]) {  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
   std::ostringstream oss;
   oss << std::hex << std::setfill('0');
   for (int i = 0; i < 16; ++i) {
@@ -62,9 +63,7 @@ TEST(MD5Test, Alphabet) {
 
 TEST(MD5Test, AlphanumericMixed) {
   uint8_t digest[16];  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
-  MD5::Hash(
-      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
-      digest);
+  MD5::Hash("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789", digest);
   EXPECT_EQ(DigestToHex(digest), "d174ab98d277d9f5a5611c2c9f419d9f");
 }
 

@@ -53,8 +53,8 @@ inline float HorizontalSumAVX2(__m256 v) {
  * @return Dot product sum
  */
 inline float DotProductAVX2(const float* a, const float* b, size_t n) {
-  constexpr size_t kVecSize = 8;   // 256 bits / 32 bits per float
-  constexpr size_t kUnroll = 4;    // 4 accumulators to hide FMA latency
+  constexpr size_t kVecSize = 8;                  // 256 bits / 32 bits per float
+  constexpr size_t kUnroll = 4;                   // 4 accumulators to hide FMA latency
   constexpr size_t kStride = kVecSize * kUnroll;  // 32 floats per iteration
 
   // 4 independent accumulators for instruction-level parallelism
@@ -66,8 +66,8 @@ inline float DotProductAVX2(const float* a, const float* b, size_t n) {
   // Process 32 floats at a time (4 AVX2 registers x 8 floats)
   size_t i = 0;
   for (; i + kStride <= n; i += kStride) {
-    sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(_mm256_loadu_ps(a + i),      _mm256_loadu_ps(b + i)));
-    sum1 = _mm256_add_ps(sum1, _mm256_mul_ps(_mm256_loadu_ps(a + i + 8),  _mm256_loadu_ps(b + i + 8)));
+    sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i)));
+    sum1 = _mm256_add_ps(sum1, _mm256_mul_ps(_mm256_loadu_ps(a + i + 8), _mm256_loadu_ps(b + i + 8)));
     sum2 = _mm256_add_ps(sum2, _mm256_mul_ps(_mm256_loadu_ps(a + i + 16), _mm256_loadu_ps(b + i + 16)));
     sum3 = _mm256_add_ps(sum3, _mm256_mul_ps(_mm256_loadu_ps(a + i + 24), _mm256_loadu_ps(b + i + 24)));
   }
@@ -160,8 +160,8 @@ inline float L2DistanceAVX2(const float* a, const float* b, size_t n) {
 
   size_t i = 0;
   for (; i + kStride <= n; i += kStride) {
-    __m256 d0 = _mm256_sub_ps(_mm256_loadu_ps(a + i),      _mm256_loadu_ps(b + i));
-    __m256 d1 = _mm256_sub_ps(_mm256_loadu_ps(a + i + 8),  _mm256_loadu_ps(b + i + 8));
+    __m256 d0 = _mm256_sub_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i));
+    __m256 d1 = _mm256_sub_ps(_mm256_loadu_ps(a + i + 8), _mm256_loadu_ps(b + i + 8));
     __m256 d2 = _mm256_sub_ps(_mm256_loadu_ps(a + i + 16), _mm256_loadu_ps(b + i + 16));
     __m256 d3 = _mm256_sub_ps(_mm256_loadu_ps(a + i + 24), _mm256_loadu_ps(b + i + 24));
     sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(d0, d0));

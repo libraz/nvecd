@@ -663,8 +663,7 @@ TEST(VectorStoreTest, AutoDefragmentAt25PercentThreshold) {
 
   // Insert 8 items
   for (int i = 0; i < 8; ++i) {
-    std::vector<float> vec = {static_cast<float>(i), static_cast<float>(i + 1),
-                              static_cast<float>(i + 2)};
+    std::vector<float> vec = {static_cast<float>(i), static_cast<float>(i + 1), static_cast<float>(i + 2)};
     ASSERT_TRUE(store.SetVector("item" + std::to_string(i), vec).has_value());
   }
   EXPECT_EQ(store.GetVectorCount(), 8);
@@ -697,8 +696,7 @@ TEST(VectorStoreTest, AutoDefragmentAt25PercentThreshold) {
 
   // Verify remaining items are still accessible
   for (int i : {0, 2, 4, 6, 7}) {
-    EXPECT_TRUE(store.HasVector("item" + std::to_string(i)))
-        << "item" << i << " should still exist";
+    EXPECT_TRUE(store.HasVector("item" + std::to_string(i))) << "item" << i << " should still exist";
   }
 }
 
@@ -709,8 +707,8 @@ TEST(VectorStoreTest, DefragmentPreservesDataIntegrity) {
   // Insert 10 items with known data
   std::vector<std::vector<float>> expected_data(10);
   for (int i = 0; i < 10; ++i) {
-    expected_data[i] = {static_cast<float>(i * 10), static_cast<float>(i * 10 + 1),
-                        static_cast<float>(i * 10 + 2), static_cast<float>(i * 10 + 3)};
+    expected_data[i] = {static_cast<float>(i * 10), static_cast<float>(i * 10 + 1), static_cast<float>(i * 10 + 2),
+                        static_cast<float>(i * 10 + 3)};
     ASSERT_TRUE(store.SetVector("vec" + std::to_string(i), expected_data[i]).has_value());
   }
 
@@ -727,14 +725,12 @@ TEST(VectorStoreTest, DefragmentPreservesDataIntegrity) {
   for (int i : {0, 2, 4, 6, 8}) {
     auto retrieved = store.GetVector("vec" + std::to_string(i));
     ASSERT_TRUE(retrieved.has_value()) << "vec" << i << " should exist after defragment";
-    EXPECT_EQ(retrieved->data, expected_data[i])
-        << "vec" << i << " data mismatch after defragment";
+    EXPECT_EQ(retrieved->data, expected_data[i]) << "vec" << i << " data mismatch after defragment";
   }
 
   // Verify deleted items are still gone
   for (int i : {1, 3, 5, 7, 9}) {
-    EXPECT_FALSE(store.HasVector("vec" + std::to_string(i)))
-        << "vec" << i << " should not exist after defragment";
+    EXPECT_FALSE(store.HasVector("vec" + std::to_string(i))) << "vec" << i << " should not exist after defragment";
   }
 
   // Compact storage should have no tombstones

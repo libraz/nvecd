@@ -6,6 +6,7 @@
 #include "storage/wal.h"
 
 #include <fcntl.h>
+#include <gtest/gtest.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -14,8 +15,6 @@
 #include <filesystem>
 #include <string>
 #include <vector>
-
-#include <gtest/gtest.h>
 
 namespace nvecd::storage {
 namespace {
@@ -61,9 +60,7 @@ TEST_F(WalTest, AppendSingle) {
   ASSERT_TRUE(wal.Open(MakeConfig()));
 
   std::string payload = "test_id";
-  auto result = wal.Append(WalOpType::kVecSet,
-                           payload.data(),
-                           static_cast<uint32_t>(payload.size()));
+  auto result = wal.Append(WalOpType::kVecSet, payload.data(), static_cast<uint32_t>(payload.size()));
   ASSERT_TRUE(result.has_value()) << result.error().to_string();
   EXPECT_EQ(*result, 1U);
   EXPECT_EQ(wal.CurrentSequence(), 1U);
@@ -75,9 +72,7 @@ TEST_F(WalTest, AppendMultiple) {
 
   for (int i = 0; i < 100; ++i) {
     std::string payload = "item_" + std::to_string(i);
-    auto result = wal.Append(WalOpType::kEventAdd,
-                             payload.data(),
-                             static_cast<uint32_t>(payload.size()));
+    auto result = wal.Append(WalOpType::kEventAdd, payload.data(), static_cast<uint32_t>(payload.size()));
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(*result, static_cast<uint64_t>(i + 1));
   }
@@ -87,9 +82,7 @@ TEST_F(WalTest, AppendMultiple) {
 TEST_F(WalTest, AppendWithoutOpen) {
   WriteAheadLog wal;
   std::string payload = "test";
-  auto result = wal.Append(WalOpType::kVecSet,
-                           payload.data(),
-                           static_cast<uint32_t>(payload.size()));
+  auto result = wal.Append(WalOpType::kVecSet, payload.data(), static_cast<uint32_t>(payload.size()));
   EXPECT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code(), utils::ErrorCode::kWalNotOpen);
 }
@@ -103,16 +96,13 @@ TEST_F(WalTest, AppendAndReplay) {
     ASSERT_TRUE(wal.Open(MakeConfig()));
 
     std::string p1 = "vec_001";
-    ASSERT_TRUE(wal.Append(WalOpType::kVecSet, p1.data(),
-                           static_cast<uint32_t>(p1.size())));
+    ASSERT_TRUE(wal.Append(WalOpType::kVecSet, p1.data(), static_cast<uint32_t>(p1.size())));
 
     std::string p2 = "vec_002";
-    ASSERT_TRUE(wal.Append(WalOpType::kVecDel, p2.data(),
-                           static_cast<uint32_t>(p2.size())));
+    ASSERT_TRUE(wal.Append(WalOpType::kVecDel, p2.data(), static_cast<uint32_t>(p2.size())));
 
     std::string p3 = "event_data";
-    ASSERT_TRUE(wal.Append(WalOpType::kEventAdd, p3.data(),
-                           static_cast<uint32_t>(p3.size())));
+    ASSERT_TRUE(wal.Append(WalOpType::kEventAdd, p3.data(), static_cast<uint32_t>(p3.size())));
   }
 
   // Replay all
@@ -121,17 +111,14 @@ TEST_F(WalTest, AppendAndReplay) {
     ASSERT_TRUE(wal.Open(MakeConfig()));
 
     std::vector<WalRecord> records;
-    auto result = wal.Replay(1, [&](const WalRecord& r) {
-      records.push_back(r);
-    });
+    auto result = wal.Replay(1, [&](const WalRecord& r) { records.push_back(r); });
     ASSERT_TRUE(result.has_value()) << result.error().to_string();
     EXPECT_EQ(*result, 3U);
     ASSERT_EQ(records.size(), 3U);
 
     EXPECT_EQ(records[0].sequence, 1U);
     EXPECT_EQ(records[0].op, WalOpType::kVecSet);
-    EXPECT_EQ(std::string(records[0].payload.begin(), records[0].payload.end()),
-              "vec_001");
+    EXPECT_EQ(std::string(records[0].payload.begin(), records[0].payload.end()), "vec_001");
 
     EXPECT_EQ(records[1].sequence, 2U);
     EXPECT_EQ(records[1].op, WalOpType::kVecDel);
@@ -148,8 +135,7 @@ TEST_F(WalTest, ReplayFromMiddle) {
 
     for (int i = 0; i < 10; ++i) {
       std::string p = "item_" + std::to_string(i);
-      ASSERT_TRUE(wal.Append(WalOpType::kVecSet, p.data(),
-                             static_cast<uint32_t>(p.size())));
+      ASSERT_TRUE(wal.Append(WalOpType::kVecSet, p.data(), static_cast<uint32_t>(p.size())));
     }
   }
 
@@ -158,9 +144,7 @@ TEST_F(WalTest, ReplayFromMiddle) {
     ASSERT_TRUE(wal.Open(MakeConfig()));
 
     std::vector<WalRecord> records;
-    auto result = wal.Replay(6, [&](const WalRecord& r) {
-      records.push_back(r);
-    });
+    auto result = wal.Replay(6, [&](const WalRecord& r) { records.push_back(r); });
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(*result, 5U);  // sequences 6,7,8,9,10
     EXPECT_EQ(records.front().sequence, 6U);
@@ -184,8 +168,7 @@ TEST_F(WalTest, ReplayPreservesTimestamp) {
     WriteAheadLog wal;
     ASSERT_TRUE(wal.Open(MakeConfig()));
     std::string p = "data";
-    ASSERT_TRUE(wal.Append(WalOpType::kVecSet, p.data(),
-                           static_cast<uint32_t>(p.size())));
+    ASSERT_TRUE(wal.Append(WalOpType::kVecSet, p.data(), static_cast<uint32_t>(p.size())));
   }
 
   {
@@ -208,8 +191,7 @@ TEST_F(WalTest, CRCCorruptionDetected) {
     WriteAheadLog wal;
     ASSERT_TRUE(wal.Open(MakeConfig()));
     std::string p = "valid_data";
-    ASSERT_TRUE(wal.Append(WalOpType::kVecSet, p.data(),
-                           static_cast<uint32_t>(p.size())));
+    ASSERT_TRUE(wal.Append(WalOpType::kVecSet, p.data(), static_cast<uint32_t>(p.size())));
   }
 
   // Corrupt the CRC field (bytes 4-7 after file header, in the first record)
@@ -250,8 +232,7 @@ TEST_F(WalTest, FileRotation) {
   // Write enough records to trigger multiple rotations
   for (int i = 0; i < 20; ++i) {
     std::string p = "rotation_test_" + std::to_string(i);
-    auto result = wal.Append(WalOpType::kVecSet, p.data(),
-                             static_cast<uint32_t>(p.size()));
+    auto result = wal.Append(WalOpType::kVecSet, p.data(), static_cast<uint32_t>(p.size()));
     ASSERT_TRUE(result.has_value()) << result.error().to_string();
   }
   wal.Close();
@@ -270,9 +251,7 @@ TEST_F(WalTest, FileRotation) {
   ASSERT_TRUE(wal2.Open(config));
 
   std::vector<WalRecord> records;
-  auto result = wal2.Replay(1, [&](const WalRecord& r) {
-    records.push_back(r);
-  });
+  auto result = wal2.Replay(1, [&](const WalRecord& r) { records.push_back(r); });
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(*result, 20U);
   EXPECT_EQ(records.size(), 20U);
@@ -294,8 +273,7 @@ TEST_F(WalTest, TruncateRemovesOldFiles) {
   // Write records across multiple files
   for (int i = 0; i < 20; ++i) {
     std::string p = "truncate_test_" + std::to_string(i);
-    ASSERT_TRUE(wal.Append(WalOpType::kVecSet, p.data(),
-                           static_cast<uint32_t>(p.size())));
+    ASSERT_TRUE(wal.Append(WalOpType::kVecSet, p.data(), static_cast<uint32_t>(p.size())));
   }
 
   uint64_t mid_seq = 10;
@@ -303,7 +281,8 @@ TEST_F(WalTest, TruncateRemovesOldFiles) {
   // Count files before truncate
   int files_before = 0;
   for (const auto& entry : fs::directory_iterator(test_dir_)) {
-    if (entry.path().extension() == ".log") ++files_before;
+    if (entry.path().extension() == ".log")
+      ++files_before;
   }
 
   // Truncate up to sequence 10
@@ -313,16 +292,15 @@ TEST_F(WalTest, TruncateRemovesOldFiles) {
   // Count files after truncate
   int files_after = 0;
   for (const auto& entry : fs::directory_iterator(test_dir_)) {
-    if (entry.path().extension() == ".log") ++files_after;
+    if (entry.path().extension() == ".log")
+      ++files_after;
   }
 
   EXPECT_LT(files_after, files_before);
 
   // Verify remaining records can still be replayed
   std::vector<WalRecord> records;
-  wal.Replay(mid_seq + 1, [&](const WalRecord& r) {
-    records.push_back(r);
-  });
+  wal.Replay(mid_seq + 1, [&](const WalRecord& r) { records.push_back(r); });
   EXPECT_GT(records.size(), 0U);
 }
 
@@ -331,8 +309,7 @@ TEST_F(WalTest, TruncatePreservesCurrentFile) {
   ASSERT_TRUE(wal.Open(MakeConfig()));
 
   std::string p = "keep_me";
-  ASSERT_TRUE(wal.Append(WalOpType::kVecSet, p.data(),
-                         static_cast<uint32_t>(p.size())));
+  ASSERT_TRUE(wal.Append(WalOpType::kVecSet, p.data(), static_cast<uint32_t>(p.size())));
 
   // Truncate up to current sequence — current file should be preserved
   auto result = wal.Truncate(wal.CurrentSequence());
@@ -341,7 +318,8 @@ TEST_F(WalTest, TruncatePreservesCurrentFile) {
   // File should still exist
   int file_count = 0;
   for (const auto& entry : fs::directory_iterator(test_dir_)) {
-    if (entry.path().extension() == ".log") ++file_count;
+    if (entry.path().extension() == ".log")
+      ++file_count;
   }
   EXPECT_GE(file_count, 1);
 }
@@ -354,8 +332,7 @@ TEST_F(WalTest, IncompleteRecordSkipped) {
     WriteAheadLog wal;
     ASSERT_TRUE(wal.Open(MakeConfig()));
     std::string p1 = "complete_record";
-    ASSERT_TRUE(wal.Append(WalOpType::kVecSet, p1.data(),
-                           static_cast<uint32_t>(p1.size())));
+    ASSERT_TRUE(wal.Append(WalOpType::kVecSet, p1.data(), static_cast<uint32_t>(p1.size())));
   }
 
   // Append garbage bytes to simulate crash mid-write
@@ -376,9 +353,7 @@ TEST_F(WalTest, IncompleteRecordSkipped) {
     ASSERT_TRUE(wal.Open(MakeConfig()));
 
     std::vector<WalRecord> records;
-    auto result = wal.Replay(1, [&](const WalRecord& r) {
-      records.push_back(r);
-    });
+    auto result = wal.Replay(1, [&](const WalRecord& r) { records.push_back(r); });
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(*result, 1U);
     EXPECT_EQ(records[0].sequence, 1U);
@@ -452,9 +427,7 @@ TEST_F(WalTest, LargePayload) {
   {
     WriteAheadLog wal;
     ASSERT_TRUE(wal.Open(MakeConfig()));
-    auto result = wal.Append(
-        WalOpType::kVecSet, vec.data(),
-        static_cast<uint32_t>(vec.size() * sizeof(float)));
+    auto result = wal.Append(WalOpType::kVecSet, vec.data(), static_cast<uint32_t>(vec.size() * sizeof(float)));
     ASSERT_TRUE(result.has_value());
   }
 
@@ -484,10 +457,8 @@ TEST_F(WalTest, SequenceContinuityAcrossReopen) {
     WriteAheadLog wal;
     ASSERT_TRUE(wal.Open(MakeConfig()));
     std::string p = "first";
-    ASSERT_TRUE(wal.Append(WalOpType::kVecSet, p.data(),
-                           static_cast<uint32_t>(p.size())));
-    ASSERT_TRUE(wal.Append(WalOpType::kVecSet, p.data(),
-                           static_cast<uint32_t>(p.size())));
+    ASSERT_TRUE(wal.Append(WalOpType::kVecSet, p.data(), static_cast<uint32_t>(p.size())));
+    ASSERT_TRUE(wal.Append(WalOpType::kVecSet, p.data(), static_cast<uint32_t>(p.size())));
     EXPECT_EQ(wal.CurrentSequence(), 2U);
   }
 
@@ -497,8 +468,7 @@ TEST_F(WalTest, SequenceContinuityAcrossReopen) {
     EXPECT_EQ(wal.CurrentSequence(), 2U);
 
     std::string p = "second";
-    auto result = wal.Append(WalOpType::kVecSet, p.data(),
-                             static_cast<uint32_t>(p.size()));
+    auto result = wal.Append(WalOpType::kVecSet, p.data(), static_cast<uint32_t>(p.size()));
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(*result, 3U);
   }
@@ -517,8 +487,7 @@ TEST_F(WalTest, BatchFsyncMode) {
   // Write several records
   for (int i = 0; i < 10; ++i) {
     std::string p = "batch_" + std::to_string(i);
-    ASSERT_TRUE(wal.Append(WalOpType::kVecSet, p.data(),
-                           static_cast<uint32_t>(p.size())));
+    ASSERT_TRUE(wal.Append(WalOpType::kVecSet, p.data(), static_cast<uint32_t>(p.size())));
   }
 
   // Wait for batch sync to trigger
@@ -542,8 +511,7 @@ TEST_F(WalTest, DestructorClosesCleanly) {
     WriteAheadLog wal;
     ASSERT_TRUE(wal.Open(MakeConfig()));
     std::string p = "destructor_test";
-    ASSERT_TRUE(wal.Append(WalOpType::kVecSet, p.data(),
-                           static_cast<uint32_t>(p.size())));
+    ASSERT_TRUE(wal.Append(WalOpType::kVecSet, p.data(), static_cast<uint32_t>(p.size())));
     // wal goes out of scope — destructor should close cleanly
   }
 
@@ -566,8 +534,7 @@ TEST_F(WalTest, MultipleRotationsReplayAll) {
 
     for (int i = 0; i < 50; ++i) {
       std::string p = "rot_" + std::to_string(i);
-      ASSERT_TRUE(wal.Append(WalOpType::kVecSet, p.data(),
-                             static_cast<uint32_t>(p.size())));
+      ASSERT_TRUE(wal.Append(WalOpType::kVecSet, p.data(), static_cast<uint32_t>(p.size())));
     }
   }
 
@@ -576,9 +543,7 @@ TEST_F(WalTest, MultipleRotationsReplayAll) {
     ASSERT_TRUE(wal.Open(config));
 
     std::vector<uint64_t> sequences;
-    wal.Replay(1, [&](const WalRecord& r) {
-      sequences.push_back(r.sequence);
-    });
+    wal.Replay(1, [&](const WalRecord& r) { sequences.push_back(r.sequence); });
 
     EXPECT_EQ(sequences.size(), 50U);
     // Verify monotonically increasing
@@ -624,8 +589,7 @@ TEST_F(WalTest, ConcurrentAppend) {
     threads.emplace_back([&, t]() {
       for (int i = 0; i < kAppendsPerThread; ++i) {
         std::string p = "t" + std::to_string(t) + "_" + std::to_string(i);
-        auto result = wal.Append(WalOpType::kVecSet, p.data(),
-                                 static_cast<uint32_t>(p.size()));
+        auto result = wal.Append(WalOpType::kVecSet, p.data(), static_cast<uint32_t>(p.size()));
         if (result.has_value()) {
           success_count++;
         }
@@ -638,8 +602,7 @@ TEST_F(WalTest, ConcurrentAppend) {
   }
 
   EXPECT_EQ(success_count.load(), kThreads * kAppendsPerThread);
-  EXPECT_EQ(wal.CurrentSequence(),
-            static_cast<uint64_t>(kThreads * kAppendsPerThread));
+  EXPECT_EQ(wal.CurrentSequence(), static_cast<uint64_t>(kThreads * kAppendsPerThread));
 
   // Verify all records can be replayed
   uint64_t replayed = 0;
@@ -664,8 +627,7 @@ TEST_F(WalTest, ConcurrentAppendWithRotation) {
     threads.emplace_back([&, t]() {
       for (int i = 0; i < kAppendsPerThread; ++i) {
         std::string p = "rotate_t" + std::to_string(t) + "_" + std::to_string(i);
-        auto result = wal.Append(WalOpType::kEventAdd, p.data(),
-                                 static_cast<uint32_t>(p.size()));
+        auto result = wal.Append(WalOpType::kEventAdd, p.data(), static_cast<uint32_t>(p.size()));
         if (result.has_value()) {
           success_count++;
         }

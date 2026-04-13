@@ -48,8 +48,7 @@ vectors::MetadataValue ParseValue(const std::string& val) {
 
 }  // namespace
 
-utils::Expected<vectors::MetadataFilter, utils::Error> ParseSimpleFilter(
-    const std::string& expr) {
+utils::Expected<vectors::MetadataFilter, utils::Error> ParseSimpleFilter(const std::string& expr) {
   vectors::MetadataFilter filter;
 
   if (expr.empty()) {
@@ -74,18 +73,16 @@ utils::Expected<vectors::MetadataFilter, utils::Error> ParseSimpleFilter(
     // Split by first ':'
     size_t colon = pair.find(':');
     if (colon == std::string::npos || colon == 0) {
-      return utils::MakeUnexpected(utils::MakeError(
-          utils::ErrorCode::kCommandParseError,
-          "Invalid filter condition: missing ':' in '" + pair + "'"));
+      return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandParseError,
+                                                    "Invalid filter condition: missing ':' in '" + pair + "'"));
     }
 
     std::string key = pair.substr(0, colon);
     std::string val = pair.substr(colon + 1);
 
     if (val.empty()) {
-      return utils::MakeUnexpected(utils::MakeError(
-          utils::ErrorCode::kCommandParseError,
-          "Empty value for filter key '" + key + "'"));
+      return utils::MakeUnexpected(
+          utils::MakeError(utils::ErrorCode::kCommandParseError, "Empty value for filter key '" + key + "'"));
     }
 
     vectors::FilterCondition cond;

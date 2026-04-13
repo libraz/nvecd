@@ -39,9 +39,7 @@ class SnapshotForkTest : public ::testing::Test {
     snapshot_path_ = "/tmp/nvecd_fork_test_snapshot.dmp";
   }
 
-  void TearDown() override {
-    std::filesystem::remove(snapshot_path_);
-  }
+  void TearDown() override { std::filesystem::remove(snapshot_path_); }
 
   config::Config config_;
   std::unique_ptr<events::EventStore> event_store_;
@@ -60,31 +58,27 @@ TEST_F(SnapshotForkTest, InitialStatusIsIdle) {
 TEST_F(SnapshotForkTest, BackgroundSaveCompletes) {
   storage::ForkSnapshotWriter writer;
 
-  auto result = writer.StartBackgroundSave(
-      snapshot_path_, config_, *event_store_, *co_index_, *vector_store_);
+  auto result = writer.StartBackgroundSave(snapshot_path_, config_, *event_store_, *co_index_, *vector_store_);
   ASSERT_TRUE(result) << result.error().message();
 
   // Wait for child to finish
   writer.WaitForChild(10000);
 
   auto status = writer.GetStatus();
-  EXPECT_EQ(status.status, storage::SnapshotStatus::kCompleted)
-      << "Error: " << status.error_message;
+  EXPECT_EQ(status.status, storage::SnapshotStatus::kCompleted) << "Error: " << status.error_message;
   EXPECT_TRUE(std::filesystem::exists(snapshot_path_));
 }
 
 TEST_F(SnapshotForkTest, SnapshotCanBeReadBack) {
   storage::ForkSnapshotWriter writer;
 
-  auto result = writer.StartBackgroundSave(
-      snapshot_path_, config_, *event_store_, *co_index_, *vector_store_);
+  auto result = writer.StartBackgroundSave(snapshot_path_, config_, *event_store_, *co_index_, *vector_store_);
   ASSERT_TRUE(result) << result.error().message();
 
   writer.WaitForChild(10000);
 
   auto status = writer.GetStatus();
-  ASSERT_EQ(status.status, storage::SnapshotStatus::kCompleted)
-      << "Error: " << status.error_message;
+  ASSERT_EQ(status.status, storage::SnapshotStatus::kCompleted) << "Error: " << status.error_message;
 
   // Read back
   config::Config loaded_config;
@@ -92,8 +86,8 @@ TEST_F(SnapshotForkTest, SnapshotCanBeReadBack) {
   events::CoOccurrenceIndex loaded_co;
   vectors::VectorStore loaded_vs(config_.vectors);
 
-  auto read_result = storage::snapshot_v1::ReadSnapshotV1(
-      snapshot_path_, loaded_config, loaded_es, loaded_co, loaded_vs);
+  auto read_result =
+      storage::snapshot_v1::ReadSnapshotV1(snapshot_path_, loaded_config, loaded_es, loaded_co, loaded_vs);
   ASSERT_TRUE(read_result) << read_result.error().message();
 
   EXPECT_EQ(loaded_vs.GetVectorCount(), 2);
@@ -104,14 +98,12 @@ TEST_F(SnapshotForkTest, SnapshotCanBeReadBack) {
 TEST_F(SnapshotForkTest, RejectsSecondConcurrentSave) {
   storage::ForkSnapshotWriter writer;
 
-  auto result1 = writer.StartBackgroundSave(
-      snapshot_path_, config_, *event_store_, *co_index_, *vector_store_);
+  auto result1 = writer.StartBackgroundSave(snapshot_path_, config_, *event_store_, *co_index_, *vector_store_);
   ASSERT_TRUE(result1) << result1.error().message();
 
   // Try to start another while first is in progress
-  auto result2 = writer.StartBackgroundSave(
-      "/tmp/nvecd_fork_test_snapshot2.dmp", config_,
-      *event_store_, *co_index_, *vector_store_);
+  auto result2 = writer.StartBackgroundSave("/tmp/nvecd_fork_test_snapshot2.dmp", config_, *event_store_, *co_index_,
+                                            *vector_store_);
   EXPECT_FALSE(result2);
   EXPECT_EQ(result2.error().code(), utils::ErrorCode::kSnapshotAlreadyInProgress);
 
@@ -122,8 +114,7 @@ TEST_F(SnapshotForkTest, RejectsSecondConcurrentSave) {
 TEST_F(SnapshotForkTest, CheckChildUpdatesStatus) {
   storage::ForkSnapshotWriter writer;
 
-  auto result = writer.StartBackgroundSave(
-      snapshot_path_, config_, *event_store_, *co_index_, *vector_store_);
+  auto result = writer.StartBackgroundSave(snapshot_path_, config_, *event_store_, *co_index_, *vector_store_);
   ASSERT_TRUE(result) << result.error().message();
 
   EXPECT_TRUE(writer.IsInProgress());
@@ -143,12 +134,10 @@ TEST_F(SnapshotForkTest, EmptyStoresWork) {
   vectors::VectorStore empty_vs(config_.vectors);
 
   storage::ForkSnapshotWriter writer;
-  auto result = writer.StartBackgroundSave(
-      snapshot_path_, config_, empty_es, empty_co, empty_vs);
+  auto result = writer.StartBackgroundSave(snapshot_path_, config_, empty_es, empty_co, empty_vs);
   ASSERT_TRUE(result) << result.error().message();
 
   writer.WaitForChild(10000);
   auto status = writer.GetStatus();
-  EXPECT_EQ(status.status, storage::SnapshotStatus::kCompleted)
-      << "Error: " << status.error_message;
+  EXPECT_EQ(status.status, storage::SnapshotStatus::kCompleted) << "Error: " << status.error_message;
 }

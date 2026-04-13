@@ -16,12 +16,12 @@
 #include <sstream>
 
 #include "cache/similarity_cache.h"
-#include "storage/snapshot_fork.h"
 #include "events/co_occurrence_index.h"
 #include "events/event_store.h"
 #include "server/command_parser.h"
 #include "server/request_dispatcher.h"
 #include "similarity/similarity_engine.h"
+#include "storage/snapshot_fork.h"
 #include "utils/memory_utils.h"
 #include "utils/network_utils.h"
 #include "utils/string_utils.h"
@@ -1289,8 +1289,7 @@ void HttpServer::HandleCacheClear(const httplib::Request& req, httplib::Response
 void HttpServer::HandleCacheEnable(const httplib::Request& /*req*/, httplib::Response& res) {
   // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
-    auto* cache_ptr =
-        (handler_context_ != nullptr) ? handler_context_->cache.load(std::memory_order_acquire) : nullptr;
+    auto* cache_ptr = (handler_context_ != nullptr) ? handler_context_->cache.load(std::memory_order_acquire) : nullptr;
     if (cache_ptr == nullptr) {
       SendError(res, kHttpInternalServerError, "Cache not initialized");
       return;
@@ -1312,8 +1311,7 @@ void HttpServer::HandleCacheEnable(const httplib::Request& /*req*/, httplib::Res
 void HttpServer::HandleCacheDisable(const httplib::Request& /*req*/, httplib::Response& res) {
   // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
-    auto* cache_ptr =
-        (handler_context_ != nullptr) ? handler_context_->cache.load(std::memory_order_acquire) : nullptr;
+    auto* cache_ptr = (handler_context_ != nullptr) ? handler_context_->cache.load(std::memory_order_acquire) : nullptr;
     if (cache_ptr == nullptr) {
       SendError(res, kHttpInternalServerError, "Cache not initialized");
       return;

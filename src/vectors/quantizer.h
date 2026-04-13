@@ -31,9 +31,7 @@ class ScalarQuantizer {
     std::vector<float> min_vals;  ///< Per-dimension minimum values
     std::vector<float> max_vals;  ///< Per-dimension maximum values
 
-    uint32_t Dimension() const {
-      return static_cast<uint32_t>(min_vals.size());
-    }
+    uint32_t Dimension() const { return static_cast<uint32_t>(min_vals.size()); }
   };
 
   /**
@@ -43,8 +41,7 @@ class ScalarQuantizer {
    * @param dim Vector dimension
    * @return Stats with per-dimension min/max values
    */
-  static Stats ComputeStats(const float* vectors, uint32_t count,
-                            uint32_t dim);
+  static Stats ComputeStats(const float* vectors, uint32_t count, uint32_t dim);
 
   /**
    * @brief Quantize a single float32 vector to uint8
@@ -53,8 +50,7 @@ class ScalarQuantizer {
    * @param dim Vector dimension
    * @param stats Quantization statistics
    */
-  static void Quantize(const float* input, uint8_t* output, uint32_t dim,
-                       const Stats& stats);
+  static void Quantize(const float* input, uint8_t* output, uint32_t dim, const Stats& stats);
 
   /**
    * @brief Dequantize a uint8 vector back to float32 (approximate)
@@ -63,8 +59,7 @@ class ScalarQuantizer {
    * @param dim Vector dimension
    * @param stats Quantization statistics
    */
-  static void Dequantize(const uint8_t* input, float* output, uint32_t dim,
-                         const Stats& stats);
+  static void Dequantize(const uint8_t* input, float* output, uint32_t dim, const Stats& stats);
 
   /**
    * @brief Batch quantize a matrix of vectors
@@ -74,9 +69,7 @@ class ScalarQuantizer {
    * @param dim Vector dimension
    * @param stats Quantization statistics
    */
-  static void QuantizeBatch(const float* input, uint8_t* output,
-                            uint32_t count, uint32_t dim,
-                            const Stats& stats);
+  static void QuantizeBatch(const float* input, uint8_t* output, uint32_t count, uint32_t dim, const Stats& stats);
 
   /**
    * @brief Approximate dot product between two quantized vectors
@@ -90,8 +83,7 @@ class ScalarQuantizer {
    * @param stats Quantization statistics (for scale/offset recovery)
    * @return Approximate dot product value
    */
-  static float QuantizedDotProduct(const uint8_t* a, const uint8_t* b,
-                                   uint32_t dim, const Stats& stats);
+  static float QuantizedDotProduct(const uint8_t* a, const uint8_t* b, uint32_t dim, const Stats& stats);
 
   /**
    * @brief Approximate cosine similarity between a float32 query and quantized vector
@@ -106,8 +98,7 @@ class ScalarQuantizer {
    * @param stats Quantization statistics
    * @return Approximate cosine similarity
    */
-  static float AsymmetricCosine(const float* query, const uint8_t* quantized,
-                                uint32_t dim, const Stats& stats);
+  static float AsymmetricCosine(const float* query, const uint8_t* quantized, uint32_t dim, const Stats& stats);
 };
 
 }  // namespace nvecd::vectors

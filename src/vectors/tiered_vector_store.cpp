@@ -16,33 +16,29 @@
 namespace nvecd::vectors {
 
 TieredVectorStore::TieredVectorStore(const Config& config)
-    : config_(config), distance_func_(GetDistanceFunc(config.distance_metric)) {
-}
+    : config_(config), distance_func_(GetDistanceFunc(config.distance_metric)) {}
 
 // ============================================================================
 // Core API
 // ============================================================================
 
-utils::Expected<void, utils::Error> TieredVectorStore::Add(
-    const std::string& id, std::vector<float> vec) {
+utils::Expected<void, utils::Error> TieredVectorStore::Add(const std::string& id, std::vector<float> vec) {
   std::unique_lock lock(mutex_);
 
   // Set dimension on first insert
   if (dimension_ == 0) {
     if (vec.empty()) {
-      return utils::MakeUnexpected(utils::MakeError(
-          utils::ErrorCode::kVectorInvalidDimension,
-          "Cannot add empty vector"));
+      return utils::MakeUnexpected(
+          utils::MakeError(utils::ErrorCode::kVectorInvalidDimension, "Cannot add empty vector"));
     }
     dimension_ = static_cast<uint32_t>(vec.size());
   }
 
   // Validate dimension
   if (vec.size() != dimension_) {
-    return utils::MakeUnexpected(utils::MakeError(
-        utils::ErrorCode::kVectorDimensionMismatch,
-        "Expected dimension " + std::to_string(dimension_) + ", got " +
-            std::to_string(vec.size())));
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kVectorDimensionMismatch,
+                         "Expected dimension " + std::to_string(dimension_) + ", got " + std::to_string(vec.size())));
   }
 
   // If ID already exists, delete first
@@ -67,14 +63,12 @@ utils::Expected<void, utils::Error> TieredVectorStore::Add(
   return {};
 }
 
-utils::Expected<void, utils::Error> TieredVectorStore::Delete(
-    const std::string& id) {
+utils::Expected<void, utils::Error> TieredVectorStore::Delete(const std::string& id) {
   std::unique_lock lock(mutex_);
 
   auto loc_it = id_location_.find(id);
   if (loc_it == id_location_.end()) {
-    return utils::MakeUnexpected(utils::MakeError(
-        utils::ErrorCode::kNotFound, "Vector not found: " + id));
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kNotFound, "Vector not found: " + id));
   }
 
   if (loc_it->second.store == StoreLocation::kMain) {
@@ -90,14 +84,12 @@ utils::Expected<void, utils::Error> TieredVectorStore::Delete(
   return {};
 }
 
-utils::Expected<void, utils::Error> TieredVectorStore::Update(
-    const std::string& id, std::vector<float> vec) {
+utils::Expected<void, utils::Error> TieredVectorStore::Update(const std::string& id, std::vector<float> vec) {
   // Add handles delete-if-exists + insert
   return Add(id, std::move(vec));
 }
 
-std::vector<TieredSearchResult> TieredVectorStore::Search(
-    const float* query, uint32_t top_k) const {
+std::vector<TieredSearchResult> TieredVectorStore::Search(const float* query, uint32_t top_k) const {
   std::shared_lock lock(mutex_);
 
   if (dimension_ == 0 || top_k == 0) {
@@ -125,8 +117,7 @@ utils::Expected<void, utils::Error> TieredVectorStore::MergeDeltaToMain() {
   for (size_t i = 0; i < delta_.ids.size(); ++i) {
     auto main_idx = static_cast<uint32_t>(main_.ids.size());
     const float* vec_ptr = &delta_.matrix[i * dimension_];
-    main_.matrix.insert(main_.matrix.end(), vec_ptr,
-                        vec_ptr + dimension_);
+    main_.matrix.insert(main_.matrix.end(), vec_ptr, vec_ptr + dimension_);
     main_.norms.push_back(delta_.norms[i]);
     main_.ids.push_back(delta_.ids[i]);
 
@@ -219,8 +210,7 @@ bool TieredVectorStore::NeedsRebuild() const {
   if (main_.TotalSlots() == 0) {
     return false;
   }
-  auto ratio = static_cast<float>(main_.deleted.size()) /
-               static_cast<float>(main_.TotalSlots());
+  auto ratio = static_cast<float>(main_.deleted.size()) / static_cast<float>(main_.TotalSlots());
   return ratio > config_.tombstone_ratio_threshold;
 }
 
@@ -238,16 +228,14 @@ bool TieredVectorStore::IsInMain(const std::string& id) const {
 bool TieredVectorStore::IsInDelta(const std::string& id) const {
   std::shared_lock lock(mutex_);
   auto it = id_location_.find(id);
-  return it != id_location_.end() &&
-         it->second.store == StoreLocation::kDelta;
+  return it != id_location_.end() && it->second.store == StoreLocation::kDelta;
 }
 
 // ============================================================================
 // Private helpers
 // ============================================================================
 
-std::vector<TieredSearchResult> TieredVectorStore::SearchMain(
-    const float* query, uint32_t top_k) const {
+std::vector<TieredSearchResult> TieredVectorStore::SearchMain(const float* query, uint32_t top_k) const {
   if (main_.ActiveSize() == 0) {
     return {};
   }
@@ -272,9 +260,7 @@ std::vector<TieredSearchResult> TieredVectorStore::SearchMain(
     // Brute-force search on main matrix
     // Min-heap: (score, index) — keeps worst score on top for eviction
     using ScorePair = std::pair<float, uint32_t>;
-    std::priority_queue<ScorePair, std::vector<ScorePair>,
-                        std::greater<ScorePair>>
-        heap;
+    std::priority_queue<ScorePair, std::vector<ScorePair>, std::greater<ScorePair>> heap;
 
     for (uint32_t i = 0; i < main_.TotalSlots(); ++i) {
       if (main_.deleted.count(i) > 0) {
@@ -304,16 +290,13 @@ std::vector<TieredSearchResult> TieredVectorStore::SearchMain(
   return results;
 }
 
-std::vector<TieredSearchResult> TieredVectorStore::SearchDelta(
-    const float* query, uint32_t top_k) const {
+std::vector<TieredSearchResult> TieredVectorStore::SearchDelta(const float* query, uint32_t top_k) const {
   if (delta_.Size() == 0) {
     return {};
   }
 
   using ScorePair = std::pair<float, uint32_t>;
-  std::priority_queue<ScorePair, std::vector<ScorePair>,
-                      std::greater<ScorePair>>
-      heap;
+  std::priority_queue<ScorePair, std::vector<ScorePair>, std::greater<ScorePair>> heap;
 
   for (uint32_t i = 0; i < static_cast<uint32_t>(delta_.ids.size()); ++i) {
     const float* vec = &delta_.matrix[static_cast<size_t>(i) * dimension_];
@@ -338,24 +321,19 @@ std::vector<TieredSearchResult> TieredVectorStore::SearchDelta(
   return results;
 }
 
-std::vector<TieredSearchResult> TieredVectorStore::MergeResults(
-    std::vector<TieredSearchResult>& main_results,
-    std::vector<TieredSearchResult>& delta_results, uint32_t top_k) {
+std::vector<TieredSearchResult> TieredVectorStore::MergeResults(std::vector<TieredSearchResult>& main_results,
+                                                                std::vector<TieredSearchResult>& delta_results,
+                                                                uint32_t top_k) {
   // Both inputs are sorted by score descending; merge them
   std::vector<TieredSearchResult> merged;
-  merged.reserve(
-      std::min(static_cast<size_t>(top_k),
-               main_results.size() + delta_results.size()));
+  merged.reserve(std::min(static_cast<size_t>(top_k), main_results.size() + delta_results.size()));
 
   size_t mi = 0;
   size_t di = 0;
 
-  while (merged.size() < top_k &&
-         (mi < main_results.size() || di < delta_results.size())) {
-    float main_score =
-        (mi < main_results.size()) ? main_results[mi].score : -1e30F;
-    float delta_score =
-        (di < delta_results.size()) ? delta_results[di].score : -1e30F;
+  while (merged.size() < top_k && (mi < main_results.size() || di < delta_results.size())) {
+    float main_score = (mi < main_results.size()) ? main_results[mi].score : -1e30F;
+    float delta_score = (di < delta_results.size()) ? delta_results[di].score : -1e30F;
 
     if (main_score >= delta_score) {
       merged.push_back(std::move(main_results[mi]));
@@ -379,8 +357,7 @@ void TieredVectorStore::RemoveFromDelta(uint32_t delta_idx) {
 
     // Copy last row's vector data to the deleted row
     std::memcpy(&delta_.matrix[static_cast<size_t>(delta_idx) * dimension_],
-                &delta_.matrix[static_cast<size_t>(last) * dimension_],
-                dimension_ * sizeof(float));
+                &delta_.matrix[static_cast<size_t>(last) * dimension_], dimension_ * sizeof(float));
 
     // Update location for the swapped element
     id_location_[delta_.ids[delta_idx]] = {StoreLocation::kDelta, delta_idx};
@@ -403,8 +380,7 @@ void TieredVectorStore::RebuildMainIndex() {
   hnsw_cfg.ef_construction = config_.hnsw_ef_construction;
   hnsw_cfg.ef_search = config_.hnsw_ef_search;
 
-  auto new_index = std::make_unique<HnswIndex>(dimension_, distance_func_,
-                                               hnsw_cfg);
+  auto new_index = std::make_unique<HnswIndex>(dimension_, distance_func_, hnsw_cfg);
 
   // Add all non-deleted main vectors
   for (uint32_t i = 0; i < main_.TotalSlots(); ++i) {

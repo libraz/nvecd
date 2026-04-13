@@ -67,8 +67,7 @@ utils::Expected<void, utils::Error> VectorStore::SetVector(const std::string& ve
     if (it != id_to_idx_.end()) {
       // Existing vector: overwrite in-place
       size_t idx = it->second;
-      std::copy(data.begin(), data.end(),
-                matrix_.begin() + static_cast<ptrdiff_t>(idx * current_dim));
+      std::copy(data.begin(), data.end(), matrix_.begin() + static_cast<ptrdiff_t>(idx * current_dim));
       norms_[idx] = simd::GetOptimalImpl().l2_norm(data.data(), data.size());
     } else {
       // New vector: check for tombstone slot to reuse
@@ -87,8 +86,7 @@ utils::Expected<void, utils::Error> VectorStore::SetVector(const std::string& ve
 
         if (idx < idx_to_id_.size()) {
           // Reusing a tombstone slot
-          std::copy(data.begin(), data.end(),
-                    matrix_.begin() + static_cast<ptrdiff_t>(idx * current_dim));
+          std::copy(data.begin(), data.end(), matrix_.begin() + static_cast<ptrdiff_t>(idx * current_dim));
           norms_[idx] = simd::GetOptimalImpl().l2_norm(data.data(), data.size());
           idx_to_id_[idx] = vector_id;
           id_to_idx_[vector_id] = idx;
@@ -99,8 +97,7 @@ utils::Expected<void, utils::Error> VectorStore::SetVector(const std::string& ve
 
       // Append new slot
       matrix_.resize(matrix_.size() + current_dim);
-      std::copy(data.begin(), data.end(),
-                matrix_.begin() + static_cast<ptrdiff_t>(idx * current_dim));
+      std::copy(data.begin(), data.end(), matrix_.begin() + static_cast<ptrdiff_t>(idx * current_dim));
       norms_.push_back(simd::GetOptimalImpl().l2_norm(data.data(), data.size()));
       idx_to_id_.push_back(vector_id);
       deleted_.push_back(false);

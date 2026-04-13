@@ -91,10 +91,10 @@ class ForkSnapshotWriter {
    * @param vector_store VectorStore (write lock acquired briefly)
    * @return Expected<void, Error> Success (fork started) or error
    */
-  utils::Expected<void, utils::Error> StartBackgroundSave(
-      const std::string& filepath, const config::Config& config,
-      events::EventStore& event_store, events::CoOccurrenceIndex& co_index,
-      vectors::VectorStore& vector_store);
+  utils::Expected<void, utils::Error> StartBackgroundSave(const std::string& filepath, const config::Config& config,
+                                                          events::EventStore& event_store,
+                                                          events::CoOccurrenceIndex& co_index,
+                                                          vectors::VectorStore& vector_store);
 
   /**
    * @brief Check and reap child process (non-blocking)
@@ -135,11 +135,10 @@ class ForkSnapshotWriter {
    *
    * This function never returns — it calls _exit().
    */
-  [[noreturn]] static void ChildProcess(
-      const std::string& filepath, const config::Config& config,
-      const events::EventStore& event_store,
-      const events::CoOccurrenceIndex& co_index,
-      const vectors::VectorStore& vector_store);
+  [[noreturn]] static void ChildProcess(const std::string& filepath, const config::Config& config,
+                                        const events::EventStore& event_store,
+                                        const events::CoOccurrenceIndex& co_index,
+                                        const vectors::VectorStore& vector_store);
 
   /**
    * @brief Close all file descriptors >= min_fd

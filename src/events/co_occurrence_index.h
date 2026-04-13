@@ -62,9 +62,9 @@ class CoOccurrenceIndex {
    * @brief Configuration for pruning behavior
    */
   struct Config {
-    uint32_t max_neighbors_per_item = 0;  ///< Max neighbors per item (0 = unlimited)
-    float min_support = 0.0F;              ///< Min score threshold (0 = no pruning)
-    uint32_t negative_max_propagation = 1; ///< Max hops for negative signal (0 = disabled)
+    uint32_t max_neighbors_per_item = 0;    ///< Max neighbors per item (0 = unlimited)
+    float min_support = 0.0F;               ///< Min score threshold (0 = no pruning)
+    uint32_t negative_max_propagation = 1;  ///< Max hops for negative signal (0 = disabled)
   };
 
   /**
@@ -96,22 +96,21 @@ class CoOccurrenceIndex {
    * @param temporal_enabled Enable temporal weighting
    * @param half_life_sec Half-life in seconds for decay
    */
-  void UpdateFromEvents(const std::string& ctx, const std::vector<Event>& events,
-                        bool temporal_enabled, double half_life_sec);
+  void UpdateFromEvents(const std::string& ctx, const std::vector<Event>& events, bool temporal_enabled,
+                        double half_life_sec);
 
   /**
    * @brief Update co-occurrence under existing write lock
    * @note Caller must hold write lock via AcquireWriteLock()
    */
-  void UpdateFromEventsLocked(const std::string& ctx, const std::vector<Event>& events,
-                              bool temporal_enabled, double half_life_sec);
+  void UpdateFromEventsLocked(const std::string& ctx, const std::vector<Event>& events, bool temporal_enabled,
+                              double half_life_sec);
 
   /**
    * @brief Apply negative signal for a removed item under existing write lock
    * @note Caller must hold write lock via AcquireWriteLock()
    */
-  void ApplyNegativeSignalLocked(const std::string& removed_id,
-                                 const std::vector<Event>& context_events,
+  void ApplyNegativeSignalLocked(const std::string& removed_id, const std::vector<Event>& context_events,
                                  double negative_weight);
 
   /**
@@ -226,11 +225,11 @@ class CoOccurrenceIndex {
   mutable std::shared_mutex mutex_;
   std::unordered_map<std::string, std::unordered_map<std::string, float>> co_scores_;
   std::atomic<uint64_t> generation_{0};  ///< Generation counter for cache invalidation
-  Config config_;                         ///< Pruning configuration
+  Config config_;                        ///< Pruning configuration
 
   /// @brief Internal implementation of UpdateFromEvents (no locking)
-  void UpdateFromEventsInternal(const std::string& ctx, const std::vector<Event>& events,
-                                bool temporal_enabled, double half_life_sec);
+  void UpdateFromEventsInternal(const std::string& ctx, const std::vector<Event>& events, bool temporal_enabled,
+                                double half_life_sec);
 
   /// @brief Prune a single item's neighbor list (caller must hold write lock)
   void PruneItemLocked(const std::string& item_id);

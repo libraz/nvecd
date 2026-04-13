@@ -151,8 +151,7 @@ TEST(GenerateHybridNgramsTest, AsciiOnly) {
 
 TEST(GenerateHybridNgramsTest, CjkOnly) {
   // Three CJK characters with kanji_ngram_size=1
-  auto ngrams =
-      GenerateHybridNgrams("\xE4\xB8\x96\xE7\x95\x8C\xE4\xBA\xBA", 2, 1);
+  auto ngrams = GenerateHybridNgrams("\xE4\xB8\x96\xE7\x95\x8C\xE4\xBA\xBA", 2, 1);
   ASSERT_EQ(ngrams.size(), 3u);
   EXPECT_EQ(ngrams[0], "\xE4\xB8\x96");  // 世
   EXPECT_EQ(ngrams[1], "\xE7\x95\x8C");  // 界
@@ -166,7 +165,9 @@ TEST(GenerateHybridNgramsTest, EmptyString) {
 
 // ========== FormatBytes tests ==========
 
-TEST(FormatBytesTest, ZeroBytes) { EXPECT_EQ(FormatBytes(0), "0B"); }
+TEST(FormatBytesTest, ZeroBytes) {
+  EXPECT_EQ(FormatBytes(0), "0B");
+}
 
 TEST(FormatBytesTest, ByteRange) {
   // 500 >= 100, so precision is 0 decimal places

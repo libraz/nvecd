@@ -40,8 +40,7 @@ class SnapshotSchedulerTest : public ::testing::Test {
   }
 
   static uint64_t GetCurrentTimestamp() {
-    return static_cast<uint64_t>(
-        std::chrono::steady_clock::now().time_since_epoch().count());
+    return static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
   }
 
   std::filesystem::path temp_dir_;

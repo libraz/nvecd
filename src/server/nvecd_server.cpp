@@ -300,9 +300,9 @@ utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
 
   // Create and start SnapshotScheduler (if auto-snapshot is enabled)
   if (config_.snapshot.interval_sec > 0) {
-    snapshot_scheduler_ = std::make_unique<SnapshotScheduler>(config_.snapshot, fork_writer_.get(), &config_,
-                                                              event_store_.get(), co_index_.get(), vector_store_.get(),
-                                                              read_only_);
+    snapshot_scheduler_ =
+        std::make_unique<SnapshotScheduler>(config_.snapshot, fork_writer_.get(), &config_, event_store_.get(),
+                                            co_index_.get(), vector_store_.get(), read_only_);
     snapshot_scheduler_->Start();
   }
 

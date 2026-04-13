@@ -13,9 +13,7 @@
 
 namespace nvecd::vectors {
 
-ScalarQuantizer::Stats ScalarQuantizer::ComputeStats(const float* vectors,
-                                                     uint32_t count,
-                                                     uint32_t dim) {
+ScalarQuantizer::Stats ScalarQuantizer::ComputeStats(const float* vectors, uint32_t count, uint32_t dim) {
   Stats stats;
   stats.min_vals.resize(dim, std::numeric_limits<float>::max());
   stats.max_vals.resize(dim, std::numeric_limits<float>::lowest());
@@ -31,8 +29,7 @@ ScalarQuantizer::Stats ScalarQuantizer::ComputeStats(const float* vectors,
   return stats;
 }
 
-void ScalarQuantizer::Quantize(const float* input, uint8_t* output,
-                               uint32_t dim, const Stats& stats) {
+void ScalarQuantizer::Quantize(const float* input, uint8_t* output, uint32_t dim, const Stats& stats) {
   for (uint32_t d = 0; d < dim; ++d) {
     float range = stats.max_vals[d] - stats.min_vals[d];
     if (range < 1e-10F) {
@@ -45,26 +42,21 @@ void ScalarQuantizer::Quantize(const float* input, uint8_t* output,
   }
 }
 
-void ScalarQuantizer::Dequantize(const uint8_t* input, float* output,
-                                 uint32_t dim, const Stats& stats) {
+void ScalarQuantizer::Dequantize(const uint8_t* input, float* output, uint32_t dim, const Stats& stats) {
   for (uint32_t d = 0; d < dim; ++d) {
     float range = stats.max_vals[d] - stats.min_vals[d];
     output[d] = stats.min_vals[d] + (static_cast<float>(input[d]) / 255.0F) * range;
   }
 }
 
-void ScalarQuantizer::QuantizeBatch(const float* input, uint8_t* output,
-                                    uint32_t count, uint32_t dim,
+void ScalarQuantizer::QuantizeBatch(const float* input, uint8_t* output, uint32_t count, uint32_t dim,
                                     const Stats& stats) {
   for (uint32_t i = 0; i < count; ++i) {
-    Quantize(input + static_cast<size_t>(i) * dim,
-             output + static_cast<size_t>(i) * dim, dim, stats);
+    Quantize(input + static_cast<size_t>(i) * dim, output + static_cast<size_t>(i) * dim, dim, stats);
   }
 }
 
-float ScalarQuantizer::QuantizedDotProduct(const uint8_t* a, const uint8_t* b,
-                                           uint32_t dim,
-                                           const Stats& stats) {
+float ScalarQuantizer::QuantizedDotProduct(const uint8_t* a, const uint8_t* b, uint32_t dim, const Stats& stats) {
   // Reconstruct approximate dot product from quantized values:
   // a_orig[d] ≈ min[d] + (a[d]/255) * range[d]
   // b_orig[d] ≈ min[d] + (b[d]/255) * range[d]
@@ -80,9 +72,8 @@ float ScalarQuantizer::QuantizedDotProduct(const uint8_t* a, const uint8_t* b,
   return result;
 }
 
-float ScalarQuantizer::AsymmetricCosine(const float* query,
-                                        const uint8_t* quantized,
-                                        uint32_t dim, const Stats& stats) {
+float ScalarQuantizer::AsymmetricCosine(const float* query, const uint8_t* quantized, uint32_t dim,
+                                        const Stats& stats) {
   // Asymmetric distance: query stays float32, candidate is dequantized
   float dot = 0.0F;
   float norm_q = 0.0F;
@@ -90,8 +81,7 @@ float ScalarQuantizer::AsymmetricCosine(const float* query,
 
   for (uint32_t d = 0; d < dim; ++d) {
     float range = stats.max_vals[d] - stats.min_vals[d];
-    float c_val =
-        stats.min_vals[d] + (static_cast<float>(quantized[d]) / 255.0F) * range;
+    float c_val = stats.min_vals[d] + (static_cast<float>(quantized[d]) / 255.0F) * range;
     dot += query[d] * c_val;
     norm_q += query[d] * query[d];
     norm_c += c_val * c_val;

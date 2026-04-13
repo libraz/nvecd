@@ -59,8 +59,7 @@ double Percentile(std::vector<double>& sorted_values, double p) {
   if (sorted_values.empty()) {
     return 0.0;
   }
-  size_t idx =
-      static_cast<size_t>(p / 100.0 * static_cast<double>(sorted_values.size() - 1));
+  size_t idx = static_cast<size_t>(p / 100.0 * static_cast<double>(sorted_values.size() - 1));
   return sorted_values[idx];
 }
 
@@ -77,11 +76,9 @@ void PrintHeader(const std::string& test_name) {
  * @brief Print throughput metrics
  */
 void PrintThroughput(const std::string& label, int ops, double duration_ms) {
-  double ops_per_sec =
-      (duration_ms > 0) ? (static_cast<double>(ops) / duration_ms * 1000.0) : 0.0;
+  double ops_per_sec = (duration_ms > 0) ? (static_cast<double>(ops) / duration_ms * 1000.0) : 0.0;
   std::cout << std::fixed << std::setprecision(1);
-  std::cout << "  " << label << ": " << ops << " ops in " << duration_ms << " ms ("
-            << ops_per_sec << " ops/sec)\n";
+  std::cout << "  " << label << ": " << ops << " ops in " << duration_ms << " ms (" << ops_per_sec << " ops/sec)\n";
 }
 
 /**
@@ -92,13 +89,12 @@ void PrintLatency(const std::string& label, std::vector<double>& latencies_ms) {
     return;
   }
   std::sort(latencies_ms.begin(), latencies_ms.end());
-  double avg = std::accumulate(latencies_ms.begin(), latencies_ms.end(), 0.0) /
-               static_cast<double>(latencies_ms.size());
+  double avg =
+      std::accumulate(latencies_ms.begin(), latencies_ms.end(), 0.0) / static_cast<double>(latencies_ms.size());
   std::cout << std::fixed << std::setprecision(3);
   std::cout << "  " << label << " latency:\n";
   std::cout << "    avg=" << avg << " ms, p50=" << Percentile(latencies_ms, 50)
-            << " ms, p95=" << Percentile(latencies_ms, 95)
-            << " ms, p99=" << Percentile(latencies_ms, 99)
+            << " ms, p95=" << Percentile(latencies_ms, 95) << " ms, p99=" << Percentile(latencies_ms, 99)
             << " ms, max=" << latencies_ms.back() << " ms\n";
 }
 
@@ -197,9 +193,8 @@ class TikTokScenarioE2ETest : public NvecdTestFixture {
    * @param videos_per_category Number of videos per category (default 200)
    */
   void PopulateCatalog(TcpClient& client, size_t videos_per_category = 200) {
-    std::cout << "  Populating catalog: " << kNumCategories << " categories x "
-              << videos_per_category << " videos = "
-              << kNumCategories * videos_per_category << " total\n";
+    std::cout << "  Populating catalog: " << kNumCategories << " categories x " << videos_per_category
+              << " videos = " << kNumCategories * videos_per_category << " total\n";
 
     // Upload all video embeddings.
     for (size_t cat = 0; cat < kNumCategories; ++cat) {
@@ -215,16 +210,14 @@ class TikTokScenarioE2ETest : public NvecdTestFixture {
     std::cout << "  Seeding co-occurrence events...\n";
     for (size_t cat = 0; cat < kNumCategories; ++cat) {
       for (size_t ctx_idx = 0; ctx_idx < 20; ++ctx_idx) {
-        std::string ctx =
-            "seed_c" + std::to_string(cat) + "_" + std::to_string(ctx_idx);
+        std::string ctx = "seed_c" + std::to_string(cat) + "_" + std::to_string(ctx_idx);
         // Each context watches ~10 popular videos from this category.
         size_t start_video = (ctx_idx * 5) % videos_per_category;
         for (size_t v = 0; v < 10; ++v) {
           size_t vid_idx = (start_video + v) % videos_per_category;
           std::string id = VideoId(cat, vid_idx);
           int score = 100 - static_cast<int>(v) * 5;
-          client.SendCommand("EVENT " + ctx + " ADD " + id + " " +
-                             std::to_string(score));
+          client.SendCommand("EVENT " + ctx + " ADD " + id + " " + std::to_string(score));
         }
       }
     }
@@ -288,15 +281,13 @@ TEST_F(TikTokScenarioE2ETest, DISABLED_TikTokLive500Viewers) {
           std::string viewer_ctx = "viewer_" + std::to_string(v);
 
           // Start by watching a random popular video.
-          std::string current_video =
-              popular_videos[rng() % popular_videos.size()];
+          std::string current_video = popular_videos[rng() % popular_videos.size()];
 
           for (size_t iter = 0; iter < kIterationsPerViewer; ++iter) {
             // Record the view event.
             int score = 100 - static_cast<int>(iter);
-            auto event_resp = client.SendCommand(
-                "EVENT " + viewer_ctx + " ADD " + current_video + " " +
-                std::to_string(score));
+            auto event_resp =
+                client.SendCommand("EVENT " + viewer_ctx + " ADD " + current_video + " " + std::to_string(score));
             if (ContainsOK(event_resp)) {
               total_events.fetch_add(1, std::memory_order_relaxed);
             }
@@ -304,22 +295,18 @@ TEST_F(TikTokScenarioE2ETest, DISABLED_TikTokLive500Viewers) {
             // Get fusion recommendations and measure latency.
             total_sim_attempts.fetch_add(1, std::memory_order_relaxed);
             std::string sim_resp;
-            double lat = MeasureMs([&]() {
-              sim_resp = client.SendCommand("SIM " + current_video +
-                                            " 10 using=fusion");
-            });
+            double lat =
+                MeasureMs([&]() { sim_resp = client.SendCommand("SIM " + current_video + " 10 using=fusion"); });
             local_latencies.push_back(lat);
 
             if (ContainsOK(sim_resp)) {
               total_sim_success.fetch_add(1, std::memory_order_relaxed);
               auto results = ParseSimResults(sim_resp);
-              total_recommendations.fetch_add(static_cast<int>(results.size()),
-                                              std::memory_order_relaxed);
+              total_recommendations.fetch_add(static_cast<int>(results.size()), std::memory_order_relaxed);
 
               // Pick a random recommendation as the next video to watch.
               if (!results.empty()) {
-                current_video =
-                    results[rng() % results.size()].first;
+                current_video = results[rng() % results.size()].first;
               }
             }
           }
@@ -329,8 +316,7 @@ TEST_F(TikTokScenarioE2ETest, DISABLED_TikTokLive500Viewers) {
 
         // Merge local latencies.
         std::lock_guard<std::mutex> lock(latency_mu);
-        all_latencies.insert(all_latencies.end(), local_latencies.begin(),
-                             local_latencies.end());
+        all_latencies.insert(all_latencies.end(), local_latencies.begin(), local_latencies.end());
       });
     }
 
@@ -344,18 +330,14 @@ TEST_F(TikTokScenarioE2ETest, DISABLED_TikTokLive500Viewers) {
   int recs = total_recommendations.load();
   int sim_ok = total_sim_success.load();
   int sim_total = total_sim_attempts.load();
-  double success_rate =
-      (sim_total > 0)
-          ? (static_cast<double>(sim_ok) / static_cast<double>(sim_total) * 100.0)
-          : 0.0;
+  double success_rate = (sim_total > 0) ? (static_cast<double>(sim_ok) / static_cast<double>(sim_total) * 100.0) : 0.0;
 
   std::cout << "\n  --- Results ---\n";
-  std::cout << "  Total wall time:          " << std::fixed << std::setprecision(1)
-            << total_ms << " ms\n";
+  std::cout << "  Total wall time:          " << std::fixed << std::setprecision(1) << total_ms << " ms\n";
   std::cout << "  Total events sent:        " << events << "\n";
   std::cout << "  Total recommendations:    " << recs << "\n";
-  std::cout << "  SIM success rate:         " << std::setprecision(1) << success_rate
-            << "% (" << sim_ok << "/" << sim_total << ")\n";
+  std::cout << "  SIM success rate:         " << std::setprecision(1) << success_rate << "% (" << sim_ok << "/"
+            << sim_total << ")\n";
   PrintThroughput("Events", events, total_ms);
   PrintThroughput("SIM queries", sim_total, total_ms);
   PrintLatency("SIM fusion", all_latencies);
@@ -391,8 +373,7 @@ TEST_F(TikTokScenarioE2ETest, DISABLED_TikTokLiveWithCreators) {
   std::vector<double> viewer_latencies;
   std::mutex latency_mu;
 
-  std::cout << "  Launching " << kViewers << " viewers and " << kCreators
-            << " creators...\n";
+  std::cout << "  Launching " << kViewers << " viewers and " << kCreators << " creators...\n";
 
   double total_ms = MeasureMs([&]() {
     std::vector<std::thread> threads;
@@ -408,24 +389,20 @@ TEST_F(TikTokScenarioE2ETest, DISABLED_TikTokLiveWithCreators) {
         try {
           TcpClient client("127.0.0.1", port_);
           std::string viewer_ctx = "vw_" + std::to_string(v);
-          std::string current_video =
-              popular_videos[rng() % popular_videos.size()];
+          std::string current_video = popular_videos[rng() % popular_videos.size()];
 
           for (size_t iter = 0; iter < kViewerIterations; ++iter) {
             int score = 100 - static_cast<int>(iter);
-            auto event_resp = client.SendCommand(
-                "EVENT " + viewer_ctx + " ADD " + current_video + " " +
-                std::to_string(score));
+            auto event_resp =
+                client.SendCommand("EVENT " + viewer_ctx + " ADD " + current_video + " " + std::to_string(score));
             if (ContainsOK(event_resp)) {
               total_events.fetch_add(1, std::memory_order_relaxed);
             }
 
             total_sim_attempts.fetch_add(1, std::memory_order_relaxed);
             std::string sim_resp;
-            double lat = MeasureMs([&]() {
-              sim_resp = client.SendCommand("SIM " + current_video +
-                                            " 10 using=fusion");
-            });
+            double lat =
+                MeasureMs([&]() { sim_resp = client.SendCommand("SIM " + current_video + " 10 using=fusion"); });
             local_latencies.push_back(lat);
 
             if (ContainsOK(sim_resp)) {
@@ -441,8 +418,7 @@ TEST_F(TikTokScenarioE2ETest, DISABLED_TikTokLiveWithCreators) {
         }
 
         std::lock_guard<std::mutex> lock(latency_mu);
-        viewer_latencies.insert(viewer_latencies.end(), local_latencies.begin(),
-                                local_latencies.end());
+        viewer_latencies.insert(viewer_latencies.end(), local_latencies.begin(), local_latencies.end());
       });
     }
 
@@ -453,8 +429,7 @@ TEST_F(TikTokScenarioE2ETest, DISABLED_TikTokLiveWithCreators) {
           TcpClient client("127.0.0.1", port_);
 
           for (size_t vid = 0; vid < kVideosPerCreator; ++vid) {
-            std::string id =
-                "new_c" + std::to_string(c) + "_" + std::to_string(vid);
+            std::string id = "new_c" + std::to_string(c) + "_" + std::to_string(vid);
             // Assign new videos to a random category.
             size_t cat = (c + vid) % kNumCategories;
             std::string vec = BuildCategoryVector(cat, 10000 + c * 1000 + vid);
@@ -485,23 +460,16 @@ TEST_F(TikTokScenarioE2ETest, DISABLED_TikTokLiveWithCreators) {
   int sim_total = total_sim_attempts.load();
   int uploads = total_uploads.load();
   int uploads_ok = total_upload_success.load();
-  double sim_rate =
-      (sim_total > 0)
-          ? (static_cast<double>(sim_ok) / static_cast<double>(sim_total) * 100.0)
-          : 0.0;
-  double upload_rate =
-      (uploads > 0)
-          ? (static_cast<double>(uploads_ok) / static_cast<double>(uploads) * 100.0)
-          : 0.0;
+  double sim_rate = (sim_total > 0) ? (static_cast<double>(sim_ok) / static_cast<double>(sim_total) * 100.0) : 0.0;
+  double upload_rate = (uploads > 0) ? (static_cast<double>(uploads_ok) / static_cast<double>(uploads) * 100.0) : 0.0;
 
   std::cout << "\n  --- Results ---\n";
-  std::cout << "  Total wall time:          " << std::fixed << std::setprecision(1)
-            << total_ms << " ms\n";
+  std::cout << "  Total wall time:          " << std::fixed << std::setprecision(1) << total_ms << " ms\n";
   std::cout << "  Events sent:              " << events << "\n";
-  std::cout << "  SIM success rate:         " << std::setprecision(1) << sim_rate
-            << "% (" << sim_ok << "/" << sim_total << ")\n";
-  std::cout << "  Videos uploaded:           " << uploads_ok << "/" << uploads
-            << " (" << std::setprecision(1) << upload_rate << "%)\n";
+  std::cout << "  SIM success rate:         " << std::setprecision(1) << sim_rate << "% (" << sim_ok << "/" << sim_total
+            << ")\n";
+  std::cout << "  Videos uploaded:           " << uploads_ok << "/" << uploads << " (" << std::setprecision(1)
+            << upload_rate << "%)\n";
   PrintThroughput("Events", events, total_ms);
   PrintThroughput("SIM queries", sim_total, total_ms);
   PrintLatency("SIM fusion (viewers)", viewer_latencies);
@@ -509,8 +477,7 @@ TEST_F(TikTokScenarioE2ETest, DISABLED_TikTokLiveWithCreators) {
   // Verify new content is searchable.
   TcpClient verify("127.0.0.1", port_);
   auto resp = verify.SendCommand("SIM new_c0_0 5 using=vectors");
-  std::cout << "  Post-test SIM on new content: "
-            << (ContainsOK(resp) ? "OK" : "FAIL") << "\n";
+  std::cout << "  Post-test SIM on new content: " << (ContainsOK(resp) ? "OK" : "FAIL") << "\n";
 
   EXPECT_GT(sim_rate, 85.0) << "SIM success rate too low under mixed load";
   EXPECT_GT(upload_rate, 95.0) << "Upload success rate too low";
@@ -533,8 +500,7 @@ TEST_F(TikTokScenarioE2ETest, DISABLED_TikTokRecommendationQuality) {
 
   std::atomic<int> total_events{0};
 
-  std::cout << "  Phase 1: " << kViewers
-            << " viewers each watching 50 same-category videos...\n";
+  std::cout << "  Phase 1: " << kViewers << " viewers each watching 50 same-category videos...\n";
 
   // Each viewer is assigned a category and watches only videos from it.
   double watch_ms = MeasureMs([&]() {
@@ -553,8 +519,7 @@ TEST_F(TikTokScenarioE2ETest, DISABLED_TikTokRecommendationQuality) {
             size_t vid_idx = rng() % kVideosPerCategory;
             std::string id = VideoId(cat, vid_idx);
             int score = 100 - static_cast<int>(w);
-            auto resp = client.SendCommand("EVENT " + ctx + " ADD " + id +
-                                           " " + std::to_string(score));
+            auto resp = client.SendCommand("EVENT " + ctx + " ADD " + id + " " + std::to_string(score));
             if (ContainsOK(resp)) {
               total_events.fetch_add(1, std::memory_order_relaxed);
             }
@@ -569,8 +534,8 @@ TEST_F(TikTokScenarioE2ETest, DISABLED_TikTokRecommendationQuality) {
     }
   });
 
-  std::cout << "  Watch phase: " << total_events.load() << " events in "
-            << std::fixed << std::setprecision(1) << watch_ms << " ms\n";
+  std::cout << "  Watch phase: " << total_events.load() << " events in " << std::fixed << std::setprecision(1)
+            << watch_ms << " ms\n";
 
   // Phase 2: Check recommendation quality.
   std::cout << "  Phase 2: Checking recommendation relevance...\n";
@@ -598,8 +563,7 @@ TEST_F(TikTokScenarioE2ETest, DISABLED_TikTokRecommendationQuality) {
       }
     }
 
-    std::cout << "    Category " << cat << " (" << probe_id << "): "
-              << results.size() << " results";
+    std::cout << "    Category " << cat << " (" << probe_id << "): " << results.size() << " results";
     size_t cat_count = 0;
     for (const auto& [id, score] : results) {
       if (id.find(cat_prefix) == 0) {
@@ -609,22 +573,18 @@ TEST_F(TikTokScenarioE2ETest, DISABLED_TikTokRecommendationQuality) {
     std::cout << ", " << cat_count << " same-category\n";
   }
 
-  double relevance_pct =
-      (total_results > 0)
-          ? (static_cast<double>(same_category_results) /
-             static_cast<double>(total_results) * 100.0)
-          : 0.0;
+  double relevance_pct = (total_results > 0)
+                             ? (static_cast<double>(same_category_results) / static_cast<double>(total_results) * 100.0)
+                             : 0.0;
 
   std::cout << "\n  --- Quality Summary ---\n";
-  std::cout << "  Same-category results: " << same_category_results << "/"
-            << total_results << " (" << std::fixed << std::setprecision(1)
-            << relevance_pct << "%)\n";
+  std::cout << "  Same-category results: " << same_category_results << "/" << total_results << " (" << std::fixed
+            << std::setprecision(1) << relevance_pct << "%)\n";
 
   // With strong co-occurrence signals, expect at least 40% same-category
   // results. This is conservative; fusion search combines both vector
   // similarity and co-occurrence, so it should beat random (10%).
-  EXPECT_GT(relevance_pct, 40.0)
-      << "Recommendation relevance too low; co-occurrence not contributing";
+  EXPECT_GT(relevance_pct, 40.0) << "Recommendation relevance too low; co-occurrence not contributing";
 }
 
 // ============================================================================
@@ -649,8 +609,7 @@ TEST_F(TikTokScenarioE2ETest, DISABLED_TikTokBurstTraffic) {
   std::vector<double> normal_latencies;
   std::mutex normal_mu;
 
-  std::cout << "  Phase 1: Normal load (" << kNormalViewers
-            << " viewers)...\n";
+  std::cout << "  Phase 1: Normal load (" << kNormalViewers << " viewers)...\n";
 
   double normal_ms = MeasureMs([&]() {
     std::vector<std::thread> threads;
@@ -673,9 +632,7 @@ TEST_F(TikTokScenarioE2ETest, DISABLED_TikTokBurstTraffic) {
 
             normal_attempts.fetch_add(1, std::memory_order_relaxed);
             std::string resp;
-            double lat = MeasureMs([&]() {
-              resp = client.SendCommand("SIM " + vid + " 10 using=fusion");
-            });
+            double lat = MeasureMs([&]() { resp = client.SendCommand("SIM " + vid + " 10 using=fusion"); });
             local_lat.push_back(lat);
 
             if (ContainsOK(resp)) {
@@ -686,8 +643,7 @@ TEST_F(TikTokScenarioE2ETest, DISABLED_TikTokBurstTraffic) {
         }
 
         std::lock_guard<std::mutex> lock(normal_mu);
-        normal_latencies.insert(normal_latencies.end(), local_lat.begin(),
-                                local_lat.end());
+        normal_latencies.insert(normal_latencies.end(), local_lat.begin(), local_lat.end());
       });
     }
 
@@ -698,13 +654,10 @@ TEST_F(TikTokScenarioE2ETest, DISABLED_TikTokBurstTraffic) {
 
   int n_ok = normal_success.load();
   int n_total = normal_attempts.load();
-  double normal_rate =
-      (n_total > 0)
-          ? (static_cast<double>(n_ok) / static_cast<double>(n_total) * 100.0)
-          : 0.0;
+  double normal_rate = (n_total > 0) ? (static_cast<double>(n_ok) / static_cast<double>(n_total) * 100.0) : 0.0;
 
-  std::cout << "  Normal phase: " << std::fixed << std::setprecision(1)
-            << normal_ms << " ms, success " << normal_rate << "%\n";
+  std::cout << "  Normal phase: " << std::fixed << std::setprecision(1) << normal_ms << " ms, success " << normal_rate
+            << "%\n";
   PrintLatency("Normal SIM", normal_latencies);
 
   // Phase 2: Burst - 500 viewers all hit the viral video simultaneously.
@@ -716,8 +669,7 @@ TEST_F(TikTokScenarioE2ETest, DISABLED_TikTokBurstTraffic) {
   std::vector<double> burst_latencies;
   std::mutex burst_mu;
 
-  std::cout << "\n  Phase 2: BURST! " << kBurstViewers
-            << " viewers on viral video '" << viral_video << "'...\n";
+  std::cout << "\n  Phase 2: BURST! " << kBurstViewers << " viewers on viral video '" << viral_video << "'...\n";
 
   double burst_ms = MeasureMs([&]() {
     std::vector<std::thread> threads;
@@ -730,8 +682,7 @@ TEST_F(TikTokScenarioE2ETest, DISABLED_TikTokBurstTraffic) {
           std::string ctx = "burst_" + std::to_string(v);
 
           // Everyone watches the viral video.
-          auto event_resp = client.SendCommand("EVENT " + ctx + " ADD " +
-                                               viral_video + " 100");
+          auto event_resp = client.SendCommand("EVENT " + ctx + " ADD " + viral_video + " 100");
           if (ContainsOK(event_resp)) {
             burst_event_success.fetch_add(1, std::memory_order_relaxed);
           }
@@ -739,10 +690,7 @@ TEST_F(TikTokScenarioE2ETest, DISABLED_TikTokBurstTraffic) {
           // Everyone requests recommendations.
           burst_sim_attempts.fetch_add(1, std::memory_order_relaxed);
           std::string sim_resp;
-          double lat = MeasureMs([&]() {
-            sim_resp =
-                client.SendCommand("SIM " + viral_video + " 10 using=fusion");
-          });
+          double lat = MeasureMs([&]() { sim_resp = client.SendCommand("SIM " + viral_video + " 10 using=fusion"); });
 
           {
             std::lock_guard<std::mutex> lock(burst_mu);
@@ -766,17 +714,12 @@ TEST_F(TikTokScenarioE2ETest, DISABLED_TikTokBurstTraffic) {
   int b_sim_ok = burst_sim_success.load();
   int b_sim_total = burst_sim_attempts.load();
   double burst_rate =
-      (b_sim_total > 0)
-          ? (static_cast<double>(b_sim_ok) / static_cast<double>(b_sim_total) * 100.0)
-          : 0.0;
+      (b_sim_total > 0) ? (static_cast<double>(b_sim_ok) / static_cast<double>(b_sim_total) * 100.0) : 0.0;
 
   std::cout << "\n  --- Burst Results ---\n";
-  std::cout << "  Burst duration:           " << std::fixed << std::setprecision(1)
-            << burst_ms << " ms\n";
-  std::cout << "  Events recorded:          " << b_events << "/" << kBurstViewers
-            << "\n";
-  std::cout << "  SIM success rate:         " << burst_rate << "% (" << b_sim_ok
-            << "/" << b_sim_total << ")\n";
+  std::cout << "  Burst duration:           " << std::fixed << std::setprecision(1) << burst_ms << " ms\n";
+  std::cout << "  Events recorded:          " << b_events << "/" << kBurstViewers << "\n";
+  std::cout << "  SIM success rate:         " << burst_rate << "% (" << b_sim_ok << "/" << b_sim_total << ")\n";
   PrintLatency("Burst SIM", burst_latencies);
 
   // Compare normal vs burst latency.
@@ -786,13 +729,11 @@ TEST_F(TikTokScenarioE2ETest, DISABLED_TikTokBurstTraffic) {
     double normal_p50 = Percentile(normal_latencies, 50);
     double burst_p50 = Percentile(burst_latencies, 50);
     double degradation = (normal_p50 > 0) ? (burst_p50 / normal_p50) : 0.0;
-    std::cout << "\n  Latency degradation (p50): " << std::setprecision(1)
-              << degradation << "x (normal=" << std::setprecision(3)
-              << normal_p50 << " ms, burst=" << burst_p50 << " ms)\n";
+    std::cout << "\n  Latency degradation (p50): " << std::setprecision(1) << degradation
+              << "x (normal=" << std::setprecision(3) << normal_p50 << " ms, burst=" << burst_p50 << " ms)\n";
   }
 
   // Expect the system to handle burst without catastrophic failure.
   EXPECT_GT(burst_rate, 80.0) << "Burst SIM success rate too low";
-  EXPECT_GT(b_events, static_cast<int>(kBurstViewers * 80 / 100))
-      << "Too many event failures during burst";
+  EXPECT_GT(b_events, static_cast<int>(kBurstViewers * 80 / 100)) << "Too many event failures during burst";
 }

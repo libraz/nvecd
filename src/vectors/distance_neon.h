@@ -35,8 +35,8 @@ namespace nvecd::vectors::simd {
  * @return Dot product sum
  */
 inline float DotProductNEON(const float* a, const float* b, size_t n) {
-  constexpr size_t kVecSize = 4;   // 128 bits / 32 bits per float
-  constexpr size_t kUnroll = 4;    // 4 accumulators to hide FMA latency
+  constexpr size_t kVecSize = 4;                  // 128 bits / 32 bits per float
+  constexpr size_t kUnroll = 4;                   // 4 accumulators to hide FMA latency
   constexpr size_t kStride = kVecSize * kUnroll;  // 16 floats per iteration
 
   // 4 independent accumulators to exploit instruction-level parallelism
@@ -49,19 +49,17 @@ inline float DotProductNEON(const float* a, const float* b, size_t n) {
   size_t vec_idx = 0;
   for (; vec_idx + kStride <= n; vec_idx += kStride) {
     // NOLINTBEGIN(cppcoreguidelines-pro-bounds-pointer-arithmetic)
-    sum0 = vmlaq_f32(sum0, vld1q_f32(a + vec_idx),      vld1q_f32(b + vec_idx));
-    sum1 = vmlaq_f32(sum1, vld1q_f32(a + vec_idx + 4),  vld1q_f32(b + vec_idx + 4));
-    sum2 = vmlaq_f32(sum2, vld1q_f32(a + vec_idx + 8),  vld1q_f32(b + vec_idx + 8));
+    sum0 = vmlaq_f32(sum0, vld1q_f32(a + vec_idx), vld1q_f32(b + vec_idx));
+    sum1 = vmlaq_f32(sum1, vld1q_f32(a + vec_idx + 4), vld1q_f32(b + vec_idx + 4));
+    sum2 = vmlaq_f32(sum2, vld1q_f32(a + vec_idx + 8), vld1q_f32(b + vec_idx + 8));
     sum3 = vmlaq_f32(sum3, vld1q_f32(a + vec_idx + 12), vld1q_f32(b + vec_idx + 12));
     // NOLINTEND(cppcoreguidelines-pro-bounds-pointer-arithmetic)
   }
 
   // Process remaining 4-float blocks
   for (; vec_idx + kVecSize <= n; vec_idx += kVecSize) {
-    float32x4_t a_vec =
-        vld1q_f32(a + vec_idx);  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
-    float32x4_t b_vec =
-        vld1q_f32(b + vec_idx);  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+    float32x4_t a_vec = vld1q_f32(a + vec_idx);  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+    float32x4_t b_vec = vld1q_f32(b + vec_idx);  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
     sum0 = vmlaq_f32(sum0, a_vec, b_vec);
   }
 

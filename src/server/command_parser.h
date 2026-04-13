@@ -41,13 +41,13 @@ struct Command {
 
   // SIM/SIMV fields
   int top_k = 100;  // NOLINT(cppcoreguidelines-avoid-magic-numbers,readability-magic-numbers) Number of results
-  std::string mode = "fusion";          // Similarity mode: events, vectors, fusion
-  std::optional<uint64_t> timestamp;     // Optional timestamp for EVENT (epoch seconds)
-  std::optional<bool> adaptive;          // Optional adaptive flag for SIM
-  std::string filter_expr;               // Filter expression (e.g., "status:active,type:news")
-  float min_score = 0.0F;               // Minimum score threshold
-  uint32_t candidate_limit = 0;         // Candidate limit for post-filter (0 = auto)
-  bool explain = false;                  // Show score breakdown
+  std::string mode = "fusion";        // Similarity mode: events, vectors, fusion
+  std::optional<uint64_t> timestamp;  // Optional timestamp for EVENT (epoch seconds)
+  std::optional<bool> adaptive;       // Optional adaptive flag for SIM
+  std::string filter_expr;            // Filter expression (e.g., "status:active,type:news")
+  float min_score = 0.0F;             // Minimum score threshold
+  uint32_t candidate_limit = 0;       // Candidate limit for post-filter (0 = auto)
+  bool explain = false;               // Show score breakdown
 
   // VECSET/SIMV fields
   int dimension = 0;          // Vector dimension

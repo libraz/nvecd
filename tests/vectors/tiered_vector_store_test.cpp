@@ -65,9 +65,7 @@ class TieredVectorStoreTest : public ::testing::Test {
  protected:
   static constexpr uint32_t kDim = 8;
 
-  void SetUp() override {
-    store_ = std::make_unique<TieredVectorStore>(DefaultConfig());
-  }
+  void SetUp() override { store_ = std::make_unique<TieredVectorStore>(DefaultConfig()); }
 
   std::unique_ptr<TieredVectorStore> store_;
 };
@@ -577,7 +575,8 @@ TEST_F(TieredVectorStoreTest, UpdateSameIdRapidly) {
   // At least our shared_id should be findable
   bool found = false;
   for (const auto& [id, score] : results) {
-    if (id == "shared_id") found = true;
+    if (id == "shared_id")
+      found = true;
   }
   EXPECT_TRUE(found);
 }

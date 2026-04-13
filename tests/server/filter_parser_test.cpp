@@ -101,8 +101,7 @@ TEST(FilterParserTest, ValueWithColon) {
   ASSERT_TRUE(result.has_value());
   ASSERT_EQ(result->conditions.size(), 1U);
   EXPECT_EQ(result->conditions[0].field, "url");
-  EXPECT_EQ(std::get<std::string>(result->conditions[0].value),
-            "http://example.com");
+  EXPECT_EQ(std::get<std::string>(result->conditions[0].value), "http://example.com");
 }
 
 TEST(FilterParserTest, TrailingComma) {

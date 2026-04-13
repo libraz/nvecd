@@ -71,10 +71,8 @@ TEST_F(MetricsE2ETest, CommandCountersExact) {
 
   // Send exactly 5 EVENT commands
   for (int i = 0; i < 5; ++i) {
-    std::string cmd =
-        "EVENT ctx1 ADD item_" + std::to_string(i) + " " + std::to_string((i + 1) * 10);
-    ASSERT_TRUE(ContainsOK(client.SendCommand(cmd)))
-        << "EVENT command " << i << " should succeed";
+    std::string cmd = "EVENT ctx1 ADD item_" + std::to_string(i) + " " + std::to_string((i + 1) * 10);
+    ASSERT_TRUE(ContainsOK(client.SendCommand(cmd))) << "EVENT command " << i << " should succeed";
   }
 
   // Send exactly 3 VECSET commands
@@ -128,8 +126,7 @@ TEST_F(MetricsE2ETest, CommandCountersExact) {
   // by the time it reads its own value, so we use 15 as lower bound.)
   if (!total_str.empty()) {
     int total_count = std::stoi(total_str);
-    EXPECT_GE(total_count, 15) << "Expected at least 15 total_commands_processed, got "
-                                << total_count;
+    EXPECT_GE(total_count, 15) << "Expected at least 15 total_commands_processed, got " << total_count;
   }
 }
 
@@ -168,9 +165,8 @@ TEST_F(MetricsE2ETest, FailedCommandCounter) {
     // At least the dimension mismatch commands should increment failed_commands.
     // If the server handles SIM on missing items gracefully (returning OK with
     // 0 results), that may not count as a failure.
-    EXPECT_GT(failed_count, baseline_failed)
-        << "failed_commands should have increased from " << baseline_failed
-        << " after sending dimension-mismatch VECSET commands";
+    EXPECT_GT(failed_count, baseline_failed) << "failed_commands should have increased from " << baseline_failed
+                                             << " after sending dimension-mismatch VECSET commands";
   }
 }
 
@@ -210,11 +206,11 @@ TEST_F(MetricsMemoryE2ETest, MemoryTrackingAfterVecset) {
   double upper_bound = static_cast<double>(expected_increase) * 1.1;
 
   EXPECT_GE(static_cast<double>(actual_increase), lower_bound)
-      << "Memory increase (" << actual_increase << " bytes) should be >= "
-      << lower_bound << " bytes (90% of " << expected_increase << ")";
+      << "Memory increase (" << actual_increase << " bytes) should be >= " << lower_bound << " bytes (90% of "
+      << expected_increase << ")";
   EXPECT_LE(static_cast<double>(actual_increase), upper_bound)
-      << "Memory increase (" << actual_increase << " bytes) should be <= "
-      << upper_bound << " bytes (110% of " << expected_increase << ")";
+      << "Memory increase (" << actual_increase << " bytes) should be <= " << upper_bound << " bytes (110% of "
+      << expected_increase << ")";
 }
 
 // ---------------------------------------------------------------------------
@@ -250,8 +246,8 @@ TEST_F(MetricsMemoryE2ETest, MemoryTrackingAfterOverwrite) {
   // Memory should NOT have doubled — it should be roughly the same
   // Allow up to 50% growth as tolerance (should really be ~0% growth)
   EXPECT_LE(mem_after_overwrite, mem_after_first * 3 / 2)
-      << "Memory after overwrite (" << mem_after_overwrite
-      << ") should not be much larger than before (" << mem_after_first << ")";
+      << "Memory after overwrite (" << mem_after_overwrite << ") should not be much larger than before ("
+      << mem_after_first << ")";
 }
 
 // ---------------------------------------------------------------------------
@@ -307,8 +303,7 @@ TEST_F(MetricsE2ETest, MetricsConcurrentAccuracy) {
     for (int i = 0; i < 5; ++i) {
       std::string item = "base_" + std::to_string(i);
       setup_client.SendCommand("EVENT ctx1 ADD " + item + " 100");
-      setup_client.SendCommand(
-          "VECSET " + item + " 1.0 0.0 0.0 0.0");
+      setup_client.SendCommand("VECSET " + item + " 1.0 0.0 0.0 0.0");
     }
   }
 
@@ -339,13 +334,11 @@ TEST_F(MetricsE2ETest, MetricsConcurrentAccuracy) {
           int cmd_type = (t * kCommandsPerThread + i) % 3;
           if (cmd_type == 0) {
             // EVENT
-            resp = client.SendCommand(
-                "EVENT ctx_t" + std::to_string(t) + " ADD item_" + std::to_string(i) + " 50");
+            resp = client.SendCommand("EVENT ctx_t" + std::to_string(t) + " ADD item_" + std::to_string(i) + " 50");
           } else if (cmd_type == 1) {
             // VECSET (use unique IDs per thread to avoid contention on same key)
-            resp = client.SendCommand(
-                "VECSET titem_" + std::to_string(t) + "_" + std::to_string(i) +
-                " 1.0 0.0 0.0 0.0");
+            resp =
+                client.SendCommand("VECSET titem_" + std::to_string(t) + "_" + std::to_string(i) + " 1.0 0.0 0.0 0.0");
           } else {
             // SIM
             resp = client.SendCommand("SIM base_0 5 using=events");
@@ -379,8 +372,8 @@ TEST_F(MetricsE2ETest, MetricsConcurrentAccuracy) {
     // We sent kThreadCount * kCommandsPerThread = 500 commands
     // Plus the INFO/baseline commands. Allow some slack for connection failures.
     EXPECT_GE(commands_during_test, static_cast<uint64_t>(kThreadCount * kCommandsPerThread) / 2)
-        << "Expected at least half of " << kThreadCount * kCommandsPerThread
-        << " commands to be counted (got " << commands_during_test << ")";
+        << "Expected at least half of " << kThreadCount * kCommandsPerThread << " commands to be counted (got "
+        << commands_during_test << ")";
   }
 
   // Verify per-type counters sum reasonably
@@ -429,10 +422,8 @@ TEST_F(MetricsE2ETest, DataCountsAccuracy) {
   ASSERT_FALSE(vec_count_str.empty()) << "vector_count should be in INFO response";
   ASSERT_FALSE(ctx_count_str.empty()) << "ctx_count should be in INFO response";
 
-  EXPECT_EQ(std::stoi(vec_count_str), 10)
-      << "vector_count should be 10 after 10 VECSET commands";
-  EXPECT_EQ(std::stoi(ctx_count_str), 3)
-      << "ctx_count should be 3 after events in 3 contexts";
+  EXPECT_EQ(std::stoi(vec_count_str), 10) << "vector_count should be 10 after 10 VECSET commands";
+  EXPECT_EQ(std::stoi(ctx_count_str), 3) << "ctx_count should be 3 after events in 3 contexts";
 
   // VECSET 5 more unique items
   for (int i = 10; i < 15; ++i) {
@@ -445,8 +436,7 @@ TEST_F(MetricsE2ETest, DataCountsAccuracy) {
   resp = client.SendCommand("INFO");
   vec_count_str = ParseResponseField(resp, "vector_count");
   ASSERT_FALSE(vec_count_str.empty()) << "vector_count should be in INFO response";
-  EXPECT_EQ(std::stoi(vec_count_str), 15)
-      << "vector_count should be 15 after 15 total VECSET commands";
+  EXPECT_EQ(std::stoi(vec_count_str), 15) << "vector_count should be 15 after 15 total VECSET commands";
 }
 
 // ---------------------------------------------------------------------------

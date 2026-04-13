@@ -73,12 +73,12 @@ class IvfIndex {
    * @brief IVF index configuration
    */
   struct Config {
-    uint32_t nlist = 256;                    ///< Number of Voronoi cells/clusters
-    uint32_t nprobe = 8;                     ///< Clusters to search at query time
-    uint32_t train_threshold = 10000;        ///< Min vectors before training
-    uint32_t max_iterations = 10;            ///< K-means max iterations
-    float convergence_threshold = 0.001F;    ///< K-means convergence threshold
-    uint32_t seal_threshold = 100000;        ///< Seal write buffer at this size
+    uint32_t nlist = 256;                  ///< Number of Voronoi cells/clusters
+    uint32_t nprobe = 8;                   ///< Clusters to search at query time
+    uint32_t train_threshold = 10000;      ///< Min vectors before training
+    uint32_t max_iterations = 10;          ///< K-means max iterations
+    float convergence_threshold = 0.001F;  ///< K-means convergence threshold
+    uint32_t seal_threshold = 100000;      ///< Seal write buffer at this size
   };
 
   /**
@@ -106,8 +106,8 @@ class IvfIndex {
    * @param assign_vectors If true, assign all valid vectors to clusters after training.
    *        Set to false when caller will use AddVector() to assign separately.
    */
-  void Train(const float* matrix, const size_t* valid_indices,
-             size_t num_valid, uint32_t dimension, bool assign_vectors = true);
+  void Train(const float* matrix, const size_t* valid_indices, size_t num_valid, uint32_t dimension,
+             bool assign_vectors = true);
 
   /**
    * @brief Add a single vector directly to the IVF inverted lists
@@ -127,8 +127,7 @@ class IvfIndex {
    * @param count Number of vectors to add
    * @param dimension Vector dimension
    */
-  void BulkAddVectors(const size_t* compact_indices, const float* vectors,
-                       size_t count, uint32_t dimension);
+  void BulkAddVectors(const size_t* compact_indices, const float* vectors, size_t count, uint32_t dimension);
 
   /**
    * @brief Remove a vector from the index
@@ -154,11 +153,9 @@ class IvfIndex {
    * @param top_k Number of results to return
    * @return Vector of (score, compact_index) pairs sorted by score descending
    */
-  std::vector<std::pair<float, size_t>> Search(
-      const float* query_vec, float query_norm,
-      const float* matrix, const float* norms,
-      size_t total_count, uint32_t dimension,
-      size_t top_k) const;
+  std::vector<std::pair<float, size_t>> Search(const float* query_vec, float query_norm, const float* matrix,
+                                               const float* norms, size_t total_count, uint32_t dimension,
+                                               size_t top_k) const;
 
   /**
    * @brief Check if the index has been trained
@@ -251,9 +248,8 @@ class IvfIndex {
    * @param top_k Number of results to return
    * @return Vector of (score, compact_index) pairs sorted by score descending
    */
-  std::vector<std::pair<float, size_t>> SearchBuffer(
-      const float* query_vec, float query_norm,
-      uint32_t dimension, size_t top_k) const;
+  std::vector<std::pair<float, size_t>> SearchBuffer(const float* query_vec, float query_norm, uint32_t dimension,
+                                                     size_t top_k) const;
 
  private:
   /**
@@ -263,8 +259,7 @@ class IvfIndex {
    * @param sample_size Number of training samples
    * @param dim Vector dimension
    */
-  void KMeansTrain(const float* matrix, const size_t* sample_indices,
-                   size_t sample_size, uint32_t dim);
+  void KMeansTrain(const float* matrix, const size_t* sample_indices, size_t sample_size, uint32_t dim);
 
   /**
    * @brief Find the nearest centroid for a vector

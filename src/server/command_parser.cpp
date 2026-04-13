@@ -18,13 +18,13 @@ namespace nvecd::server {
 
 namespace {
 
-constexpr size_t kUsingPrefixLength = 6;           // Length of "using=" prefix
-constexpr size_t kTimestampPrefixLength = 10;      // Length of "timestamp=" prefix
-constexpr size_t kAdaptivePrefixLength = 9;        // Length of "adaptive=" prefix
-constexpr size_t kFilterPrefixLength = 7;          // Length of "filter=" prefix
-constexpr size_t kMinScorePrefixLength = 10;       // Length of "min_score=" prefix
-constexpr size_t kCandidateLimitPrefixLength = 16; // Length of "candidate_limit=" prefix
-constexpr size_t kExplainPrefixLength = 8;         // Length of "explain=" prefix
+constexpr size_t kUsingPrefixLength = 6;            // Length of "using=" prefix
+constexpr size_t kTimestampPrefixLength = 10;       // Length of "timestamp=" prefix
+constexpr size_t kAdaptivePrefixLength = 9;         // Length of "adaptive=" prefix
+constexpr size_t kFilterPrefixLength = 7;           // Length of "filter=" prefix
+constexpr size_t kMinScorePrefixLength = 10;        // Length of "min_score=" prefix
+constexpr size_t kCandidateLimitPrefixLength = 16;  // Length of "candidate_limit=" prefix
+constexpr size_t kExplainPrefixLength = 8;          // Length of "explain=" prefix
 
 /**
  * @brief Split string_view by delimiter, returning owned strings
@@ -191,9 +191,9 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request) 
     if (type_str == "ADD") {
       cmd.event_type = events::EventType::ADD;
       if (tokens.size() < 5 || tokens.size() > 6) {
-        return utils::MakeUnexpected(utils::MakeError(
-            utils::ErrorCode::kCommandSyntaxError,
-            "EVENT ADD requires 4-5 arguments: <ctx> ADD <id> <score> [timestamp=<value>]"));
+        return utils::MakeUnexpected(
+            utils::MakeError(utils::ErrorCode::kCommandSyntaxError,
+                             "EVENT ADD requires 4-5 arguments: <ctx> ADD <id> <score> [timestamp=<value>]"));
       }
       cmd.id = tokens[3];
       auto score_result = ParseInt(tokens[4]);
@@ -212,9 +212,9 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request) 
     } else if (type_str == "SET") {
       cmd.event_type = events::EventType::SET;
       if (tokens.size() < 5 || tokens.size() > 6) {
-        return utils::MakeUnexpected(utils::MakeError(
-            utils::ErrorCode::kCommandSyntaxError,
-            "EVENT SET requires 4-5 arguments: <ctx> SET <id> <score> [timestamp=<value>]"));
+        return utils::MakeUnexpected(
+            utils::MakeError(utils::ErrorCode::kCommandSyntaxError,
+                             "EVENT SET requires 4-5 arguments: <ctx> SET <id> <score> [timestamp=<value>]"));
       }
       cmd.id = tokens[3];
       auto score_result = ParseInt(tokens[4]);
@@ -233,8 +233,9 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request) 
     } else if (type_str == "DEL") {
       cmd.event_type = events::EventType::DEL;
       if (tokens.size() < 4 || tokens.size() > 5) {
-        return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandSyntaxError,
-                                                      "EVENT DEL requires 3-4 arguments: <ctx> DEL <id> [timestamp=<value>]"));
+        return utils::MakeUnexpected(
+            utils::MakeError(utils::ErrorCode::kCommandSyntaxError,
+                             "EVENT DEL requires 3-4 arguments: <ctx> DEL <id> [timestamp=<value>]"));
       }
       cmd.id = tokens[3];
       cmd.score = 0;  // DEL doesn't use score
@@ -423,8 +424,8 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request) 
   } else if (cmd_name == "DUMP") {
     // DUMP SAVE|LOAD|VERIFY|INFO [filepath]
     if (tokens.size() < 2) {
-      return utils::MakeUnexpected(
-          utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "DUMP requires subcommand: SAVE|LOAD|VERIFY|INFO|STATUS"));
+      return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandSyntaxError,
+                                                    "DUMP requires subcommand: SAVE|LOAD|VERIFY|INFO|STATUS"));
     }
     std::string subcmd = ToUpper(tokens[1]);
     if (subcmd == "SAVE") {

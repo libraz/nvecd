@@ -30,9 +30,9 @@ enum class FilterOp {
  * @brief A single filter condition
  */
 struct FilterCondition {
-  std::string field;            ///< Metadata field name
-  FilterOp op;                  ///< Comparison operator
-  MetadataValue value;          ///< Value for Eq, Ne, Gt, Ge, Lt, Le
+  std::string field;                  ///< Metadata field name
+  FilterOp op;                        ///< Comparison operator
+  MetadataValue value;                ///< Value for Eq, Ne, Gt, Ge, Lt, Le
   std::vector<MetadataValue> values;  ///< Values for In operator
 
   /**

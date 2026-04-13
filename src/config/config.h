@@ -52,7 +52,7 @@ constexpr int kMaxConnections = 1000;
 constexpr int kConnectionTimeoutSec = 300;
 constexpr int kRecvBufferSize = 4096;
 constexpr int kSendBufferSize = 65536;
-constexpr int kMaxQueryLength = 1024 * 1024;   // 1MB
+constexpr int kMaxQueryLength = 1024 * 1024;  // 1MB
 constexpr int kShutdownTimeoutMs = 5000;
 
 // HTTP defaults
@@ -69,7 +69,7 @@ struct EventsConfig {
   double decay_alpha = defaults::kDecayAlpha;                 ///< Decay factor (0.0-1.0)
   uint32_t dedup_window_sec = defaults::kDedupWindowSec;      ///< Deduplication time window in seconds
   uint32_t dedup_cache_size = defaults::kDedupCacheSize;      ///< Deduplication cache size (LRU)
-  bool temporal_cooccurrence = false;       ///< Enable time-decay for co-occurrence updates
+  bool temporal_cooccurrence = false;                         ///< Enable time-decay for co-occurrence updates
   double temporal_half_life_sec = 86400.0;  ///< Half-life in seconds for temporal decay (default: 1 day)
   bool negative_signals = false;            ///< Enable negative signal on DEL events
   double negative_weight = 0.5;             ///< Reduction weight for negative signals (0.0-1.0)
@@ -92,26 +92,26 @@ struct SimilarityConfig {
   double fusion_alpha = defaults::kFusionAlpha;     ///< Weight for vector similarity in fusion mode
   double fusion_beta = defaults::kFusionBeta;       ///< Weight for co-occurrence in fusion mode
   uint32_t sample_size = defaults::kSampleSize;     ///< Random sampling size for approximate search (0 = exact)
-  bool adaptive_fusion = false;              ///< Enable adaptive weight computation based on item maturity
-  double adaptive_min_alpha = 0.2;           ///< Min vector weight (for mature items with many co-occurrences)
-  double adaptive_max_alpha = 0.9;           ///< Max vector weight (for new items with few co-occurrences)
-  uint32_t adaptive_maturity_threshold = 50; ///< Co-occurrence neighbor count considered "mature"
+  bool adaptive_fusion = false;                     ///< Enable adaptive weight computation based on item maturity
+  double adaptive_min_alpha = 0.2;                  ///< Min vector weight (for mature items with many co-occurrences)
+  double adaptive_max_alpha = 0.9;                  ///< Max vector weight (for new items with few co-occurrences)
+  uint32_t adaptive_maturity_threshold = 50;        ///< Co-occurrence neighbor count considered "mature"
 
   // ANN index settings
-  std::string index_type = "flat";        ///< Index type: "hnsw", "ivf", or "flat" (brute-force)
+  std::string index_type = "flat";  ///< Index type: "hnsw", "ivf", or "flat" (brute-force)
 
   // IVF (Inverted File) index settings
-  bool ivf_enabled = false;               ///< Enable IVF approximate search (legacy, use index_type="ivf")
-  uint32_t ivf_nlist = 256;               ///< Number of Voronoi cells/clusters
+  bool ivf_enabled = false;              ///< Enable IVF approximate search (legacy, use index_type="ivf")
+  uint32_t ivf_nlist = 256;              ///< Number of Voronoi cells/clusters
   uint32_t ivf_nprobe = 8;               ///< Number of clusters to probe at query time
-  uint32_t ivf_train_threshold = 10000;   ///< Minimum vectors before auto-training IVF index
-  uint32_t ivf_seal_threshold = 100000;   ///< Seal write buffer when it reaches this size
+  uint32_t ivf_train_threshold = 10000;  ///< Minimum vectors before auto-training IVF index
+  uint32_t ivf_seal_threshold = 100000;  ///< Seal write buffer when it reaches this size
 
   // HNSW index settings
-  uint32_t hnsw_m = 16;                   ///< Number of connections per node
-  uint32_t hnsw_ef_construction = 200;    ///< Search width during construction
-  uint32_t hnsw_ef_search = 50;           ///< Search width during query
-  uint32_t hnsw_max_elements = 0;         ///< Pre-allocate capacity (0 = dynamic)
+  uint32_t hnsw_m = 16;                 ///< Number of connections per node
+  uint32_t hnsw_ef_construction = 200;  ///< Search width during construction
+  uint32_t hnsw_ef_search = 50;         ///< Search width during query
+  uint32_t hnsw_max_elements = 0;       ///< Pre-allocate capacity (0 = dynamic)
 };
 
 /**

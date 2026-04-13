@@ -3,19 +3,18 @@
  * @brief Tests for CoOccurrenceIndex pruning and negative signal control
  */
 
-#include "events/co_occurrence_index.h"
-
 #include <gtest/gtest.h>
 
 #include <cmath>
 #include <string>
 #include <vector>
 
+#include "events/co_occurrence_index.h"
+
 namespace nvecd::events {
 namespace {
 
-std::vector<Event> MakeEvents(
-    const std::vector<std::tuple<std::string, int, uint64_t>>& data) {
+std::vector<Event> MakeEvents(const std::vector<std::tuple<std::string, int, uint64_t>>& data) {
   std::vector<Event> events;
   for (const auto& [id, score, timestamp] : data) {
     events.emplace_back(id, score, timestamp);
@@ -64,8 +63,7 @@ TEST(CoOccurrencePruningTest, MaxNeighborsPreservesSymmetry) {
   index.UpdateFromEvents("ctx1", events);
 
   // If item0->item1 was pruned, item1->item0 should also be pruned
-  EXPECT_FLOAT_EQ(index.GetScore("item0", "item1"),
-                  index.GetScore("item1", "item0"));
+  EXPECT_FLOAT_EQ(index.GetScore("item0", "item1"), index.GetScore("item1", "item0"));
 }
 
 TEST(CoOccurrencePruningTest, MaxNeighborsZeroMeansUnlimited) {

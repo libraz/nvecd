@@ -3,6 +3,8 @@
  * @brief Unit tests for RequestDispatcher command routing and auth
  */
 
+#include "server/request_dispatcher.h"
+
 #include <gtest/gtest.h>
 
 #include <atomic>
@@ -14,7 +16,6 @@
 #include "config/runtime_variable_manager.h"
 #include "events/co_occurrence_index.h"
 #include "events/event_store.h"
-#include "server/request_dispatcher.h"
 #include "server/server_types.h"
 #include "similarity/similarity_engine.h"
 #include "vectors/vector_store.h"

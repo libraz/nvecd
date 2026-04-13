@@ -17,14 +17,14 @@
 #include "events/co_occurrence_index.h"
 #include "events/event_store.h"
 #include "server/connection_acceptor.h"
-#include "server/snapshot_scheduler.h"
 #include "server/http_server.h"
 #include "server/rate_limiter.h"
-#include "storage/snapshot_fork.h"
 #include "server/request_dispatcher.h"
 #include "server/server_types.h"
+#include "server/snapshot_scheduler.h"
 #include "server/thread_pool.h"
 #include "similarity/similarity_engine.h"
+#include "storage/snapshot_fork.h"
 #include "utils/error.h"
 #include "utils/expected.h"
 #include "vectors/metadata_store.h"
@@ -185,11 +185,11 @@ class NvecdServer {
   std::unique_ptr<RequestDispatcher> dispatcher_;
   std::unique_ptr<ThreadPool> thread_pool_;
   std::unique_ptr<ConnectionAcceptor> acceptor_;
-  std::unique_ptr<ConnectionAcceptor> unix_acceptor_;  ///< Unix domain socket acceptor (optional)
-  std::unique_ptr<HttpServer> http_server_;            // HTTP API server (optional)
-  std::unique_ptr<RateLimiter> rate_limiter_;          // Per-client rate limiter (optional)
+  std::unique_ptr<ConnectionAcceptor> unix_acceptor_;         ///< Unix domain socket acceptor (optional)
+  std::unique_ptr<HttpServer> http_server_;                   // HTTP API server (optional)
+  std::unique_ptr<RateLimiter> rate_limiter_;                 // Per-client rate limiter (optional)
   std::unique_ptr<storage::ForkSnapshotWriter> fork_writer_;  ///< Fork-based snapshot writer
-  std::unique_ptr<SnapshotScheduler> snapshot_scheduler_;    ///< Background auto-snapshot scheduler
+  std::unique_ptr<SnapshotScheduler> snapshot_scheduler_;     ///< Background auto-snapshot scheduler
 };
 
 }  // namespace nvecd::server

@@ -58,8 +58,7 @@ double Percentile(std::vector<double>& sorted_values, double p) {
   if (sorted_values.empty()) {
     return 0.0;
   }
-  size_t idx = static_cast<size_t>(
-      p / 100.0 * static_cast<double>(sorted_values.size() - 1));
+  size_t idx = static_cast<size_t>(p / 100.0 * static_cast<double>(sorted_values.size() - 1));
   return sorted_values[idx];
 }
 
@@ -76,13 +75,9 @@ void PrintHeader(const std::string& test_name) {
  * @brief Print throughput metrics
  */
 void PrintThroughput(const std::string& label, int ops, double duration_ms) {
-  double ops_per_sec =
-      (duration_ms > 0)
-          ? (static_cast<double>(ops) / duration_ms * 1000.0)
-          : 0.0;
+  double ops_per_sec = (duration_ms > 0) ? (static_cast<double>(ops) / duration_ms * 1000.0) : 0.0;
   std::cout << std::fixed << std::setprecision(1);
-  std::cout << "  " << label << ": " << ops << " ops in " << duration_ms
-            << " ms (" << ops_per_sec << " ops/sec)\n";
+  std::cout << "  " << label << ": " << ops << " ops in " << duration_ms << " ms (" << ops_per_sec << " ops/sec)\n";
 }
 
 /**
@@ -93,13 +88,12 @@ void PrintLatency(const std::string& label, std::vector<double>& latencies_ms) {
     return;
   }
   std::sort(latencies_ms.begin(), latencies_ms.end());
-  double avg = std::accumulate(latencies_ms.begin(), latencies_ms.end(), 0.0) /
-               static_cast<double>(latencies_ms.size());
+  double avg =
+      std::accumulate(latencies_ms.begin(), latencies_ms.end(), 0.0) / static_cast<double>(latencies_ms.size());
   std::cout << std::fixed << std::setprecision(3);
   std::cout << "  " << label << " latency:\n";
   std::cout << "    avg=" << avg << " ms, p50=" << Percentile(latencies_ms, 50)
-            << " ms, p95=" << Percentile(latencies_ms, 95)
-            << " ms, p99=" << Percentile(latencies_ms, 99)
+            << " ms, p95=" << Percentile(latencies_ms, 95) << " ms, p99=" << Percentile(latencies_ms, 99)
             << " ms, max=" << latencies_ms.back() << " ms\n";
 }
 
@@ -201,8 +195,7 @@ class TikTok1MScaleTest : public NvecdTestFixture {
     size_t remainder = count % num_loaders;
     std::atomic<size_t> total_loaded{0};
 
-    std::cout << "  Loading " << count << " videos with " << num_loaders
-              << " parallel loaders...\n";
+    std::cout << "  Loading " << count << " videos with " << num_loaders << " parallel loaders...\n";
 
     double load_ms = MeasureMs([&]() {
       std::vector<std::thread> threads;
@@ -240,13 +233,9 @@ class TikTok1MScaleTest : public NvecdTestFixture {
     });
 
     size_t loaded = total_loaded.load();
-    double throughput =
-        (load_ms > 0)
-            ? (static_cast<double>(loaded) / load_ms * 1000.0)
-            : 0.0;
-    std::cout << "  Loaded " << loaded << "/" << count << " videos in "
-              << std::fixed << std::setprecision(1) << load_ms << " ms ("
-              << throughput << " ops/sec)\n";
+    double throughput = (load_ms > 0) ? (static_cast<double>(loaded) / load_ms * 1000.0) : 0.0;
+    std::cout << "  Loaded " << loaded << "/" << count << " videos in " << std::fixed << std::setprecision(1) << load_ms
+              << " ms (" << throughput << " ops/sec)\n";
   }
 
   /**
@@ -259,15 +248,12 @@ class TikTok1MScaleTest : public NvecdTestFixture {
    * @param events_per_ctx Number of events per context
    * @param num_loaders Number of concurrent loader threads
    */
-  void ParallelBulkSeedEvents(size_t contexts_count,
-                              size_t events_per_ctx = 10,
-                              size_t num_loaders = 16) {
+  void ParallelBulkSeedEvents(size_t contexts_count, size_t events_per_ctx = 10, size_t num_loaders = 16) {
     size_t per_loader = contexts_count / num_loaders;
     size_t remainder = contexts_count % num_loaders;
     std::atomic<size_t> total_events{0};
 
-    std::cout << "  Seeding " << contexts_count << " contexts x "
-              << events_per_ctx << " events with " << num_loaders
+    std::cout << "  Seeding " << contexts_count << " contexts x " << events_per_ctx << " events with " << num_loaders
               << " loaders...\n";
 
     double seed_ms = MeasureMs([&]() {
@@ -294,8 +280,7 @@ class TikTok1MScaleTest : public NvecdTestFixture {
                 size_t vid_idx = rng() % 1000;  // Pick from first 1000 per cat
                 std::string id = VideoId(cat, vid_idx);
                 int score = 100 - static_cast<int>(e) * 5;
-                auto resp = client.SendCommand("EVENT " + ctx + " ADD " + id +
-                                               " " + std::to_string(score));
+                auto resp = client.SendCommand("EVENT " + ctx + " ADD " + id + " " + std::to_string(score));
                 if (ContainsOK(resp)) {
                   total_events.fetch_add(1, std::memory_order_relaxed);
                 }
@@ -313,13 +298,9 @@ class TikTok1MScaleTest : public NvecdTestFixture {
     });
 
     size_t seeded = total_events.load();
-    double throughput =
-        (seed_ms > 0)
-            ? (static_cast<double>(seeded) / seed_ms * 1000.0)
-            : 0.0;
-    std::cout << "  Seeded " << seeded << " events in " << std::fixed
-              << std::setprecision(1) << seed_ms << " ms (" << throughput
-              << " ops/sec)\n";
+    double throughput = (seed_ms > 0) ? (static_cast<double>(seeded) / seed_ms * 1000.0) : 0.0;
+    std::cout << "  Seeded " << seeded << " events in " << std::fixed << std::setprecision(1) << seed_ms << " ms ("
+              << throughput << " ops/sec)\n";
   }
 
   /**
@@ -344,16 +325,14 @@ class TikTok1MScaleTest : public NvecdTestFixture {
 TEST_F(TikTok1MScaleTest, DISABLED_ScalingProfile) {
   PrintHeader("Scaling Profile: 10K -> 10M");
 
-  const std::vector<size_t> kScalePoints = {10000, 50000, 100000, 500000,
-                                            1000000, 5000000, 10000000};
+  const std::vector<size_t> kScalePoints = {10000, 50000, 100000, 500000, 1000000, 5000000, 10000000};
   const size_t kQueryCount = 100;
   size_t loaded_so_far = 0;
 
   // Table header.
-  std::cout << "\n  " << std::left << std::setw(10) << "Scale" << std::setw(14)
-            << "Load ops/s" << std::setw(10) << "SIM-evt" << std::setw(10)
-            << "SIM-vec" << std::setw(10) << "SIM-fus" << std::setw(10)
-            << "SIMV" << std::setw(14) << "Memory" << "\n";
+  std::cout << "\n  " << std::left << std::setw(10) << "Scale" << std::setw(14) << "Load ops/s" << std::setw(10)
+            << "SIM-evt" << std::setw(10) << "SIM-vec" << std::setw(10) << "SIM-fus" << std::setw(10) << "SIMV"
+            << std::setw(14) << "Memory" << "\n";
   std::cout << "  " << std::string(78, '-') << "\n";
 
   for (size_t scale : kScalePoints) {
@@ -400,16 +379,12 @@ TEST_F(TikTok1MScaleTest, DISABLED_ScalingProfile) {
       });
 
       loaded_so_far = scale;
-      double load_throughput =
-          (load_ms > 0)
-              ? (static_cast<double>(delta_loaded.load()) / load_ms * 1000.0)
-              : 0.0;
+      double load_throughput = (load_ms > 0) ? (static_cast<double>(delta_loaded.load()) / load_ms * 1000.0) : 0.0;
 
       // Measure SIM latencies for each mode.
       TcpClient query_client("127.0.0.1", port_);
 
-      auto measure_sim_latency =
-          [&](const std::string& mode) -> std::vector<double> {
+      auto measure_sim_latency = [&](const std::string& mode) -> std::vector<double> {
         std::vector<double> latencies;
         latencies.reserve(kQueryCount);
         std::mt19937 rng(static_cast<unsigned>(scale + 42));
@@ -417,9 +392,7 @@ TEST_F(TikTok1MScaleTest, DISABLED_ScalingProfile) {
           size_t cat = rng() % kNumCategories;
           size_t vid_idx = rng() % (scale / kNumCategories);
           std::string probe = VideoId(cat, vid_idx);
-          double lat = MeasureMs([&]() {
-            query_client.SendCommand("SIM " + probe + " 10 using=" + mode);
-          });
+          double lat = MeasureMs([&]() { query_client.SendCommand("SIM " + probe + " 10 using=" + mode); });
           latencies.push_back(lat);
         }
         std::sort(latencies.begin(), latencies.end());
@@ -439,9 +412,7 @@ TEST_F(TikTok1MScaleTest, DISABLED_ScalingProfile) {
           // Build a random query vector.
           size_t cat = rng() % kNumCategories;
           std::string vec = BuildCategoryVector(cat, rng() % 10000);
-          double lat = MeasureMs([&]() {
-            query_client.SendCommand("SIMV 10 " + vec);
-          });
+          double lat = MeasureMs([&]() { query_client.SendCommand("SIMV 10 " + vec); });
           simv_lat.push_back(lat);
         }
         std::sort(simv_lat.begin(), simv_lat.end());
@@ -455,48 +426,35 @@ TEST_F(TikTok1MScaleTest, DISABLED_ScalingProfile) {
       }
 
       // Print row.
-      std::cout << "  " << std::left << std::setw(10) << scale << std::fixed
-                << std::setprecision(0) << std::setw(14) << load_throughput
-                << std::setprecision(2) << std::setw(10)
-                << Percentile(evt_lat, 50) << std::setw(10)
-                << Percentile(vec_lat, 50) << std::setw(10)
-                << Percentile(fus_lat, 50) << std::setw(10)
-                << Percentile(simv_lat, 50) << std::setw(14) << memory_str
-                << "\n";
+      std::cout << "  " << std::left << std::setw(10) << scale << std::fixed << std::setprecision(0) << std::setw(14)
+                << load_throughput << std::setprecision(2) << std::setw(10) << Percentile(evt_lat, 50) << std::setw(10)
+                << Percentile(vec_lat, 50) << std::setw(10) << Percentile(fus_lat, 50) << std::setw(10)
+                << Percentile(simv_lat, 50) << std::setw(14) << memory_str << "\n";
 
       // Print detailed latency breakdown at each scale.
       std::cout << "    Events  - avg="
-                << std::accumulate(evt_lat.begin(), evt_lat.end(), 0.0) /
-                       static_cast<double>(evt_lat.size())
-                << " p95=" << Percentile(evt_lat, 95)
-                << " p99=" << Percentile(evt_lat, 99)
-                << " max=" << evt_lat.back() << "\n";
+                << std::accumulate(evt_lat.begin(), evt_lat.end(), 0.0) / static_cast<double>(evt_lat.size())
+                << " p95=" << Percentile(evt_lat, 95) << " p99=" << Percentile(evt_lat, 99) << " max=" << evt_lat.back()
+                << "\n";
       std::cout << "    Vectors - avg="
-                << std::accumulate(vec_lat.begin(), vec_lat.end(), 0.0) /
-                       static_cast<double>(vec_lat.size())
-                << " p95=" << Percentile(vec_lat, 95)
-                << " p99=" << Percentile(vec_lat, 99)
-                << " max=" << vec_lat.back() << "\n";
+                << std::accumulate(vec_lat.begin(), vec_lat.end(), 0.0) / static_cast<double>(vec_lat.size())
+                << " p95=" << Percentile(vec_lat, 95) << " p99=" << Percentile(vec_lat, 99) << " max=" << vec_lat.back()
+                << "\n";
       std::cout << "    Fusion  - avg="
-                << std::accumulate(fus_lat.begin(), fus_lat.end(), 0.0) /
-                       static_cast<double>(fus_lat.size())
-                << " p95=" << Percentile(fus_lat, 95)
-                << " p99=" << Percentile(fus_lat, 99)
-                << " max=" << fus_lat.back() << "\n";
+                << std::accumulate(fus_lat.begin(), fus_lat.end(), 0.0) / static_cast<double>(fus_lat.size())
+                << " p95=" << Percentile(fus_lat, 95) << " p99=" << Percentile(fus_lat, 99) << " max=" << fus_lat.back()
+                << "\n";
       std::cout << "    SIMV    - avg="
-                << std::accumulate(simv_lat.begin(), simv_lat.end(), 0.0) /
-                       static_cast<double>(simv_lat.size())
-                << " p95=" << Percentile(simv_lat, 95)
-                << " p99=" << Percentile(simv_lat, 99)
+                << std::accumulate(simv_lat.begin(), simv_lat.end(), 0.0) / static_cast<double>(simv_lat.size())
+                << " p95=" << Percentile(simv_lat, 95) << " p99=" << Percentile(simv_lat, 99)
                 << " max=" << simv_lat.back() << "\n";
 
       // At 1M and 10M, report scaling health.
       if (scale >= 1000000) {
         std::string scale_label = std::to_string(scale / 1000000) + "M";
-        std::cout << "    [" << scale_label << "] Fusion p99="
-                  << Percentile(fus_lat, 99) << " ms, Vector p99="
-                  << Percentile(vec_lat, 99) << " ms, SIMV p99="
-                  << Percentile(simv_lat, 99) << " ms\n";
+        std::cout << "    [" << scale_label << "] Fusion p99=" << Percentile(fus_lat, 99)
+                  << " ms, Vector p99=" << Percentile(vec_lat, 99) << " ms, SIMV p99=" << Percentile(simv_lat, 99)
+                  << " ms\n";
       }
     }
   }
@@ -517,8 +475,7 @@ TEST_F(TikTok1MScaleTest, DISABLED_TikTokLive1MWith500Viewers) {
     ParallelBulkLoadVideos(1000000, 16);
     ParallelBulkSeedEvents(10000, 10, 16);
   });
-  std::cout << "  Total data loading time: " << std::fixed
-            << std::setprecision(1) << load_ms << " ms\n";
+  std::cout << "  Total data loading time: " << std::fixed << std::setprecision(1) << load_ms << " ms\n";
 
   auto popular_videos = GetPopularVideos();
 
@@ -534,8 +491,7 @@ TEST_F(TikTok1MScaleTest, DISABLED_TikTokLive1MWith500Viewers) {
   std::vector<double> all_latencies;
   std::mutex latency_mu;
 
-  std::cout << "\n  Phase 2: Launching " << kViewers
-            << " viewer threads, " << kIterationsPerViewer
+  std::cout << "\n  Phase 2: Launching " << kViewers << " viewer threads, " << kIterationsPerViewer
             << " iterations each...\n";
 
   double viewer_ms = MeasureMs([&]() {
@@ -553,15 +509,13 @@ TEST_F(TikTok1MScaleTest, DISABLED_TikTokLive1MWith500Viewers) {
           std::string viewer_ctx = "viewer_" + std::to_string(v);
 
           // Start by watching a random popular video.
-          std::string current_video =
-              popular_videos[rng() % popular_videos.size()];
+          std::string current_video = popular_videos[rng() % popular_videos.size()];
 
           for (size_t iter = 0; iter < kIterationsPerViewer; ++iter) {
             // Record the view event.
             int score = 100 - static_cast<int>(iter);
-            auto event_resp = client.SendCommand(
-                "EVENT " + viewer_ctx + " ADD " + current_video + " " +
-                std::to_string(score));
+            auto event_resp =
+                client.SendCommand("EVENT " + viewer_ctx + " ADD " + current_video + " " + std::to_string(score));
             if (ContainsOK(event_resp)) {
               total_events.fetch_add(1, std::memory_order_relaxed);
             }
@@ -569,17 +523,14 @@ TEST_F(TikTok1MScaleTest, DISABLED_TikTokLive1MWith500Viewers) {
             // Get fusion recommendations and measure latency.
             total_sim_attempts.fetch_add(1, std::memory_order_relaxed);
             std::string sim_resp;
-            double lat = MeasureMs([&]() {
-              sim_resp = client.SendCommand("SIM " + current_video +
-                                            " 10 using=fusion");
-            });
+            double lat =
+                MeasureMs([&]() { sim_resp = client.SendCommand("SIM " + current_video + " 10 using=fusion"); });
             local_latencies.push_back(lat);
 
             if (ContainsOK(sim_resp)) {
               total_sim_success.fetch_add(1, std::memory_order_relaxed);
               auto results = ParseSimResults(sim_resp);
-              total_recommendations.fetch_add(static_cast<int>(results.size()),
-                                              std::memory_order_relaxed);
+              total_recommendations.fetch_add(static_cast<int>(results.size()), std::memory_order_relaxed);
 
               // Pick a random recommendation as the next video.
               if (!results.empty()) {
@@ -592,8 +543,7 @@ TEST_F(TikTok1MScaleTest, DISABLED_TikTokLive1MWith500Viewers) {
         }
 
         std::lock_guard<std::mutex> lock(latency_mu);
-        all_latencies.insert(all_latencies.end(), local_latencies.begin(),
-                             local_latencies.end());
+        all_latencies.insert(all_latencies.end(), local_latencies.begin(), local_latencies.end());
       });
     }
 
@@ -607,20 +557,15 @@ TEST_F(TikTok1MScaleTest, DISABLED_TikTokLive1MWith500Viewers) {
   int recs = total_recommendations.load();
   int sim_ok = total_sim_success.load();
   int sim_total = total_sim_attempts.load();
-  double success_rate =
-      (sim_total > 0)
-          ? (static_cast<double>(sim_ok) / static_cast<double>(sim_total) *
-             100.0)
-          : 0.0;
+  double success_rate = (sim_total > 0) ? (static_cast<double>(sim_ok) / static_cast<double>(sim_total) * 100.0) : 0.0;
 
   std::cout << "\n  --- Results ---\n";
-  std::cout << "  Data loading time:        " << std::fixed
-            << std::setprecision(1) << load_ms << " ms\n";
+  std::cout << "  Data loading time:        " << std::fixed << std::setprecision(1) << load_ms << " ms\n";
   std::cout << "  Viewer phase wall time:   " << viewer_ms << " ms\n";
   std::cout << "  Total events sent:        " << events << "\n";
   std::cout << "  Total recommendations:    " << recs << "\n";
-  std::cout << "  SIM success rate:         " << std::setprecision(1)
-            << success_rate << "% (" << sim_ok << "/" << sim_total << ")\n";
+  std::cout << "  SIM success rate:         " << std::setprecision(1) << success_rate << "% (" << sim_ok << "/"
+            << sim_total << ")\n";
   PrintThroughput("Events", events, viewer_ms);
   PrintThroughput("SIM queries", sim_total, viewer_ms);
   PrintLatency("SIM fusion", all_latencies);
@@ -651,8 +596,8 @@ TEST_F(TikTok1MScaleTest, DISABLED_TikTokBurst1M) {
   std::vector<double> normal_latencies;
   std::mutex normal_mu;
 
-  std::cout << "\n  Phase 1: Normal load (" << kNormalViewers
-            << " viewers, " << kNormalIterations << " iterations)...\n";
+  std::cout << "\n  Phase 1: Normal load (" << kNormalViewers << " viewers, " << kNormalIterations
+            << " iterations)...\n";
 
   double normal_ms = MeasureMs([&]() {
     std::vector<std::thread> threads;
@@ -674,10 +619,7 @@ TEST_F(TikTok1MScaleTest, DISABLED_TikTokBurst1M) {
 
             normal_attempts.fetch_add(1, std::memory_order_relaxed);
             std::string resp;
-            double lat = MeasureMs([&]() {
-              resp =
-                  client.SendCommand("SIM " + vid + " 10 using=fusion");
-            });
+            double lat = MeasureMs([&]() { resp = client.SendCommand("SIM " + vid + " 10 using=fusion"); });
             local_lat.push_back(lat);
 
             if (ContainsOK(resp)) {
@@ -688,8 +630,7 @@ TEST_F(TikTok1MScaleTest, DISABLED_TikTokBurst1M) {
         }
 
         std::lock_guard<std::mutex> lock(normal_mu);
-        normal_latencies.insert(normal_latencies.end(), local_lat.begin(),
-                                local_lat.end());
+        normal_latencies.insert(normal_latencies.end(), local_lat.begin(), local_lat.end());
       });
     }
 
@@ -700,13 +641,10 @@ TEST_F(TikTok1MScaleTest, DISABLED_TikTokBurst1M) {
 
   int n_ok = normal_success.load();
   int n_total = normal_attempts.load();
-  double normal_rate =
-      (n_total > 0)
-          ? (static_cast<double>(n_ok) / static_cast<double>(n_total) * 100.0)
-          : 0.0;
+  double normal_rate = (n_total > 0) ? (static_cast<double>(n_ok) / static_cast<double>(n_total) * 100.0) : 0.0;
 
-  std::cout << "  Normal phase: " << std::fixed << std::setprecision(1)
-            << normal_ms << " ms, success " << normal_rate << "%\n";
+  std::cout << "  Normal phase: " << std::fixed << std::setprecision(1) << normal_ms << " ms, success " << normal_rate
+            << "%\n";
   PrintLatency("Normal SIM", normal_latencies);
 
   // Phase 2: Burst - 500 viewers all hit the same viral video.
@@ -719,8 +657,7 @@ TEST_F(TikTok1MScaleTest, DISABLED_TikTokBurst1M) {
   std::vector<double> burst_latencies;
   std::mutex burst_mu;
 
-  std::cout << "\n  Phase 2: BURST! " << kBurstViewers
-            << " viewers on viral video '" << viral_video
+  std::cout << "\n  Phase 2: BURST! " << kBurstViewers << " viewers on viral video '" << viral_video
             << "' (1M dataset)...\n";
 
   double burst_ms = MeasureMs([&]() {
@@ -733,18 +670,14 @@ TEST_F(TikTok1MScaleTest, DISABLED_TikTokBurst1M) {
           TcpClient client("127.0.0.1", port_);
           std::string ctx = "burst_" + std::to_string(v);
 
-          auto event_resp = client.SendCommand("EVENT " + ctx + " ADD " +
-                                               viral_video + " 100");
+          auto event_resp = client.SendCommand("EVENT " + ctx + " ADD " + viral_video + " 100");
           if (ContainsOK(event_resp)) {
             burst_event_success.fetch_add(1, std::memory_order_relaxed);
           }
 
           burst_sim_attempts.fetch_add(1, std::memory_order_relaxed);
           std::string sim_resp;
-          double lat = MeasureMs([&]() {
-            sim_resp = client.SendCommand("SIM " + viral_video +
-                                          " 10 using=fusion");
-          });
+          double lat = MeasureMs([&]() { sim_resp = client.SendCommand("SIM " + viral_video + " 10 using=fusion"); });
 
           {
             std::lock_guard<std::mutex> lock(burst_mu);
@@ -768,18 +701,12 @@ TEST_F(TikTok1MScaleTest, DISABLED_TikTokBurst1M) {
   int b_sim_ok = burst_sim_success.load();
   int b_sim_total = burst_sim_attempts.load();
   double burst_rate =
-      (b_sim_total > 0)
-          ? (static_cast<double>(b_sim_ok) / static_cast<double>(b_sim_total) *
-             100.0)
-          : 0.0;
+      (b_sim_total > 0) ? (static_cast<double>(b_sim_ok) / static_cast<double>(b_sim_total) * 100.0) : 0.0;
 
   std::cout << "\n  --- Burst Results ---\n";
-  std::cout << "  Burst duration:           " << std::fixed
-            << std::setprecision(1) << burst_ms << " ms\n";
-  std::cout << "  Events recorded:          " << b_events << "/"
-            << kBurstViewers << "\n";
-  std::cout << "  SIM success rate:         " << burst_rate << "% ("
-            << b_sim_ok << "/" << b_sim_total << ")\n";
+  std::cout << "  Burst duration:           " << std::fixed << std::setprecision(1) << burst_ms << " ms\n";
+  std::cout << "  Events recorded:          " << b_events << "/" << kBurstViewers << "\n";
+  std::cout << "  SIM success rate:         " << burst_rate << "% (" << b_sim_ok << "/" << b_sim_total << ")\n";
   PrintLatency("Burst SIM", burst_latencies);
 
   // Compare normal vs burst latency.
@@ -790,20 +717,15 @@ TEST_F(TikTok1MScaleTest, DISABLED_TikTokBurst1M) {
     double normal_p99 = Percentile(normal_latencies, 99);
     double burst_p50 = Percentile(burst_latencies, 50);
     double burst_p99 = Percentile(burst_latencies, 99);
-    double degradation_p50 =
-        (normal_p50 > 0) ? (burst_p50 / normal_p50) : 0.0;
-    double degradation_p99 =
-        (normal_p99 > 0) ? (burst_p99 / normal_p99) : 0.0;
+    double degradation_p50 = (normal_p50 > 0) ? (burst_p50 / normal_p50) : 0.0;
+    double degradation_p99 = (normal_p99 > 0) ? (burst_p99 / normal_p99) : 0.0;
 
     std::cout << "\n  --- Latency Comparison (1M dataset) ---\n";
     std::cout << std::fixed << std::setprecision(3);
-    std::cout << "  Normal p50=" << normal_p50 << " ms, p99=" << normal_p99
-              << " ms\n";
-    std::cout << "  Burst  p50=" << burst_p50 << " ms, p99=" << burst_p99
-              << " ms\n";
+    std::cout << "  Normal p50=" << normal_p50 << " ms, p99=" << normal_p99 << " ms\n";
+    std::cout << "  Burst  p50=" << burst_p50 << " ms, p99=" << burst_p99 << " ms\n";
     std::cout << std::setprecision(1);
-    std::cout << "  Degradation: p50=" << degradation_p50
-              << "x, p99=" << degradation_p99 << "x\n";
+    std::cout << "  Degradation: p50=" << degradation_p50 << "x, p99=" << degradation_p99 << "x\n";
   }
 
   EXPECT_GT(burst_rate, 80.0) << "Burst SIM success rate too low at 1M scale";
@@ -816,15 +738,13 @@ TEST_F(TikTok1MScaleTest, DISABLED_TikTokBurst1M) {
 TEST_F(TikTok1MScaleTest, DISABLED_MemoryProfile1M) {
   PrintHeader("Memory Profile: 10K -> 1M");
 
-  const std::vector<size_t> kScalePoints = {10000, 50000, 100000, 500000,
-                                            1000000};
+  const std::vector<size_t> kScalePoints = {10000, 50000, 100000, 500000, 1000000};
   size_t loaded_so_far = 0;
 
   // Table header.
-  std::cout << "\n  " << std::left << std::setw(10) << "Scale"
-            << std::setw(18) << "Memory (bytes)" << std::setw(14)
-            << "Vectors" << std::setw(14) << "Events" << std::setw(14)
-            << "Contexts" << std::setw(14) << "Bytes/Video" << "\n";
+  std::cout << "\n  " << std::left << std::setw(10) << "Scale" << std::setw(18) << "Memory (bytes)" << std::setw(14)
+            << "Vectors" << std::setw(14) << "Events" << std::setw(14) << "Contexts" << std::setw(14) << "Bytes/Video"
+            << "\n";
   std::cout << "  " << std::string(84, '-') << "\n";
 
   for (size_t scale : kScalePoints) {
@@ -881,17 +801,13 @@ TEST_F(TikTok1MScaleTest, DISABLED_MemoryProfile1M) {
     TcpClient info_client("127.0.0.1", port_);
     auto info_resp = info_client.SendCommand("INFO");
 
-    std::string memory_str =
-        ParseResponseField(info_resp, "used_memory_bytes");
+    std::string memory_str = ParseResponseField(info_resp, "used_memory_bytes");
     if (memory_str.empty()) {
       memory_str = ParseResponseField(info_resp, "used_memory");
     }
-    std::string vector_count_str =
-        ParseResponseField(info_resp, "vector_count");
-    std::string event_count_str =
-        ParseResponseField(info_resp, "event_count");
-    std::string context_count_str =
-        ParseResponseField(info_resp, "context_count");
+    std::string vector_count_str = ParseResponseField(info_resp, "vector_count");
+    std::string event_count_str = ParseResponseField(info_resp, "event_count");
+    std::string context_count_str = ParseResponseField(info_resp, "context_count");
 
     // Calculate bytes per video.
     long long memory_bytes = 0;
@@ -903,16 +819,12 @@ TEST_F(TikTok1MScaleTest, DISABLED_MemoryProfile1M) {
       }
     }
     double bytes_per_video =
-        (scale > 0 && memory_bytes > 0)
-            ? (static_cast<double>(memory_bytes) / static_cast<double>(scale))
-            : 0.0;
+        (scale > 0 && memory_bytes > 0) ? (static_cast<double>(memory_bytes) / static_cast<double>(scale)) : 0.0;
 
     // Print row.
-    std::cout << "  " << std::left << std::setw(10) << scale << std::setw(18)
-              << memory_str << std::setw(14) << vector_count_str
-              << std::setw(14) << event_count_str << std::setw(14)
-              << context_count_str << std::fixed << std::setprecision(1)
-              << std::setw(14) << bytes_per_video << "\n";
+    std::cout << "  " << std::left << std::setw(10) << scale << std::setw(18) << memory_str << std::setw(14)
+              << vector_count_str << std::setw(14) << event_count_str << std::setw(14) << context_count_str
+              << std::fixed << std::setprecision(1) << std::setw(14) << bytes_per_video << "\n";
   }
 
   std::cout << "\n  Memory profile complete.\n";
@@ -931,8 +843,7 @@ TEST_F(TikTok1MScaleTest, DISABLED_TikTokLive10MWith500Viewers) {
     ParallelBulkLoadVideos(10000000, 16);
     ParallelBulkSeedEvents(10000, 10, 16);
   });
-  std::cout << "  Total data loading time: " << std::fixed
-            << std::setprecision(1) << load_ms << " ms ("
+  std::cout << "  Total data loading time: " << std::fixed << std::setprecision(1) << load_ms << " ms ("
             << std::setprecision(1) << load_ms / 1000.0 << " sec)\n";
 
   // Check memory usage after loading.
@@ -941,11 +852,8 @@ TEST_F(TikTok1MScaleTest, DISABLED_TikTokLive10MWith500Viewers) {
     auto info = info_client.SendCommand("INFO");
     std::string mem = ParseResponseField(info, "used_memory_bytes");
     std::string vecs = ParseResponseField(info, "vector_count");
-    std::cout << "  Loaded vectors: " << vecs << ", Memory: " << mem
-              << " bytes ("
-              << (mem.empty() ? 0.0
-                              : std::stod(mem) / 1024.0 / 1024.0)
-              << " MB)\n";
+    std::cout << "  Loaded vectors: " << vecs << ", Memory: " << mem << " bytes ("
+              << (mem.empty() ? 0.0 : std::stod(mem) / 1024.0 / 1024.0) << " MB)\n";
   }
 
   auto popular_videos = GetPopularVideos();
@@ -962,8 +870,7 @@ TEST_F(TikTok1MScaleTest, DISABLED_TikTokLive10MWith500Viewers) {
   std::vector<double> all_latencies;
   std::mutex latency_mu;
 
-  std::cout << "\n  Phase 2: Launching " << kViewers
-            << " viewer threads, " << kIterationsPerViewer
+  std::cout << "\n  Phase 2: Launching " << kViewers << " viewer threads, " << kIterationsPerViewer
             << " iterations each...\n";
 
   double viewer_ms = MeasureMs([&]() {
@@ -979,32 +886,26 @@ TEST_F(TikTok1MScaleTest, DISABLED_TikTokLive10MWith500Viewers) {
         try {
           TcpClient client("127.0.0.1", port_);
           std::string viewer_ctx = "viewer_" + std::to_string(v);
-          std::string current_video =
-              popular_videos[rng() % popular_videos.size()];
+          std::string current_video = popular_videos[rng() % popular_videos.size()];
 
           for (size_t iter = 0; iter < kIterationsPerViewer; ++iter) {
             int score = 100 - static_cast<int>(iter);
-            auto event_resp = client.SendCommand(
-                "EVENT " + viewer_ctx + " ADD " + current_video + " " +
-                std::to_string(score));
+            auto event_resp =
+                client.SendCommand("EVENT " + viewer_ctx + " ADD " + current_video + " " + std::to_string(score));
             if (ContainsOK(event_resp)) {
               total_events.fetch_add(1, std::memory_order_relaxed);
             }
 
             total_sim_attempts.fetch_add(1, std::memory_order_relaxed);
             std::string sim_resp;
-            double lat = MeasureMs([&]() {
-              sim_resp = client.SendCommand("SIM " + current_video +
-                                            " 10 using=fusion");
-            });
+            double lat =
+                MeasureMs([&]() { sim_resp = client.SendCommand("SIM " + current_video + " 10 using=fusion"); });
             local_latencies.push_back(lat);
 
             if (ContainsOK(sim_resp)) {
               total_sim_success.fetch_add(1, std::memory_order_relaxed);
               auto results = ParseSimResults(sim_resp);
-              total_recommendations.fetch_add(
-                  static_cast<int>(results.size()),
-                  std::memory_order_relaxed);
+              total_recommendations.fetch_add(static_cast<int>(results.size()), std::memory_order_relaxed);
               if (!results.empty()) {
                 current_video = results[rng() % results.size()].first;
               }
@@ -1014,8 +915,7 @@ TEST_F(TikTok1MScaleTest, DISABLED_TikTokLive10MWith500Viewers) {
         }
 
         std::lock_guard<std::mutex> lock(latency_mu);
-        all_latencies.insert(all_latencies.end(), local_latencies.begin(),
-                             local_latencies.end());
+        all_latencies.insert(all_latencies.end(), local_latencies.begin(), local_latencies.end());
       });
     }
 
@@ -1028,20 +928,15 @@ TEST_F(TikTok1MScaleTest, DISABLED_TikTokLive10MWith500Viewers) {
   int recs = total_recommendations.load();
   int sim_ok = total_sim_success.load();
   int sim_total = total_sim_attempts.load();
-  double success_rate =
-      (sim_total > 0)
-          ? (static_cast<double>(sim_ok) / static_cast<double>(sim_total) *
-             100.0)
-          : 0.0;
+  double success_rate = (sim_total > 0) ? (static_cast<double>(sim_ok) / static_cast<double>(sim_total) * 100.0) : 0.0;
 
   std::cout << "\n  --- Results (10M dataset) ---\n";
-  std::cout << "  Data loading time:        " << std::fixed
-            << std::setprecision(1) << load_ms / 1000.0 << " sec\n";
+  std::cout << "  Data loading time:        " << std::fixed << std::setprecision(1) << load_ms / 1000.0 << " sec\n";
   std::cout << "  Viewer phase wall time:   " << viewer_ms << " ms\n";
   std::cout << "  Total events sent:        " << events << "\n";
   std::cout << "  Total recommendations:    " << recs << "\n";
-  std::cout << "  SIM success rate:         " << std::setprecision(1)
-            << success_rate << "% (" << sim_ok << "/" << sim_total << ")\n";
+  std::cout << "  SIM success rate:         " << std::setprecision(1) << success_rate << "% (" << sim_ok << "/"
+            << sim_total << ")\n";
   PrintThroughput("Events", events, viewer_ms);
   PrintThroughput("SIM queries", sim_total, viewer_ms);
   PrintLatency("SIM fusion", all_latencies);
@@ -1054,17 +949,13 @@ TEST_F(TikTok1MScaleTest, DISABLED_TikTokLive10MWith500Viewers) {
     double p99 = Percentile(all_latencies, 99);
     std::cout << "\n  --- 10M Viability Assessment ---\n";
     if (p99 < 100.0) {
-      std::cout << "  PASS: p99=" << p99
-                << " ms - viable for real-time recommendations\n";
+      std::cout << "  PASS: p99=" << p99 << " ms - viable for real-time recommendations\n";
     } else if (p99 < 500.0) {
-      std::cout << "  WARNING: p99=" << p99
-                << " ms - marginal, consider ANN index (FAISS)\n";
+      std::cout << "  WARNING: p99=" << p99 << " ms - marginal, consider ANN index (FAISS)\n";
     } else {
-      std::cout << "  CRITICAL: p99=" << p99
-                << " ms - ANN index (FAISS) required for production\n";
+      std::cout << "  CRITICAL: p99=" << p99 << " ms - ANN index (FAISS) required for production\n";
     }
-    std::cout << "  Estimated throughput at p50: "
-              << std::setprecision(0) << (1000.0 / p50)
+    std::cout << "  Estimated throughput at p50: " << std::setprecision(0) << (1000.0 / p50)
               << " queries/sec per thread\n";
   }
 
@@ -1078,14 +969,11 @@ TEST_F(TikTok1MScaleTest, DISABLED_TikTokLive10MWith500Viewers) {
 TEST_F(TikTok1MScaleTest, DISABLED_MemoryProfile10M) {
   PrintHeader("Memory Profile: 10K -> 10M");
 
-  const std::vector<size_t> kScalePoints = {10000, 50000, 100000, 500000,
-                                            1000000, 5000000, 10000000};
+  const std::vector<size_t> kScalePoints = {10000, 50000, 100000, 500000, 1000000, 5000000, 10000000};
   size_t loaded_so_far = 0;
 
-  std::cout << "\n  " << std::left << std::setw(12) << "Scale"
-            << std::setw(18) << "Memory (bytes)" << std::setw(10)
-            << "MB" << std::setw(14) << "Vectors" << std::setw(14)
-            << "Bytes/Video" << "\n";
+  std::cout << "\n  " << std::left << std::setw(12) << "Scale" << std::setw(18) << "Memory (bytes)" << std::setw(10)
+            << "MB" << std::setw(14) << "Vectors" << std::setw(14) << "Bytes/Video" << "\n";
   std::cout << "  " << std::string(68, '-') << "\n";
 
   for (size_t scale : kScalePoints) {
@@ -1128,10 +1016,8 @@ TEST_F(TikTok1MScaleTest, DISABLED_MemoryProfile10M) {
 
     TcpClient info_client("127.0.0.1", port_);
     auto info_resp = info_client.SendCommand("INFO");
-    std::string memory_str =
-        ParseResponseField(info_resp, "used_memory_bytes");
-    std::string vector_count_str =
-        ParseResponseField(info_resp, "vector_count");
+    std::string memory_str = ParseResponseField(info_resp, "used_memory_bytes");
+    std::string vector_count_str = ParseResponseField(info_resp, "vector_count");
 
     long long memory_bytes = 0;
     if (!memory_str.empty()) {
@@ -1142,14 +1028,10 @@ TEST_F(TikTok1MScaleTest, DISABLED_MemoryProfile10M) {
     }
     double mb = static_cast<double>(memory_bytes) / 1024.0 / 1024.0;
     double bytes_per_video =
-        (scale > 0 && memory_bytes > 0)
-            ? (static_cast<double>(memory_bytes) / static_cast<double>(scale))
-            : 0.0;
+        (scale > 0 && memory_bytes > 0) ? (static_cast<double>(memory_bytes) / static_cast<double>(scale)) : 0.0;
 
-    std::cout << "  " << std::left << std::setw(12) << scale
-              << std::setw(18) << memory_str << std::fixed
-              << std::setprecision(1) << std::setw(10) << mb
-              << std::setw(14) << vector_count_str << std::setw(14)
+    std::cout << "  " << std::left << std::setw(12) << scale << std::setw(18) << memory_str << std::fixed
+              << std::setprecision(1) << std::setw(10) << mb << std::setw(14) << vector_count_str << std::setw(14)
               << bytes_per_video << "\n";
   }
 
@@ -1182,10 +1064,10 @@ class TikTok1MScaleIvfTest : public NvecdTestFixture {
 
     // Enable IVF — train after bulk load completes
     config_.similarity.ivf_enabled = true;
-    config_.similarity.ivf_nlist = 256;     // Fixed: good balance for 1M-10M
+    config_.similarity.ivf_nlist = 256;  // Fixed: good balance for 1M-10M
     config_.similarity.ivf_nprobe = 10;
-    config_.similarity.ivf_train_threshold = 100000;   // Train early at 100K
-    config_.similarity.ivf_seal_threshold = 10000;     // Small buffer: fast seal + fast brute-force
+    config_.similarity.ivf_train_threshold = 100000;  // Train early at 100K
+    config_.similarity.ivf_seal_threshold = 10000;    // Small buffer: fast seal + fast brute-force
 
     server_ = std::make_unique<nvecd::server::NvecdServer>(config_);
     ASSERT_TRUE(server_->Start().has_value());
@@ -1231,10 +1113,8 @@ class TikTok1MScaleIvfTest : public NvecdTestFixture {
       }
     });
 
-    std::cout << "  Loaded " << count << " in " << std::fixed
-              << std::setprecision(1) << load_ms << " ms ("
-              << (load_ms > 0 ? static_cast<double>(count) / load_ms * 1000.0 : 0.0)
-              << " ops/sec)\n";
+    std::cout << "  Loaded " << count << " in " << std::fixed << std::setprecision(1) << load_ms << " ms ("
+              << (load_ms > 0 ? static_cast<double>(count) / load_ms * 1000.0 : 0.0) << " ops/sec)\n";
   }
 };
 
@@ -1245,15 +1125,13 @@ class TikTok1MScaleIvfTest : public NvecdTestFixture {
 TEST_F(TikTok1MScaleIvfTest, DISABLED_IvfScalingProfile) {
   PrintHeader("IVF Scaling Profile: 10K -> 10M");
 
-  const std::vector<size_t> kScalePoints = {10000, 50000, 100000, 500000,
-                                            1000000, 5000000, 10000000};
+  const std::vector<size_t> kScalePoints = {10000, 50000, 100000, 500000, 1000000, 5000000, 10000000};
   const size_t kQueryCount = 100;
   size_t loaded_so_far = 0;
 
-  std::cout << "\n  " << std::left << std::setw(12) << "Scale"
-            << std::setw(14) << "SIM-vec(ms)" << std::setw(14) << "SIM-fus(ms)"
-            << std::setw(14) << "SIMV(ms)" << std::setw(14) << "p99-vec"
-            << std::setw(14) << "p99-fus" << "\n";
+  std::cout << "\n  " << std::left << std::setw(12) << "Scale" << std::setw(14) << "SIM-vec(ms)" << std::setw(14)
+            << "SIM-fus(ms)" << std::setw(14) << "SIMV(ms)" << std::setw(14) << "p99-vec" << std::setw(14) << "p99-fus"
+            << "\n";
   std::cout << "  " << std::string(82, '-') << "\n";
 
   for (size_t scale : kScalePoints) {
@@ -1299,8 +1177,7 @@ TEST_F(TikTok1MScaleIvfTest, DISABLED_IvfScalingProfile) {
 
     TcpClient query_client("127.0.0.1", port_);
 
-    auto measure_latency =
-        [&](const std::string& mode) -> std::vector<double> {
+    auto measure_latency = [&](const std::string& mode) -> std::vector<double> {
       std::vector<double> latencies;
       latencies.reserve(kQueryCount);
       std::mt19937 rng(static_cast<unsigned>(scale + 42));
@@ -1308,9 +1185,7 @@ TEST_F(TikTok1MScaleIvfTest, DISABLED_IvfScalingProfile) {
         size_t cat = rng() % kNumCategories;
         size_t vid_idx = rng() % (scale / kNumCategories);
         std::string probe = VideoId(cat, vid_idx);
-        double lat = MeasureMs([&]() {
-          query_client.SendCommand("SIM " + probe + " 10 using=" + mode);
-        });
+        double lat = MeasureMs([&]() { query_client.SendCommand("SIM " + probe + " 10 using=" + mode); });
         latencies.push_back(lat);
       }
       std::sort(latencies.begin(), latencies.end());
@@ -1328,26 +1203,19 @@ TEST_F(TikTok1MScaleIvfTest, DISABLED_IvfScalingProfile) {
       for (size_t q = 0; q < kQueryCount; ++q) {
         size_t cat = rng() % kNumCategories;
         std::string vec = BuildCategoryVector(cat, rng() % 10000);
-        double lat = MeasureMs([&]() {
-          query_client.SendCommand("SIMV 10 " + vec);
-        });
+        double lat = MeasureMs([&]() { query_client.SendCommand("SIMV 10 " + vec); });
         simv_lat.push_back(lat);
       }
       std::sort(simv_lat.begin(), simv_lat.end());
     }
 
-    double vec_avg = std::accumulate(vec_lat.begin(), vec_lat.end(), 0.0) /
-                     static_cast<double>(vec_lat.size());
-    double fus_avg = std::accumulate(fus_lat.begin(), fus_lat.end(), 0.0) /
-                     static_cast<double>(fus_lat.size());
-    double simv_avg = std::accumulate(simv_lat.begin(), simv_lat.end(), 0.0) /
-                      static_cast<double>(simv_lat.size());
+    double vec_avg = std::accumulate(vec_lat.begin(), vec_lat.end(), 0.0) / static_cast<double>(vec_lat.size());
+    double fus_avg = std::accumulate(fus_lat.begin(), fus_lat.end(), 0.0) / static_cast<double>(fus_lat.size());
+    double simv_avg = std::accumulate(simv_lat.begin(), simv_lat.end(), 0.0) / static_cast<double>(simv_lat.size());
 
-    std::cout << "  " << std::left << std::setw(12) << scale << std::fixed
-              << std::setprecision(2) << std::setw(14) << vec_avg
-              << std::setw(14) << fus_avg << std::setw(14) << simv_avg
-              << std::setw(14) << Percentile(vec_lat, 99) << std::setw(14)
-              << Percentile(fus_lat, 99) << "\n";
+    std::cout << "  " << std::left << std::setw(12) << scale << std::fixed << std::setprecision(2) << std::setw(14)
+              << vec_avg << std::setw(14) << fus_avg << std::setw(14) << simv_avg << std::setw(14)
+              << Percentile(vec_lat, 99) << std::setw(14) << Percentile(fus_lat, 99) << "\n";
   }
 }
 
@@ -1373,8 +1241,7 @@ TEST_F(TikTok1MScaleIvfTest, DISABLED_IvfTikTokLive10MWith500Viewers) {
     auto info = info_client.SendCommand("INFO");
     std::string vecs = ParseResponseField(info, "vector_count");
     std::string mem = ParseResponseField(info, "used_memory_bytes");
-    std::cout << "  Vectors: " << vecs << ", Memory: "
-              << (mem.empty() ? 0.0 : std::stod(mem) / 1024.0 / 1024.0)
+    std::cout << "  Vectors: " << vecs << ", Memory: " << (mem.empty() ? 0.0 : std::stod(mem) / 1024.0 / 1024.0)
               << " MB\n";
   }
 
@@ -1394,8 +1261,7 @@ TEST_F(TikTok1MScaleIvfTest, DISABLED_IvfTikTokLive10MWith500Viewers) {
   std::vector<double> all_latencies;
   std::mutex latency_mu;
 
-  std::cout << "\n  Phase 2: " << kViewers << " viewers x "
-            << kIterationsPerViewer << " iterations\n";
+  std::cout << "\n  Phase 2: " << kViewers << " viewers x " << kIterationsPerViewer << " iterations\n";
 
   double viewer_ms = MeasureMs([&]() {
     std::vector<std::thread> threads;
@@ -1413,18 +1279,15 @@ TEST_F(TikTok1MScaleIvfTest, DISABLED_IvfTikTokLive10MWith500Viewers) {
           std::string current = popular_videos[rng() % popular_videos.size()];
 
           for (size_t iter = 0; iter < kIterationsPerViewer; ++iter) {
-            auto ev = client.SendCommand(
-                "EVENT " + ctx + " ADD " + current + " " +
-                std::to_string(100 - static_cast<int>(iter)));
+            auto ev = client.SendCommand("EVENT " + ctx + " ADD " + current + " " +
+                                         std::to_string(100 - static_cast<int>(iter)));
             if (ContainsOK(ev)) {
               total_events.fetch_add(1, std::memory_order_relaxed);
             }
 
             total_sim_attempts.fetch_add(1, std::memory_order_relaxed);
             std::string resp;
-            double lat = MeasureMs([&]() {
-              resp = client.SendCommand("SIM " + current + " 10 using=fusion");
-            });
+            double lat = MeasureMs([&]() { resp = client.SendCommand("SIM " + current + " 10 using=fusion"); });
             local_latencies.push_back(lat);
 
             if (ContainsOK(resp)) {
@@ -1439,8 +1302,7 @@ TEST_F(TikTok1MScaleIvfTest, DISABLED_IvfTikTokLive10MWith500Viewers) {
         }
 
         std::lock_guard<std::mutex> lock(latency_mu);
-        all_latencies.insert(all_latencies.end(), local_latencies.begin(),
-                             local_latencies.end());
+        all_latencies.insert(all_latencies.end(), local_latencies.begin(), local_latencies.end());
       });
     }
 
@@ -1451,17 +1313,12 @@ TEST_F(TikTok1MScaleIvfTest, DISABLED_IvfTikTokLive10MWith500Viewers) {
 
   int sim_ok = total_sim_success.load();
   int sim_total = total_sim_attempts.load();
-  double rate = (sim_total > 0)
-                    ? (static_cast<double>(sim_ok) /
-                       static_cast<double>(sim_total) * 100.0)
-                    : 0.0;
+  double rate = (sim_total > 0) ? (static_cast<double>(sim_ok) / static_cast<double>(sim_total) * 100.0) : 0.0;
 
   std::cout << "\n  --- IVF Results (10M) ---\n";
-  std::cout << "  Load time:        " << std::fixed << std::setprecision(1)
-            << load_ms / 1000.0 << " sec\n";
+  std::cout << "  Load time:        " << std::fixed << std::setprecision(1) << load_ms / 1000.0 << " sec\n";
   std::cout << "  Viewer wall time: " << viewer_ms << " ms\n";
-  std::cout << "  SIM success:      " << rate << "% (" << sim_ok << "/"
-            << sim_total << ")\n";
+  std::cout << "  SIM success:      " << rate << "% (" << sim_ok << "/" << sim_total << ")\n";
   PrintThroughput("SIM queries", sim_total, viewer_ms);
   PrintLatency("SIM fusion (IVF)", all_latencies);
 

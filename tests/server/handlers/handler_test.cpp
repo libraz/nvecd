@@ -385,8 +385,7 @@ TEST_F(HandlerTest, DumpSave_WithValidData_Succeeds) {
 
   std::string dump_path = "/tmp/nvecd_handler_test_dump.dmp";
   auto result = HandleDumpSave(*ctx_, dump_path);
-  ASSERT_TRUE(result.has_value()) << "DumpSave failed: "
-      << (result.has_value() ? "" : result.error().message());
+  ASSERT_TRUE(result.has_value()) << "DumpSave failed: " << (result.has_value() ? "" : result.error().message());
   EXPECT_THAT(*result, HasSubstr("DUMP_SAVED"));
 
   // Verify file was created
@@ -441,8 +440,7 @@ TEST_F(HandlerTest, DumpVerify_ValidFile_Succeeds) {
 
   // Verify the saved file
   auto verify_result = HandleDumpVerify("/tmp", dump_path);
-  ASSERT_TRUE(verify_result.has_value()) << "DumpVerify failed: "
-      << verify_result.error().message();
+  ASSERT_TRUE(verify_result.has_value()) << "DumpVerify failed: " << verify_result.error().message();
   EXPECT_THAT(*verify_result, HasSubstr("DUMP_VERIFIED"));
 
   // Clean up

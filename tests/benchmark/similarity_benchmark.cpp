@@ -16,6 +16,8 @@
  * 7. Cache hit vs miss latency
  */
 
+#include <gtest/gtest.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -25,8 +27,6 @@
 #include <random>
 #include <string>
 #include <vector>
-
-#include <gtest/gtest.h>
 
 #include "cache/cache_key.h"
 #include "cache/similarity_cache.h"
@@ -86,8 +86,8 @@ void PrintHeader(const std::string& title) {
             << std::string(78, '=') << "\n"
             << "  " << title << "\n"
             << std::string(78, '=') << "\n"
-            << std::left << std::setw(12) << "Scale" << std::setw(18) << "Median (us)"
-            << std::setw(18) << "Median (ms)" << std::setw(18) << "Ops/sec"
+            << std::left << std::setw(12) << "Scale" << std::setw(18) << "Median (us)" << std::setw(18) << "Median (ms)"
+            << std::setw(18) << "Ops/sec"
             << "\n"
             << std::string(78, '-') << "\n";
 }
@@ -176,7 +176,6 @@ TEST_F(SimilarityBenchmark, DISABLED_BruteForceScan) {
     std::mt19937 rng(kSeed);
     PopulateStore(store, scale, kDim, rng);
 
-
     // Generate a query vector and pre-compute its norm.
     auto query = RandomVector(rng, kDim);
     float query_norm = vectors::L2Norm(query);
@@ -194,8 +193,8 @@ TEST_F(SimilarityBenchmark, DISABLED_BruteForceScan) {
       std::vector<std::pair<size_t, float>> scores;
       scores.reserve(n);
       for (size_t i = 0; i < n; ++i) {
-        float sim = vectors::CosineSimilarityPreNorm(query.data(), store.GetMatrixRow(i), kDim, query_norm,
-                                                     store.GetNorm(i));
+        float sim =
+            vectors::CosineSimilarityPreNorm(query.data(), store.GetMatrixRow(i), kDim, query_norm, store.GetNorm(i));
         scores.emplace_back(i, sim);
       }
 
@@ -328,7 +327,6 @@ TEST_F(SimilarityBenchmark, DISABLED_SearchByIdVectors) {
     std::mt19937 rng(kSeed);
     PopulateStore(store, scale, kDim, rng);
 
-
     config::EventsConfig ecfg;
     events::EventStore event_store(ecfg);
     events::CoOccurrenceIndex co_index;
@@ -377,7 +375,6 @@ TEST_F(SimilarityBenchmark, DISABLED_SearchByVector) {
     std::mt19937 rng(kSeed);
     PopulateStore(store, scale, kDim, rng);
 
-
     config::EventsConfig ecfg;
     events::EventStore event_store(ecfg);
     events::CoOccurrenceIndex co_index;
@@ -417,8 +414,8 @@ TEST_F(SimilarityBenchmark, DISABLED_CacheHitVsMiss) {
   PrintHeader("SimilarityCache lookup latency (hit vs miss)");
 
   constexpr size_t kCacheMemory = 64 * 1024 * 1024;  // 64 MB
-  constexpr double kMinQueryCost = 0.0;               // Cache everything
-  constexpr int kTtlSeconds = 0;                      // No TTL
+  constexpr double kMinQueryCost = 0.0;              // Cache everything
+  constexpr int kTtlSeconds = 0;                     // No TTL
 
   // Build some results to cache.
   std::vector<similarity::SimilarityResult> dummy_results;
