@@ -66,6 +66,8 @@ add_library(nvecd_vectors STATIC
   vectors/vector_store.cpp
   vectors/ivf_index.cpp
   vectors/hnsw_index.cpp
+  vectors/metadata_filter.cpp
+  vectors/metadata_store.cpp
   vectors/cpu_features.cpp
 )
 target_link_libraries(nvecd_vectors PUBLIC

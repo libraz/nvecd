@@ -29,6 +29,8 @@
 #include "vectors/ann_index.h"
 #include "vectors/distance.h"
 #include "vectors/ivf_index.h"
+#include "vectors/metadata_filter.h"
+#include "vectors/metadata_store.h"
 #include "vectors/vector_store.h"
 
 namespace nvecd::similarity {
@@ -68,10 +70,13 @@ class SimilarityEngine {
    * @param co_index Co-occurrence index (not owned, must outlive this object)
    * @param vector_store Vector store (not owned, must outlive this object)
    * @param config Similarity configuration
+   * @param vectors_config Vector configuration
+   * @param metadata_store Metadata store (not owned, optional, null disables filtering)
    */
   SimilarityEngine(events::EventStore* event_store, events::CoOccurrenceIndex* co_index,
                    vectors::VectorStore* vector_store, const config::SimilarityConfig& config,
-                   const config::VectorsConfig& vectors_config = config::VectorsConfig{});
+                   const config::VectorsConfig& vectors_config = config::VectorsConfig{},
+                   vectors::MetadataStore* metadata_store = nullptr);
 
   /// @brief Destructor joins background training thread if running
   ~SimilarityEngine();
@@ -102,9 +107,12 @@ class SimilarityEngine {
    *
    * @param item_id Query item ID
    * @param top_k Maximum number of results
+   * @param filter Optional metadata filter (empty = no filtering)
    * @return Expected<vector<SimilarityResult>, Error> Results or error
    */
-  utils::Expected<std::vector<SimilarityResult>, utils::Error> SearchByIdVectors(const std::string& item_id, int top_k);
+  utils::Expected<std::vector<SimilarityResult>, utils::Error> SearchByIdVectors(
+      const std::string& item_id, int top_k,
+      const vectors::MetadataFilter& filter = {});
 
   /**
    * @brief Search similar items using fusion (events + vectors)
@@ -117,7 +125,8 @@ class SimilarityEngine {
    * @return Expected<vector<SimilarityResult>, Error> Results or error
    */
   utils::Expected<std::vector<SimilarityResult>, utils::Error> SearchByIdFusion(
-      const std::string& item_id, int top_k, std::optional<bool> adaptive = std::nullopt);
+      const std::string& item_id, int top_k, std::optional<bool> adaptive = std::nullopt,
+      const vectors::MetadataFilter& filter = {});
 
   /**
    * @brief Search similar items using vector query (SIMV)
@@ -129,8 +138,9 @@ class SimilarityEngine {
    * @param top_k Maximum number of results
    * @return Expected<vector<SimilarityResult>, Error> Results or error
    */
-  utils::Expected<std::vector<SimilarityResult>, utils::Error> SearchByVector(const std::vector<float>& query_vector,
-                                                                              int top_k);
+  utils::Expected<std::vector<SimilarityResult>, utils::Error> SearchByVector(
+      const std::vector<float>& query_vector, int top_k,
+      const vectors::MetadataFilter& filter = {});
 
   /**
    * @brief Notify the engine that a vector was added or updated
@@ -229,6 +239,7 @@ class SimilarityEngine {
   [[maybe_unused]] events::EventStore* event_store_;  ///< Event store (not owned)
   events::CoOccurrenceIndex* co_index_;               ///< Co-occurrence index (not owned)
   vectors::VectorStore* vector_store_;                ///< Vector store (not owned)
+  vectors::MetadataStore* metadata_store_;             ///< Metadata store (not owned, may be null)
   config::SimilarityConfig config_;                   ///< Configuration
   DistanceFunc distance_func_;                        ///< Distance function for similarity
   bool use_prenorm_ = false;                          ///< Whether to use pre-computed norm optimization (cosine only)

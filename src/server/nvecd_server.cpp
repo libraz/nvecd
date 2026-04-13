@@ -216,6 +216,10 @@ utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
   vector_store_ = std::make_unique<vectors::VectorStore>(config_.vectors);
   spdlog::info("VectorStore initialized (default_dimension={})", config_.vectors.default_dimension);
 
+  // Create MetadataStore
+  metadata_store_ = std::make_unique<vectors::MetadataStore>();
+  spdlog::info("MetadataStore initialized");
+
   // Create SimilarityEngine
   similarity_engine_ = std::make_unique<similarity::SimilarityEngine>(
       event_store_.get(), co_index_.get(), vector_store_.get(), config_.similarity, config_.vectors);
@@ -269,6 +273,7 @@ utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
   handler_ctx_.event_store = event_store_.get();
   handler_ctx_.co_index = co_index_.get();
   handler_ctx_.vector_store = vector_store_.get();
+  handler_ctx_.metadata_store = metadata_store_.get();
   handler_ctx_.similarity_engine = similarity_engine_.get();
   handler_ctx_.cache.store(cache_.get(), std::memory_order_release);
   handler_ctx_.variable_manager = variable_manager_.get();

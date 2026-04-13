@@ -70,6 +70,7 @@ class HandlerTest : public ::testing::Test {
     ctx_ = new (ctx_storage_) HandlerContext{/*.event_store=*/event_store_.get(),
                                              /*.co_index=*/co_index_.get(),
                                              /*.vector_store=*/vector_store_.get(),
+                                             /*.metadata_store=*/nullptr,
                                              /*.similarity_engine=*/similarity_engine_.get(),
                                              /*.cache=*/{},
                                              /*.variable_manager=*/variable_manager_.get(),
@@ -77,7 +78,8 @@ class HandlerTest : public ::testing::Test {
                                              /*.config=*/config_.get(),
                                              /*.loading=*/loading_,
                                              /*.read_only=*/read_only_,
-                                             /*.dump_dir=*/"/tmp"};
+                                             /*.dump_dir=*/"/tmp",
+                                             /*.requirepass=*/""};
     ctx_->cache.store(cache_.get(), std::memory_order_release);
   }
 
@@ -121,6 +123,7 @@ class HandlerNullTest : public ::testing::Test {
     ctx_ = new (ctx_storage_) HandlerContext{/*.event_store=*/event_store_.get(),
                                              /*.co_index=*/nullptr,
                                              /*.vector_store=*/vector_store_.get(),
+                                             /*.metadata_store=*/nullptr,
                                              /*.similarity_engine=*/nullptr,
                                              /*.cache=*/{},
                                              /*.variable_manager=*/nullptr,
@@ -128,7 +131,8 @@ class HandlerNullTest : public ::testing::Test {
                                              /*.config=*/nullptr,
                                              /*.loading=*/loading_,
                                              /*.read_only=*/read_only_,
-                                             /*.dump_dir=*/""};
+                                             /*.dump_dir=*/"",
+                                             /*.requirepass=*/""};
   }
 
   void TearDown() override {

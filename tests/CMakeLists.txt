@@ -102,6 +102,7 @@ target_link_libraries(http_server_test
   gtest_main
 )
 gtest_discover_tests(http_server_test
+  DISCOVERY_TIMEOUT 30
   PROPERTIES
     LABELS "http"
     RESOURCE_LOCK http_port_18081
@@ -307,6 +308,30 @@ target_link_libraries(hnsw_index_test
   gtest_main
 )
 gtest_discover_tests(hnsw_index_test)
+
+# Metadata filter tests
+add_executable(metadata_filter_test
+  vectors/metadata_filter_test.cpp
+)
+target_link_libraries(metadata_filter_test
+  nvecd_vectors
+  nvecd_utils
+  gtest
+  gtest_main
+)
+gtest_discover_tests(metadata_filter_test)
+
+# Metadata store tests
+add_executable(metadata_store_test
+  vectors/metadata_store_test.cpp
+)
+target_link_libraries(metadata_store_test
+  nvecd_vectors
+  nvecd_utils
+  gtest
+  gtest_main
+)
+gtest_discover_tests(metadata_store_test)
 
 # SIMD correctness tests
 add_executable(distance_simd_test

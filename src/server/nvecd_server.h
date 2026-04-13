@@ -27,6 +27,7 @@
 #include "similarity/similarity_engine.h"
 #include "utils/error.h"
 #include "utils/expected.h"
+#include "vectors/metadata_store.h"
 #include "vectors/vector_store.h"
 
 namespace nvecd::server {
@@ -158,6 +159,7 @@ class NvecdServer {
   std::unique_ptr<events::EventStore> event_store_;
   std::unique_ptr<events::CoOccurrenceIndex> co_index_;
   std::unique_ptr<vectors::VectorStore> vector_store_;
+  std::unique_ptr<vectors::MetadataStore> metadata_store_;
   std::unique_ptr<similarity::SimilarityEngine> similarity_engine_;
   std::unique_ptr<cache::SimilarityCache> cache_;
   std::unique_ptr<config::RuntimeVariableManager> variable_manager_;
@@ -167,6 +169,7 @@ class NvecdServer {
       nullptr,     // event_store
       nullptr,     // co_index
       nullptr,     // vector_store
+      nullptr,     // metadata_store
       nullptr,     // similarity_engine
       nullptr,     // cache
       nullptr,     // variable_manager
@@ -174,7 +177,8 @@ class NvecdServer {
       &config_,    // config
       loading_,    // loading
       read_only_,  // read_only
-      ""           // dump_dir - Will be initialized from config in InitializeComponents
+      "",          // dump_dir - Will be initialized from config in InitializeComponents
+      ""           // requirepass - Will be initialized from config in InitializeComponents
   };
 
   // Server components (owned)

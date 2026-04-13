@@ -26,6 +26,7 @@ class CoOccurrenceIndex;
 
 namespace vectors {
 class VectorStore;
+class MetadataStore;
 }  // namespace vectors
 
 namespace similarity {
@@ -158,6 +159,7 @@ struct HandlerContext {
   events::EventStore* event_store = nullptr;
   events::CoOccurrenceIndex* co_index = nullptr;
   vectors::VectorStore* vector_store = nullptr;
+  vectors::MetadataStore* metadata_store = nullptr;
   similarity::SimilarityEngine* similarity_engine = nullptr;
   std::atomic<cache::SimilarityCache*> cache{nullptr};
 

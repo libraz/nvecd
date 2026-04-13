@@ -23,10 +23,12 @@ namespace nvecd::similarity {
 
 SimilarityEngine::SimilarityEngine(events::EventStore* event_store, events::CoOccurrenceIndex* co_index,
                                    vectors::VectorStore* vector_store, const config::SimilarityConfig& config,
-                                   const config::VectorsConfig& vectors_config)
+                                   const config::VectorsConfig& vectors_config,
+                                   vectors::MetadataStore* metadata_store)
     : event_store_(event_store),
       co_index_(co_index),
       vector_store_(vector_store),
+      metadata_store_(metadata_store),
       config_(config),
       distance_func_(SelectDistanceFunction(vectors_config.distance_metric)),
       use_prenorm_(vectors_config.distance_metric.empty() || vectors_config.distance_metric == "cosine") {
@@ -133,7 +135,7 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
 // ============================================================================
 
 utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::SearchByIdVectors(
-    const std::string& item_id, int top_k) {
+    const std::string& item_id, int top_k, const vectors::MetadataFilter& filter) {
   auto validated_top_k = ValidateTopK(top_k);
   if (!validated_top_k) {
     return utils::MakeUnexpected(validated_top_k.error());
@@ -155,10 +157,16 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
   const float* query_ptr = snap.matrix + query_idx * snap.dim;
   float query_norm = snap.norms[query_idx];
 
+  // Oversampling factor for post-filter: fetch more candidates then filter
+  bool has_filter = !filter.Empty() && metadata_store_ != nullptr;
+  constexpr int kOversamplingFactor = 3;
+  int fetch_k = has_filter ? validated_top_k.value() * kOversamplingFactor
+                           : validated_top_k.value();
+
   // ANN accelerated path (HNSW or IVF)
   if (ann_index_ && IsAnnIndexReady()) {
     auto ann_results = ann_index_->Search(
-        query_ptr, static_cast<uint32_t>(validated_top_k.value()) + 1);
+        query_ptr, static_cast<uint32_t>(fetch_k) + 1);
 
     std::vector<SimilarityResult> results;
     results.reserve(ann_results.size());
@@ -167,6 +175,9 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
         continue;  // Exclude self
       }
       if (vector_store_->IsDeleted(compact_idx)) {
+        continue;
+      }
+      if (has_filter && !metadata_store_->Matches(compact_idx, filter)) {
         continue;
       }
       results.emplace_back((*snap.idx_to_id)[compact_idx], score);
@@ -196,6 +207,10 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
       return;
     }
     if (vector_store_->IsDeleted(idx)) {
+      return;
+    }
+    if (has_filter &&
+        !metadata_store_->Matches(static_cast<uint32_t>(idx), filter)) {
       return;
     }
     float score;
@@ -251,7 +266,8 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
 // ============================================================================
 
 utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::SearchByIdFusion(
-    const std::string& item_id, int top_k, std::optional<bool> adaptive) {
+    const std::string& item_id, int top_k, std::optional<bool> adaptive,
+    const vectors::MetadataFilter& filter) {
   auto validated_top_k = ValidateTopK(top_k);
   if (!validated_top_k) {
     return utils::MakeUnexpected(validated_top_k.error());
@@ -285,7 +301,7 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
     vector_results = SearchByIdVectorsFiltered(item_id, candidate_ids, fetch_k);
   } else {
     // Not enough event candidates, fall back to full vector scan
-    vector_results = SearchByIdVectors(item_id, fetch_k);
+    vector_results = SearchByIdVectors(item_id, fetch_k, filter);
   }
 
   // If both failed, return error
@@ -348,7 +364,8 @@ std::pair<float, float> SimilarityEngine::ComputeAdaptiveWeights(size_t neighbor
 // ============================================================================
 
 utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::SearchByVector(
-    const std::vector<float>& query_vector, int top_k) {
+    const std::vector<float>& query_vector, int top_k,
+    const vectors::MetadataFilter& filter) {
   auto validated_top_k = ValidateTopK(top_k);
   if (!validated_top_k) {
     return utils::MakeUnexpected(validated_top_k.error());
@@ -376,10 +393,15 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
   // Compute query norm using SIMD
   float query_norm = vectors::simd::GetOptimalImpl().l2_norm(query_vector.data(), query_vector.size());
 
+  bool has_filter = !filter.Empty() && metadata_store_ != nullptr;
+  constexpr int kOversamplingFactor = 3;
+  int fetch_k = has_filter ? validated_top_k.value() * kOversamplingFactor
+                           : validated_top_k.value();
+
   // ANN accelerated path (HNSW or IVF)
   if (ann_index_ && IsAnnIndexReady()) {
     auto ann_results = ann_index_->Search(
-        query_vector.data(), static_cast<uint32_t>(validated_top_k.value()));
+        query_vector.data(), static_cast<uint32_t>(fetch_k));
 
     std::vector<SimilarityResult> results;
     results.reserve(ann_results.size());
@@ -387,7 +409,13 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
       if (vector_store_->IsDeleted(compact_idx)) {
         continue;
       }
+      if (has_filter && !metadata_store_->Matches(compact_idx, filter)) {
+        continue;
+      }
       results.emplace_back((*snap.idx_to_id)[compact_idx], score);
+      if (static_cast<int>(results.size()) >= validated_top_k.value()) {
+        break;
+      }
     }
     std::sort(results.begin(), results.end());
     return results;
@@ -402,6 +430,10 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
   // Lambda to push a candidate into the min-heap
   auto push_candidate = [&](size_t idx) {
     if (vector_store_->IsDeleted(idx)) {
+      return;
+    }
+    if (has_filter &&
+        !metadata_store_->Matches(static_cast<uint32_t>(idx), filter)) {
       return;
     }
     float score;
