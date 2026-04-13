@@ -505,6 +505,83 @@ TEST_F(TieredVectorStoreTest, ConcurrentSearches) {
   EXPECT_GT(total_results.load(), 0);
 }
 
+TEST_F(TieredVectorStoreTest, ConcurrentAddDeleteSearch) {
+  constexpr int kWriters = 2;
+  constexpr int kReaders = 4;
+  constexpr int kOpsPerWriter = 50;
+  constexpr int kSearchesPerReader = 50;
+  std::atomic<bool> stop{false};
+  std::atomic<int> search_results{0};
+
+  // Pre-populate
+  std::mt19937 rng(42);
+  for (int i = 0; i < 20; ++i) {
+    store_->Add("pre_" + std::to_string(i), MakeRandomVector(kDim, rng));
+  }
+
+  // Writer threads: add and delete
+  std::vector<std::thread> threads;
+  for (int w = 0; w < kWriters; ++w) {
+    threads.emplace_back([&, w] {
+      std::mt19937 local_rng(w * 1000);
+      for (int i = 0; i < kOpsPerWriter; ++i) {
+        std::string id = "w" + std::to_string(w) + "_" + std::to_string(i);
+        store_->Add(id, MakeRandomVector(kDim, local_rng));
+        if (i % 3 == 0) {
+          store_->Delete(id);
+        }
+      }
+    });
+  }
+
+  // Reader threads: search concurrently
+  for (int r = 0; r < kReaders; ++r) {
+    threads.emplace_back([&, r] {
+      std::mt19937 local_rng(r * 2000);
+      for (int i = 0; i < kSearchesPerReader && !stop.load(); ++i) {
+        auto q = MakeRandomVector(kDim, local_rng);
+        auto results = store_->Search(q.data(), 5);
+        search_results.fetch_add(static_cast<int>(results.size()));
+      }
+    });
+  }
+
+  for (auto& th : threads) {
+    th.join();
+  }
+
+  EXPECT_GT(search_results.load(), 0);
+}
+
+TEST_F(TieredVectorStoreTest, UpdateSameIdRapidly) {
+  constexpr int kThreads = 4;
+  constexpr int kUpdatesPerThread = 50;
+
+  std::vector<std::thread> threads;
+  for (int t = 0; t < kThreads; ++t) {
+    threads.emplace_back([&, t] {
+      std::mt19937 local_rng(t * 100);
+      for (int i = 0; i < kUpdatesPerThread; ++i) {
+        store_->Update("shared_id", MakeRandomVector(kDim, local_rng));
+      }
+    });
+  }
+
+  for (auto& th : threads) {
+    th.join();
+  }
+
+  // The vector should exist and be searchable
+  auto query = MakeAxisVector(kDim, 0);
+  auto results = store_->Search(query.data(), 5);
+  // At least our shared_id should be findable
+  bool found = false;
+  for (const auto& [id, score] : results) {
+    if (id == "shared_id") found = true;
+  }
+  EXPECT_TRUE(found);
+}
+
 // ============================================================================
 // MergeScheduler
 // ============================================================================

@@ -609,5 +609,84 @@ TEST_F(WalTest, InvalidMagicRejected) {
   EXPECT_EQ(wal.CurrentSequence(), 0U);
 }
 
+// --- Concurrent Append ---
+
+TEST_F(WalTest, ConcurrentAppend) {
+  WriteAheadLog wal;
+  ASSERT_TRUE(wal.Open(MakeConfig()));
+
+  constexpr int kThreads = 8;
+  constexpr int kAppendsPerThread = 100;
+  std::atomic<int> success_count{0};
+
+  std::vector<std::thread> threads;
+  for (int t = 0; t < kThreads; ++t) {
+    threads.emplace_back([&, t]() {
+      for (int i = 0; i < kAppendsPerThread; ++i) {
+        std::string p = "t" + std::to_string(t) + "_" + std::to_string(i);
+        auto result = wal.Append(WalOpType::kVecSet, p.data(),
+                                 static_cast<uint32_t>(p.size()));
+        if (result.has_value()) {
+          success_count++;
+        }
+      }
+    });
+  }
+
+  for (auto& t : threads) {
+    t.join();
+  }
+
+  EXPECT_EQ(success_count.load(), kThreads * kAppendsPerThread);
+  EXPECT_EQ(wal.CurrentSequence(),
+            static_cast<uint64_t>(kThreads * kAppendsPerThread));
+
+  // Verify all records can be replayed
+  uint64_t replayed = 0;
+  auto result = wal.Replay(1, [&](const WalRecord&) { ++replayed; });
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(*result, static_cast<uint64_t>(kThreads * kAppendsPerThread));
+}
+
+// --- Concurrent Append with Rotation ---
+
+TEST_F(WalTest, ConcurrentAppendWithRotation) {
+  auto config = MakeConfig(256);  // Small files to force rotation
+  WriteAheadLog wal;
+  ASSERT_TRUE(wal.Open(config));
+
+  constexpr int kThreads = 4;
+  constexpr int kAppendsPerThread = 50;
+  std::atomic<int> success_count{0};
+
+  std::vector<std::thread> threads;
+  for (int t = 0; t < kThreads; ++t) {
+    threads.emplace_back([&, t]() {
+      for (int i = 0; i < kAppendsPerThread; ++i) {
+        std::string p = "rotate_t" + std::to_string(t) + "_" + std::to_string(i);
+        auto result = wal.Append(WalOpType::kEventAdd, p.data(),
+                                 static_cast<uint32_t>(p.size()));
+        if (result.has_value()) {
+          success_count++;
+        }
+      }
+    });
+  }
+
+  for (auto& t : threads) {
+    t.join();
+  }
+
+  EXPECT_EQ(success_count.load(), kThreads * kAppendsPerThread);
+  wal.Close();
+
+  // Verify all replayed across rotated files
+  WriteAheadLog wal2;
+  ASSERT_TRUE(wal2.Open(config));
+  uint64_t replayed = 0;
+  wal2.Replay(1, [&](const WalRecord&) { ++replayed; });
+  EXPECT_EQ(replayed, static_cast<uint64_t>(kThreads * kAppendsPerThread));
+}
+
 }  // namespace
 }  // namespace nvecd::storage

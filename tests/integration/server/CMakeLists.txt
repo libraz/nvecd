@@ -211,6 +211,27 @@ gtest_discover_tests(tiktok_1m_scale_test
     LABELS integration
 )
 
+# API Extension End-to-End Tests
+
+add_executable(api_extension_e2e_test
+  api_extension_e2e_test.cpp
+)
+
+target_link_libraries(api_extension_e2e_test
+  nvecd_server
+  nvecd_storage
+  gtest_main
+)
+
+gtest_discover_tests(api_extension_e2e_test
+  DISCOVERY_MODE POST_BUILD
+  DISCOVERY_TIMEOUT 30
+  PROPERTIES
+    RESOURCE_LOCK server_port
+    TIMEOUT 300
+    LABELS integration
+)
+
 # Differentiation Features End-to-End Tests
 
 add_executable(differentiation_e2e_test
