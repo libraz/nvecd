@@ -172,6 +172,17 @@ target_link_libraries(rate_limiter_test
 )
 gtest_discover_tests(rate_limiter_test)
 
+add_executable(filter_parser_test
+  server/filter_parser_test.cpp
+)
+target_link_libraries(filter_parser_test
+  nvecd_server
+  nvecd_vectors
+  gtest
+  gtest_main
+)
+gtest_discover_tests(filter_parser_test)
+
 add_executable(request_dispatcher_test
   server/request_dispatcher_test.cpp
 )

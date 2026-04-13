@@ -21,6 +21,7 @@
 #include "server/handlers/debug_handler.h"
 #include "server/handlers/dump_handler.h"
 #include "server/handlers/info_handler.h"
+#include "server/filter_parser.h"
 #include "server/handlers/variable_handler.h"
 #include "server/request_dispatcher.h"
 #include "similarity/similarity_engine.h"
@@ -293,6 +294,17 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSim(const Co
     }
   }
 
+  // Parse filter expression if provided
+  vectors::MetadataFilter filter;
+  if (!cmd.filter_expr.empty()) {
+    auto filter_result = ParseSimpleFilter(cmd.filter_expr);
+    if (!filter_result) {
+      return utils::MakeUnexpected(filter_result.error());
+    }
+    filter = std::move(*filter_result);
+    cache_enabled = false;  // Disable cache for filtered queries
+  }
+
   auto start = std::chrono::steady_clock::now();
 
   // Select search method based on mode
@@ -300,9 +312,9 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSim(const Co
   if (cmd.mode == "events") {
     result = ctx_.similarity_engine->SearchByIdEvents(cmd.id, cmd.top_k);
   } else if (cmd.mode == "vectors") {
-    result = ctx_.similarity_engine->SearchByIdVectors(cmd.id, cmd.top_k);
+    result = ctx_.similarity_engine->SearchByIdVectors(cmd.id, cmd.top_k, filter);
   } else {  // fusion (default)
-    result = ctx_.similarity_engine->SearchByIdFusion(cmd.id, cmd.top_k, cmd.adaptive);
+    result = ctx_.similarity_engine->SearchByIdFusion(cmd.id, cmd.top_k, cmd.adaptive, filter);
   }
 
   if (!result) {
@@ -325,11 +337,13 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSim(const Co
     cache_ptr->RegisterResultItems(cache_key, item_ids);
   }
 
-  // Convert SimilarityResult to pair<string, float>
+  // Apply min_score filter and convert to pair<string, float>
   std::vector<std::pair<std::string, float>> pairs;
   pairs.reserve(result->size());
   for (const auto& item : *result) {
-    pairs.emplace_back(item.item_id, item.score);
+    if (item.score >= cmd.min_score) {
+      pairs.emplace_back(item.item_id, item.score);
+    }
   }
 
   return FormatSimResults(pairs, static_cast<int>(pairs.size()));
@@ -367,9 +381,20 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSimv(const C
     }
   }
 
+  // Parse filter expression if provided
+  vectors::MetadataFilter filter;
+  if (!cmd.filter_expr.empty()) {
+    auto filter_result = ParseSimpleFilter(cmd.filter_expr);
+    if (!filter_result) {
+      return utils::MakeUnexpected(filter_result.error());
+    }
+    filter = std::move(*filter_result);
+    cache_enabled = false;
+  }
+
   auto start = std::chrono::steady_clock::now();
 
-  auto result = ctx_.similarity_engine->SearchByVector(cmd.vector, cmd.top_k);
+  auto result = ctx_.similarity_engine->SearchByVector(cmd.vector, cmd.top_k, filter);
   if (!result) {
     return utils::MakeUnexpected(result.error());
   }
@@ -389,11 +414,13 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSimv(const C
     cache_ptr->RegisterResultItems(cache_key, item_ids);
   }
 
-  // Convert SimilarityResult to pair<string, float>
+  // Apply min_score filter and convert to pair<string, float>
   std::vector<std::pair<std::string, float>> pairs;
   pairs.reserve(result->size());
   for (const auto& item : *result) {
-    pairs.emplace_back(item.item_id, item.score);
+    if (item.score >= cmd.min_score) {
+      pairs.emplace_back(item.item_id, item.score);
+    }
   }
 
   return FormatSimResults(pairs, static_cast<int>(pairs.size()));

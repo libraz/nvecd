@@ -18,9 +18,13 @@ namespace nvecd::server {
 
 namespace {
 
-constexpr size_t kUsingPrefixLength = 6;      // Length of "using=" prefix
-constexpr size_t kTimestampPrefixLength = 10;  // Length of "timestamp=" prefix
-constexpr size_t kAdaptivePrefixLength = 9;    // Length of "adaptive=" prefix
+constexpr size_t kUsingPrefixLength = 6;           // Length of "using=" prefix
+constexpr size_t kTimestampPrefixLength = 10;      // Length of "timestamp=" prefix
+constexpr size_t kAdaptivePrefixLength = 9;        // Length of "adaptive=" prefix
+constexpr size_t kFilterPrefixLength = 7;          // Length of "filter=" prefix
+constexpr size_t kMinScorePrefixLength = 10;       // Length of "min_score=" prefix
+constexpr size_t kCandidateLimitPrefixLength = 16; // Length of "candidate_limit=" prefix
+constexpr size_t kExplainPrefixLength = 8;         // Length of "explain=" prefix
 
 /**
  * @brief Split string_view by delimiter, returning owned strings
@@ -285,7 +289,7 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request) 
     }
     cmd.top_k = *top_k_result;
 
-    // Parse optional options (using=mode, adaptive=on|off)
+    // Parse optional options
     for (size_t i = 3; i < tokens.size(); ++i) {
       if (tokens[i].rfind("using=", 0) == 0) {
         cmd.mode = tokens[i].substr(kUsingPrefixLength);
@@ -299,6 +303,30 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request) 
           return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandSyntaxError,
                                                         "Invalid adaptive value: " + val + " (must be on or off)"));
         }
+      } else if (tokens[i].rfind("filter=", 0) == 0) {
+        cmd.filter_expr = tokens[i].substr(kFilterPrefixLength);
+      } else if (tokens[i].rfind("min_score=", 0) == 0) {
+        auto val = ParseFloat(tokens[i].substr(kMinScorePrefixLength));
+        if (!val) {
+          return utils::MakeUnexpected(val.error());
+        }
+        cmd.min_score = *val;
+      } else if (tokens[i].rfind("candidate_limit=", 0) == 0) {
+        auto val = ParseInt(tokens[i].substr(kCandidateLimitPrefixLength));
+        if (!val) {
+          return utils::MakeUnexpected(val.error());
+        }
+        cmd.candidate_limit = static_cast<uint32_t>(*val);
+      } else if (tokens[i].rfind("explain=", 0) == 0) {
+        std::string val = tokens[i].substr(kExplainPrefixLength);
+        if (val == "on") {
+          cmd.explain = true;
+        } else if (val == "off") {
+          cmd.explain = false;
+        } else {
+          return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandSyntaxError,
+                                                        "Invalid explain value: " + val + " (must be on or off)"));
+        }
       } else {
         return utils::MakeUnexpected(
             utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "Invalid SIM option: " + tokens[i]));
@@ -306,7 +334,7 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request) 
     }
 
   } else if (cmd_name == "SIMV") {
-    // SIMV <top_k> <f1> <f2> ... <fN>
+    // SIMV <top_k> [filter=...] [min_score=...] [candidate_limit=...] [explain=on|off] <f1> <f2> ... <fN>
     if (tokens.size() < 3) {
       return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandSyntaxError,
                                                     "SIMV requires at least 2 arguments: <top_k> <floats>"));
@@ -319,10 +347,45 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request) 
     }
     cmd.top_k = *top_k_result;
 
+    // Parse optional options (tokens containing '=') then vector floats
+    size_t vec_start = 2;
+    for (size_t i = 2; i < tokens.size(); ++i) {
+      if (tokens[i].find('=') == std::string::npos) {
+        vec_start = i;
+        break;
+      }
+      if (tokens[i].rfind("filter=", 0) == 0) {
+        cmd.filter_expr = tokens[i].substr(kFilterPrefixLength);
+      } else if (tokens[i].rfind("min_score=", 0) == 0) {
+        auto val = ParseFloat(tokens[i].substr(kMinScorePrefixLength));
+        if (!val) {
+          return utils::MakeUnexpected(val.error());
+        }
+        cmd.min_score = *val;
+      } else if (tokens[i].rfind("candidate_limit=", 0) == 0) {
+        auto val = ParseInt(tokens[i].substr(kCandidateLimitPrefixLength));
+        if (!val) {
+          return utils::MakeUnexpected(val.error());
+        }
+        cmd.candidate_limit = static_cast<uint32_t>(*val);
+      } else if (tokens[i].rfind("explain=", 0) == 0) {
+        std::string val = tokens[i].substr(kExplainPrefixLength);
+        if (val == "on") {
+          cmd.explain = true;
+        } else if (val == "off") {
+          cmd.explain = false;
+        }
+      } else {
+        return utils::MakeUnexpected(
+            utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "Invalid SIMV option: " + tokens[i]));
+      }
+      vec_start = i + 1;
+    }
+
     // Parse vector from remaining tokens
     std::vector<float> vec;
-    vec.reserve(tokens.size() - 2);
-    for (size_t i = 2; i < tokens.size(); ++i) {
+    vec.reserve(tokens.size() - vec_start);
+    for (size_t i = vec_start; i < tokens.size(); ++i) {
       auto val_result = ParseFloat(tokens[i]);
       if (!val_result) {
         return utils::MakeUnexpected(val_result.error());

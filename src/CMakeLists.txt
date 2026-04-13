@@ -29,6 +29,7 @@ add_library(nvecd_server STATIC
   server/handlers/variable_handler.cpp
   server/handlers/cache_handler.cpp
   server/handlers/dump_handler.cpp
+  server/filter_parser.cpp
   server/rate_limiter.cpp
   server/request_dispatcher.cpp
   server/snapshot_scheduler.cpp
