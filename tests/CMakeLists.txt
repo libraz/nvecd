@@ -286,6 +286,15 @@ target_link_libraries(co_occurrence_negative_test
 )
 gtest_discover_tests(co_occurrence_negative_test)
 
+add_executable(co_occurrence_pruning_test
+  events/co_occurrence_pruning_test.cpp
+)
+target_link_libraries(co_occurrence_pruning_test
+  nvecd_events
+  gtest_main
+)
+gtest_discover_tests(co_occurrence_pruning_test)
+
 # Vectors tests
 add_executable(vector_store_test
   vectors/vector_store_test.cpp
@@ -471,6 +480,18 @@ target_link_libraries(cache_key_generator_test
   gtest_main
 )
 gtest_discover_tests(cache_key_generator_test)
+
+add_executable(cache_policy_test
+  cache/cache_policy_test.cpp
+)
+target_link_libraries(cache_policy_test
+  nvecd_cache
+  nvecd_similarity
+  nvecd_utils
+  gtest
+  gtest_main
+)
+gtest_discover_tests(cache_policy_test)
 
 add_executable(md5_test
   cache/md5_test.cpp

@@ -23,7 +23,12 @@ constexpr size_t kSerializedResultSize = 256 + sizeof(float);
 }  // namespace
 
 SimilarityCache::SimilarityCache(size_t max_memory_bytes, double min_query_cost_ms, int ttl_seconds)
-    : max_memory_bytes_(max_memory_bytes), min_query_cost_ms_(min_query_cost_ms), ttl_seconds_(ttl_seconds) {}
+    : max_memory_bytes_(max_memory_bytes), min_query_cost_ms_(min_query_cost_ms), ttl_seconds_(ttl_seconds) {
+  // Default policies: item_search enabled, vector_search disabled, filtered_search enabled with 60s TTL
+  policies_[static_cast<size_t>(SearchType::kItemSearch)] = {true, 0};
+  policies_[static_cast<size_t>(SearchType::kVectorSearch)] = {false, 0};
+  policies_[static_cast<size_t>(SearchType::kFilteredSearch)] = {true, 60};
+}
 
 std::optional<std::vector<similarity::SimilarityResult>> SimilarityCache::Lookup(const CacheKey& key) {
   if (!enabled_.load(std::memory_order_relaxed)) {
@@ -484,6 +489,66 @@ bool SimilarityCache::EvictForSpace(size_t required_bytes) {
 
   // Check if enough space was freed
   return total_memory_bytes_ + required_bytes <= max_memory_bytes_;
+}
+
+std::optional<std::vector<similarity::SimilarityResult>> SimilarityCache::Lookup(const CacheKey& key,
+                                                                                SearchType search_type) {
+  auto idx = static_cast<size_t>(search_type);
+
+  // Check per-type policy
+  {
+    std::lock_guard<std::mutex> lock(policy_mutex_);
+    if (!policies_[idx].enabled) {
+      return std::nullopt;
+    }
+  }
+
+  stats_.per_type_queries[idx]++;
+
+  // Save current TTL, apply per-type override if set
+  int original_ttl = ttl_seconds_.load(std::memory_order_relaxed);
+  {
+    std::lock_guard<std::mutex> lock(policy_mutex_);
+    if (policies_[idx].ttl_seconds > 0) {
+      ttl_seconds_.store(policies_[idx].ttl_seconds, std::memory_order_relaxed);
+    }
+  }
+
+  auto result = Lookup(key);
+
+  // Restore original TTL
+  ttl_seconds_.store(original_ttl, std::memory_order_relaxed);
+
+  if (result.has_value()) {
+    stats_.per_type_hits[idx]++;
+  }
+
+  return result;
+}
+
+bool SimilarityCache::Insert(const CacheKey& key, const std::vector<similarity::SimilarityResult>& results,
+                             double query_cost_ms, SearchType search_type) {
+  auto idx = static_cast<size_t>(search_type);
+
+  // Check per-type policy
+  {
+    std::lock_guard<std::mutex> lock(policy_mutex_);
+    if (!policies_[idx].enabled) {
+      return false;
+    }
+  }
+
+  return Insert(key, results, query_cost_ms);
+}
+
+void SimilarityCache::SetSearchTypePolicy(SearchType search_type, const CachePolicy& policy) {
+  std::lock_guard<std::mutex> lock(policy_mutex_);
+  policies_[static_cast<size_t>(search_type)] = policy;
+}
+
+CachePolicy SimilarityCache::GetSearchTypePolicy(SearchType search_type) const {
+  std::lock_guard<std::mutex> lock(policy_mutex_);
+  return policies_[static_cast<size_t>(search_type)];
 }
 
 void SimilarityCache::Touch(const CacheKey& key) {

@@ -59,9 +59,24 @@ struct CoOccurrenceIndexStatistics {
 class CoOccurrenceIndex {
  public:
   /**
-   * @brief Construct empty co-occurrence index
+   * @brief Configuration for pruning behavior
+   */
+  struct Config {
+    uint32_t max_neighbors_per_item = 0;  ///< Max neighbors per item (0 = unlimited)
+    float min_support = 0.0F;              ///< Min score threshold (0 = no pruning)
+    uint32_t negative_max_propagation = 1; ///< Max hops for negative signal (0 = disabled)
+  };
+
+  /**
+   * @brief Construct empty co-occurrence index with default config
    */
   CoOccurrenceIndex() = default;
+
+  /**
+   * @brief Construct co-occurrence index with pruning config
+   * @param config Pruning configuration
+   */
+  explicit CoOccurrenceIndex(const Config& config);
 
   /**
    * @brief Update co-occurrence scores from events
@@ -169,6 +184,14 @@ class CoOccurrenceIndex {
   void SetScore(const std::string& item1, const std::string& item2, float score);
 
   /**
+   * @brief Prune the entire index based on config settings
+   *
+   * Removes entries below min_support and trims neighbors exceeding
+   * max_neighbors_per_item. Acquires write lock internally.
+   */
+  void Prune();
+
+  /**
    * @brief Clear all co-occurrence data
    */
   void Clear();
@@ -203,10 +226,14 @@ class CoOccurrenceIndex {
   mutable std::shared_mutex mutex_;
   std::unordered_map<std::string, std::unordered_map<std::string, float>> co_scores_;
   std::atomic<uint64_t> generation_{0};  ///< Generation counter for cache invalidation
+  Config config_;                         ///< Pruning configuration
 
   /// @brief Internal implementation of UpdateFromEvents (no locking)
   void UpdateFromEventsInternal(const std::string& ctx, const std::vector<Event>& events,
                                 bool temporal_enabled, double half_life_sec);
+
+  /// @brief Prune a single item's neighbor list (caller must hold write lock)
+  void PruneItemLocked(const std::string& item_id);
 };
 
 }  // namespace nvecd::events

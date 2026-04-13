@@ -11,6 +11,8 @@
 
 namespace nvecd::events {
 
+CoOccurrenceIndex::CoOccurrenceIndex(const Config& config) : config_(config) {}
+
 void CoOccurrenceIndex::UpdateFromEvents(const std::string& ctx, const std::vector<Event>& events) {
   if (events.empty()) {
     return;
@@ -83,11 +85,27 @@ void CoOccurrenceIndex::UpdateFromEventsInternal(const std::string& ctx [[maybe_
   }
 
   generation_.fetch_add(1, std::memory_order_release);
+
+  // Prune affected items if max_neighbors is configured
+  if (config_.max_neighbors_per_item > 0) {
+    for (size_t i = 0; i < events.size(); ++i) {
+      auto it = co_scores_.find(events[i].item_id);
+      if (it != co_scores_.end() &&
+          it->second.size() > config_.max_neighbors_per_item) {
+        PruneItemLocked(events[i].item_id);
+      }
+    }
+  }
 }
 
 void CoOccurrenceIndex::ApplyNegativeSignalLocked(const std::string& removed_id,
                                                    const std::vector<Event>& context_events,
                                                    double negative_weight) {
+  // Skip if negative signal propagation is disabled
+  if (config_.negative_max_propagation == 0) {
+    return;
+  }
+
   for (const auto& event : context_events) {
     if (event.item_id == removed_id) {
       continue;
@@ -169,12 +187,14 @@ void CoOccurrenceIndex::ApplyDecay(double alpha) {
   std::unique_lock lock(mutex_);
 
   constexpr float kDecayThreshold = 1e-6F;
+  float threshold =
+      (config_.min_support > 0.0F) ? config_.min_support : kDecayThreshold;
 
   for (auto outer_it = co_scores_.begin(); outer_it != co_scores_.end();) {
     auto& scores_map = outer_it->second;
     for (auto inner_it = scores_map.begin(); inner_it != scores_map.end();) {
       inner_it->second *= static_cast<float>(alpha);
-      if (std::abs(inner_it->second) < kDecayThreshold) {
+      if (std::abs(inner_it->second) < threshold) {
         inner_it = scores_map.erase(inner_it);
       } else {
         ++inner_it;
@@ -215,6 +235,82 @@ void CoOccurrenceIndex::SetScore(const std::string& item1, const std::string& it
   co_scores_[item1][item2] = score;
   co_scores_[item2][item1] = score;
   generation_.fetch_add(1, std::memory_order_release);
+}
+
+void CoOccurrenceIndex::Prune() {
+  std::unique_lock lock(mutex_);
+
+  // Collect item IDs first (iteration will modify the map)
+  std::vector<std::string> items;
+  items.reserve(co_scores_.size());
+  for (const auto& [id, _] : co_scores_) {
+    items.push_back(id);
+  }
+
+  for (const auto& id : items) {
+    PruneItemLocked(id);
+  }
+
+  generation_.fetch_add(1, std::memory_order_release);
+}
+
+void CoOccurrenceIndex::PruneItemLocked(const std::string& item_id) {
+  auto it = co_scores_.find(item_id);
+  if (it == co_scores_.end()) {
+    return;
+  }
+
+  auto& neighbors = it->second;
+
+  // Remove entries below min_support
+  if (config_.min_support > 0.0F) {
+    for (auto nit = neighbors.begin(); nit != neighbors.end();) {
+      if (std::abs(nit->second) < config_.min_support) {
+        // Also remove reverse entry
+        auto rev_it = co_scores_.find(nit->first);
+        if (rev_it != co_scores_.end()) {
+          rev_it->second.erase(item_id);
+          if (rev_it->second.empty()) {
+            co_scores_.erase(rev_it);
+          }
+        }
+        nit = neighbors.erase(nit);
+      } else {
+        ++nit;
+      }
+    }
+  }
+
+  // Trim to max_neighbors if needed
+  if (config_.max_neighbors_per_item > 0 &&
+      neighbors.size() > config_.max_neighbors_per_item) {
+    // Collect into vector, sort by absolute score descending, keep top-K
+    std::vector<std::pair<std::string, float>> sorted_neighbors(
+        neighbors.begin(), neighbors.end());
+    std::sort(sorted_neighbors.begin(), sorted_neighbors.end(),
+              [](const auto& a, const auto& b) {
+                return std::abs(a.second) > std::abs(b.second);
+              });
+
+    // Remove entries beyond max_neighbors
+    for (size_t i = config_.max_neighbors_per_item;
+         i < sorted_neighbors.size(); ++i) {
+      const auto& removed_id = sorted_neighbors[i].first;
+      neighbors.erase(removed_id);
+      // Also remove reverse entry
+      auto rev_it = co_scores_.find(removed_id);
+      if (rev_it != co_scores_.end()) {
+        rev_it->second.erase(item_id);
+        if (rev_it->second.empty()) {
+          co_scores_.erase(rev_it);
+        }
+      }
+    }
+  }
+
+  if (neighbors.empty()) {
+    co_scores_.erase(it);
+  }
 }
 
 void CoOccurrenceIndex::Clear() {

@@ -29,6 +29,26 @@
 namespace nvecd::cache {
 
 /**
+ * @brief Search type for per-type cache policies
+ */
+enum class SearchType : uint8_t {
+  kItemSearch = 0,      ///< SIM item_id (events/vectors/fusion)
+  kVectorSearch = 1,    ///< SIMV query_vector
+  kFilteredSearch = 2,  ///< Any search with filter= parameter
+};
+
+/// Number of search types
+static constexpr size_t kSearchTypeCount = 3;
+
+/**
+ * @brief Per-search-type cache policy
+ */
+struct CachePolicy {
+  bool enabled = true;     ///< Whether caching is enabled for this type
+  int ttl_seconds = 0;     ///< TTL override (0 = use global TTL)
+};
+
+/**
  * @brief Cache statistics snapshot (copyable)
  *
  * Snapshot of cache statistics for reporting.
@@ -52,6 +72,14 @@ struct CacheStatisticsSnapshot {
   double total_cache_hit_time_ms = 0.0;
   double total_cache_miss_time_ms = 0.0;
   double total_query_saved_time_ms = 0.0;
+
+  // Per-search-type statistics
+  uint64_t item_search_queries = 0;
+  uint64_t item_search_hits = 0;
+  uint64_t vector_search_queries = 0;
+  uint64_t vector_search_hits = 0;
+  uint64_t filtered_search_queries = 0;
+  uint64_t filtered_search_hits = 0;
 
   /**
    * @brief Calculate cache hit rate
@@ -98,6 +126,10 @@ struct CacheStatistics {
   std::atomic<uint64_t> ttl_expirations{0};
   std::atomic<uint64_t> decompression_failures{0};
 
+  // Per-search-type statistics
+  std::atomic<uint64_t> per_type_queries[kSearchTypeCount]{};
+  std::atomic<uint64_t> per_type_hits[kSearchTypeCount]{};
+
   // Timing statistics (protected by mutex)
   mutable std::mutex timing_mutex_;
   double total_cache_hit_time_ms{0.0};
@@ -140,6 +172,15 @@ class SimilarityCache {
   [[nodiscard]] std::optional<std::vector<similarity::SimilarityResult>> Lookup(const CacheKey& key);
 
   /**
+   * @brief Lookup cache entry with search type policy check
+   * @param key Cache key
+   * @param search_type Type of search for policy routing
+   * @return Cached results if policy allows and entry found, nullopt otherwise
+   */
+  [[nodiscard]] std::optional<std::vector<similarity::SimilarityResult>> Lookup(const CacheKey& key,
+                                                                                SearchType search_type);
+
+  /**
    * @brief Insert cache entry
    * @param key Cache key
    * @param results Search results to cache
@@ -147,6 +188,31 @@ class SimilarityCache {
    * @return true if inserted, false if not cached (below threshold or eviction failure)
    */
   bool Insert(const CacheKey& key, const std::vector<similarity::SimilarityResult>& results, double query_cost_ms);
+
+  /**
+   * @brief Insert cache entry with search type policy check
+   * @param key Cache key
+   * @param results Search results to cache
+   * @param query_cost_ms Query execution time
+   * @param search_type Type of search for policy routing
+   * @return true if inserted, false if policy disables caching for this type
+   */
+  bool Insert(const CacheKey& key, const std::vector<similarity::SimilarityResult>& results, double query_cost_ms,
+              SearchType search_type);
+
+  /**
+   * @brief Set cache policy for a search type
+   * @param search_type Search type
+   * @param policy Cache policy
+   */
+  void SetSearchTypePolicy(SearchType search_type, const CachePolicy& policy);
+
+  /**
+   * @brief Get cache policy for a search type
+   * @param search_type Search type
+   * @return Current policy
+   */
+  [[nodiscard]] CachePolicy GetSearchTypePolicy(SearchType search_type) const;
 
   /**
    * @brief Mark cache entry as invalidated (immediate invalidation)
@@ -264,6 +330,13 @@ class SimilarityCache {
       snapshot.total_cache_miss_time_ms = stats_.total_cache_miss_time_ms;
       snapshot.total_query_saved_time_ms = stats_.total_query_saved_time_ms;
     }
+    // Per-type stats
+    snapshot.item_search_queries = stats_.per_type_queries[0].load();
+    snapshot.item_search_hits = stats_.per_type_hits[0].load();
+    snapshot.vector_search_queries = stats_.per_type_queries[1].load();
+    snapshot.vector_search_hits = stats_.per_type_hits[1].load();
+    snapshot.filtered_search_queries = stats_.per_type_queries[2].load();
+    snapshot.filtered_search_hits = stats_.per_type_hits[2].load();
     return snapshot;
   }
 
@@ -338,6 +411,10 @@ class SimilarityCache {
 
   /// Maximum item IDs tracked per cache entry for reverse index
   static constexpr size_t kMaxTrackedItemsPerEntry = 50;
+
+  // Per-search-type policies
+  mutable std::mutex policy_mutex_;
+  CachePolicy policies_[kSearchTypeCount];
 
   // Memory tracking
   size_t total_memory_bytes_ = 0;

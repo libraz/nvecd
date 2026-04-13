@@ -278,21 +278,7 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSim(const Co
   auto* cache_ptr = ctx_.cache.load(std::memory_order_acquire);
   cache::CacheKey cache_key;
   bool cache_enabled = (cache_ptr != nullptr && cache_ptr->IsEnabled());
-  if (cache_enabled) {
-    auto gen = ctx_.co_index != nullptr ? ctx_.co_index->GetGeneration() : 0;
-    std::string key_str = "SIM:" + cmd.id + ":" + std::to_string(cmd.top_k) + ":" + cmd.mode +
-                           ":g" + std::to_string(gen);
-    cache_key = cache::CacheKeyGenerator::Generate(key_str);
-    auto cached = cache_ptr->Lookup(cache_key);
-    if (cached.has_value()) {
-      std::vector<std::pair<std::string, float>> pairs;
-      pairs.reserve(cached->size());
-      for (const auto& item : *cached) {
-        pairs.emplace_back(item.item_id, item.score);
-      }
-      return FormatSimResults(pairs, static_cast<int>(pairs.size()));
-    }
-  }
+  auto search_type = cache::SearchType::kItemSearch;
 
   // Parse filter expression if provided
   vectors::MetadataFilter filter;
@@ -302,7 +288,26 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSim(const Co
       return utils::MakeUnexpected(filter_result.error());
     }
     filter = std::move(*filter_result);
-    cache_enabled = false;  // Disable cache for filtered queries
+    search_type = cache::SearchType::kFilteredSearch;
+  }
+
+  if (cache_enabled) {
+    auto gen = ctx_.co_index != nullptr ? ctx_.co_index->GetGeneration() : 0;
+    std::string key_str = "SIM:" + cmd.id + ":" + std::to_string(cmd.top_k) + ":" + cmd.mode +
+                           ":g" + std::to_string(gen);
+    if (!cmd.filter_expr.empty()) {
+      key_str += ":f" + cmd.filter_expr;
+    }
+    cache_key = cache::CacheKeyGenerator::Generate(key_str);
+    auto cached = cache_ptr->Lookup(cache_key, search_type);
+    if (cached.has_value()) {
+      std::vector<std::pair<std::string, float>> pairs;
+      pairs.reserve(cached->size());
+      for (const auto& item : *cached) {
+        pairs.emplace_back(item.item_id, item.score);
+      }
+      return FormatSimResults(pairs, static_cast<int>(pairs.size()));
+    }
   }
 
   auto start = std::chrono::steady_clock::now();
@@ -325,7 +330,7 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSim(const Co
   if (cache_enabled) {
     auto elapsed = std::chrono::steady_clock::now() - start;
     double elapsed_ms = std::chrono::duration<double, std::milli>(elapsed).count();
-    cache_ptr->Insert(cache_key, *result, elapsed_ms);
+    cache_ptr->Insert(cache_key, *result, elapsed_ms, search_type);
 
     // Register result items for selective cache invalidation
     std::vector<std::string> item_ids;
@@ -361,25 +366,7 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSimv(const C
   auto* cache_ptr = ctx_.cache.load(std::memory_order_acquire);
   cache::CacheKey cache_key;
   bool cache_enabled = (cache_ptr != nullptr && cache_ptr->IsEnabled());
-  if (cache_enabled) {
-    // Build cache key from vector hash: first few floats + size
-    std::string vec_hash;
-    for (size_t i = 0; i < std::min(cmd.vector.size(), static_cast<size_t>(4)); ++i) {
-      vec_hash += std::to_string(cmd.vector[i]) + ",";
-    }
-    vec_hash += std::to_string(cmd.vector.size());
-    std::string key_str = "SIMV:" + vec_hash + ":" + std::to_string(cmd.top_k);
-    cache_key = cache::CacheKeyGenerator::Generate(key_str);
-    auto cached = cache_ptr->Lookup(cache_key);
-    if (cached.has_value()) {
-      std::vector<std::pair<std::string, float>> pairs;
-      pairs.reserve(cached->size());
-      for (const auto& item : *cached) {
-        pairs.emplace_back(item.item_id, item.score);
-      }
-      return FormatSimResults(pairs, static_cast<int>(pairs.size()));
-    }
-  }
+  auto search_type = cache::SearchType::kVectorSearch;
 
   // Parse filter expression if provided
   vectors::MetadataFilter filter;
@@ -389,7 +376,30 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSimv(const C
       return utils::MakeUnexpected(filter_result.error());
     }
     filter = std::move(*filter_result);
-    cache_enabled = false;
+    search_type = cache::SearchType::kFilteredSearch;
+  }
+
+  if (cache_enabled) {
+    // Build cache key from vector hash: first few floats + size
+    std::string vec_hash;
+    for (size_t i = 0; i < std::min(cmd.vector.size(), static_cast<size_t>(4)); ++i) {
+      vec_hash += std::to_string(cmd.vector[i]) + ",";
+    }
+    vec_hash += std::to_string(cmd.vector.size());
+    std::string key_str = "SIMV:" + vec_hash + ":" + std::to_string(cmd.top_k);
+    if (!cmd.filter_expr.empty()) {
+      key_str += ":f" + cmd.filter_expr;
+    }
+    cache_key = cache::CacheKeyGenerator::Generate(key_str);
+    auto cached = cache_ptr->Lookup(cache_key, search_type);
+    if (cached.has_value()) {
+      std::vector<std::pair<std::string, float>> pairs;
+      pairs.reserve(cached->size());
+      for (const auto& item : *cached) {
+        pairs.emplace_back(item.item_id, item.score);
+      }
+      return FormatSimResults(pairs, static_cast<int>(pairs.size()));
+    }
   }
 
   auto start = std::chrono::steady_clock::now();
@@ -403,7 +413,7 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSimv(const C
   if (cache_enabled) {
     auto elapsed = std::chrono::steady_clock::now() - start;
     double elapsed_ms = std::chrono::duration<double, std::milli>(elapsed).count();
-    cache_ptr->Insert(cache_key, *result, elapsed_ms);
+    cache_ptr->Insert(cache_key, *result, elapsed_ms, search_type);
 
     // Register result items for selective cache invalidation
     std::vector<std::string> item_ids;
