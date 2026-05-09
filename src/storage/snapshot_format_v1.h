@@ -61,6 +61,7 @@
 #include "storage/snapshot_format.h"
 #include "utils/error.h"
 #include "utils/expected.h"
+#include "vectors/metadata_store.h"
 #include "vectors/vector_store.h"
 
 namespace nvecd::storage::snapshot_v1 {
@@ -191,6 +192,12 @@ Expected<void, Error> SerializeVectorStore(std::ostream& output_stream, const ve
  */
 Expected<void, Error> DeserializeVectorStore(std::istream& input_stream, vectors::VectorStore& vector_store);
 
+Expected<void, Error> SerializeMetadataStore(std::ostream& output_stream, const vectors::MetadataStore& metadata_store,
+                                             const vectors::VectorStore& vector_store);
+
+Expected<void, Error> DeserializeMetadataStore(std::istream& input_stream, vectors::MetadataStore& metadata_store,
+                                               const vectors::VectorStore& vector_store);
+
 /**
  * @brief Write Version 1 snapshot header
  * @param output_stream Output stream
@@ -252,7 +259,8 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
                                       const events::EventStore& event_store, const events::CoOccurrenceIndex& co_index,
                                       const vectors::VectorStore& vector_store,
                                       const SnapshotStatistics* stats = nullptr,
-                                      const std::unordered_map<std::string, StoreStatistics>* store_stats = nullptr);
+                                      const std::unordered_map<std::string, StoreStatistics>* store_stats = nullptr,
+                                      const vectors::MetadataStore* metadata_store = nullptr);
 
 /**
  * @brief Read complete snapshot from file (Version 1 format)
@@ -283,6 +291,7 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
  * @param event_store EventStore to load into (must be pre-allocated)
  * @param co_index CoOccurrenceIndex to load into (must be pre-allocated)
  * @param vector_store VectorStore to load into (must be pre-allocated)
+ * @param metadata_store Optional MetadataStore to load into
  * @param stats Optional output for snapshot-level statistics
  * @param store_stats Optional output for per-store statistics map
  * @param integrity_error Optional output for detailed integrity error information
@@ -297,7 +306,8 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
                                      events::EventStore& event_store, events::CoOccurrenceIndex& co_index,
                                      vectors::VectorStore& vector_store, SnapshotStatistics* stats = nullptr,
                                      std::unordered_map<std::string, StoreStatistics>* store_stats = nullptr,
-                                     snapshot_format::IntegrityError* integrity_error = nullptr);
+                                     snapshot_format::IntegrityError* integrity_error = nullptr,
+                                     vectors::MetadataStore* metadata_store = nullptr);
 
 /**
  * @brief Verify snapshot file integrity without loading

@@ -21,6 +21,7 @@
 #include "events/event_store.h"
 #include "utils/error.h"
 #include "utils/expected.h"
+#include "vectors/metadata_store.h"
 #include "vectors/vector_store.h"
 
 namespace nvecd::storage {
@@ -94,7 +95,8 @@ class ForkSnapshotWriter {
   utils::Expected<void, utils::Error> StartBackgroundSave(const std::string& filepath, const config::Config& config,
                                                           events::EventStore& event_store,
                                                           events::CoOccurrenceIndex& co_index,
-                                                          vectors::VectorStore& vector_store);
+                                                          vectors::VectorStore& vector_store,
+                                                          vectors::MetadataStore* metadata_store = nullptr);
 
   /**
    * @brief Check and reap child process (non-blocking)
@@ -138,7 +140,8 @@ class ForkSnapshotWriter {
   [[noreturn]] static void ChildProcess(const std::string& filepath, const config::Config& config,
                                         const events::EventStore& event_store,
                                         const events::CoOccurrenceIndex& co_index,
-                                        const vectors::VectorStore& vector_store);
+                                        const vectors::VectorStore& vector_store,
+                                        const vectors::MetadataStore* metadata_store);
 
   /**
    * @brief Close all file descriptors >= min_fd

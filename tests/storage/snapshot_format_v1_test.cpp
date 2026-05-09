@@ -14,11 +14,13 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <variant>
 
 #include "config/config.h"
 #include "events/co_occurrence_index.h"
 #include "events/event_store.h"
 #include "storage/snapshot_format.h"
+#include "vectors/metadata_store.h"
 #include "vectors/vector_store.h"
 
 namespace fs = std::filesystem;
@@ -41,6 +43,7 @@ class SnapshotFormatV1Test : public ::testing::Test {
     event_store_ = std::make_unique<events::EventStore>(events_cfg);
     co_index_ = std::make_unique<events::CoOccurrenceIndex>();
     vector_store_ = std::make_unique<vectors::VectorStore>(vectors_cfg);
+    metadata_store_ = std::make_unique<vectors::MetadataStore>();
   }
 
   void TearDown() override {
@@ -83,6 +86,7 @@ class SnapshotFormatV1Test : public ::testing::Test {
   std::unique_ptr<events::EventStore> event_store_;
   std::unique_ptr<events::CoOccurrenceIndex> co_index_;
   std::unique_ptr<vectors::VectorStore> vector_store_;
+  std::unique_ptr<vectors::MetadataStore> metadata_store_;
 };
 
 // ---------------------------------------------------------------------------
@@ -145,6 +149,47 @@ TEST_F(SnapshotFormatV1Test, WriteAndRead_RoundTrip) {
   for (size_t i = 0; i < orig_vec1->data.size(); ++i) {
     EXPECT_FLOAT_EQ(loaded_vec1->data[i], orig_vec1->data[i]);
   }
+}
+
+TEST_F(SnapshotFormatV1Test, WriteAndRead_MetadataRoundTrip) {
+  PopulateStores();
+
+  auto item2_idx = vector_store_->GetCompactIndex("item2");
+  ASSERT_TRUE(item2_idx.has_value());
+  metadata_store_->Set(
+      item2_idx.value(),
+      {{"category", std::string("electronics")}, {"active", true}, {"rank", int64_t{10}}, {"score", 0.75}});
+
+  const std::string path = TestFilePath("metadata_round_trip.dmp");
+  auto write_result = WriteSnapshotV1(path, config_, *event_store_, *co_index_, *vector_store_, nullptr, nullptr,
+                                      metadata_store_.get());
+  ASSERT_TRUE(write_result.has_value()) << "WriteSnapshotV1 failed: " << write_result.error().message();
+
+  config::EventsConfig events_cfg;
+  config::VectorsConfig vectors_cfg;
+  events::EventStore loaded_events(events_cfg);
+  events::CoOccurrenceIndex loaded_co;
+  vectors::VectorStore loaded_vectors(vectors_cfg);
+  vectors::MetadataStore loaded_metadata;
+  config::Config loaded_config;
+
+  auto read_result = ReadSnapshotV1(path, loaded_config, loaded_events, loaded_co, loaded_vectors, nullptr, nullptr,
+                                    nullptr, &loaded_metadata);
+  ASSERT_TRUE(read_result.has_value()) << "ReadSnapshotV1 failed: " << read_result.error().message();
+
+  auto loaded_idx = loaded_vectors.GetCompactIndex("item2");
+  ASSERT_TRUE(loaded_idx.has_value());
+  const auto* metadata = loaded_metadata.Get(loaded_idx.value());
+  ASSERT_NE(metadata, nullptr);
+  EXPECT_EQ(std::get<std::string>(metadata->at("category")), "electronics");
+  EXPECT_EQ(std::get<bool>(metadata->at("active")), true);
+  EXPECT_EQ(std::get<int64_t>(metadata->at("rank")), 10);
+  EXPECT_DOUBLE_EQ(std::get<double>(metadata->at("score")), 0.75);
+
+  SnapshotInfo info;
+  auto info_result = GetSnapshotInfo(path, info);
+  ASSERT_TRUE(info_result.has_value());
+  EXPECT_EQ(info.store_count, 4u);
 }
 
 // ---------------------------------------------------------------------------

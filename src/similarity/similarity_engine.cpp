@@ -293,7 +293,7 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
     for (const auto& r : *event_results) {
       candidate_ids.insert(r.item_id);
     }
-    vector_results = SearchByIdVectorsFiltered(item_id, candidate_ids, fetch_k);
+    vector_results = SearchByIdVectorsFiltered(item_id, candidate_ids, fetch_k, filter);
   } else {
     // Not enough event candidates, fall back to full vector scan
     vector_results = SearchByIdVectors(item_id, fetch_k, filter);
@@ -329,11 +329,19 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
     }
   }
 
+  const bool has_filter = !filter.Empty() && metadata_store_ != nullptr;
+
   // Convert to result vector
   std::vector<SimilarityResult> results;
   results.reserve(fusion_scores.size());
 
   for (const auto& [fused_id, score] : fusion_scores) {
+    if (has_filter) {
+      auto compact_idx = vector_store_->GetCompactIndex(fused_id);
+      if (!compact_idx.has_value() || !metadata_store_->Matches(compact_idx.value(), filter)) {
+        continue;
+      }
+    }
     results.emplace_back(fused_id, score);
   }
 
@@ -510,7 +518,8 @@ std::vector<size_t> SimilarityEngine::SampleIndices(size_t total, size_t sample_
 // ============================================================================
 
 utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::SearchByIdVectorsFiltered(
-    const std::string& item_id, const std::unordered_set<std::string>& candidate_ids, int top_k) {
+    const std::string& item_id, const std::unordered_set<std::string>& candidate_ids, int top_k,
+    const vectors::MetadataFilter& filter) {
   auto validated_top_k = ValidateTopK(top_k);
   if (!validated_top_k) {
     return utils::MakeUnexpected(validated_top_k.error());
@@ -539,6 +548,7 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
     size_t query_idx = query_it->second;
     const float* query_ptr = snap.matrix + query_idx * snap.dim;
     float query_norm = snap.norms[query_idx];
+    bool has_filter = !filter.Empty() && metadata_store_ != nullptr;
 
     // For non-cosine metrics, build query vector once
     std::vector<float> query_vec_data;
@@ -556,6 +566,9 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
       }
       size_t cidx = cidx_it->second;
       if (vector_store_->IsDeleted(cidx)) {
+        continue;
+      }
+      if (has_filter && !metadata_store_->Matches(static_cast<uint32_t>(cidx), filter)) {
         continue;
       }
       float score;

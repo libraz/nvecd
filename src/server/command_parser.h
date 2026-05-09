@@ -44,10 +44,8 @@ struct Command {
   std::string mode = "fusion";        // Similarity mode: events, vectors, fusion
   std::optional<uint64_t> timestamp;  // Optional timestamp for EVENT (epoch seconds)
   std::optional<bool> adaptive;       // Optional adaptive flag for SIM
-  std::string filter_expr;            // Filter expression (e.g., "status:active,type:news")
+  std::string filter_expr;            // Filter or metadata expression (e.g., "status:active,type:news")
   float min_score = 0.0F;             // Minimum score threshold
-  uint32_t candidate_limit = 0;       // Candidate limit for post-filter (0 = auto)
-  bool explain = false;               // Show score breakdown
 
   // VECSET/SIMV fields
   int dimension = 0;          // Vector dimension
@@ -70,6 +68,7 @@ struct Command {
  * - EVENT <ctx> SET <id> <score> [timestamp=<epoch_sec>]
  * - EVENT <ctx> DEL <id> [timestamp=<epoch_sec>]
  * - VECSET <id> <dim> text\n<floats>
+ * - METASET <id> <key:value[,key:value...]>
  * - SIM <id> <top_k> [using=mode] [adaptive=on|off]
  * - SIMV <dim> <top_k>\n<floats>
  * - INFO

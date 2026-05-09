@@ -157,6 +157,8 @@ class SnapshotIntegrationTest : public ::testing::Test {
     EXPECT_TRUE(client.SendCommand("VECSET vec1 " + vec1_data).find("OK") == 0);
     EXPECT_TRUE(client.SendCommand("VECSET vec2 " + vec2_data).find("OK") == 0);
     EXPECT_TRUE(client.SendCommand("VECSET vec3 " + vec3_data).find("OK") == 0);
+    EXPECT_TRUE(client.SendCommand("METASET vec2 status:active,category:test").find("OK") == 0);
+    EXPECT_TRUE(client.SendCommand("METASET vec3 status:draft,category:test").find("OK") == 0);
   }
 
   /**
@@ -169,6 +171,11 @@ class SnapshotIntegrationTest : public ::testing::Test {
 
     response = client.SendCommand("SIM vec2 10 using=vectors");
     EXPECT_TRUE(response.find("OK") == 0 || response.find("RESULTS") != std::string::npos);
+
+    response = client.SendCommand("SIM vec1 10 using=vectors filter=status:active");
+    EXPECT_TRUE(response.find("OK") == 0);
+    EXPECT_TRUE(response.find("vec2") != std::string::npos);
+    EXPECT_TRUE(response.find("vec3") == std::string::npos);
 
     // Check INFO command shows non-zero counts
     response = client.SendCommand("INFO");

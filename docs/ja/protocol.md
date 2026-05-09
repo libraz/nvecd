@@ -187,6 +187,25 @@ VECSET item789 0.11 0.98 -0.22 0.44 ... (768 個の値)
 
 ---
 
+### METASET — アイテムメタデータの登録
+
+`filter=` クエリで使うメタデータを既存のベクトルアイテムに付与します。
+
+**構文**:
+```
+METASET <id> <key:value[,key:value...]>
+```
+
+**例**:
+```
+METASET product456 category:electronics,active:true,rank:10
+SIM product123 10 using=vectors filter=category:electronics
+```
+
+値は `filter=` と同じく、文字列、整数、浮動小数点、真偽値として自動型判定されます。対象アイテムは先に `VECSET` で `VectorStore` に登録されている必要があります。
+
+---
+
 ### SIM — ID による類似度検索
 
 既存アイテムのベクトルと共起データに基づいて類似アイテムを検索します。

@@ -187,6 +187,25 @@ VECSET item789 0.11 0.98 -0.22 0.44 ... (768 values)
 
 ---
 
+### METASET — Register item metadata
+
+Attach metadata to an existing vector item for `filter=` queries.
+
+**Syntax**:
+```
+METASET <id> <key:value[,key:value...]>
+```
+
+**Example**:
+```
+METASET product456 category:electronics,active:true,rank:10
+SIM product123 10 using=vectors filter=category:electronics
+```
+
+Values are auto-typed the same way as `filter=` values: string, integer, float, or bool. The item must already exist in `VectorStore` via `VECSET`.
+
+---
+
 ### SIM — Similarity search by ID
 
 Find similar items based on an existing item's vector and co-occurrence data.

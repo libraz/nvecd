@@ -35,11 +35,9 @@ ForkSnapshotWriter::~ForkSnapshotWriter() {
   WaitForChild(5000);  // NOLINT(cppcoreguidelines-avoid-magic-numbers)
 }
 
-utils::Expected<void, utils::Error> ForkSnapshotWriter::StartBackgroundSave(const std::string& filepath,
-                                                                            const config::Config& config,
-                                                                            events::EventStore& event_store,
-                                                                            events::CoOccurrenceIndex& co_index,
-                                                                            vectors::VectorStore& vector_store) {
+utils::Expected<void, utils::Error> ForkSnapshotWriter::StartBackgroundSave(
+    const std::string& filepath, const config::Config& config, events::EventStore& event_store,
+    events::CoOccurrenceIndex& co_index, vectors::VectorStore& vector_store, vectors::MetadataStore* metadata_store) {
   {
     std::lock_guard lock(status_mutex_);
     if (current_result_.status == SnapshotStatus::kInProgress) {
@@ -55,6 +53,7 @@ utils::Expected<void, utils::Error> ForkSnapshotWriter::StartBackgroundSave(cons
   auto lock_es = event_store.AcquireWriteLock();
   auto lock_co = co_index.AcquireWriteLock();
   auto lock_vs = vector_store.AcquireWriteLock();
+  auto lock_ms = metadata_store != nullptr ? metadata_store->AcquireWriteLock() : std::unique_lock<std::shared_mutex>();
 
   // Ensure SIGCHLD is not SIG_IGN (macOS auto-reaps children when ignored)
   signal(SIGCHLD, SIG_DFL);  // NOLINT(cppcoreguidelines-pro-type-cstyle-cast)
@@ -78,9 +77,12 @@ utils::Expected<void, utils::Error> ForkSnapshotWriter::StartBackgroundSave(cons
     lock_es.unlock();
     lock_co.unlock();
     lock_vs.unlock();
+    if (lock_ms.owns_lock()) {
+      lock_ms.unlock();
+    }
 
     // Enter child process (never returns)
-    ChildProcess(filepath, config, event_store, co_index, vector_store);
+    ChildProcess(filepath, config, event_store, co_index, vector_store, metadata_store);
     // UNREACHABLE
   }
 
@@ -89,6 +91,9 @@ utils::Expected<void, utils::Error> ForkSnapshotWriter::StartBackgroundSave(cons
   lock_es.unlock();
   lock_co.unlock();
   lock_vs.unlock();
+  if (lock_ms.owns_lock()) {
+    lock_ms.unlock();
+  }
 
   // Update status
   {
@@ -108,7 +113,8 @@ utils::Expected<void, utils::Error> ForkSnapshotWriter::StartBackgroundSave(cons
 
 void ForkSnapshotWriter::ChildProcess(const std::string& filepath, const config::Config& config,
                                       const events::EventStore& event_store, const events::CoOccurrenceIndex& co_index,
-                                      const vectors::VectorStore& vector_store) {
+                                      const vectors::VectorStore& vector_store,
+                                      const vectors::MetadataStore* metadata_store) {
   // 1. Close inherited file descriptors (server sockets, log files, etc.)
   CloseInheritedFDs(kMinInheritedFD);
 
@@ -121,7 +127,8 @@ void ForkSnapshotWriter::ChildProcess(const std::string& filepath, const config:
   signal(SIGTERM, SIG_DFL);  // NOLINT(cppcoreguidelines-pro-type-cstyle-cast)
 
   // 4. Write snapshot — data is a frozen COW copy from parent
-  auto result = snapshot_v1::WriteSnapshotV1(filepath, config, event_store, co_index, vector_store);
+  auto result = snapshot_v1::WriteSnapshotV1(filepath, config, event_store, co_index, vector_store, nullptr, nullptr,
+                                             metadata_store);
 
   // 5. Exit (never call exit() — use _exit() to avoid atexit handlers)
   _exit(result ? kChildExitSuccess : kChildExitFailure);

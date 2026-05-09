@@ -376,14 +376,6 @@ TEST_F(AdversarialE2ETest, EventAddDeleteAddCycle) {
   // additional conditions. We verify the server responds correctly.
   auto resp = client.SendCommand("SIM item1 10 using=events");
   ASSERT_TRUE(ContainsOK(resp));
-  auto results = ParseSimResults(resp);
-  float item2_score_before = 0.0f;
-  for (const auto& r : results) {
-    if (r.first == "item2") {
-      item2_score_before = r.second;
-      break;
-    }
-  }
 
   // Step c: Delete item2 from all contexts
   for (int i = 0; i < 5; ++i) {

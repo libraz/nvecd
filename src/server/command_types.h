@@ -18,6 +18,7 @@ namespace nvecd::server {
  * Core commands:
  * - EVENT: Ingest co-occurrence event
  * - VECSET: Register vector embedding
+ * - METASET: Register item metadata
  * - SIM: Similarity search by ID
  * - SIMV: Similarity search by vector
  *
@@ -31,6 +32,7 @@ enum class CommandType : std::uint8_t {
   // Core commands
   kEvent,
   kVecset,
+  kMetaset,
   kSim,
   kSimv,
 
@@ -72,6 +74,8 @@ inline const char* CommandTypeToString(CommandType type) {
       return "EVENT";
     case CommandType::kVecset:
       return "VECSET";
+    case CommandType::kMetaset:
+      return "METASET";
     case CommandType::kSim:
       return "SIM";
     case CommandType::kSimv:
@@ -136,6 +140,7 @@ inline CommandPrivilege GetCommandPrivilege(CommandType type) {
   switch (type) {
     case CommandType::kEvent:
     case CommandType::kVecset:
+    case CommandType::kMetaset:
     case CommandType::kSet:
     case CommandType::kCacheClear:
     case CommandType::kCacheEnable:

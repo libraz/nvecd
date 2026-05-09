@@ -22,16 +22,15 @@ class ApiExtensionE2ETest : public NvecdTestFixture {
 // --- SIM with filter ---
 
 TEST_F(ApiExtensionE2ETest, SimWithFilterReturnsFilteredResults) {
-  // NOTE: The server has no METASET command, so metadata can only be set via
-  // the C++ MetadataStore API. This test verifies that the filter parameter is
-  // parsed and accepted without error, but cannot verify actual filtering
-  // behavior at the TCP protocol level.
   TcpClient client("127.0.0.1", port_);
 
   // Register vectors
   EXPECT_TRUE(ContainsOK(client.SendCommand("VECSET item1 1.0 0.0 0.0")));
   EXPECT_TRUE(ContainsOK(client.SendCommand("VECSET item2 0.9 0.1 0.0")));
   EXPECT_TRUE(ContainsOK(client.SendCommand("VECSET item3 0.0 1.0 0.0")));
+  EXPECT_TRUE(ContainsOK(client.SendCommand("METASET item1 status:active")));
+  EXPECT_TRUE(ContainsOK(client.SendCommand("METASET item2 status:active")));
+  EXPECT_TRUE(ContainsOK(client.SendCommand("METASET item3 status:draft")));
 
   // Register events for co-occurrence
   EXPECT_TRUE(ContainsOK(client.SendCommand("EVENT ctx1 ADD item1 100")));
@@ -44,15 +43,13 @@ TEST_F(ApiExtensionE2ETest, SimWithFilterReturnsFilteredResults) {
   auto baseline = ParseSimResults(response);
   EXPECT_GT(baseline.size(), 0U);
 
-  // SIM with filter — verify the filter parameter is accepted (no error)
-  auto filtered_response = client.SendCommand("SIM item1 10 filter=status:active");
+  // SIM with filter — verify the filter parameter is accepted and applied.
+  auto filtered_response = client.SendCommand("SIM item1 10 using=vectors filter=status:active");
   EXPECT_TRUE(ContainsOK(filtered_response));
   auto filtered = ParseSimResults(filtered_response);
 
-  // Without metadata set, filter has no items to exclude, so results should
-  // still be returned. This confirms the filter parameter was parsed correctly
-  // and did not cause a command error.
-  EXPECT_GT(filtered.size(), 0U);
+  ASSERT_EQ(filtered.size(), 1U);
+  EXPECT_EQ(filtered[0].first, "item2");
 }
 
 // --- SIM with min_score ---
@@ -183,21 +180,18 @@ TEST_F(ApiExtensionE2ETest, SimvReturnsResults) {
 // --- SIMV with filter ---
 
 TEST_F(ApiExtensionE2ETest, SimvWithFilterParsesCorrectly) {
-  // NOTE: The server has no METASET command, so metadata can only be set via
-  // the C++ MetadataStore API. This test verifies that the filter parameter is
-  // parsed and accepted without error at the TCP protocol level, but cannot
-  // verify actual filtering behavior.
   TcpClient client("127.0.0.1", port_);
 
   EXPECT_TRUE(ContainsOK(client.SendCommand("VECSET item1 1.0 0.0 0.0")));
   EXPECT_TRUE(ContainsOK(client.SendCommand("VECSET item2 0.9 0.1 0.0")));
+  EXPECT_TRUE(ContainsOK(client.SendCommand("METASET item1 tag:control")));
+  EXPECT_TRUE(ContainsOK(client.SendCommand("METASET item2 tag:test")));
 
   auto response = client.SendCommand("SIMV 3 filter=tag:test 1.0 0.0 0.0");
-  // Filter should be parsed without error
   EXPECT_TRUE(ContainsOK(response));
   auto results = ParseSimResults(response);
-  // Without metadata, filter has nothing to exclude — results should still come back
-  EXPECT_GT(results.size(), 0U);
+  ASSERT_EQ(results.size(), 1U);
+  EXPECT_EQ(results[0].first, "item2");
 }
 
 // --- SIMV with min_score ---

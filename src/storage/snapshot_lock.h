@@ -17,6 +17,7 @@
 #include "storage/snapshot_format.h"
 #include "utils/error.h"
 #include "utils/expected.h"
+#include "vectors/metadata_store.h"
 #include "vectors/vector_store.h"
 
 namespace nvecd::storage {
@@ -43,6 +44,7 @@ namespace nvecd::storage {
 utils::Expected<void, utils::Error> WriteSnapshotWithLock(
     const std::string& filepath, const config::Config& config, events::EventStore& event_store,
     events::CoOccurrenceIndex& co_index, vectors::VectorStore& vector_store, const SnapshotStatistics* stats = nullptr,
-    const std::unordered_map<std::string, StoreStatistics>* store_stats = nullptr);
+    const std::unordered_map<std::string, StoreStatistics>* store_stats = nullptr,
+    vectors::MetadataStore* metadata_store = nullptr);
 
 }  // namespace nvecd::storage

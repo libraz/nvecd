@@ -25,6 +25,7 @@
 #include "events/event_store.h"
 #include "server/server_types.h"
 #include "similarity/similarity_engine.h"
+#include "vectors/metadata_store.h"
 #include "vectors/vector_store.h"
 
 using json = nlohmann::json;
@@ -48,14 +49,17 @@ class HttpServerTest : public ::testing::Test {
     event_store_ = std::make_unique<events::EventStore>(config_->events);
     co_index_ = std::make_unique<events::CoOccurrenceIndex>();
     vector_store_ = std::make_unique<vectors::VectorStore>(config_->vectors);
-    similarity_engine_ = std::make_unique<similarity::SimilarityEngine>(
-        event_store_.get(), co_index_.get(), vector_store_.get(), config_->similarity, config_->vectors);
+    metadata_store_ = std::make_unique<vectors::MetadataStore>();
+    similarity_engine_ =
+        std::make_unique<similarity::SimilarityEngine>(event_store_.get(), co_index_.get(), vector_store_.get(),
+                                                       config_->similarity, config_->vectors, metadata_store_.get());
     cache_ = std::make_unique<cache::SimilarityCache>(10 * 1024 * 1024, 0.1);
 
     // Setup handler context (pointers only, references already set in initializer)
     handler_ctx_.event_store = event_store_.get();
     handler_ctx_.co_index = co_index_.get();
     handler_ctx_.vector_store = vector_store_.get();
+    handler_ctx_.metadata_store = metadata_store_.get();
     handler_ctx_.similarity_engine = similarity_engine_.get();
     handler_ctx_.cache = cache_.get();
     handler_ctx_.config = config_.get();
@@ -90,6 +94,7 @@ class HttpServerTest : public ::testing::Test {
   std::unique_ptr<events::EventStore> event_store_;
   std::unique_ptr<events::CoOccurrenceIndex> co_index_;
   std::unique_ptr<vectors::VectorStore> vector_store_;
+  std::unique_ptr<vectors::MetadataStore> metadata_store_;
   std::unique_ptr<similarity::SimilarityEngine> similarity_engine_;
   std::unique_ptr<cache::SimilarityCache> cache_;
 
@@ -100,6 +105,7 @@ class HttpServerTest : public ::testing::Test {
       .event_store = nullptr,
       .co_index = nullptr,
       .vector_store = nullptr,
+      .metadata_store = nullptr,
       .similarity_engine = nullptr,
       .cache = nullptr,
       .stats = stats_,
@@ -348,6 +354,62 @@ TEST_F(HttpServerTest, Sim) {
   EXPECT_EQ(body["status"], "ok");
   EXPECT_EQ(body["mode"], "vectors");
   EXPECT_TRUE(body.contains("results"));
+}
+
+TEST_F(HttpServerTest, SimWithMetadataFilter) {
+  json vec1;
+  vec1["id"] = "active_item";
+  vec1["vector"] = {1.0f, 0.0f, 0.0f, 0.0f};
+  vec1["metadata"] = {{"status", "active"}, {"category", "electronics"}};
+  ASSERT_EQ(client_->Post("/vecset", vec1.dump(), "application/json")->status, 200);
+
+  json vec2;
+  vec2["id"] = "draft_item";
+  vec2["vector"] = {0.9f, 0.1f, 0.0f, 0.0f};
+  vec2["metadata"] = {{"status", "draft"}, {"category", "electronics"}};
+  ASSERT_EQ(client_->Post("/vecset", vec2.dump(), "application/json")->status, 200);
+
+  json req_body;
+  req_body["id"] = "active_item";
+  req_body["top_k"] = 5;
+  req_body["mode"] = "vectors";
+  req_body["filter"] = "status:draft";
+
+  auto res = client_->Post("/sim", req_body.dump(), "application/json");
+  ASSERT_TRUE(res);
+  ASSERT_EQ(res->status, 200);
+
+  auto body = json::parse(res->body);
+  ASSERT_EQ(body["count"], 1);
+  EXPECT_EQ(body["results"][0]["id"], "draft_item");
+}
+
+TEST_F(HttpServerTest, SimvWithMetadataFilterAndMinScore) {
+  json vec1;
+  vec1["id"] = "active_item";
+  vec1["vector"] = {1.0f, 0.0f, 0.0f, 0.0f};
+  vec1["metadata"] = {{"status", "active"}};
+  ASSERT_EQ(client_->Post("/vecset", vec1.dump(), "application/json")->status, 200);
+
+  json vec2;
+  vec2["id"] = "draft_item";
+  vec2["vector"] = {0.9f, 0.1f, 0.0f, 0.0f};
+  vec2["metadata"] = {{"status", "draft"}};
+  ASSERT_EQ(client_->Post("/vecset", vec2.dump(), "application/json")->status, 200);
+
+  json req_body;
+  req_body["vector"] = {1.0f, 0.0f, 0.0f, 0.0f};
+  req_body["top_k"] = 5;
+  req_body["filter"] = "status:draft";
+  req_body["min_score"] = 0.1;
+
+  auto res = client_->Post("/simv", req_body.dump(), "application/json");
+  ASSERT_TRUE(res);
+  ASSERT_EQ(res->status, 200);
+
+  auto body = json::parse(res->body);
+  ASSERT_EQ(body["count"], 1);
+  EXPECT_EQ(body["results"][0]["id"], "draft_item");
 }
 
 TEST_F(HttpServerTest, SimNotFound) {

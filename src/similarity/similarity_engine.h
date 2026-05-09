@@ -225,7 +225,8 @@ class SimilarityEngine {
 
   /// @brief Search vectors only among candidate IDs (pre-filtered)
   utils::Expected<std::vector<SimilarityResult>, utils::Error> SearchByIdVectorsFiltered(
-      const std::string& item_id, const std::unordered_set<std::string>& candidate_ids, int top_k);
+      const std::string& item_id, const std::unordered_set<std::string>& candidate_ids, int top_k,
+      const vectors::MetadataFilter& filter = {});
 
   /**
    * @brief Compute adaptive fusion weights based on item maturity

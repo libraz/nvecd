@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <variant>
 #include <vector>
 
 #include "utils/structured_log.h"
@@ -49,6 +50,13 @@ constexpr uint32_t kMaxConfigSize = 16 * 1024 * 1024;      // 16MB max for confi
 constexpr uint32_t kMaxStatsSize = 16 * 1024 * 1024;       // 16MB max for statistics section
 constexpr uint32_t kMaxStoreDataSize = 512 * 1024 * 1024;  // 512MB max for store data
 constexpr uint32_t kMaxStoreStatsSize = 16 * 1024 * 1024;  // 16MB max for store statistics
+
+enum class MetadataValueType : uint8_t {
+  kString = 1,
+  kInt64 = 2,
+  kDouble = 3,
+  kBool = 4,
+};
 
 /// @brief Absolute file offset of the file_crc32 field in the V1 header.
 /// kFixedHeaderSize (8) + header_size(4) + flags(4) + snapshot_timestamp(8) + total_file_size(8) = 32
@@ -623,13 +631,164 @@ Expected<void, Error> DeserializeVectorStore(std::istream& input_stream, vectors
 }
 
 // ============================================================================
+// MetadataStore Serialization
+// ============================================================================
+
+Expected<void, Error> SerializeMetadataStore(std::ostream& output_stream, const vectors::MetadataStore& metadata_store,
+                                             const vectors::VectorStore& vector_store) {
+  std::vector<std::pair<std::string, vectors::Metadata>> entries;
+  auto ids = vector_store.GetAllIds();
+  entries.reserve(ids.size());
+  for (const auto& id : ids) {
+    auto compact_idx = vector_store.GetCompactIndex(id);
+    if (!compact_idx.has_value()) {
+      continue;
+    }
+    const auto* metadata = metadata_store.Get(compact_idx.value());
+    if (metadata != nullptr && !metadata->empty()) {
+      entries.emplace_back(id, *metadata);
+    }
+  }
+
+  auto item_count = static_cast<uint32_t>(entries.size());
+  if (!WriteBinary(output_stream, item_count)) {
+    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write metadata item count"));
+  }
+
+  for (const auto& [id, metadata] : entries) {
+    if (!WriteString(output_stream, id)) {
+      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write metadata item ID: " + id));
+    }
+
+    auto field_count = static_cast<uint32_t>(metadata.size());
+    if (!WriteBinary(output_stream, field_count)) {
+      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write metadata field count"));
+    }
+
+    for (const auto& [key, value] : metadata) {
+      if (!WriteString(output_stream, key)) {
+        return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write metadata key"));
+      }
+
+      if (std::holds_alternative<std::string>(value)) {
+        auto type = static_cast<uint8_t>(MetadataValueType::kString);
+        if (!WriteBinary(output_stream, type) || !WriteString(output_stream, std::get<std::string>(value))) {
+          return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write string metadata"));
+        }
+      } else if (std::holds_alternative<int64_t>(value)) {
+        auto type = static_cast<uint8_t>(MetadataValueType::kInt64);
+        auto data = std::get<int64_t>(value);
+        if (!WriteBinary(output_stream, type) || !WriteBinary(output_stream, data)) {
+          return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write integer metadata"));
+        }
+      } else if (std::holds_alternative<double>(value)) {
+        auto type = static_cast<uint8_t>(MetadataValueType::kDouble);
+        auto data = std::get<double>(value);
+        if (!WriteBinary(output_stream, type) || !WriteBinary(output_stream, data)) {
+          return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write double metadata"));
+        }
+      } else if (std::holds_alternative<bool>(value)) {
+        auto type = static_cast<uint8_t>(MetadataValueType::kBool);
+        auto data = std::get<bool>(value);
+        if (!WriteBinary(output_stream, type) || !WriteBinary(output_stream, data)) {
+          return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write bool metadata"));
+        }
+      }
+    }
+  }
+
+  return {};
+}
+
+Expected<void, Error> DeserializeMetadataStore(std::istream& input_stream, vectors::MetadataStore& metadata_store,
+                                               const vectors::VectorStore& vector_store) {
+  metadata_store.Clear();
+
+  uint32_t item_count = 0;
+  if (!ReadBinary(input_stream, item_count)) {
+    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read metadata item count"));
+  }
+
+  for (uint32_t item_idx = 0; item_idx < item_count; ++item_idx) {
+    std::string id;
+    if (!ReadString(input_stream, id)) {
+      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read metadata item ID"));
+    }
+
+    uint32_t field_count = 0;
+    if (!ReadBinary(input_stream, field_count)) {
+      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read metadata field count"));
+    }
+
+    vectors::Metadata metadata;
+    for (uint32_t field_idx = 0; field_idx < field_count; ++field_idx) {
+      std::string key;
+      if (!ReadString(input_stream, key)) {
+        return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read metadata key"));
+      }
+
+      uint8_t type = 0;
+      if (!ReadBinary(input_stream, type)) {
+        return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read metadata value type"));
+      }
+
+      switch (static_cast<MetadataValueType>(type)) {
+        case MetadataValueType::kString: {
+          std::string value;
+          if (!ReadString(input_stream, value)) {
+            return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read string metadata"));
+          }
+          metadata[key] = std::move(value);
+          break;
+        }
+        case MetadataValueType::kInt64: {
+          int64_t value = 0;
+          if (!ReadBinary(input_stream, value)) {
+            return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read integer metadata"));
+          }
+          metadata[key] = value;
+          break;
+        }
+        case MetadataValueType::kDouble: {
+          double value = 0.0;
+          if (!ReadBinary(input_stream, value)) {
+            return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read double metadata"));
+          }
+          metadata[key] = value;
+          break;
+        }
+        case MetadataValueType::kBool: {
+          bool value = false;
+          if (!ReadBinary(input_stream, value)) {
+            return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read bool metadata"));
+          }
+          metadata[key] = value;
+          break;
+        }
+        default:
+          return MakeUnexpected(
+              MakeError(ErrorCode::kStorageDumpReadError, "Unknown metadata value type: " + std::to_string(type)));
+      }
+    }
+
+    auto compact_idx = vector_store.GetCompactIndex(id);
+    if (compact_idx.has_value() && !metadata.empty()) {
+      metadata_store.Set(compact_idx.value(), std::move(metadata));
+    }
+  }
+
+  return {};
+}
+
+// ============================================================================
 // Main Snapshot Write/Read Functions
 // ============================================================================
 
 Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config::Config& config,
                                       const events::EventStore& event_store, const events::CoOccurrenceIndex& co_index,
                                       const vectors::VectorStore& vector_store, const SnapshotStatistics* stats,
-                                      const std::unordered_map<std::string, StoreStatistics>* store_stats) {
+                                      const std::unordered_map<std::string, StoreStatistics>* store_stats,
+                                      const vectors::MetadataStore* metadata_store) {
   // Create temporary file path
   std::string temp_filepath = filepath + ".tmp";
 
@@ -707,7 +866,7 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
     }
 
     // Write store data section
-    uint32_t store_count = 3;  // events, co_occurrence, vectors
+    uint32_t store_count = metadata_store != nullptr ? 4 : 3;  // events, co_occurrence, vectors, metadata
     WriteBinary(output_stream, store_count);
 
     // Store 1: EventStore
@@ -798,6 +957,25 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
 
       std::ostringstream store_data_ss;
       auto serialize_result = SerializeVectorStore(store_data_ss, vector_store);
+      if (!serialize_result) {
+        return serialize_result;
+      }
+      std::string store_data = store_data_ss.str();
+      auto store_data_size = static_cast<uint32_t>(store_data.size());
+      uint32_t store_data_crc = CalculateCRC32(store_data);
+      WriteBinary(output_stream, store_data_size);
+      WriteBinary(output_stream, store_data_crc);
+      output_stream.write(store_data.data(), store_data_size);
+    }
+
+    // Store 4: MetadataStore
+    if (metadata_store != nullptr) {
+      WriteString(output_stream, "metadata");
+      uint32_t zero = 0;
+      WriteBinary(output_stream, zero);  // No store stats
+
+      std::ostringstream store_data_ss;
+      auto serialize_result = SerializeMetadataStore(store_data_ss, *metadata_store, vector_store);
       if (!serialize_result) {
         return serialize_result;
       }
@@ -906,7 +1084,8 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
                                      events::EventStore& event_store, events::CoOccurrenceIndex& co_index,
                                      vectors::VectorStore& vector_store, SnapshotStatistics* stats,
                                      std::unordered_map<std::string, StoreStatistics>* store_stats,
-                                     snapshot_format::IntegrityError* integrity_error) {
+                                     snapshot_format::IntegrityError* integrity_error,
+                                     vectors::MetadataStore* metadata_store) {
   // Open file for binary reading
   std::ifstream input_stream(filepath, std::ios::binary);
   if (!input_stream) {
@@ -1084,6 +1263,8 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
             crc_error_type = snapshot_format::CRCErrorType::CoOccurrenceCRC;
           } else if (store_name == "vectors") {
             crc_error_type = snapshot_format::CRCErrorType::VectorStoreCRC;
+          } else if (store_name == "metadata") {
+            crc_error_type = snapshot_format::CRCErrorType::MetadataStoreCRC;
           }
           if (integrity_error != nullptr) {
             integrity_error->type = crc_error_type;
@@ -1114,6 +1295,13 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
         auto deserialize_result = DeserializeVectorStore(store_data_ss, vector_store);
         if (!deserialize_result) {
           return deserialize_result;
+        }
+      } else if (store_name == "metadata") {
+        if (metadata_store != nullptr) {
+          auto deserialize_result = DeserializeMetadataStore(store_data_ss, *metadata_store, vector_store);
+          if (!deserialize_result) {
+            return deserialize_result;
+          }
         }
       } else {
         LogStorageWarning("snapshot_read", "Unknown store name: " + store_name);
@@ -1252,9 +1440,25 @@ Expected<void, Error> GetSnapshotInfo(const std::string& filepath, SnapshotInfo&
   info.file_size = header.total_file_size;
   info.has_statistics = (header.flags & snapshot_format::flags_v1::kWithStatistics) != 0;
 
-  // We could read more info (like store count) by continuing to parse,
-  // but for now this is sufficient for GetSnapshotInfo
-  info.store_count = 3;  // We always have 3 stores
+  uint32_t config_size = 0;
+  uint32_t config_crc = 0;
+  if (!ReadBinary(input_stream, config_size) || !ReadBinary(input_stream, config_crc)) {
+    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read config section header"));
+  }
+  input_stream.seekg(config_size, std::ios::cur);
+
+  if (info.has_statistics) {
+    uint32_t stats_size = 0;
+    uint32_t stats_crc = 0;
+    if (!ReadBinary(input_stream, stats_size) || !ReadBinary(input_stream, stats_crc)) {
+      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read statistics section header"));
+    }
+    input_stream.seekg(stats_size, std::ios::cur);
+  }
+
+  if (!ReadBinary(input_stream, info.store_count)) {
+    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read store count"));
+  }
 
   return {};
 }

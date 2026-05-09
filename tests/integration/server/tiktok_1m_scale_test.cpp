@@ -979,7 +979,6 @@ TEST_F(TikTok1MScaleTest, DISABLED_MemoryProfile10M) {
   for (size_t scale : kScalePoints) {
     size_t delta = scale - loaded_so_far;
     if (delta > 0) {
-      std::atomic<size_t> delta_loaded{0};
       const size_t kLoaders = 16;
       size_t per_loader = delta / kLoaders;
       size_t rem = delta % kLoaders;

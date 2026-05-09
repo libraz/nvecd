@@ -41,8 +41,8 @@ constexpr int kMaxWaitReadyRetries = 100;     // Maximum retries for --wait-read
 #ifdef USE_READLINE
 // Command list for tab completion
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays,cppcoreguidelines-avoid-non-const-global-variables)
-const char* command_list[] = {"EVENT", "VECSET", "SIM",  "SIMV", "INFO", "CONFIG", "CACHE",
-                              "DUMP",  "DEBUG",  "quit", "exit", "help", nullptr};
+const char* command_list[] = {"EVENT", "VECSET", "METASET", "SIM",  "SIMV", "INFO", "CONFIG",
+                              "CACHE", "DUMP",   "DEBUG",   "quit", "exit", "help", nullptr};
 
 /**
  * @brief Command name generator for readline completion
@@ -159,6 +159,16 @@ char** CommandCompletion(const char* text, int start, int /* end */) {
       return rl_completion_matches(text, KeywordGeneratorWrapper);
     }
     current_keywords = {"<vector_values>"};
+    return rl_completion_matches(text, KeywordGeneratorWrapper);
+  }
+
+  // METASET <id> <key:value[,key:value...]>
+  if (command == "METASET") {
+    if (token_count == 1) {
+      current_keywords = {"<item_id>"};
+      return rl_completion_matches(text, KeywordGeneratorWrapper);
+    }
+    current_keywords = {"<key:value[,key:value...]>"};
     return rl_completion_matches(text, KeywordGeneratorWrapper);
   }
 
@@ -504,8 +514,9 @@ class NvecdClient {
  private:
   static void PrintHelp() {
     std::cout << "Available commands:" << '\n';
-    std::cout << "  EVENT <ctx> <id> <score>          - Track user behavior event" << '\n';
+    std::cout << "  EVENT <ctx> ADD <id> <score>      - Track user behavior event" << '\n';
     std::cout << "  VECSET <id> <f1> <f2> ... <fN>    - Register or update vector" << '\n';
+    std::cout << "  METASET <id> <key:value[,..]>      - Register or update item metadata" << '\n';
     std::cout << "  SIM <id> <top_k> [using=<mode>]   - Search similar items by ID" << '\n';
     std::cout << "  SIMV <top_k> <f1> <f2> ... <fN>   - Search similar items by vector" << '\n';
     std::cout << "  INFO                               - Show server statistics" << '\n';
@@ -520,13 +531,14 @@ class NvecdClient {
     std::cout << "  DEBUG OFF                          - Disable debug mode" << '\n';
     std::cout << '\n';
     std::cout << "Search modes (for SIM command):" << '\n';
-    std::cout << "  using=vectors  - Content-based similarity (default)" << '\n';
+    std::cout << "  using=vectors  - Content-based similarity" << '\n';
     std::cout << "  using=events   - Behavior-based similarity (co-occurrence)" << '\n';
     std::cout << "  using=fusion   - Hybrid: vectors + events" << '\n';
     std::cout << '\n';
     std::cout << "Examples:" << '\n';
-    std::cout << "  EVENT user_alice product123 100              # Track purchase" << '\n';
+    std::cout << "  EVENT user_alice ADD product123 100          # Track purchase" << '\n';
     std::cout << "  VECSET product123 0.1 0.2 0.3 0.4            # Register 4-dim vector" << '\n';
+    std::cout << "  METASET product123 category:electronics      # Register metadata" << '\n';
     std::cout << "  SIM product123 10 using=vectors              # Top-10 content similar" << '\n';
     std::cout << "  SIM product123 10 using=fusion               # Top-10 hybrid" << '\n';
     std::cout << "  SIMV 10 0.5 0.3 0.2 0.1                      # Search by query vector" << '\n';

@@ -221,8 +221,9 @@ utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
   spdlog::info("MetadataStore initialized");
 
   // Create SimilarityEngine
-  similarity_engine_ = std::make_unique<similarity::SimilarityEngine>(
-      event_store_.get(), co_index_.get(), vector_store_.get(), config_.similarity, config_.vectors);
+  similarity_engine_ =
+      std::make_unique<similarity::SimilarityEngine>(event_store_.get(), co_index_.get(), vector_store_.get(),
+                                                     config_.similarity, config_.vectors, metadata_store_.get());
   spdlog::info("SimilarityEngine initialized (fusion: alpha={}, beta={})", config_.similarity.fusion_alpha,
                config_.similarity.fusion_beta);
 
@@ -302,7 +303,7 @@ utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
   if (config_.snapshot.interval_sec > 0) {
     snapshot_scheduler_ =
         std::make_unique<SnapshotScheduler>(config_.snapshot, fork_writer_.get(), &config_, event_store_.get(),
-                                            co_index_.get(), vector_store_.get(), read_only_);
+                                            co_index_.get(), vector_store_.get(), metadata_store_.get(), read_only_);
     snapshot_scheduler_->Start();
   }
 

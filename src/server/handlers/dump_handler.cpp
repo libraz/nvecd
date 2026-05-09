@@ -76,7 +76,7 @@ utils::Expected<std::string, utils::Error> HandleDumpSave(HandlerContext& ctx, c
     ctx.fork_snapshot_writer->CheckChild();
 
     auto result = ctx.fork_snapshot_writer->StartBackgroundSave(resolved_path, *ctx.config, *ctx.event_store,
-                                                                *ctx.co_index, *ctx.vector_store);
+                                                                *ctx.co_index, *ctx.vector_store, ctx.metadata_store);
 
     if (!result) {
       utils::LogStorageError("dump_save", resolved_path, result.error().message());
@@ -90,8 +90,8 @@ utils::Expected<std::string, utils::Error> HandleDumpSave(HandlerContext& ctx, c
     // Lock mode: synchronous blocking save
     utils::FlagGuard read_only_guard(ctx.read_only);
 
-    auto result =
-        storage::WriteSnapshotWithLock(resolved_path, *ctx.config, *ctx.event_store, *ctx.co_index, *ctx.vector_store);
+    auto result = storage::WriteSnapshotWithLock(resolved_path, *ctx.config, *ctx.event_store, *ctx.co_index,
+                                                 *ctx.vector_store, nullptr, nullptr, ctx.metadata_store);
 
     if (result) {
       utils::LogStorageInfo("dump_save", "Successfully saved snapshot to: " + resolved_path);
@@ -132,8 +132,9 @@ utils::Expected<std::string, utils::Error> HandleDumpLoad(HandlerContext& ctx, c
   storage::snapshot_format::IntegrityError integrity_error;
 
   // Call snapshot_v1 API
-  auto result = storage::snapshot_v1::ReadSnapshotV1(resolved_path, loaded_config, *ctx.event_store, *ctx.co_index,
-                                                     *ctx.vector_store, nullptr, nullptr, &integrity_error);
+  auto result =
+      storage::snapshot_v1::ReadSnapshotV1(resolved_path, loaded_config, *ctx.event_store, *ctx.co_index,
+                                           *ctx.vector_store, nullptr, nullptr, &integrity_error, ctx.metadata_store);
 
   if (result) {
     utils::LogStorageInfo("dump_load", "Successfully loaded snapshot from: " + resolved_path);

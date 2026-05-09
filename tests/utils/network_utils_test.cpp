@@ -82,6 +82,8 @@ TEST(NetworkUtilsTest, CIDR_Parse_Invalid) {
   EXPECT_FALSE(CIDR::Parse("192.168.1.0/").has_value());    // Empty prefix
   EXPECT_FALSE(CIDR::Parse("192.168.1.0/33").has_value());  // Invalid prefix
   EXPECT_FALSE(CIDR::Parse("192.168.1.0/-1").has_value());  // Negative prefix
+  EXPECT_FALSE(CIDR::Parse("192.168.1.0/24abc").has_value());
+  EXPECT_FALSE(CIDR::Parse("192.168.1.0/ 24").has_value());
   EXPECT_FALSE(CIDR::Parse("not-an-ip/24").has_value());
   EXPECT_FALSE(CIDR::Parse("192.168.1.256/24").has_value());
 }

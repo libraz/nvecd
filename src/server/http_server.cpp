@@ -13,12 +13,15 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <optional>
 #include <sstream>
 
 #include "cache/similarity_cache.h"
 #include "events/co_occurrence_index.h"
 #include "events/event_store.h"
 #include "server/command_parser.h"
+#include "server/filter_parser.h"
 #include "server/request_dispatcher.h"
 #include "similarity/similarity_engine.h"
 #include "storage/snapshot_fork.h"
@@ -26,6 +29,7 @@
 #include "utils/network_utils.h"
 #include "utils/string_utils.h"
 #include "utils/structured_log.h"
+#include "vectors/metadata_store.h"
 #include "vectors/vector_store.h"
 #include "version.h"
 
@@ -64,6 +68,78 @@ std::vector<utils::CIDR> ParseAllowCidrs(const std::vector<std::string>& allow_c
   }
 
   return parsed;
+}
+
+std::vector<std::pair<std::string, float>> ApplyMinScore(const std::vector<similarity::SimilarityResult>& results,
+                                                         float min_score) {
+  std::vector<std::pair<std::string, float>> filtered;
+  filtered.reserve(results.size());
+  for (const auto& item : results) {
+    if (item.score >= min_score) {
+      filtered.emplace_back(item.item_id, item.score);
+    }
+  }
+  return filtered;
+}
+
+std::vector<similarity::SimilarityResult> ApplyMetadataFilter(const std::vector<similarity::SimilarityResult>& results,
+                                                              vectors::VectorStore* vector_store,
+                                                              vectors::MetadataStore* metadata_store,
+                                                              const vectors::MetadataFilter& filter) {
+  if (filter.Empty() || vector_store == nullptr || metadata_store == nullptr) {
+    return results;
+  }
+
+  std::vector<similarity::SimilarityResult> filtered;
+  filtered.reserve(results.size());
+  for (const auto& item : results) {
+    auto compact_idx = vector_store->GetCompactIndex(item.item_id);
+    if (compact_idx.has_value() && metadata_store->Matches(compact_idx.value(), filter)) {
+      filtered.push_back(item);
+    }
+  }
+  return filtered;
+}
+
+bool JsonNumberIsFinite(const json& value) {
+  if (!value.is_number()) {
+    return false;
+  }
+  return std::isfinite(value.get<double>());
+}
+
+utils::Expected<vectors::Metadata, utils::Error> ParseMetadataJson(const json& value) {
+  if (!value.is_object()) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kCommandInvalidArgument, "Field 'metadata' must be an object"));
+  }
+
+  vectors::Metadata metadata;
+  for (const auto& [key, item] : value.items()) {
+    if (key.empty()) {
+      return utils::MakeUnexpected(
+          utils::MakeError(utils::ErrorCode::kCommandInvalidArgument, "Metadata keys must not be empty"));
+    }
+    if (item.is_string()) {
+      metadata[key] = item.get<std::string>();
+    } else if (item.is_boolean()) {
+      metadata[key] = item.get<bool>();
+    } else if (item.is_number_integer()) {
+      metadata[key] = item.get<int64_t>();
+    } else if (item.is_number_float()) {
+      double number = item.get<double>();
+      if (!std::isfinite(number)) {
+        return utils::MakeUnexpected(
+            utils::MakeError(utils::ErrorCode::kCommandInvalidArgument, "Metadata numeric values must be finite"));
+      }
+      metadata[key] = number;
+    } else {
+      return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandInvalidArgument,
+                                                    "Metadata values must be string, integer, float, or bool"));
+    }
+  }
+
+  return metadata;
 }
 }  // namespace
 
@@ -613,16 +689,25 @@ void HttpServer::HandleEvent(const httplib::Request& req, httplib::Response& res
 
     int score = 0;
     if (event_type != events::EventType::DEL) {
-      if (!body["score"].is_number()) {
+      if (!JsonNumberIsFinite(body["score"])) {
         SendError(res, kHttpBadRequest, "Field 'score' must be a number");
         return;
       }
       score = body["score"];
     }
 
+    uint64_t timestamp = 0;
+    if (body.contains("timestamp")) {
+      if (!body["timestamp"].is_number_unsigned()) {
+        SendError(res, kHttpBadRequest, "Field 'timestamp' must be an unsigned integer");
+        return;
+      }
+      timestamp = body["timestamp"];
+    }
+
     // Add event to event store
     if (handler_context_->event_store) {
-      auto result = handler_context_->event_store->AddEvent(ctx, id, score, event_type);
+      auto result = handler_context_->event_store->AddEvent(ctx, id, score, event_type, timestamp);
       if (!result) {
         SendError(res, kHttpInternalServerError, result.error().message());
         return;
@@ -635,7 +720,26 @@ void HttpServer::HandleEvent(const httplib::Request& req, httplib::Response& res
     // Update co-occurrence index
     if (handler_context_->co_index) {
       auto events = handler_context_->event_store->GetEvents(ctx);
-      handler_context_->co_index->UpdateFromEvents(ctx, events);
+      if (handler_context_->config != nullptr && handler_context_->config->events.negative_signals &&
+          event_type == events::EventType::DEL) {
+        auto lock = handler_context_->co_index->AcquireWriteLock();
+        handler_context_->co_index->UpdateFromEventsLocked(ctx, events,
+                                                           handler_context_->config->events.temporal_cooccurrence,
+                                                           handler_context_->config->events.temporal_half_life_sec);
+        handler_context_->co_index->ApplyNegativeSignalLocked(id, events,
+                                                              handler_context_->config->events.negative_weight);
+      } else if (handler_context_->config != nullptr) {
+        handler_context_->co_index->UpdateFromEvents(ctx, events,
+                                                     handler_context_->config->events.temporal_cooccurrence,
+                                                     handler_context_->config->events.temporal_half_life_sec);
+      } else {
+        handler_context_->co_index->UpdateFromEvents(ctx, events);
+      }
+    }
+
+    auto* cache_ptr = handler_context_->cache.load(std::memory_order_acquire);
+    if (cache_ptr != nullptr) {
+      cache_ptr->InvalidateByItemId(id);
     }
 
     stats_.event_commands.fetch_add(1);
@@ -683,16 +787,31 @@ void HttpServer::HandleVecset(const httplib::Request& req, httplib::Response& re
       return;
     }
 
-    // Validate all vector elements are numbers
+    // Validate all vector elements are finite numbers
     for (const auto& elem : body["vector"]) {
-      if (!elem.is_number()) {
-        SendError(res, kHttpBadRequest, "Field 'vector' must contain only numbers");
+      if (!JsonNumberIsFinite(elem)) {
+        SendError(res, kHttpBadRequest, "Field 'vector' must contain only finite numbers");
         return;
       }
     }
 
     std::string id = body["id"];
     std::vector<float> vector = body["vector"].get<std::vector<float>>();
+    if (vector.empty()) {
+      SendError(res, kHttpBadRequest, "Field 'vector' must not be empty");
+      return;
+    }
+
+    vectors::Metadata metadata;
+    bool has_metadata = body.contains("metadata");
+    if (has_metadata) {
+      auto metadata_result = ParseMetadataJson(body["metadata"]);
+      if (!metadata_result) {
+        SendError(res, kHttpBadRequest, metadata_result.error().message());
+        return;
+      }
+      metadata = std::move(*metadata_result);
+    }
 
     // Add vector to vector store
     if (handler_context_->vector_store) {
@@ -704,6 +823,25 @@ void HttpServer::HandleVecset(const httplib::Request& req, httplib::Response& re
     } else {
       SendError(res, kHttpInternalServerError, "Vector store not initialized");
       return;
+    }
+
+    auto compact_idx = handler_context_->vector_store->GetCompactIndex(id);
+    if (compact_idx.has_value()) {
+      if (has_metadata && handler_context_->metadata_store != nullptr) {
+        handler_context_->metadata_store->Set(compact_idx.value(), std::move(metadata));
+      }
+
+      if (handler_context_->similarity_engine != nullptr) {
+        handler_context_->similarity_engine->NotifyVectorAdded(compact_idx.value(), vector.data());
+      }
+    }
+
+    auto* cache_ptr = handler_context_->cache.load(std::memory_order_acquire);
+    if (cache_ptr != nullptr) {
+      cache_ptr->InvalidateByItemId(id);
+      if (has_metadata) {
+        cache_ptr->Clear();
+      }
     }
 
     stats_.vecset_commands.fetch_add(1);
@@ -750,6 +888,34 @@ void HttpServer::HandleSim(const httplib::Request& req, httplib::Response& res) 
     std::string id = body["id"];
     int top_k = body.value("top_k", handler_context_->config->similarity.default_top_k);
     std::string mode = body.value("mode", "fusion");
+    float min_score = body.value("min_score", 0.0F);
+    if (!std::isfinite(min_score)) {
+      SendError(res, kHttpBadRequest, "Field 'min_score' must be finite");
+      return;
+    }
+
+    vectors::MetadataFilter filter;
+    if (body.contains("filter")) {
+      if (!body["filter"].is_string()) {
+        SendError(res, kHttpBadRequest, "Field 'filter' must be a string");
+        return;
+      }
+      auto filter_result = ParseSimpleFilter(body["filter"].get<std::string>());
+      if (!filter_result) {
+        SendError(res, kHttpBadRequest, filter_result.error().message());
+        return;
+      }
+      filter = std::move(*filter_result);
+    }
+
+    std::optional<bool> adaptive;
+    if (body.contains("adaptive")) {
+      if (!body["adaptive"].is_boolean()) {
+        SendError(res, kHttpBadRequest, "Field 'adaptive' must be a boolean");
+        return;
+      }
+      adaptive = body["adaptive"].get<bool>();
+    }
 
     // Check if similarity engine is initialized
     if (!handler_context_->similarity_engine) {
@@ -762,9 +928,9 @@ void HttpServer::HandleSim(const httplib::Request& req, httplib::Response& res) 
     if (mode == "events") {
       result = handler_context_->similarity_engine->SearchByIdEvents(id, top_k);
     } else if (mode == "vectors") {
-      result = handler_context_->similarity_engine->SearchByIdVectors(id, top_k);
+      result = handler_context_->similarity_engine->SearchByIdVectors(id, top_k, filter);
     } else if (mode == "fusion") {
-      result = handler_context_->similarity_engine->SearchByIdFusion(id, top_k);
+      result = handler_context_->similarity_engine->SearchByIdFusion(id, top_k, adaptive, filter);
     } else {
       SendError(res, kHttpBadRequest, "Invalid mode. Must be one of: events, vectors, fusion");
       return;
@@ -778,6 +944,7 @@ void HttpServer::HandleSim(const httplib::Request& req, httplib::Response& res) 
       }
       return;
     }
+    *result = ApplyMetadataFilter(*result, handler_context_->vector_store, handler_context_->metadata_store, filter);
 
     stats_.sim_commands.fetch_add(1);
     stats_.total_commands.fetch_add(1);
@@ -785,14 +952,15 @@ void HttpServer::HandleSim(const httplib::Request& req, httplib::Response& res) 
     // Build JSON response
     json response;
     response["status"] = "ok";
-    response["count"] = result->size();
+    auto filtered_results = ApplyMinScore(*result, min_score);
+    response["count"] = filtered_results.size();
     response["mode"] = mode;
 
     json results_array = json::array();
-    for (const auto& sim_result : *result) {
+    for (const auto& sim_result : filtered_results) {
       json item;
-      item["id"] = sim_result.item_id;
-      item["score"] = sim_result.score;
+      item["id"] = sim_result.first;
+      item["score"] = sim_result.second;
       results_array.push_back(item);
     }
     response["results"] = results_array;
@@ -832,16 +1000,35 @@ void HttpServer::HandleSimv(const httplib::Request& req, httplib::Response& res)
       return;
     }
 
-    // Validate all vector elements are numbers
+    // Validate all vector elements are finite numbers
     for (const auto& elem : body["vector"]) {
-      if (!elem.is_number()) {
-        SendError(res, kHttpBadRequest, "Field 'vector' must contain only numbers");
+      if (!JsonNumberIsFinite(elem)) {
+        SendError(res, kHttpBadRequest, "Field 'vector' must contain only finite numbers");
         return;
       }
     }
 
     std::vector<float> vector = body["vector"].get<std::vector<float>>();
     int top_k = body.value("top_k", handler_context_->config->similarity.default_top_k);
+    float min_score = body.value("min_score", 0.0F);
+    if (!std::isfinite(min_score)) {
+      SendError(res, kHttpBadRequest, "Field 'min_score' must be finite");
+      return;
+    }
+
+    vectors::MetadataFilter filter;
+    if (body.contains("filter")) {
+      if (!body["filter"].is_string()) {
+        SendError(res, kHttpBadRequest, "Field 'filter' must be a string");
+        return;
+      }
+      auto filter_result = ParseSimpleFilter(body["filter"].get<std::string>());
+      if (!filter_result) {
+        SendError(res, kHttpBadRequest, filter_result.error().message());
+        return;
+      }
+      filter = std::move(*filter_result);
+    }
 
     // Check if similarity engine is initialized
     if (!handler_context_->similarity_engine) {
@@ -850,7 +1037,7 @@ void HttpServer::HandleSimv(const httplib::Request& req, httplib::Response& res)
     }
 
     // Search by vector
-    auto result = handler_context_->similarity_engine->SearchByVector(vector, top_k);
+    auto result = handler_context_->similarity_engine->SearchByVector(vector, top_k, filter);
     if (!result) {
       SendError(res, kHttpInternalServerError, result.error().message());
       return;
@@ -861,14 +1048,15 @@ void HttpServer::HandleSimv(const httplib::Request& req, httplib::Response& res)
     // Build JSON response
     json response;
     response["status"] = "ok";
-    response["count"] = result->size();
+    auto filtered_results = ApplyMinScore(*result, min_score);
+    response["count"] = filtered_results.size();
     response["dimension"] = vector.size();
 
     json results_array = json::array();
-    for (const auto& sim_result : *result) {
+    for (const auto& sim_result : filtered_results) {
       json item;
-      item["id"] = sim_result.item_id;
-      item["score"] = sim_result.score;
+      item["id"] = sim_result.first;
+      item["score"] = sim_result.second;
       results_array.push_back(item);
     }
     response["results"] = results_array;

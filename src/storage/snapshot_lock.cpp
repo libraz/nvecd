@@ -13,7 +13,7 @@ namespace nvecd::storage {
 utils::Expected<void, utils::Error> WriteSnapshotWithLock(
     const std::string& filepath, const config::Config& config, events::EventStore& event_store,
     events::CoOccurrenceIndex& co_index, vectors::VectorStore& vector_store, const SnapshotStatistics* stats,
-    const std::unordered_map<std::string, StoreStatistics>* store_stats) {
+    const std::unordered_map<std::string, StoreStatistics>* store_stats, vectors::MetadataStore* metadata_store) {
   utils::LogStorageInfo("snapshot_lock", "Acquiring write locks as barrier for consistent snapshot");
 
   // Write lock barrier: drain all in-flight writes by acquiring exclusive
@@ -28,13 +28,17 @@ utils::Expected<void, utils::Error> WriteSnapshotWithLock(
     auto lock_es = event_store.AcquireWriteLock();
     auto lock_co = co_index.AcquireWriteLock();
     auto lock_vs = vector_store.AcquireWriteLock();
+    if (metadata_store != nullptr) {
+      auto lock_ms = metadata_store->AcquireWriteLock();
+    }
     // All writes drained. Release write locks.
   }
 
   utils::LogStorageInfo("snapshot_lock", "Write barrier complete, serializing snapshot");
 
   // Serialize stores — each const getter acquires its own read lock
-  auto result = snapshot_v1::WriteSnapshotV1(filepath, config, event_store, co_index, vector_store, stats, store_stats);
+  auto result = snapshot_v1::WriteSnapshotV1(filepath, config, event_store, co_index, vector_store, stats, store_stats,
+                                             metadata_store);
 
   // Locks released by RAII when function returns
   if (result) {

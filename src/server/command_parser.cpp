@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <string_view>
 
 #include "utils/structured_log.h"
@@ -18,13 +19,11 @@ namespace nvecd::server {
 
 namespace {
 
-constexpr size_t kUsingPrefixLength = 6;            // Length of "using=" prefix
-constexpr size_t kTimestampPrefixLength = 10;       // Length of "timestamp=" prefix
-constexpr size_t kAdaptivePrefixLength = 9;         // Length of "adaptive=" prefix
-constexpr size_t kFilterPrefixLength = 7;           // Length of "filter=" prefix
-constexpr size_t kMinScorePrefixLength = 10;        // Length of "min_score=" prefix
-constexpr size_t kCandidateLimitPrefixLength = 16;  // Length of "candidate_limit=" prefix
-constexpr size_t kExplainPrefixLength = 8;          // Length of "explain=" prefix
+constexpr size_t kUsingPrefixLength = 6;       // Length of "using=" prefix
+constexpr size_t kTimestampPrefixLength = 10;  // Length of "timestamp=" prefix
+constexpr size_t kAdaptivePrefixLength = 9;    // Length of "adaptive=" prefix
+constexpr size_t kFilterPrefixLength = 7;      // Length of "filter=" prefix
+constexpr size_t kMinScorePrefixLength = 10;   // Length of "min_score=" prefix
 
 /**
  * @brief Split string_view by delimiter, returning owned strings
@@ -94,7 +93,7 @@ utils::Expected<float, utils::Error> ParseFloat(const std::string& str) {
   try {
     size_t pos = 0;
     float value = std::stof(str, &pos);
-    if (pos != str.length()) {
+    if (pos != str.length() || !std::isfinite(value)) {
       return utils::MakeUnexpected(
           utils::MakeError(utils::ErrorCode::kCommandInvalidArgument, "Invalid float: " + str));
     }
@@ -275,6 +274,16 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request) 
     cmd.dimension = static_cast<int>(vec.size());
     cmd.vector = std::move(vec);
 
+  } else if (cmd_name == "METASET") {
+    // METASET <id> <key:value[,key:value...]>
+    if (tokens.size() != 3) {
+      return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandSyntaxError,
+                                                    "METASET requires 2 arguments: <id> <key:value[,key:value...]>"));
+    }
+    cmd.type = CommandType::kMetaset;
+    cmd.id = tokens[1];
+    cmd.filter_expr = tokens[2];
+
   } else if (cmd_name == "SIM") {
     // SIM <id> <top_k> [using=mode]
     if (tokens.size() < 3) {
@@ -294,6 +303,11 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request) 
     for (size_t i = 3; i < tokens.size(); ++i) {
       if (tokens[i].rfind("using=", 0) == 0) {
         cmd.mode = tokens[i].substr(kUsingPrefixLength);
+        if (cmd.mode != "events" && cmd.mode != "vectors" && cmd.mode != "fusion") {
+          return utils::MakeUnexpected(
+              utils::MakeError(utils::ErrorCode::kCommandSyntaxError,
+                               "Invalid using value: " + cmd.mode + " (must be events, vectors, or fusion)"));
+        }
       } else if (tokens[i].rfind("adaptive=", 0) == 0) {
         std::string val = tokens[i].substr(kAdaptivePrefixLength);
         if (val == "on") {
@@ -313,21 +327,11 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request) 
         }
         cmd.min_score = *val;
       } else if (tokens[i].rfind("candidate_limit=", 0) == 0) {
-        auto val = ParseInt(tokens[i].substr(kCandidateLimitPrefixLength));
-        if (!val) {
-          return utils::MakeUnexpected(val.error());
-        }
-        cmd.candidate_limit = static_cast<uint32_t>(*val);
+        return utils::MakeUnexpected(
+            utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "candidate_limit option is not supported"));
       } else if (tokens[i].rfind("explain=", 0) == 0) {
-        std::string val = tokens[i].substr(kExplainPrefixLength);
-        if (val == "on") {
-          cmd.explain = true;
-        } else if (val == "off") {
-          cmd.explain = false;
-        } else {
-          return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandSyntaxError,
-                                                        "Invalid explain value: " + val + " (must be on or off)"));
-        }
+        return utils::MakeUnexpected(
+            utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "explain option is not supported"));
       } else {
         return utils::MakeUnexpected(
             utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "Invalid SIM option: " + tokens[i]));
@@ -335,7 +339,7 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request) 
     }
 
   } else if (cmd_name == "SIMV") {
-    // SIMV <top_k> [filter=...] [min_score=...] [candidate_limit=...] [explain=on|off] <f1> <f2> ... <fN>
+    // SIMV <top_k> [filter=...] [min_score=...] <f1> <f2> ... <fN>
     if (tokens.size() < 3) {
       return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandSyntaxError,
                                                     "SIMV requires at least 2 arguments: <top_k> <floats>"));
@@ -364,18 +368,11 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request) 
         }
         cmd.min_score = *val;
       } else if (tokens[i].rfind("candidate_limit=", 0) == 0) {
-        auto val = ParseInt(tokens[i].substr(kCandidateLimitPrefixLength));
-        if (!val) {
-          return utils::MakeUnexpected(val.error());
-        }
-        cmd.candidate_limit = static_cast<uint32_t>(*val);
+        return utils::MakeUnexpected(
+            utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "candidate_limit option is not supported"));
       } else if (tokens[i].rfind("explain=", 0) == 0) {
-        std::string val = tokens[i].substr(kExplainPrefixLength);
-        if (val == "on") {
-          cmd.explain = true;
-        } else if (val == "off") {
-          cmd.explain = false;
-        }
+        return utils::MakeUnexpected(
+            utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "explain option is not supported"));
       } else {
         return utils::MakeUnexpected(
             utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "Invalid SIMV option: " + tokens[i]));
@@ -392,6 +389,10 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request) 
         return utils::MakeUnexpected(val_result.error());
       }
       vec.push_back(*val_result);
+    }
+    if (vec.empty()) {
+      return utils::MakeUnexpected(
+          utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "SIMV requires at least one vector float"));
     }
 
     cmd.dimension = static_cast<int>(vec.size());

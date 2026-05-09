@@ -54,6 +54,7 @@ nvecd-cli -p 11017 SIM product123 10 using=fusion
 nvecd-cli -p 11017 SIMV 10 0.5 0.3 0.2 0.1
 
 # Filter by metadata
+nvecd-cli -p 11017 METASET product456 category:electronics
 nvecd-cli -p 11017 SIM product123 10 filter=category:electronics
 
 # Set minimum score threshold

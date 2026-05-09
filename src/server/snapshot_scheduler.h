@@ -17,6 +17,7 @@
 #include "events/co_occurrence_index.h"
 #include "events/event_store.h"
 #include "storage/snapshot_fork.h"
+#include "vectors/metadata_store.h"
 #include "vectors/vector_store.h"
 
 namespace nvecd::server {
@@ -48,6 +49,11 @@ class SnapshotScheduler {
    * @param vector_store Vector store for snapshot data (non-owning)
    * @param read_only Reference to read_only flag for mutual exclusion with manual DUMP SAVE
    */
+  SnapshotScheduler(config::SnapshotConfig config, storage::ForkSnapshotWriter* fork_writer,
+                    const config::Config* full_config, events::EventStore* event_store,
+                    events::CoOccurrenceIndex* co_index, vectors::VectorStore* vector_store,
+                    vectors::MetadataStore* metadata_store, std::atomic<bool>& read_only);
+
   SnapshotScheduler(config::SnapshotConfig config, storage::ForkSnapshotWriter* fork_writer,
                     const config::Config* full_config, events::EventStore* event_store,
                     events::CoOccurrenceIndex* co_index, vectors::VectorStore* vector_store,
@@ -114,6 +120,7 @@ class SnapshotScheduler {
   events::EventStore* event_store_;
   events::CoOccurrenceIndex* co_index_;
   vectors::VectorStore* vector_store_;
+  vectors::MetadataStore* metadata_store_;
   std::atomic<bool>& read_only_;
 
   std::atomic<bool> running_{false};

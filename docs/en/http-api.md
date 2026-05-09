@@ -78,7 +78,11 @@ Content-Type: application/json
 
 {
   "id": "product123",
-  "vector": [0.1, 0.2, 0.3, 0.4, 0.5]
+  "vector": [0.1, 0.2, 0.3, 0.4, 0.5],
+  "metadata": {
+    "category": "electronics",
+    "active": true
+  }
 }
 ```
 
@@ -88,6 +92,7 @@ Content-Type: application/json
 |-------|------|----------|-------------|
 | `id` | string | Yes | Item ID |
 | `vector` | array of floats | Yes | Embedding vector (dimension must match existing vectors) |
+| `metadata` | object | No | Metadata used by `filter=` queries. Values may be string, integer, float, or bool. |
 
 **Response (200 OK):**
 

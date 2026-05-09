@@ -18,6 +18,7 @@
 #include "events/event_store.h"
 #include "server/server_types.h"
 #include "similarity/similarity_engine.h"
+#include "vectors/metadata_store.h"
 #include "vectors/vector_store.h"
 
 using namespace nvecd::server;
@@ -38,10 +39,11 @@ class RequestDispatcherTest : public ::testing::Test {
 
     nvecd::config::VectorsConfig vectors_cfg;
     vector_store_ = std::make_unique<nvecd::vectors::VectorStore>(vectors_cfg);
+    metadata_store_ = std::make_unique<nvecd::vectors::MetadataStore>();
 
     nvecd::config::SimilarityConfig sim_cfg;
     similarity_engine_ = std::make_unique<nvecd::similarity::SimilarityEngine>(
-        event_store_.get(), co_index_.get(), vector_store_.get(), sim_cfg, vectors_cfg);
+        event_store_.get(), co_index_.get(), vector_store_.get(), sim_cfg, vectors_cfg, metadata_store_.get());
 
     cache_ = std::make_unique<nvecd::cache::SimilarityCache>(1024 * 1024, 0, 0);
 
@@ -53,7 +55,7 @@ class RequestDispatcherTest : public ::testing::Test {
     ctx_ = new (ctx_storage_) HandlerContext{/*.event_store=*/event_store_.get(),
                                              /*.co_index=*/co_index_.get(),
                                              /*.vector_store=*/vector_store_.get(),
-                                             /*.metadata_store=*/nullptr,
+                                             /*.metadata_store=*/metadata_store_.get(),
                                              /*.similarity_engine=*/similarity_engine_.get(),
                                              /*.cache=*/{},
                                              /*.variable_manager=*/variable_manager_.get(),
@@ -95,6 +97,7 @@ class RequestDispatcherTest : public ::testing::Test {
   std::unique_ptr<nvecd::events::EventStore> event_store_;
   std::unique_ptr<nvecd::events::CoOccurrenceIndex> co_index_;
   std::unique_ptr<nvecd::vectors::VectorStore> vector_store_;
+  std::unique_ptr<nvecd::vectors::MetadataStore> metadata_store_;
   std::unique_ptr<nvecd::similarity::SimilarityEngine> similarity_engine_;
   std::unique_ptr<nvecd::cache::SimilarityCache> cache_;
   std::unique_ptr<nvecd::config::RuntimeVariableManager> variable_manager_;
@@ -187,4 +190,98 @@ TEST_F(RequestDispatcherTest, StatsIncrementOnDispatch) {
 
   uint64_t after = stats_.total_commands.load();
   EXPECT_GE(after - before, 3u);
+}
+
+TEST_F(RequestDispatcherTest, SimvCachedResultStillAppliesMinScore) {
+  nvecd::cache::CachePolicy policy;
+  policy.enabled = true;
+  cache_->SetSearchTypePolicy(nvecd::cache::SearchType::kVectorSearch, policy);
+
+  ASSERT_NE(Dispatch("VECSET item1 1 0\r\n").find("OK"), std::string::npos);
+  ASSERT_NE(Dispatch("VECSET item2 0 1\r\n").find("OK"), std::string::npos);
+
+  auto warm_response = Dispatch("SIMV 2 min_score=0 1 0\r\n");
+  ASSERT_NE(warm_response.find("OK RESULTS 2"), std::string::npos);
+  ASSERT_NE(warm_response.find("item1"), std::string::npos);
+  ASSERT_NE(warm_response.find("item2"), std::string::npos);
+
+  auto filtered_cached_response = Dispatch("SIMV 2 min_score=0.5 1 0\r\n");
+  EXPECT_NE(filtered_cached_response.find("OK RESULTS 1"), std::string::npos);
+  EXPECT_NE(filtered_cached_response.find("item1"), std::string::npos);
+  EXPECT_EQ(filtered_cached_response.find("item2"), std::string::npos);
+}
+
+TEST_F(RequestDispatcherTest, SimvCacheKeyUsesFullVector) {
+  nvecd::cache::CachePolicy policy;
+  policy.enabled = true;
+  cache_->SetSearchTypePolicy(nvecd::cache::SearchType::kVectorSearch, policy);
+
+  ASSERT_NE(Dispatch("VECSET positive_tail 0 0 0 0 1\r\n").find("OK"), std::string::npos);
+  ASSERT_NE(Dispatch("VECSET negative_tail 0 0 0 0 -1\r\n").find("OK"), std::string::npos);
+
+  auto positive_response = Dispatch("SIMV 1 0 0 0 0 1\r\n");
+  ASSERT_NE(positive_response.find("OK RESULTS 1"), std::string::npos);
+  ASSERT_NE(positive_response.find("positive_tail"), std::string::npos);
+
+  auto negative_response = Dispatch("SIMV 1 0 0 0 0 -1\r\n");
+  EXPECT_NE(negative_response.find("OK RESULTS 1"), std::string::npos);
+  EXPECT_NE(negative_response.find("negative_tail"), std::string::npos);
+  EXPECT_EQ(negative_response.find("positive_tail"), std::string::npos);
+}
+
+TEST_F(RequestDispatcherTest, SimFilterUsesMetadataStore) {
+  ASSERT_NE(Dispatch("VECSET query 1 0\r\n").find("OK"), std::string::npos);
+  ASSERT_NE(Dispatch("VECSET active 0.9 0.1\r\n").find("OK"), std::string::npos);
+  ASSERT_NE(Dispatch("VECSET draft 0.8 0.2\r\n").find("OK"), std::string::npos);
+
+  auto active_idx = vector_store_->GetCompactIndex("active");
+  auto draft_idx = vector_store_->GetCompactIndex("draft");
+  ASSERT_TRUE(active_idx.has_value());
+  ASSERT_TRUE(draft_idx.has_value());
+
+  metadata_store_->Set(active_idx.value(), {{"status", std::string("active")}});
+  metadata_store_->Set(draft_idx.value(), {{"status", std::string("draft")}});
+
+  auto response = Dispatch("SIM query 10 using=vectors filter=status:draft\r\n");
+  EXPECT_NE(response.find("OK RESULTS 1"), std::string::npos);
+  EXPECT_NE(response.find("draft"), std::string::npos);
+  EXPECT_EQ(response.find("active"), std::string::npos);
+}
+
+TEST_F(RequestDispatcherTest, MetasetStoresMetadataForFiltering) {
+  ASSERT_NE(Dispatch("VECSET query 1 0\r\n").find("OK"), std::string::npos);
+  ASSERT_NE(Dispatch("VECSET item1 0.9 0.1\r\n").find("OK"), std::string::npos);
+  ASSERT_NE(Dispatch("VECSET item2 0.8 0.2\r\n").find("OK"), std::string::npos);
+
+  EXPECT_NE(Dispatch("METASET item1 status:active,rank:10\r\n").find("OK METASET"), std::string::npos);
+  EXPECT_NE(Dispatch("METASET item2 status:draft,rank:5\r\n").find("OK METASET"), std::string::npos);
+
+  auto response = Dispatch("SIM query 10 using=vectors filter=status:active\r\n");
+  EXPECT_NE(response.find("OK RESULTS 1"), std::string::npos);
+  EXPECT_NE(response.find("item1"), std::string::npos);
+  EXPECT_EQ(response.find("item2"), std::string::npos);
+}
+
+TEST_F(RequestDispatcherTest, MetasetRequiresExistingVector) {
+  auto response = Dispatch("METASET missing status:active\r\n");
+  EXPECT_NE(response.find("ERROR"), std::string::npos);
+  EXPECT_NE(response.find("Vector not found"), std::string::npos);
+}
+
+TEST_F(RequestDispatcherTest, SimvFilterUsesMetadataStore) {
+  ASSERT_NE(Dispatch("VECSET active 1 0\r\n").find("OK"), std::string::npos);
+  ASSERT_NE(Dispatch("VECSET draft 0.9 0.1\r\n").find("OK"), std::string::npos);
+
+  auto active_idx = vector_store_->GetCompactIndex("active");
+  auto draft_idx = vector_store_->GetCompactIndex("draft");
+  ASSERT_TRUE(active_idx.has_value());
+  ASSERT_TRUE(draft_idx.has_value());
+
+  metadata_store_->Set(active_idx.value(), {{"status", std::string("active")}});
+  metadata_store_->Set(draft_idx.value(), {{"status", std::string("draft")}});
+
+  auto response = Dispatch("SIMV 10 filter=status:draft 1 0\r\n");
+  EXPECT_NE(response.find("OK RESULTS 1"), std::string::npos);
+  EXPECT_NE(response.find("draft"), std::string::npos);
+  EXPECT_EQ(response.find("active"), std::string::npos);
 }

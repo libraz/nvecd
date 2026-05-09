@@ -8,6 +8,8 @@
 #include <arpa/inet.h>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
+#include <cctype>
 #include <optional>
 #include <sstream>
 
@@ -56,9 +58,18 @@ std::optional<CIDR> CIDR::Parse(const std::string& cidr_str) {
 
   // Parse prefix length part
   std::string prefix_str = cidr_str.substr(slash_pos + 1);
+  if (prefix_str.empty() ||
+      !std::all_of(prefix_str.begin(), prefix_str.end(), [](unsigned char chr) { return std::isdigit(chr) != 0; })) {
+    return std::nullopt;
+  }
+
   int prefix_length = 0;
   try {
-    prefix_length = std::stoi(prefix_str);
+    size_t pos = 0;
+    prefix_length = std::stoi(prefix_str, &pos);
+    if (pos != prefix_str.size()) {
+      return std::nullopt;
+    }
   } catch (...) {
     return std::nullopt;
   }

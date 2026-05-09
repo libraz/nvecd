@@ -9,10 +9,12 @@
 #include <spdlog/spdlog.h>
 
 #include <chrono>
+#include <optional>
 #include <sstream>
 
 // Include concrete types before request_dispatcher.h to resolve forward declarations
 #include "cache/cache_key.h"
+#include "cache/cache_key_generator.h"
 #include "cache/similarity_cache.h"
 #include "events/co_occurrence_index.h"
 #include "events/event_store.h"
@@ -27,9 +29,52 @@
 #include "similarity/similarity_engine.h"
 #include "utils/error.h"
 #include "utils/structured_log.h"
+#include "vectors/metadata_store.h"
 #include "vectors/vector_store.h"
 
 namespace nvecd::server {
+
+namespace {
+
+std::vector<std::pair<std::string, float>> ApplyMinScore(const std::vector<similarity::SimilarityResult>& results,
+                                                         float min_score) {
+  std::vector<std::pair<std::string, float>> pairs;
+  pairs.reserve(results.size());
+  for (const auto& item : results) {
+    if (item.score >= min_score) {
+      pairs.emplace_back(item.item_id, item.score);
+    }
+  }
+  return pairs;
+}
+
+std::string AdaptiveCachePart(std::optional<bool> adaptive) {
+  if (!adaptive.has_value()) {
+    return "default";
+  }
+  return *adaptive ? "on" : "off";
+}
+
+std::vector<similarity::SimilarityResult> ApplyMetadataFilter(const std::vector<similarity::SimilarityResult>& results,
+                                                              vectors::VectorStore* vector_store,
+                                                              vectors::MetadataStore* metadata_store,
+                                                              const vectors::MetadataFilter& filter) {
+  if (filter.Empty() || vector_store == nullptr || metadata_store == nullptr) {
+    return results;
+  }
+
+  std::vector<similarity::SimilarityResult> filtered;
+  filtered.reserve(results.size());
+  for (const auto& result : results) {
+    auto compact_idx = vector_store->GetCompactIndex(result.item_id);
+    if (compact_idx.has_value() && metadata_store->Matches(compact_idx.value(), filter)) {
+      filtered.push_back(result);
+    }
+  }
+  return filtered;
+}
+
+}  // namespace
 
 RequestDispatcher::RequestDispatcher(HandlerContext& handler_ctx) : ctx_(handler_ctx) {}
 
@@ -68,6 +113,10 @@ std::string RequestDispatcher::Dispatch(const std::string& request, ConnectionCo
     case CommandType::kVecset:
       ctx_.stats.vecset_commands++;
       result = HandleVecset(*cmd);
+      break;
+
+    case CommandType::kMetaset:
+      result = HandleMetaset(*cmd);
       break;
 
     case CommandType::kSim:
@@ -262,6 +311,43 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleVecset(const
   return FormatOK("VECSET");
 }
 
+utils::Expected<std::string, utils::Error> RequestDispatcher::HandleMetaset(const Command& cmd) const {
+  if (ctx_.vector_store == nullptr) {
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kInternalError, "VectorStore not initialized"));
+  }
+  if (ctx_.metadata_store == nullptr) {
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kInternalError, "MetadataStore not initialized"));
+  }
+
+  auto compact_idx = ctx_.vector_store->GetCompactIndex(cmd.id);
+  if (!compact_idx.has_value()) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kVectorNotFound, "Vector not found for metadata: " + cmd.id));
+  }
+
+  auto parsed = ParseSimpleFilter(cmd.filter_expr);
+  if (!parsed) {
+    return utils::MakeUnexpected(parsed.error());
+  }
+
+  vectors::Metadata metadata;
+  for (const auto& condition : parsed->conditions) {
+    if (condition.field.empty()) {
+      return utils::MakeUnexpected(
+          utils::MakeError(utils::ErrorCode::kCommandInvalidArgument, "Metadata key must not be empty"));
+    }
+    metadata[condition.field] = condition.value;
+  }
+  ctx_.metadata_store->Set(compact_idx.value(), std::move(metadata));
+
+  auto* cache_ptr = ctx_.cache.load(std::memory_order_acquire);
+  if (cache_ptr != nullptr) {
+    cache_ptr->Clear();
+  }
+
+  return FormatOK("METASET");
+}
+
 utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSim(const Command& cmd,
                                                                         ConnectionContext& conn_ctx) const {
   (void)conn_ctx;
@@ -289,19 +375,15 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSim(const Co
 
   if (cache_enabled) {
     auto gen = ctx_.co_index != nullptr ? ctx_.co_index->GetGeneration() : 0;
-    std::string key_str =
-        "SIM:" + cmd.id + ":" + std::to_string(cmd.top_k) + ":" + cmd.mode + ":g" + std::to_string(gen);
+    std::string key_str = "SIM:" + cmd.id + ":" + std::to_string(cmd.top_k) + ":" + cmd.mode + ":a" +
+                          AdaptiveCachePart(cmd.adaptive) + ":g" + std::to_string(gen);
     if (!cmd.filter_expr.empty()) {
       key_str += ":f" + cmd.filter_expr;
     }
     cache_key = cache::CacheKeyGenerator::Generate(key_str);
     auto cached = cache_ptr->Lookup(cache_key, search_type);
     if (cached.has_value()) {
-      std::vector<std::pair<std::string, float>> pairs;
-      pairs.reserve(cached->size());
-      for (const auto& item : *cached) {
-        pairs.emplace_back(item.item_id, item.score);
-      }
+      auto pairs = ApplyMinScore(*cached, cmd.min_score);
       return FormatSimResults(pairs, static_cast<int>(pairs.size()));
     }
   }
@@ -321,6 +403,7 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSim(const Co
   if (!result) {
     return utils::MakeUnexpected(result.error());
   }
+  *result = ApplyMetadataFilter(*result, ctx_.vector_store, ctx_.metadata_store, filter);
 
   // Cache store
   if (cache_enabled) {
@@ -339,13 +422,7 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSim(const Co
   }
 
   // Apply min_score filter and convert to pair<string, float>
-  std::vector<std::pair<std::string, float>> pairs;
-  pairs.reserve(result->size());
-  for (const auto& item : *result) {
-    if (item.score >= cmd.min_score) {
-      pairs.emplace_back(item.item_id, item.score);
-    }
-  }
+  auto pairs = ApplyMinScore(*result, cmd.min_score);
 
   return FormatSimResults(pairs, static_cast<int>(pairs.size()));
 }
@@ -376,12 +453,7 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSimv(const C
   }
 
   if (cache_enabled) {
-    // Build cache key from vector hash: first few floats + size
-    std::string vec_hash;
-    for (size_t i = 0; i < std::min(cmd.vector.size(), static_cast<size_t>(4)); ++i) {
-      vec_hash += std::to_string(cmd.vector[i]) + ",";
-    }
-    vec_hash += std::to_string(cmd.vector.size());
+    std::string vec_hash = cache::HashVector(cmd.vector);
     std::string key_str = "SIMV:" + vec_hash + ":" + std::to_string(cmd.top_k);
     if (!cmd.filter_expr.empty()) {
       key_str += ":f" + cmd.filter_expr;
@@ -389,11 +461,7 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSimv(const C
     cache_key = cache::CacheKeyGenerator::Generate(key_str);
     auto cached = cache_ptr->Lookup(cache_key, search_type);
     if (cached.has_value()) {
-      std::vector<std::pair<std::string, float>> pairs;
-      pairs.reserve(cached->size());
-      for (const auto& item : *cached) {
-        pairs.emplace_back(item.item_id, item.score);
-      }
+      auto pairs = ApplyMinScore(*cached, cmd.min_score);
       return FormatSimResults(pairs, static_cast<int>(pairs.size()));
     }
   }
@@ -404,6 +472,7 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSimv(const C
   if (!result) {
     return utils::MakeUnexpected(result.error());
   }
+  *result = ApplyMetadataFilter(*result, ctx_.vector_store, ctx_.metadata_store, filter);
 
   // Cache store
   if (cache_enabled) {
@@ -421,13 +490,7 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSimv(const C
   }
 
   // Apply min_score filter and convert to pair<string, float>
-  std::vector<std::pair<std::string, float>> pairs;
-  pairs.reserve(result->size());
-  for (const auto& item : *result) {
-    if (item.score >= cmd.min_score) {
-      pairs.emplace_back(item.item_id, item.score);
-    }
-  }
+  auto pairs = ApplyMinScore(*result, cmd.min_score);
 
   return FormatSimResults(pairs, static_cast<int>(pairs.size()));
 }

@@ -61,6 +61,31 @@ TEST(CommandParserTest, ParseVecset_MissingVector) {
   EXPECT_EQ(result.error().code(), ErrorCode::kCommandSyntaxError);
 }
 
+TEST(CommandParserTest, ParseVecset_RejectsNonFiniteFloat) {
+  auto result = ParseCommand("VECSET item123 1.0 nan");
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), ErrorCode::kCommandInvalidArgument);
+
+  result = ParseCommand("VECSET item123 1.0 inf");
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), ErrorCode::kCommandInvalidArgument);
+}
+
+// METASET command tests
+TEST(CommandParserTest, ParseMetaset_Valid) {
+  auto result = ParseCommand("METASET item123 category:electronics,active:true");
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->type, CommandType::kMetaset);
+  EXPECT_EQ(result->id, "item123");
+  EXPECT_EQ(result->filter_expr, "category:electronics,active:true");
+}
+
+TEST(CommandParserTest, ParseMetaset_MissingArgs) {
+  auto result = ParseCommand("METASET item123");
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), ErrorCode::kCommandSyntaxError);
+}
+
 // SIM command tests
 TEST(CommandParserTest, ParseSim_Basic) {
   auto result = ParseCommand("SIM item123 10");
@@ -86,6 +111,18 @@ TEST(CommandParserTest, ParseSim_MissingArgs) {
   EXPECT_EQ(result.error().code(), ErrorCode::kCommandSyntaxError);
 }
 
+TEST(CommandParserTest, ParseSim_InvalidMode) {
+  auto result = ParseCommand("SIM item123 10 using=unknown");
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), ErrorCode::kCommandSyntaxError);
+}
+
+TEST(CommandParserTest, ParseSim_UnsupportedCandidateLimit) {
+  auto result = ParseCommand("SIM item123 10 candidate_limit=-1");
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), ErrorCode::kCommandSyntaxError);
+}
+
 // SIMV command tests
 TEST(CommandParserTest, ParseSimv_Valid) {
   auto result = ParseCommand("SIMV 5 0.5 0.6 0.7");
@@ -102,6 +139,24 @@ TEST(CommandParserTest, ParseSimv_Valid) {
 TEST(CommandParserTest, ParseSimv_DimensionMismatch) {
   // Dimension is now auto-detected, test with missing floats instead
   auto result = ParseCommand("SIMV 5");  // Missing floats
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), ErrorCode::kCommandSyntaxError);
+}
+
+TEST(CommandParserTest, ParseSimv_MissingVectorAfterSupportedOptions) {
+  auto result = ParseCommand("SIMV 5 min_score=0.1");
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), ErrorCode::kCommandSyntaxError);
+}
+
+TEST(CommandParserTest, ParseSimv_UnsupportedExplain) {
+  auto result = ParseCommand("SIMV 5 explain=on");
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), ErrorCode::kCommandSyntaxError);
+}
+
+TEST(CommandParserTest, ParseSimv_UnsupportedCandidateLimit) {
+  auto result = ParseCommand("SIMV 5 candidate_limit=100 0.1 0.2");
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code(), ErrorCode::kCommandSyntaxError);
 }

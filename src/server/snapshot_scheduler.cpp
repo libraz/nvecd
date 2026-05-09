@@ -27,14 +27,22 @@ constexpr int kCheckIntervalMs = 1000;  // Check for shutdown every second
 SnapshotScheduler::SnapshotScheduler(config::SnapshotConfig config, storage::ForkSnapshotWriter* fork_writer,
                                      const config::Config* full_config, events::EventStore* event_store,
                                      events::CoOccurrenceIndex* co_index, vectors::VectorStore* vector_store,
-                                     std::atomic<bool>& read_only)
+                                     vectors::MetadataStore* metadata_store, std::atomic<bool>& read_only)
     : config_(std::move(config)),
       fork_writer_(fork_writer),
       full_config_(full_config),
       event_store_(event_store),
       co_index_(co_index),
       vector_store_(vector_store),
+      metadata_store_(metadata_store),
       read_only_(read_only) {}
+
+SnapshotScheduler::SnapshotScheduler(config::SnapshotConfig config, storage::ForkSnapshotWriter* fork_writer,
+                                     const config::Config* full_config, events::EventStore* event_store,
+                                     events::CoOccurrenceIndex* co_index, vectors::VectorStore* vector_store,
+                                     std::atomic<bool>& read_only)
+    : SnapshotScheduler(std::move(config), fork_writer, full_config, event_store, co_index, vector_store, nullptr,
+                        read_only) {}
 
 SnapshotScheduler::~SnapshotScheduler() {
   Stop();
@@ -137,7 +145,7 @@ void SnapshotScheduler::TakeSnapshot() {
 
     // Start background fork-based snapshot
     auto result = fork_writer_->StartBackgroundSave(snapshot_path.string(), *full_config_, *event_store_, *co_index_,
-                                                    *vector_store_);
+                                                    *vector_store_, metadata_store_);
 
     if (result) {
       utils::StructuredLog().Event("snapshot_started").Field("path", snapshot_path.string()).Info();

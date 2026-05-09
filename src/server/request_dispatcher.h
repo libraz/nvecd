@@ -64,6 +64,7 @@ class RequestDispatcher {
   // Handler methods
   utils::Expected<std::string, utils::Error> HandleEvent(const Command& cmd) const;
   utils::Expected<std::string, utils::Error> HandleVecset(const Command& cmd) const;
+  utils::Expected<std::string, utils::Error> HandleMetaset(const Command& cmd) const;
   utils::Expected<std::string, utils::Error> HandleSim(const Command& cmd, ConnectionContext& conn_ctx) const;
   utils::Expected<std::string, utils::Error> HandleSimv(const Command& cmd, ConnectionContext& conn_ctx) const;
   utils::Expected<std::string, utils::Error> HandleInfo(const Command& cmd);

@@ -78,7 +78,11 @@ Content-Type: application/json
 
 {
   "id": "product123",
-  "vector": [0.1, 0.2, 0.3, 0.4, 0.5]
+  "vector": [0.1, 0.2, 0.3, 0.4, 0.5],
+  "metadata": {
+    "category": "electronics",
+    "active": true
+  }
 }
 ```
 
@@ -88,6 +92,7 @@ Content-Type: application/json
 |-----------|---|------|------|
 | `id` | string | Yes | アイテム ID |
 | `vector` | array of floats | Yes | 埋め込みベクトル（次元は既存ベクトルと一致する必要あり） |
+| `metadata` | object | No | `filter=` クエリで使うメタデータ。値は string、integer、float、bool を指定可能 |
 
 **レスポンス（200 OK）:**
 
