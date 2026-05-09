@@ -6,7 +6,7 @@ This document presents measured performance benchmarks for nvecd's similarity se
 
 - **Hardware**: Apple M5 Max (arm64), 128GB unified memory
 - **SIMD**: NEON (4-wide, 128-bit), 4x multi-accumulator unrolled
-- **Build**: Release (`-O2`), Clang 16
+- **Build**: Release (`-O3 -march=native`), Apple Clang
 - **Configuration**: Default (`distance_metric: cosine`, `sample_size: 10000`)
 - **Test Methodology**: Median over 15 iterations, warm state (compact storage populated)
 - **Reproducible**: `./bin/similarity_benchmark --gtest_also_run_disabled_tests`
@@ -19,29 +19,28 @@ This document presents measured performance benchmarks for nvecd's similarity se
 
 | Dataset Size | SearchByIdVectors (SIM) | SearchByVector (SIMV) | Cache Hit |
 |---|---|---|---|
-| 1K vectors | 0.019ms | 0.018ms | 0.42us |
-| 10K vectors | 0.18ms | 0.18ms | 0.42us |
-| 50K vectors | 1.33ms | 1.36ms | 0.42us |
-| 100K vectors | **1.84ms** | **1.77ms** | **0.42us** |
+| 1K vectors | 0.010ms | 0.010ms | 0.21us |
+| 10K vectors | 0.092ms | 0.092ms | 0.21us |
+| 50K vectors | 0.59ms | 0.58ms | 0.21us |
+| 100K vectors | **0.90ms** | **0.91ms** | **0.21us** |
 
 **Key findings:**
 
-- Sub-millisecond latency up to 10K vectors without sampling
-- 100K vectors: ~1.8ms per query (**~540 QPS per thread**)
-- Cache hit latency: 417 nanoseconds (**2.4 million ops/sec**)
-- Cache provides **4,300x** speedup over cold queries at 100K scale
+- Sub-millisecond latency up to 50K vectors without sampling
+- 100K vectors: ~0.9ms per query (**~1,100 QPS per thread**)
+- Cache hit latency: 208 nanoseconds (**4.8 million ops/sec**)
+- Cache provides **~4,300x** speedup over cold queries at 100K scale
 
 ## Pipeline Breakdown (100K vectors, dim=128)
 
 | Component | Time | % of E2E |
 |---|---|---|
-| NEON cosine scan (brute-force) | 1.45ms | 79% |
-| Min-heap top-k selection | 0.09ms | 5% |
-| Lock acquisition + index lookup | 0.05ms | 3% |
-| Result string construction (k=10) | 0.03ms | 2% |
-| **Total (SearchByIdVectors)** | **1.84ms** | **100%** |
+| NEON cosine scan (brute-force) | 0.73ms | 81% |
+| Min-heap top-k selection | 0.06ms | 7% |
+| Lock acquisition, index lookup, result construction | 0.11ms | 12% |
+| **Total (SearchByIdVectors)** | **0.90ms** | **100%** |
 
-The scan (SIMD dot product) dominates at 78%. The min-heap approach avoids allocating 100K result strings, reducing overhead from ~0.22ms (partial_sort) to ~0.05ms.
+The scan (SIMD dot product) dominates at over 80%. The min-heap approach avoids allocating 100K result strings, keeping top-k selection at ~0.06ms.
 
 ## SIMD Performance
 
@@ -75,9 +74,10 @@ The dot product loop uses 4 independent SIMD accumulators to hide FMA latency:
 | Compact contiguous storage | 2.83ms | 1.86x | 1.86x |
 | Min-heap top-k (no string alloc) | 1.66ms | 1.71x | 3.17x |
 | 4x SIMD multi-accumulator | 1.25ms | 1.33x | 4.22x |
-| Unified storage (no dual map) | **1.03ms** | 1.21x | **5.12x** |
+| Unified storage (no dual map) | 1.03ms | 1.21x | 5.12x |
+| Per-search-type cache + co-occurrence pruning | **0.90ms** | 1.14x | **5.86x** |
 
-**Total: 5.12x faster** from baseline to current.
+**Total: 5.86x faster** from baseline to current.
 
 ## Compact Storage vs Dual Storage
 
@@ -108,8 +108,8 @@ Selective invalidation uses a reverse index (`item_id -> set<CacheKey>`) to inva
 
 | Operation | Latency | Ops/sec |
 |---|---|---|
-| Cache miss (key not found) | 84-125ns | 8-12M |
-| Cache hit (decompress + return) | 417ns | 2.4M |
+| Cache miss (key not found) | 42ns | ~24M |
+| Cache hit (decompress + return) | 208ns | ~4.8M |
 
 Cache overhead is negligible compared to search latency.
 
@@ -119,10 +119,10 @@ Cache overhead is negligible compared to search latency.
 
 | sample_size | Coverage (1M vectors) | Latency | Recall@10 (typical) |
 |---|---|---|---|
-| 0 (exact) | 100% | ~11ms | 100% |
-| 50,000 | 5% | ~0.6ms | ~95% |
-| **10,000 (default)** | **1%** | **~0.12ms** | **~80-90%** |
-| 5,000 | 0.5% | ~0.06ms | ~70-80% |
+| 0 (exact) | 100% | ~9ms | 100% |
+| 50,000 | 5% | ~0.5ms | ~95% |
+| **10,000 (default)** | **1%** | **~0.10ms** | **~80-90%** |
+| 5,000 | 0.5% | ~0.05ms | ~70-80% |
 
 Reservoir sampling (Algorithm R) provides uniform random coverage. For recommendation workloads where approximate results are acceptable, `sample_size=10000` offers a good speed/quality tradeoff.
 
@@ -139,10 +139,10 @@ After `DeleteVector()`, tombstoned slots accumulate. `Defragment()` runs automat
 
 | Dataset Size | Defragment Time (25% tombstones) |
 |---|---|
-| 1K vectors | 0.04ms |
-| 10K vectors | 0.33ms |
-| 50K vectors | 1.69ms |
-| 100K vectors | 3.39ms |
+| 1K vectors | 0.03ms |
+| 10K vectors | 0.27ms |
+| 50K vectors | 1.49ms |
+| 100K vectors | 3.07ms |
 
 Defragment acquires an exclusive lock briefly for the pointer swap. The rebuild phase itself is fast due to contiguous memory access patterns.
 

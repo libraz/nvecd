@@ -714,14 +714,14 @@ snapshot:
 
 For detailed measured benchmarks, see [Benchmarks](benchmarks.md).
 
-### Query Latency Summary (100K vectors, dim=128, Apple M4 Max)
+### Query Latency Summary (100K vectors, dim=128, Apple M5 Max)
 
 | Operation | Cold Latency | Cached Latency | Throughput/thread |
 |-----------|-------------|----------------|-------------------|
-| SIM       | **1.12ms**  | 0.00025ms      | 900 QPS           |
-| SIMV      | **0.98ms**  | 0.00025ms      | 1,000 QPS         |
+| SIM       | **0.90ms**  | 0.00021ms      | ~1,100 QPS        |
+| SIMV      | **0.91ms**  | 0.00021ms      | ~1,100 QPS        |
 
-At 1M vectors with default sampling (10K): **~0.12ms** per query, **64K QPS** on 8 threads.
+At 1M vectors with default sampling (10K): **~0.10ms** per query, **~80K QPS** on 8 threads.
 
 ### Optimization Tips
 

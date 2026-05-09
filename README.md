@@ -96,11 +96,11 @@ Measured on Apple M5 Max (NEON), dim=128, cosine, top_k=10:
 
 | Vectors | SIM Latency | SIMV Latency |
 |---|---|---|
-| 1K | 0.019ms | 0.018ms |
-| 10K | 0.18ms | 0.18ms |
-| 100K | **1.84ms** | **1.77ms** |
+| 1K | 0.010ms | 0.010ms |
+| 10K | 0.092ms | 0.092ms |
+| 100K | **0.90ms** | **0.91ms** |
 
-Cache hit: **0.42us** (2.4M ops/sec). See [Benchmarks](docs/en/benchmarks.md) for methodology and detailed breakdown.
+Cache hit: **0.21us** (4.8M ops/sec). See [Benchmarks](docs/en/benchmarks.md) for methodology and detailed breakdown.
 
 ## Features
 

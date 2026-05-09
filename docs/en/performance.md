@@ -288,16 +288,16 @@ echo "DUMP SAVE /backup/nvecd-$(date +%Y%m%d-%H%M%S).dmp" | nc localhost 11017
 
 For detailed benchmark results with measured data, see the **[Benchmarks](benchmarks.md)** page.
 
-### Summary (100K vectors, dim=128, cosine, Apple M4 Max)
+### Summary (100K vectors, dim=128, cosine, Apple M5 Max)
 
 | Query Type | Cold (no cache) | Warm (cached) |
 |------------|-----------------|---------------|
-| SIM (ID search, vectors) | **1.12ms** | 0.00025ms |
-| SIMV (vector query) | **0.98ms** | 0.00025ms |
+| SIM (ID search, vectors) | **0.90ms** | 0.00021ms |
+| SIMV (vector query) | **0.91ms** | 0.00021ms |
 
 **Key Performance Numbers:**
-- **4.71x** cumulative speedup from optimization pipeline
-- **4 million ops/sec** cache hit throughput
+- **5.86x** cumulative speedup from optimization pipeline
+- **4.8 million ops/sec** cache hit throughput
 - **50% memory reduction** from unified storage (no dual map)
 - **0ms write blocking** (eliminated 160ms Compact() rebuild)
 
@@ -307,10 +307,10 @@ For detailed benchmark results with measured data, see the **[Benchmarks](benchm
 
 | Dataset Size | Full Scan | With Sampling (10K) |
 |---|---|---|
-| 1K vectors | 0.015ms | 0.015ms (full scan) |
-| 10K vectors | 0.13ms | 0.13ms (full scan) |
-| 100K vectors | 1.12ms | 1.12ms (full scan) |
-| 1M vectors | ~11ms | **~0.12ms** |
+| 1K vectors | 0.010ms | 0.010ms (full scan) |
+| 10K vectors | 0.092ms | 0.092ms (full scan) |
+| 100K vectors | 0.90ms | 0.90ms (full scan) |
+| 1M vectors | ~9ms | **~0.10ms** |
 
 **Approximate search** with `sample_size: 10000` (default) enables sub-millisecond latency at 1M+ scale.
 
@@ -318,10 +318,10 @@ For detailed benchmark results with measured data, see the **[Benchmarks](benchm
 
 | Hit Rate | Effective Latency (100K) |
 |----------|--------------------------|
-| 0% (cold) | 1.12ms |
-| 50% | 0.56ms |
-| 90% | 0.11ms |
-| 99% | 0.011ms |
+| 0% (cold) | 0.90ms |
+| 50% | 0.45ms |
+| 90% | 0.09ms |
+| 99% | 0.009ms |
 
 ## Troubleshooting
 
