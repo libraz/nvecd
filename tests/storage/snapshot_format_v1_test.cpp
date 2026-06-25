@@ -344,3 +344,102 @@ TEST_F(SnapshotFormatV1Test, WriteEmptyStores) {
   EXPECT_TRUE(verify_result.has_value()) << "VerifySnapshotIntegrity failed: " << verify_result.error().message();
   EXPECT_FALSE(integrity_error.HasError());
 }
+
+// ---------------------------------------------------------------------------
+// 9. ReadCorruptedBody_FailsFileCRC
+//
+// Regression test: ReadSnapshotV1 must verify the whole-file CRC32 and reject
+// a snapshot whose body has been tampered with, rather than loading corrupt
+// data silently.
+// ---------------------------------------------------------------------------
+TEST_F(SnapshotFormatV1Test, ReadCorruptedBody_FailsFileCRC) {
+  PopulateStores();
+
+  const std::string path = TestFilePath("read_corrupted_body.dmp");
+
+  auto write_result = WriteSnapshotV1(path, config_, *event_store_, *co_index_, *vector_store_);
+  ASSERT_TRUE(write_result.has_value()) << "WriteSnapshotV1 failed: " << write_result.error().message();
+
+  // Read the file, flip a byte in the body, write it back.
+  std::string file_data;
+  {
+    std::ifstream ifs(path, std::ios::binary);
+    ASSERT_TRUE(ifs.is_open());
+    file_data.assign(std::istreambuf_iterator<char>(ifs), std::istreambuf_iterator<char>());
+  }
+  ASSERT_GT(file_data.size(), 100u);
+
+  // Flip a byte roughly in the middle of the data section (well past the header).
+  size_t corrupt_offset = file_data.size() / 2;
+  file_data[corrupt_offset] ^= 0xFF;
+
+  {
+    std::ofstream ofs(path, std::ios::binary | std::ios::trunc);
+    ASSERT_TRUE(ofs.is_open());
+    ofs.write(file_data.data(), static_cast<std::streamsize>(file_data.size()));
+  }
+
+  // LOAD must fail (not silently succeed).
+  config::EventsConfig events_cfg;
+  config::VectorsConfig vectors_cfg;
+  events::EventStore loaded_events(events_cfg);
+  events::CoOccurrenceIndex loaded_co;
+  vectors::VectorStore loaded_vectors(vectors_cfg);
+  config::Config loaded_config;
+  snapshot_format::IntegrityError integrity_error;
+
+  auto read_result =
+      ReadSnapshotV1(path, loaded_config, loaded_events, loaded_co, loaded_vectors, nullptr, nullptr, &integrity_error);
+  EXPECT_FALSE(read_result.has_value()) << "Corrupted snapshot must not load successfully";
+  EXPECT_TRUE(integrity_error.HasError());
+  EXPECT_EQ(integrity_error.type, snapshot_format::CRCErrorType::FileCRC);
+}
+
+// ---------------------------------------------------------------------------
+// 10. ReadTruncated_FailsNotSilent
+//
+// Regression test: a snapshot truncated mid-store-section must be rejected by
+// ReadSnapshotV1 (caught by the file size / CRC check), never loaded as an
+// empty or partial store.
+// ---------------------------------------------------------------------------
+TEST_F(SnapshotFormatV1Test, ReadTruncated_FailsNotSilent) {
+  PopulateStores();
+
+  const std::string path = TestFilePath("read_truncated.dmp");
+
+  auto write_result = WriteSnapshotV1(path, config_, *event_store_, *co_index_, *vector_store_);
+  ASSERT_TRUE(write_result.has_value()) << "WriteSnapshotV1 failed: " << write_result.error().message();
+
+  // Read the full file, then truncate it to roughly 60% to cut into the store
+  // data section (after the header, config and store-count fields).
+  std::string file_data;
+  {
+    std::ifstream ifs(path, std::ios::binary);
+    ASSERT_TRUE(ifs.is_open());
+    file_data.assign(std::istreambuf_iterator<char>(ifs), std::istreambuf_iterator<char>());
+  }
+  ASSERT_GT(file_data.size(), 100u);
+
+  size_t truncated_size = (file_data.size() * 3) / 5;
+  ASSERT_GT(truncated_size, snapshot_format::kFixedHeaderSize);
+  file_data.resize(truncated_size);
+
+  {
+    std::ofstream ofs(path, std::ios::binary | std::ios::trunc);
+    ASSERT_TRUE(ofs.is_open());
+    ofs.write(file_data.data(), static_cast<std::streamsize>(file_data.size()));
+  }
+
+  // LOAD must fail rather than silently succeed with a partial/empty store.
+  config::EventsConfig events_cfg;
+  config::VectorsConfig vectors_cfg;
+  events::EventStore loaded_events(events_cfg);
+  events::CoOccurrenceIndex loaded_co;
+  vectors::VectorStore loaded_vectors(vectors_cfg);
+  config::Config loaded_config;
+  snapshot_format::IntegrityError integrity_error;
+
+  auto read_result =
+      ReadSnapshotV1(path, loaded_config, loaded_events, loaded_co, loaded_vectors, nullptr, nullptr, &integrity_error);
+  EXPECT_FALSE(read_result.has_value()) << "Truncated snapshot must not load successfully";
+}

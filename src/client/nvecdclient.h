@@ -24,6 +24,37 @@
 
 namespace nvecd::client {
 
+namespace detail {
+
+/**
+ * @brief Determine whether a received response is complete (framing).
+ *
+ * The nvecd wire protocol uses line-delimited text responses. Most responses
+ * are a single line terminated by a newline. SIM/SIMV searches, however, send a
+ * multi-line response framed by a header:
+ *
+ * @code
+ *   OK RESULTS <count>\r\n
+ *   <id1> <score1>\r\n
+ *   ...
+ *   <idN> <scoreN>\r\n
+ * @endcode
+ *
+ * A single recv() may return only part of such a response (e.g. just the header
+ * line), or several responses at once. Using "buffer ends with a newline" as the
+ * completion signal therefore truncates SIM/SIMV results. This helper inspects
+ * the accumulated buffer and reports completion using length-aware framing:
+ * when the buffer starts with "OK RESULTS <count>", it is complete only once
+ * <count> + 1 newline-terminated lines have been received; otherwise a single
+ * newline-terminated line marks completion.
+ *
+ * @param buffer Accumulated bytes received so far.
+ * @return true if @p buffer contains at least one complete response.
+ */
+bool IsResponseComplete(const std::string& buffer);
+
+}  // namespace detail
+
 /**
  * @brief Similarity search result item
  */

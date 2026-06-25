@@ -134,6 +134,74 @@ uint32_t CalculateCRC32(const std::string& str) {
   return CalculateCRC32(str.data(), str.size());
 }
 
+namespace {
+
+/**
+ * @brief Verify the whole-file size and CRC32 recorded in the V1 header.
+ *
+ * Validates the stored total_file_size against the actual on-disk size and
+ * recomputes the CRC32 over the entire file (with the file_crc32 field zeroed)
+ * to compare against header.file_crc32. This is the same check performed by
+ * VerifySnapshotIntegrity and is shared so the two code paths cannot diverge.
+ *
+ * The input stream position is modified by this function (seeks to end/begin).
+ *
+ * @param input_stream Open binary input stream for the snapshot file
+ * @param header Parsed V1 header containing total_file_size and file_crc32
+ * @param integrity_error Optional output populated with FileCRC details on failure
+ * @return Expected<void, Error> Success or a FileCRC failure
+ */
+Expected<void, Error> VerifyFileLevelIntegrity(std::istream& input_stream, const HeaderV1& header,
+                                               snapshot_format::IntegrityError* integrity_error) {
+  // Verify file size against the value recorded in the header.
+  input_stream.seekg(0, std::ios::end);
+  auto actual_file_size = static_cast<uint64_t>(input_stream.tellg());
+  if (actual_file_size != header.total_file_size) {
+    std::string message = "File size mismatch: expected " + std::to_string(header.total_file_size) + ", got " +
+                          std::to_string(actual_file_size);
+    if (integrity_error != nullptr) {
+      integrity_error->type = snapshot_format::CRCErrorType::FileCRC;
+      integrity_error->message = message;
+    }
+    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, message));
+  }
+
+  // Verify whole-file CRC32 (computed with the file_crc32 field zeroed out).
+  if (header.file_crc32 != 0) {
+    input_stream.seekg(0, std::ios::beg);
+    std::string file_contents(static_cast<size_t>(actual_file_size), '\0');
+    input_stream.read(file_contents.data(), static_cast<std::streamsize>(actual_file_size));
+    if (input_stream.fail()) {
+      std::string message = "Failed to read file contents for CRC verification";
+      if (integrity_error != nullptr) {
+        integrity_error->type = snapshot_format::CRCErrorType::FileCRC;
+        integrity_error->message = message;
+      }
+      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, message));
+    }
+
+    // Zero out the file_crc32 field for CRC computation (it was 0 when written).
+    if (file_contents.size() >= kFileCRC32Offset + sizeof(uint32_t)) {
+      std::memset(&file_contents[kFileCRC32Offset], 0, sizeof(uint32_t));
+    }
+
+    uint32_t computed_crc = CalculateCRC32(file_contents);
+    if (computed_crc != header.file_crc32) {
+      std::string message = "File CRC32 mismatch: expected " + std::to_string(header.file_crc32) + ", got " +
+                            std::to_string(computed_crc);
+      if (integrity_error != nullptr) {
+        integrity_error->type = snapshot_format::CRCErrorType::FileCRC;
+        integrity_error->message = message;
+      }
+      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, message));
+    }
+  }
+
+  return {};
+}
+
+}  // namespace
+
 // ============================================================================
 // Header V1 Serialization
 // ============================================================================
@@ -1120,6 +1188,18 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
       return read_header_result;
     }
 
+    // Verify whole-file integrity (size + CRC32) before deserializing any
+    // section. This catches truncation and bit-rot anywhere in the file. The
+    // helper repositions the stream, so remember where the sections begin and
+    // seek back afterwards.
+    auto sections_begin = input_stream.tellg();
+    auto file_integrity_result = VerifyFileLevelIntegrity(input_stream, header, integrity_error);
+    if (!file_integrity_result) {
+      return file_integrity_result;
+    }
+    input_stream.clear();
+    input_stream.seekg(sections_begin, std::ios::beg);
+
     // Read config section
     uint32_t config_size = 0;
     uint32_t config_crc = 0;
@@ -1198,25 +1278,39 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
 
     // Read store data section
     uint32_t store_count = 0;
-    ReadBinary(input_stream, store_count);
+    if (!ReadBinary(input_stream, store_count)) {
+      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read store count"));
+    }
 
     for (uint32_t store_idx = 0; store_idx < store_count; ++store_idx) {
       // Read store name
       std::string store_name;
-      ReadString(input_stream, store_name);
+      if (!ReadString(input_stream, store_name)) {
+        return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read store name"));
+      }
 
       // Read store statistics (if present)
       uint32_t store_stats_size = 0;
-      ReadBinary(input_stream, store_stats_size);
+      if (!ReadBinary(input_stream, store_stats_size)) {
+        return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError,
+                                        "Failed to read store statistics size for '" + store_name + "'"));
+      }
       if (store_stats_size > 0 && store_stats != nullptr) {
         uint32_t store_stats_crc = 0;
-        ReadBinary(input_stream, store_stats_crc);
+        if (!ReadBinary(input_stream, store_stats_crc)) {
+          return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError,
+                                          "Failed to read store statistics CRC for '" + store_name + "'"));
+        }
         if (store_stats_size > kMaxStoreStatsSize) {
           return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Store statistics size exceeds maximum: " +
                                                                                 std::to_string(store_stats_size)));
         }
         std::string store_stats_data(store_stats_size, '\0');
         input_stream.read(store_stats_data.data(), store_stats_size);
+        if (!input_stream.good()) {
+          return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError,
+                                          "Failed to read store statistics data for '" + store_name + "'"));
+        }
         {
           uint32_t actual_crc = CalculateCRC32(store_stats_data);
           if (actual_crc != store_stats_crc) {
@@ -1244,14 +1338,24 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
       // Read store data
       uint32_t store_data_size = 0;
       uint32_t store_data_crc = 0;
-      ReadBinary(input_stream, store_data_size);
-      ReadBinary(input_stream, store_data_crc);
+      if (!ReadBinary(input_stream, store_data_size)) {
+        return MakeUnexpected(
+            MakeError(ErrorCode::kStorageDumpReadError, "Failed to read store data size for '" + store_name + "'"));
+      }
+      if (!ReadBinary(input_stream, store_data_crc)) {
+        return MakeUnexpected(
+            MakeError(ErrorCode::kStorageDumpReadError, "Failed to read store data CRC for '" + store_name + "'"));
+      }
       if (store_data_size > kMaxStoreDataSize) {
         return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError,
                                         "Store data size exceeds maximum: " + std::to_string(store_data_size)));
       }
       std::string store_data(store_data_size, '\0');
       input_stream.read(store_data.data(), store_data_size);
+      if (!input_stream.good()) {
+        return MakeUnexpected(
+            MakeError(ErrorCode::kStorageDumpReadError, "Failed to read store data for '" + store_name + "'"));
+      }
       {
         uint32_t actual_crc = CalculateCRC32(store_data);
         if (actual_crc != store_data_crc) {
@@ -1359,39 +1463,10 @@ Expected<void, Error> VerifySnapshotIntegrity(const std::string& filepath,
       return read_header_result;
     }
 
-    // Verify file size
-    input_stream.seekg(0, std::ios::end);
-    uint64_t actual_file_size = static_cast<uint64_t>(input_stream.tellg());
-    if (actual_file_size != header.total_file_size) {
-      integrity_error.type = snapshot_format::CRCErrorType::FileCRC;
-      integrity_error.message = "File size mismatch: expected " + std::to_string(header.total_file_size) + ", got " +
-                                std::to_string(actual_file_size);
-      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, integrity_error.message));
-    }
-
-    // Verify file CRC32
-    if (header.file_crc32 != 0) {
-      input_stream.seekg(0, std::ios::beg);
-      std::string file_contents(static_cast<size_t>(actual_file_size), '\0');
-      input_stream.read(file_contents.data(), static_cast<std::streamsize>(actual_file_size));
-      if (input_stream.fail()) {
-        integrity_error.type = snapshot_format::CRCErrorType::FileCRC;
-        integrity_error.message = "Failed to read file contents for CRC verification";
-        return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, integrity_error.message));
-      }
-
-      // Zero out the file_crc32 field for CRC computation
-      if (file_contents.size() >= kFileCRC32Offset + sizeof(uint32_t)) {
-        std::memset(&file_contents[kFileCRC32Offset], 0, sizeof(uint32_t));
-      }
-
-      uint32_t computed_crc = CalculateCRC32(file_contents);
-      if (computed_crc != header.file_crc32) {
-        integrity_error.type = snapshot_format::CRCErrorType::FileCRC;
-        integrity_error.message = "File CRC32 mismatch: expected " + std::to_string(header.file_crc32) + ", got " +
-                                  std::to_string(computed_crc);
-        return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, integrity_error.message));
-      }
+    // Verify whole-file size and CRC32 via the shared helper.
+    auto file_integrity_result = VerifyFileLevelIntegrity(input_stream, header, &integrity_error);
+    if (!file_integrity_result) {
+      return file_integrity_result;
     }
 
     LogStorageInfo("snapshot_verify", "Snapshot integrity verified: " + filepath);

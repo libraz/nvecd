@@ -45,6 +45,29 @@
           "default": 10000,
           "minimum": 0,
           "maximum": 1000000
+        },
+        "temporal_cooccurrence": {
+          "type": "boolean",
+          "description": "Enable time-decay for co-occurrence updates",
+          "default": false
+        },
+        "temporal_half_life_sec": {
+          "type": "number",
+          "description": "Half-life in seconds for temporal decay (score halves per this many seconds of age)",
+          "default": 86400.0,
+          "exclusiveMinimum": 0.0
+        },
+        "negative_signals": {
+          "type": "boolean",
+          "description": "Enable negative signal (down-ranking) on DEL events",
+          "default": false
+        },
+        "negative_weight": {
+          "type": "number",
+          "description": "Reduction weight applied for negative signals (0.0-1.0)",
+          "default": 0.5,
+          "minimum": 0.0,
+          "maximum": 1.0
         }
       }
     },
@@ -131,6 +154,67 @@
           "description": "Minimum number of vectors before auto-training IVF index",
           "default": 10000,
           "minimum": 1
+        },
+        "ivf_seal_threshold": {
+          "type": "integer",
+          "description": "Seal the write buffer when it reaches this number of vectors",
+          "default": 100000,
+          "minimum": 1
+        },
+        "adaptive_fusion": {
+          "type": "boolean",
+          "description": "Enable adaptive fusion weight computation based on item maturity",
+          "default": false
+        },
+        "adaptive_min_alpha": {
+          "type": "number",
+          "description": "Minimum vector weight for mature items with many co-occurrences (0.0-1.0)",
+          "default": 0.2,
+          "minimum": 0.0,
+          "maximum": 1.0
+        },
+        "adaptive_max_alpha": {
+          "type": "number",
+          "description": "Maximum vector weight for new items with few co-occurrences (0.0-1.0)",
+          "default": 0.9,
+          "minimum": 0.0,
+          "maximum": 1.0
+        },
+        "adaptive_maturity_threshold": {
+          "type": "integer",
+          "description": "Co-occurrence neighbor count at which an item is considered mature",
+          "default": 50,
+          "minimum": 1
+        },
+        "index_type": {
+          "type": "string",
+          "description": "ANN index type: hnsw, ivf, or flat (brute-force)",
+          "default": "flat",
+          "enum": ["hnsw", "ivf", "flat"]
+        },
+        "hnsw_m": {
+          "type": "integer",
+          "description": "HNSW number of connections per node",
+          "default": 16,
+          "minimum": 1
+        },
+        "hnsw_ef_construction": {
+          "type": "integer",
+          "description": "HNSW search width during construction",
+          "default": 200,
+          "minimum": 1
+        },
+        "hnsw_ef_search": {
+          "type": "integer",
+          "description": "HNSW search width during query",
+          "default": 50,
+          "minimum": 1
+        },
+        "hnsw_max_elements": {
+          "type": "integer",
+          "description": "HNSW pre-allocated capacity (0 = dynamic growth)",
+          "default": 0,
+          "minimum": 0
         }
       }
     },

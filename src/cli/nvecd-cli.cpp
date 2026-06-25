@@ -18,6 +18,7 @@
 #include <iostream>
 #include <memory>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -37,6 +38,59 @@ constexpr size_t kReceiveBufferSize = 65536;  // Receive buffer size (64KB)
 constexpr size_t kOkPrefixLength = 3;         // "OK " length
 constexpr size_t kErrorPrefixLength = 6;      // "ERROR " length
 constexpr int kMaxWaitReadyRetries = 100;     // Maximum retries for --wait-ready (~5 minutes)
+
+/**
+ * @brief Determine whether a received response is complete (framing).
+ *
+ * Mirrors nvecd::client::detail::IsResponseComplete (the CLI is a standalone
+ * binary and does not link the client library). Single-line responses complete
+ * at the first newline; multi-line SIM/SIMV responses framed by an
+ * "OK RESULTS <count>" header complete only once <count> + 1 newline-terminated
+ * lines have been received, so partial TCP segments do not truncate results.
+ *
+ * @param buffer Accumulated bytes received so far.
+ * @return true if @p buffer contains at least one complete response.
+ */
+bool IsResponseComplete(const std::string& buffer) {
+  size_t first_newline = buffer.find('\n');
+  if (first_newline == std::string::npos) {
+    return false;  // Header line not yet fully received.
+  }
+
+  std::string header = buffer.substr(0, first_newline);
+  if (!header.empty() && header.back() == '\r') {
+    header.pop_back();
+  }
+
+  constexpr char kResultsPrefix[] = "OK RESULTS ";
+  constexpr size_t kResultsPrefixLen = sizeof(kResultsPrefix) - 1;
+  if (header.compare(0, kResultsPrefixLen, kResultsPrefix) == 0) {
+    long count = 0;
+    try {
+      size_t pos = 0;
+      count = std::stol(header.substr(kResultsPrefixLen), &pos);
+    } catch (const std::exception&) {
+      return true;  // Malformed count: let the caller surface a protocol error.
+    }
+    if (count < 0) {
+      return true;
+    }
+
+    size_t expected_lines = static_cast<size_t>(count) + 1;
+    size_t newline_count = 0;
+    for (char character : buffer) {
+      if (character == '\n') {
+        ++newline_count;
+        if (newline_count >= expected_lines) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  return true;
+}
 
 #ifdef USE_READLINE
 // Command list for tab completion
@@ -359,15 +413,15 @@ class NvecdClient {
       return "(error) Failed to send command: " + std::string(strerror(saved_errno));
     }
 
-    // Receive response (may need multiple recv calls for complete response)
+    // Receive response. A single recv() may return only part of a multi-line
+    // SIM/SIMV response, so loop until length-aware framing reports completion.
     std::string response;
     // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
     char buffer[kReceiveBufferSize];
 
-    // Keep reading until we get a complete response (ends with \n)
-    while (true) {
+    while (!IsResponseComplete(response)) {
       // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
-      ssize_t received = recv(sock_, buffer, sizeof(buffer) - 1, 0);
+      ssize_t received = recv(sock_, buffer, sizeof(buffer), 0);
       if (received <= 0) {
         if (received == 0) {
           return "(error) SERVER_DISCONNECTED: Server closed the connection. This usually means:\n"
@@ -386,15 +440,8 @@ class NvecdClient {
         return "(error) Failed to receive response: " + std::string(strerror(saved_errno));
       }
 
-      // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-constant-array-index)
-      buffer[received] = '\0';
       // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
-      response += buffer;
-
-      // Check if we have a complete response (ends with \n)
-      if (!response.empty() && response.back() == '\n') {
-        break;
-      }
+      response.append(buffer, static_cast<size_t>(received));
     }
 
     // Remove trailing newline

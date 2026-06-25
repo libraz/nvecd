@@ -17,11 +17,10 @@
 #include <unistd.h>
 
 #include <cctype>
-#include <chrono>
 #include <cstring>
 #include <iomanip>
 #include <sstream>
-#include <thread>
+#include <stdexcept>
 #include <utility>
 
 #include "utils/error.h"
@@ -85,6 +84,60 @@ std::string EscapeString(const std::string& str) {
 }
 
 }  // namespace
+
+namespace detail {
+
+bool IsResponseComplete(const std::string& buffer) {
+  // Locate the end of the first line (the header).
+  size_t first_newline = buffer.find('\n');
+  if (first_newline == std::string::npos) {
+    return false;  // Header line not yet fully received.
+  }
+
+  // Extract the header without its trailing CR/LF.
+  std::string header = buffer.substr(0, first_newline);
+  if (!header.empty() && header.back() == '\r') {
+    header.pop_back();
+  }
+
+  // Multi-line SIM/SIMV responses are framed by an explicit result count.
+  // Header format: "OK RESULTS <count>".
+  constexpr char kResultsPrefix[] = "OK RESULTS ";
+  constexpr size_t kResultsPrefixLen = sizeof(kResultsPrefix) - 1;
+  if (header.compare(0, kResultsPrefixLen, kResultsPrefix) == 0) {
+    long count = 0;
+    try {
+      size_t pos = 0;
+      count = std::stol(header.substr(kResultsPrefixLen), &pos);
+    } catch (const std::exception&) {
+      // Malformed count: fall back to single-line framing so the caller can
+      // surface a protocol error instead of blocking forever.
+      return true;
+    }
+    if (count < 0) {
+      return true;
+    }
+
+    // The complete response is the header line plus <count> result lines, each
+    // terminated by a newline. Count the newlines received so far.
+    size_t expected_lines = static_cast<size_t>(count) + 1;
+    size_t newline_count = 0;
+    for (char character : buffer) {
+      if (character == '\n') {
+        ++newline_count;
+        if (newline_count >= expected_lines) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  // Single-line response: complete as soon as the first line terminates.
+  return true;
+}
+
+}  // namespace detail
 
 /**
  * @brief PIMPL implementation class
@@ -195,12 +248,14 @@ class NvecdClient::Impl {
           MakeError(ErrorCode::kClientCommandFailed, std::string("Failed to send command: ") + strerror(errno)));
     }
 
-    // Receive response (loop until complete response is received)
+    // Receive response. A single recv() may deliver only part of a multi-line
+    // SIM/SIMV response (or coalesce several responses), so loop until length-
+    // aware framing reports a complete response. See detail::IsResponseComplete.
     std::string response;
     std::vector<char> buffer(config_.recv_buffer_size);
 
-    while (true) {
-      ssize_t received = recv(sock_, buffer.data(), buffer.size() - 1, 0);
+    while (!detail::IsResponseComplete(response)) {
+      ssize_t received = recv(sock_, buffer.data(), buffer.size(), 0);
       if (received <= 0) {
         if (received == 0) {
           return MakeUnexpected(MakeError(ErrorCode::kClientConnectionClosed, "Connection closed by server"));
@@ -209,19 +264,7 @@ class NvecdClient::Impl {
             MakeError(ErrorCode::kClientCommandFailed, std::string("Failed to receive response: ") + strerror(errno)));
       }
 
-      buffer[received] = '\0';
-      response.append(buffer.data(), received);
-
-      // Check if response is complete by looking for \r\n terminator
-      if (response.size() >= 2 && response[response.size() - 2] == '\r' && response[response.size() - 1] == '\n') {
-        break;
-      }
-
-      // If we received less than buffer size, server has no more data
-      if (static_cast<size_t>(received) < buffer.size() - 1) {
-        // Small delay to allow more data to arrive
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      }
+      response.append(buffer.data(), static_cast<size_t>(received));
     }
 
     // Remove trailing \r\n

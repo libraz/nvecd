@@ -71,6 +71,63 @@ class NvecdClientTest : public ::testing::Test {
 }  // namespace
 
 //
+// Response framing tests (detail::IsResponseComplete)
+//
+// These exercise the length-aware framing that fixes truncated multi-line
+// SIM/SIMV responses delivered across multiple TCP segments. They are pure
+// function tests and do not require a running server.
+//
+
+TEST(NvecdClientFramingTest, SingleLineOkCompleteOnNewline) {
+  EXPECT_FALSE(detail::IsResponseComplete("OK"));
+  EXPECT_TRUE(detail::IsResponseComplete("OK\r\n"));
+  EXPECT_TRUE(detail::IsResponseComplete("OK\n"));
+}
+
+TEST(NvecdClientFramingTest, SingleLineErrorCompleteOnNewline) {
+  EXPECT_FALSE(detail::IsResponseComplete("ERROR Item not found"));
+  EXPECT_TRUE(detail::IsResponseComplete("ERROR Item not found\r\n"));
+}
+
+TEST(NvecdClientFramingTest, ResultsHeaderAloneIsIncomplete) {
+  // The header arrived (and ends in \r\n) but no result rows have been read yet.
+  // The old "ends with \r\n" heuristic incorrectly treated this as complete.
+  EXPECT_FALSE(detail::IsResponseComplete("OK RESULTS 3\r\n"));
+}
+
+TEST(NvecdClientFramingTest, ResultsPartialRowsIsIncomplete) {
+  EXPECT_FALSE(detail::IsResponseComplete("OK RESULTS 3\r\nitem789 0.9245\r\n"));
+  EXPECT_FALSE(detail::IsResponseComplete("OK RESULTS 3\r\nitem789 0.9245\r\nitem101 0.8932\r\n"));
+}
+
+TEST(NvecdClientFramingTest, ResultsAllRowsIsComplete) {
+  EXPECT_TRUE(detail::IsResponseComplete("OK RESULTS 3\r\nitem789 0.9245\r\nitem101 0.8932\r\nitem202 0.8567\r\n"));
+}
+
+TEST(NvecdClientFramingTest, ResultsZeroCountCompleteAfterHeader) {
+  EXPECT_TRUE(detail::IsResponseComplete("OK RESULTS 0\r\n"));
+}
+
+TEST(NvecdClientFramingTest, ChunkedFeedCompletesOnlyWhenAllRowsArrive) {
+  // Simulate a response delivered across TCP segments: the header arrives first
+  // (ending in \r\n), then each result row arrives separately.
+  const std::vector<std::string> chunks = {"OK RESULTS 3\r\n", "item789 0.9245\r\n", "item101 0.8932\r\n",
+                                           "item202 0.8567\r\n"};
+  std::string buffer;
+  for (size_t i = 0; i < chunks.size(); ++i) {
+    buffer += chunks[i];
+    bool is_last = (i + 1 == chunks.size());
+    EXPECT_EQ(detail::IsResponseComplete(buffer), is_last) << "after chunk " << i;
+  }
+}
+
+TEST(NvecdClientFramingTest, MalformedCountTreatedAsComplete) {
+  // A non-numeric count must not block the read loop forever; the parser layer
+  // will then surface a protocol error.
+  EXPECT_TRUE(detail::IsResponseComplete("OK RESULTS abc\r\n"));
+}
+
+//
 // Connection tests
 //
 

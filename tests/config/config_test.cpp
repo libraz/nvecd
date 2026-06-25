@@ -169,6 +169,62 @@ vectors:
 }
 
 /**
+ * @brief Test that all documented flagship-feature keys pass JSON Schema validation
+ *
+ * Regression for the schema/parser drift where adaptive fusion, temporal
+ * co-occurrence, negative signals, index_type and HNSW/IVF tuning keys were
+ * read by the parser and documented in the README, but absent from
+ * config-schema.json whose sections use additionalProperties:false. A config
+ * enabling any of those documented features was rejected at startup.
+ */
+TEST(ConfigTest, LoadFlagshipFeatureConfig) {
+  const char* flagship_config = R"(
+events:
+  temporal_cooccurrence: true
+  temporal_half_life_sec: 43200.0
+  negative_signals: true
+  negative_weight: 0.3
+
+similarity:
+  adaptive_fusion: true
+  adaptive_min_alpha: 0.2
+  adaptive_max_alpha: 0.9
+  adaptive_maturity_threshold: 40
+  index_type: hnsw
+  hnsw_m: 32
+  hnsw_ef_construction: 256
+  hnsw_ef_search: 64
+  hnsw_max_elements: 100000
+  ivf_seal_threshold: 50000
+)";
+
+  std::ofstream ofs("flagship_test_config.yaml");
+  ofs << flagship_config;
+  ofs.close();
+
+  auto config_result = LoadConfig("flagship_test_config.yaml");
+  ASSERT_TRUE(config_result) << "Flagship config rejected by schema: " << config_result.error().message();
+
+  Config config = *config_result;
+  EXPECT_TRUE(config.events.temporal_cooccurrence);
+  EXPECT_DOUBLE_EQ(config.events.temporal_half_life_sec, 43200.0);
+  EXPECT_TRUE(config.events.negative_signals);
+  EXPECT_DOUBLE_EQ(config.events.negative_weight, 0.3);
+  EXPECT_TRUE(config.similarity.adaptive_fusion);
+  EXPECT_DOUBLE_EQ(config.similarity.adaptive_min_alpha, 0.2);
+  EXPECT_DOUBLE_EQ(config.similarity.adaptive_max_alpha, 0.9);
+  EXPECT_EQ(config.similarity.adaptive_maturity_threshold, 40U);
+  EXPECT_EQ(config.similarity.index_type, "hnsw");
+  EXPECT_EQ(config.similarity.hnsw_m, 32U);
+  EXPECT_EQ(config.similarity.hnsw_ef_construction, 256U);
+  EXPECT_EQ(config.similarity.hnsw_ef_search, 64U);
+  EXPECT_EQ(config.similarity.hnsw_max_elements, 100000U);
+  EXPECT_EQ(config.similarity.ivf_seal_threshold, 50000U);
+
+  std::remove("flagship_test_config.yaml");
+}
+
+/**
  * @brief Test loading configuration with invalid YAML syntax
  */
 TEST(ConfigTest, LoadInvalidYAML) {
