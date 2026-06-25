@@ -703,36 +703,27 @@ void HttpServer::HandleEvent(const httplib::Request& req, httplib::Response& res
       timestamp = body["timestamp"];
     }
 
-    // Add event to event store
-    if (handler_context_->event_store) {
-      auto result = handler_context_->event_store->AddEvent(ctx, id, score, event_type, timestamp);
-      if (!result) {
-        SendError(res, kHttpInternalServerError, result.error().message());
-        return;
-      }
-    } else {
+    // Add event to event store, atomically capturing the prior buffer state.
+    if (handler_context_->event_store == nullptr) {
       SendError(res, kHttpInternalServerError, "Event store not initialized");
       return;
     }
+    auto result = handler_context_->event_store->AddEventAndGetPrior(ctx, id, score, event_type, timestamp);
+    if (!result) {
+      SendError(res, kHttpInternalServerError, result.error().message());
+      return;
+    }
 
-    // Update co-occurrence index
-    if (handler_context_->co_index) {
-      auto events = handler_context_->event_store->GetEvents(ctx);
-      if (handler_context_->config != nullptr && handler_context_->config->events.negative_signals &&
-          event_type == events::EventType::DEL) {
-        auto lock = handler_context_->co_index->AcquireWriteLock();
-        handler_context_->co_index->UpdateFromEventsLocked(ctx, events,
-                                                           handler_context_->config->events.temporal_cooccurrence,
-                                                           handler_context_->config->events.temporal_half_life_sec);
-        handler_context_->co_index->ApplyNegativeSignalLocked(id, events,
-                                                              handler_context_->config->events.negative_weight);
-      } else if (handler_context_->config != nullptr) {
-        handler_context_->co_index->UpdateFromEvents(ctx, events,
-                                                     handler_context_->config->events.temporal_cooccurrence,
-                                                     handler_context_->config->events.temporal_half_life_sec);
-      } else {
-        handler_context_->co_index->UpdateFromEvents(ctx, events);
+    // Update co-occurrence index incrementally (only new pairs, once each).
+    if (handler_context_->co_index != nullptr && !result->deduped) {
+      events::CoOccurrenceIndex::IngestOptions options;
+      if (handler_context_->config != nullptr) {
+        options.temporal_enabled = handler_context_->config->events.temporal_cooccurrence;
+        options.half_life_sec = handler_context_->config->events.temporal_half_life_sec;
+        options.negative_signals = handler_context_->config->events.negative_signals;
+        options.negative_weight = handler_context_->config->events.negative_weight;
       }
+      handler_context_->co_index->ApplyIngestedEvent(ctx, result->prior_events, result->stored_event, options);
     }
 
     auto* cache_ptr = handler_context_->cache.load(std::memory_order_acquire);

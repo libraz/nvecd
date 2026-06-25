@@ -295,6 +295,15 @@ target_link_libraries(co_occurrence_pruning_test
 )
 gtest_discover_tests(co_occurrence_pruning_test)
 
+add_executable(co_occurrence_incremental_test
+  events/co_occurrence_incremental_test.cpp
+)
+target_link_libraries(co_occurrence_incremental_test
+  nvecd_events
+  gtest_main
+)
+gtest_discover_tests(co_occurrence_incremental_test)
+
 # Vectors tests
 add_executable(vector_store_test
   vectors/vector_store_test.cpp

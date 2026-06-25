@@ -39,6 +39,97 @@ void CoOccurrenceIndex::UpdateFromEventsLocked(const std::string& ctx, const std
   UpdateFromEventsInternal(ctx, events, temporal_enabled, half_life_sec);
 }
 
+void CoOccurrenceIndex::ApplyIngestedEvent(const std::string& ctx [[maybe_unused]],
+                                           const std::vector<Event>& prior_events, const Event& new_event,
+                                           const IngestOptions& options) {
+  std::unique_lock lock(mutex_);
+
+  // Incrementally score the new event against the prior buffer (once each).
+  AddEventIncrementalInternal(prior_events, new_event, options.temporal_enabled, options.half_life_sec);
+
+  // For deletions with negative signals enabled, dampen the removed item's
+  // associations with the items it previously co-occurred with.
+  if (options.negative_signals && new_event.type == EventType::DEL) {
+    ApplyNegativeSignalLocked(new_event.item_id, prior_events, options.negative_weight);
+  }
+}
+
+void CoOccurrenceIndex::AddEventIncremental(const std::string& ctx [[maybe_unused]],
+                                            const std::vector<Event>& prior_events, const Event& new_event,
+                                            bool temporal_enabled, double half_life_sec) {
+  std::unique_lock lock(mutex_);
+  AddEventIncrementalInternal(prior_events, new_event, temporal_enabled, half_life_sec);
+}
+
+void CoOccurrenceIndex::AddEventIncrementalLocked(const std::string& ctx [[maybe_unused]],
+                                                  const std::vector<Event>& prior_events, const Event& new_event,
+                                                  bool temporal_enabled, double half_life_sec) {
+  // Caller holds the lock
+  AddEventIncrementalInternal(prior_events, new_event, temporal_enabled, half_life_sec);
+}
+
+void CoOccurrenceIndex::AddEventIncrementalInternal(const std::vector<Event>& prior_events, const Event& new_event,
+                                                    bool temporal_enabled, double half_life_sec) {
+  if (prior_events.empty()) {
+    return;
+  }
+
+  // Pre-compute the decay weight for the new event and each prior event.
+  // Ages are measured relative to the most recent timestamp across all
+  // events involved (new + prior), mirroring the full-scan path so that the
+  // incremental result matches a from-scratch computation.
+  float new_decay = 1.0F;
+  std::vector<float> prior_decay;
+  if (temporal_enabled && half_life_sec > 0.0) {
+    uint64_t max_ts = new_event.timestamp;
+    for (const auto& e : prior_events) {
+      if (e.timestamp > max_ts) {
+        max_ts = e.timestamp;
+      }
+    }
+
+    const double inv_half_life = 1.0 / half_life_sec;
+    constexpr float kMinDecay = 1e-6F;
+    auto decay_for = [&](uint64_t ts) {
+      double age = static_cast<double>(max_ts - ts);
+      auto decay = static_cast<float>(std::exp2(-age * inv_half_life));
+      return std::max(decay, kMinDecay);
+    };
+
+    new_decay = decay_for(new_event.timestamp);
+    prior_decay.resize(prior_events.size());
+    for (size_t i = 0; i < prior_events.size(); ++i) {
+      prior_decay[i] = decay_for(prior_events[i].timestamp);
+    }
+  }
+
+  // Add only the pairs (new_event, prior_events[i]) once each (symmetric).
+  for (size_t i = 0; i < prior_events.size(); ++i) {
+    const auto& prior = prior_events[i];
+    if (prior.item_id == new_event.item_id) {
+      continue;  // Skip self-pairs
+    }
+
+    auto score = static_cast<float>(new_event.score * prior.score);
+    if (!prior_decay.empty()) {
+      score *= new_decay * prior_decay[i];
+    }
+
+    co_scores_[new_event.item_id][prior.item_id] += score;
+    co_scores_[prior.item_id][new_event.item_id] += score;
+  }
+
+  generation_.fetch_add(1, std::memory_order_release);
+
+  // Only the new event's neighbor list can grow here, so prune just that item.
+  if (config_.max_neighbors_per_item > 0) {
+    auto it = co_scores_.find(new_event.item_id);
+    if (it != co_scores_.end() && it->second.size() > config_.max_neighbors_per_item) {
+      PruneItemLocked(new_event.item_id);
+    }
+  }
+}
+
 void CoOccurrenceIndex::UpdateFromEventsInternal(const std::string& ctx [[maybe_unused]],
                                                  const std::vector<Event>& events, bool temporal_enabled,
                                                  double half_life_sec) {
@@ -324,14 +415,19 @@ CoOccurrenceIndexStatistics CoOccurrenceIndex::GetStatistics() const {
   }
   stats.co_pairs = pairs / 2;  // Symmetric matrix, so divide by 2
 
-  stats.memory_bytes = MemoryUsage();
+  // Reuse the lock we already hold; MemoryUsage() would re-lock the
+  // non-recursive shared_mutex (undefined behavior / potential deadlock).
+  stats.memory_bytes = MemoryUsageLocked();
 
   return stats;
 }
 
 size_t CoOccurrenceIndex::MemoryUsage() const {
   std::shared_lock lock(mutex_);
+  return MemoryUsageLocked();
+}
 
+size_t CoOccurrenceIndex::MemoryUsageLocked() const {
   size_t total = 0;
 
   // Base container overhead

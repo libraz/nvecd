@@ -24,8 +24,32 @@ EventStore::EventStore(const config::EventsConfig& config) : config_(config) {
   }
 }
 
+namespace {
+
+/// @brief Resolve a request timestamp, substituting current time for 0.
+uint64_t ResolveTimestamp(uint64_t timestamp) {
+  if (timestamp != 0) {
+    return timestamp;
+  }
+  auto now = std::chrono::system_clock::now();
+  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count());
+}
+
+}  // namespace
+
 utils::Expected<void, utils::Error> EventStore::AddEvent(const std::string& ctx, const std::string& id, int score,
                                                          EventType type, uint64_t timestamp) {
+  auto result = AddEventAndGetPrior(ctx, id, score, type, timestamp);
+  if (!result) {
+    return utils::MakeUnexpected(result.error());
+  }
+  return {};
+}
+
+utils::Expected<EventStore::IngestResult, utils::Error> EventStore::AddEventAndGetPrior(const std::string& ctx,
+                                                                                        const std::string& id,
+                                                                                        int score, EventType type,
+                                                                                        uint64_t timestamp) {
   // Validate inputs
   if (ctx.empty()) {
     auto error = utils::MakeError(utils::ErrorCode::kInvalidArgument, "Context cannot be empty");
@@ -40,14 +64,12 @@ utils::Expected<void, utils::Error> EventStore::AddEvent(const std::string& ctx,
   }
 
   // Use provided timestamp or current time
-  uint64_t ts = timestamp;
-  if (ts == 0) {
-    auto now = std::chrono::system_clock::now();
-    ts = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count());
-  }
+  uint64_t ts = ResolveTimestamp(timestamp);
 
   // Increment total event count (includes duplicates)
   total_events_.fetch_add(1, std::memory_order_relaxed);
+
+  IngestResult result;
 
   // Deduplication based on event type
   switch (type) {
@@ -57,7 +79,8 @@ utils::Expected<void, utils::Error> EventStore::AddEvent(const std::string& ctx,
         EventKey key(ctx, id, score);
         if (dedup_cache_->IsDuplicate(key, ts)) {
           deduped_events_.fetch_add(1, std::memory_order_relaxed);
-          return {};  // Duplicate within time window
+          result.deduped = true;
+          return result;  // Duplicate within time window
         }
         dedup_cache_->Insert(key, ts);
       }
@@ -69,7 +92,8 @@ utils::Expected<void, utils::Error> EventStore::AddEvent(const std::string& ctx,
         StateKey key(ctx, id);
         if (state_cache_->IsDuplicateSet(key, score)) {
           deduped_events_.fetch_add(1, std::memory_order_relaxed);
-          return {};  // Same value, idempotent skip
+          result.deduped = true;
+          return result;  // Same value, idempotent skip
         }
         state_cache_->UpdateScore(key, score);
       }
@@ -81,7 +105,8 @@ utils::Expected<void, utils::Error> EventStore::AddEvent(const std::string& ctx,
         StateKey key(ctx, id);
         if (state_cache_->IsDuplicateDel(key)) {
           deduped_events_.fetch_add(1, std::memory_order_relaxed);
-          return {};  // Already deleted
+          result.deduped = true;
+          return result;  // Already deleted
         }
         state_cache_->MarkDeleted(key);
       }
@@ -92,8 +117,12 @@ utils::Expected<void, utils::Error> EventStore::AddEvent(const std::string& ctx,
 
   // Create event
   Event event(id, score, ts, type);
+  result.stored_event = event;
 
-  // Add to context's ring buffer
+  // Atomically snapshot the prior buffer state and append the new event.
+  // Capturing prior_events under the same lock that performs the push
+  // guarantees that concurrent same-context ingests each observe a distinct,
+  // consistent prior view (no lost or duplicated co-occurrence pairs).
   {
     std::unique_lock lock(mutex_);
 
@@ -104,11 +133,14 @@ utils::Expected<void, utils::Error> EventStore::AddEvent(const std::string& ctx,
       it = new_it;
     }
 
+    // Snapshot the buffer contents that existed before this event.
+    result.prior_events = it->second.GetAll();
+
     // Add event to ring buffer
     it->second.Push(event);
   }
 
-  return {};
+  return result;
 }
 
 std::vector<Event> EventStore::GetEvents(const std::string& ctx) const {

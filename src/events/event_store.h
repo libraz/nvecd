@@ -119,6 +119,39 @@ class EventStore {
                                                EventType type = EventType::ADD, uint64_t timestamp = 0);
 
   /**
+   * @brief Result of an atomic event ingestion
+   *
+   * Describes what happened when an event was offered to the store so the
+   * caller can apply the matching incremental co-occurrence delta.
+   */
+  struct IngestResult {
+    bool deduped = false;             ///< True if the event was a duplicate and not stored
+    Event stored_event;               ///< The event as stored (populated when !deduped)
+    std::vector<Event> prior_events;  ///< Context buffer contents immediately before the append
+  };
+
+  /**
+   * @brief Atomically append an event and capture the prior buffer state
+   *
+   * Performs the same validation and deduplication as AddEvent(), then, under
+   * a single critical section, snapshots the context's existing events and
+   * pushes the new one. The returned prior_events reflect the buffer state
+   * exactly as it was immediately before this event's append, so the caller
+   * can compute the incremental co-occurrence delta from a consistent view
+   * even under concurrent ingestion of the same context.
+   *
+   * @param ctx Context identifier (e.g., user ID, session ID)
+   * @param item_id Event ID (e.g., item ID)
+   * @param score Event score/weight
+   * @param type Event type (ADD/SET/DEL)
+   * @param timestamp Unix timestamp in seconds (0 = use current time)
+   * @return Expected<IngestResult, Error> Ingestion outcome or error
+   */
+  utils::Expected<IngestResult, utils::Error> AddEventAndGetPrior(const std::string& ctx, const std::string& item_id,
+                                                                  int score, EventType type = EventType::ADD,
+                                                                  uint64_t timestamp = 0);
+
+  /**
    * @brief Get all events for a context
    *
    * Returns events in insertion order (oldest to newest).

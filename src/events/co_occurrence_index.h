@@ -107,11 +107,71 @@ class CoOccurrenceIndex {
                               double half_life_sec);
 
   /**
+   * @brief Incrementally add co-occurrence pairs for a single new event
+   *
+   * Adds only the pairs (new_event, p) for each p in @p prior_events, each
+   * counted exactly once (both directions, symmetric). This is the correct
+   * incremental update for streaming ingestion: when a new event arrives in a
+   * context whose buffer already contains @p prior_events, only the new pairs
+   * involving @p new_event need to be scored. It avoids the O(N^2) re-scan
+   * (and resulting over-count) of re-processing the entire buffer per event.
+   *
+   * Self-pairs (same item_id) are skipped. Temporal decay, when enabled, is
+   * computed relative to the most recent timestamp among the new event and the
+   * prior events. The pruning hook (max_neighbors / min_support) is applied to
+   * the affected item, matching UpdateFromEvents.
+   *
+   * @param ctx Context identifier (used for logging, not stored)
+   * @param prior_events Events already present in the context before new_event
+   * @param new_event The newly arrived event
+   * @param temporal_enabled Enable temporal weighting
+   * @param half_life_sec Half-life in seconds for decay
+   */
+  void AddEventIncremental(const std::string& ctx, const std::vector<Event>& prior_events, const Event& new_event,
+                           bool temporal_enabled, double half_life_sec);
+
+  /**
+   * @brief Incrementally add co-occurrence pairs under an existing write lock
+   * @note Caller must hold write lock via AcquireWriteLock()
+   * @see AddEventIncremental
+   */
+  void AddEventIncrementalLocked(const std::string& ctx, const std::vector<Event>& prior_events, const Event& new_event,
+                                 bool temporal_enabled, double half_life_sec);
+
+  /**
    * @brief Apply negative signal for a removed item under existing write lock
    * @note Caller must hold write lock via AcquireWriteLock()
    */
   void ApplyNegativeSignalLocked(const std::string& removed_id, const std::vector<Event>& context_events,
                                  double negative_weight);
+
+  /**
+   * @brief Options controlling how an ingested event updates the index
+   */
+  struct IngestOptions {
+    bool temporal_enabled = false;  ///< Enable temporal decay weighting
+    double half_life_sec = 0.0;     ///< Half-life in seconds for temporal decay
+    bool negative_signals = false;  ///< Apply negative signal on DEL events
+    double negative_weight = 0.0;   ///< Weight for negative signal reduction
+  };
+
+  /**
+   * @brief Apply the incremental co-occurrence update for one ingested event
+   *
+   * Shared ingestion routine used by both the TCP and HTTP EVENT handlers so
+   * the incremental, atomic update logic lives in a single place. Given the
+   * prior buffer state and the newly stored event (as returned by
+   * EventStore::AddEventAndGetPrior), this adds only the new pairs once and,
+   * for DEL events with negative signals enabled, applies the negative signal
+   * against the prior buffer. The whole update runs under a single write lock.
+   *
+   * @param ctx Context identifier (used for logging, not stored)
+   * @param prior_events Buffer contents before the new event was appended
+   * @param new_event The newly stored event
+   * @param options Temporal / negative-signal options
+   */
+  void ApplyIngestedEvent(const std::string& ctx, const std::vector<Event>& prior_events, const Event& new_event,
+                          const IngestOptions& options);
 
   /**
    * @brief Get the number of co-occurring neighbors for an item
@@ -231,8 +291,15 @@ class CoOccurrenceIndex {
   void UpdateFromEventsInternal(const std::string& ctx, const std::vector<Event>& events, bool temporal_enabled,
                                 double half_life_sec);
 
+  /// @brief Internal implementation of AddEventIncremental (caller holds write lock)
+  void AddEventIncrementalInternal(const std::vector<Event>& prior_events, const Event& new_event,
+                                   bool temporal_enabled, double half_life_sec);
+
   /// @brief Prune a single item's neighbor list (caller must hold write lock)
   void PruneItemLocked(const std::string& item_id);
+
+  /// @brief Estimate memory usage assuming the caller already holds the lock
+  size_t MemoryUsageLocked() const;
 };
 
 }  // namespace nvecd::events

@@ -244,24 +244,23 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleEvent(const 
     return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kInternalError, "EventStore not initialized"));
   }
 
-  auto result = ctx_.event_store->AddEvent(cmd.ctx, cmd.id, cmd.score, cmd.event_type, cmd.timestamp.value_or(0));
+  // Atomically append the event and capture the prior buffer state so the
+  // incremental co-occurrence delta is computed from a consistent view, even
+  // under concurrent same-context ingestion.
+  auto result =
+      ctx_.event_store->AddEventAndGetPrior(cmd.ctx, cmd.id, cmd.score, cmd.event_type, cmd.timestamp.value_or(0));
   if (!result) {
     return utils::MakeUnexpected(result.error());
   }
 
-  // Update co-occurrence index from the full event list for this context
-  if (ctx_.co_index != nullptr) {
-    auto events = ctx_.event_store->GetEvents(cmd.ctx);
-    if (ctx_.config->events.negative_signals && cmd.event_type == events::EventType::DEL) {
-      // Single lock scope for both operations (avoids intermediate state exposure)
-      auto lock = ctx_.co_index->AcquireWriteLock();
-      ctx_.co_index->UpdateFromEventsLocked(cmd.ctx, events, ctx_.config->events.temporal_cooccurrence,
-                                            ctx_.config->events.temporal_half_life_sec);
-      ctx_.co_index->ApplyNegativeSignalLocked(cmd.id, events, ctx_.config->events.negative_weight);
-    } else {
-      ctx_.co_index->UpdateFromEvents(cmd.ctx, events, ctx_.config->events.temporal_cooccurrence,
-                                      ctx_.config->events.temporal_half_life_sec);
-    }
+  // Update co-occurrence index incrementally (only new pairs, once each).
+  if (ctx_.co_index != nullptr && !result->deduped) {
+    events::CoOccurrenceIndex::IngestOptions options;
+    options.temporal_enabled = ctx_.config->events.temporal_cooccurrence;
+    options.half_life_sec = ctx_.config->events.temporal_half_life_sec;
+    options.negative_signals = ctx_.config->events.negative_signals;
+    options.negative_weight = ctx_.config->events.negative_weight;
+    ctx_.co_index->ApplyIngestedEvent(cmd.ctx, result->prior_events, result->stored_event, options);
   }
 
   // Selective cache invalidation for mutated item
