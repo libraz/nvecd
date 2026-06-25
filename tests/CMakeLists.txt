@@ -434,6 +434,15 @@ target_link_libraries(adaptive_fusion_test
 )
 gtest_discover_tests(adaptive_fusion_test)
 
+add_executable(concurrency_stress_test
+  similarity/concurrency_stress_test.cpp
+)
+target_link_libraries(concurrency_stress_test
+  nvecd_similarity
+  gtest_main
+)
+gtest_discover_tests(concurrency_stress_test)
+
 # Cache tests
 add_executable(result_compressor_test
   cache/result_compressor_test.cpp

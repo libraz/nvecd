@@ -289,15 +289,23 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleVecset(const
   // Copy the vector data under a brief read lock, then notify without holding any lock.
   // This avoids recursive shared_mutex acquisition (undefined behavior in C++17).
   if (ctx_.similarity_engine != nullptr) {
-    auto compact_idx = ctx_.vector_store->GetCompactIndex(cmd.id);
-    if (compact_idx.has_value()) {
-      std::vector<float> vec_copy;
-      {
-        auto lock = ctx_.vector_store->AcquireReadLock();
-        const float* vec_ptr = ctx_.vector_store->GetMatrixRow(compact_idx.value());
-        uint32_t dim = ctx_.vector_store->GetDimension();
-        vec_copy.assign(vec_ptr, vec_ptr + dim);
+    // Resolve the index and copy the vector data atomically under a single
+    // snapshot (read lock). Looking the index up separately from the copy
+    // would race with a concurrent defragment that re-indexes slots.
+    std::optional<size_t> compact_idx;
+    std::vector<float> vec_copy;
+    {
+      auto snap = ctx_.vector_store->GetCompactSnapshot();
+      if (!snap.Empty()) {
+        auto idx_it = snap.id_to_idx->find(cmd.id);
+        if (idx_it != snap.id_to_idx->end()) {
+          compact_idx = idx_it->second;
+          const float* vec_ptr = snap.matrix + idx_it->second * snap.dim;
+          vec_copy.assign(vec_ptr, vec_ptr + snap.dim);
+        }
       }
+    }
+    if (compact_idx.has_value()) {
       ctx_.similarity_engine->NotifyVectorAdded(compact_idx.value(), vec_copy.data());
     }
   }

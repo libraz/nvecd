@@ -221,9 +221,25 @@ class VectorStore {
   std::unique_lock<std::shared_mutex> AcquireWriteLock();
 
   /**
-   * @brief Snapshot of compact storage for lock-free read access
+   * @brief Snapshot of compact storage for read access
    *
-   * The caller should hold a read lock while using this snapshot.
+   * The snapshot OWNS a shared (read) lock on the store for its entire
+   * lifetime. All pointers and map references remain valid as long as the
+   * snapshot object is alive. This makes concurrent reallocation
+   * (SetVector/DeleteVector) and defragmentation impossible while any thread
+   * holds a snapshot, eliminating dangling-pointer / torn-read hazards.
+   *
+   * Because it holds a lock, the snapshot is move-only and must be kept
+   * alive (not bound to a temporary) for the full duration the pointers and
+   * maps are used.
+   *
+   * @warning A thread holding a snapshot must NOT call any method that takes
+   *          the write lock (SetVector/DeleteVector/Defragment/Clear) on the
+   *          same store, or it will self-deadlock. Read-only accessors that
+   *          take a shared lock (IsDeleted/GetCompactIndex/...) are safe with
+   *          C++17 std::shared_mutex recursive shared acquisition only if the
+   *          implementation permits it; prefer reading the snapshot members or
+   *          the *Locked variants below instead.
    */
   struct CompactSnapshot {
     const float* matrix = nullptr;  ///< Pointer to contiguous matrix
@@ -232,14 +248,33 @@ class VectorStore {
     size_t dim = 0;                 ///< Vector dimension
     const std::unordered_map<std::string, size_t>* id_to_idx = nullptr;
     const std::vector<std::string>* idx_to_id = nullptr;
+    const std::vector<bool>* deleted = nullptr;  ///< Tombstone flags per slot
+
+    /// Read lock held for the lifetime of this snapshot (move-only).
+    std::shared_lock<std::shared_mutex> lock;
+
+    /**
+     * @brief Check whether the store had no data when snapshotted
+     * @return True if there are no vectors (matrix is null / count is zero)
+     */
+    bool Empty() const { return matrix == nullptr || count == 0; }
+
+    /**
+     * @brief Check if slot at given index is a tombstone (no extra locking)
+     * @param idx Row index in compact matrix
+     * @return True if the slot is deleted
+     */
+    bool IsDeleted(size_t idx) const { return deleted != nullptr && idx < deleted->size() && (*deleted)[idx]; }
   };
 
   /**
-   * @brief Get a snapshot of compact storage under read lock
+   * @brief Get a snapshot of compact storage that holds a read lock
    *
-   * Acquires read lock briefly to copy pointers, then releases.
+   * Acquires a shared (read) lock and moves it into the returned snapshot so
+   * the lock is held until the snapshot is destroyed. All returned pointers
+   * and map references stay valid for the snapshot's lifetime.
    *
-   * @return CompactSnapshot with pointers to compact data, or empty if no data
+   * @return CompactSnapshot owning a read lock; Empty() is true if no data
    */
   CompactSnapshot GetCompactSnapshot() const;
 

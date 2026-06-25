@@ -141,7 +141,7 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
   }
 
   auto snap = vector_store_->GetCompactSnapshot();
-  if (snap.count == 0 || snap.matrix == nullptr) {
+  if (snap.Empty()) {
     // Empty store: check if the query ID exists (it won't in an empty store)
     return utils::MakeUnexpected(
         utils::MakeError(utils::ErrorCode::kVectorNotFound, "Query vector not found: " + item_id));
@@ -163,21 +163,33 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
 
   // ANN accelerated path (HNSW or IVF)
   if (ann_index_ && IsAnnIndexReady()) {
-    auto ann_results = ann_index_->Search(query_ptr, static_cast<uint32_t>(fetch_k) + 1);
+    // Copy the query vector out of the snapshot, then release the snapshot's
+    // read lock BEFORE calling the ANN index. The IVF adapter acquires its own
+    // snapshot internally; holding our snapshot across that call would attempt
+    // a recursive shared_lock on the same mutex (UB under C++17).
+    std::vector<float> query_copy(query_ptr, query_ptr + snap.dim);
+    snap.lock.unlock();
 
+    auto ann_results = ann_index_->Search(query_copy.data(), static_cast<uint32_t>(fetch_k) + 1);
+
+    // Re-acquire a snapshot to map result indices to IDs consistently.
+    auto map_snap = vector_store_->GetCompactSnapshot();
+    if (map_snap.Empty()) {
+      return std::vector<SimilarityResult>{};
+    }
     std::vector<SimilarityResult> results;
     results.reserve(ann_results.size());
     for (const auto& [compact_idx, score] : ann_results) {
       if (static_cast<size_t>(compact_idx) == query_idx) {
         continue;  // Exclude self
       }
-      if (vector_store_->IsDeleted(compact_idx)) {
+      if (compact_idx >= map_snap.count || map_snap.IsDeleted(compact_idx)) {
         continue;
       }
       if (has_filter && !metadata_store_->Matches(compact_idx, filter)) {
         continue;
       }
-      results.emplace_back((*snap.idx_to_id)[compact_idx], score);
+      results.emplace_back((*map_snap.idx_to_id)[compact_idx], score);
       if (static_cast<int>(results.size()) >= validated_top_k.value()) {
         break;
       }
@@ -203,7 +215,7 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
     if (idx == query_idx) {
       return;
     }
-    if (vector_store_->IsDeleted(idx)) {
+    if (snap.IsDeleted(idx)) {
       return;
     }
     if (has_filter && !metadata_store_->Matches(static_cast<uint32_t>(idx), filter)) {
@@ -387,11 +399,6 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
     return utils::MakeUnexpected(error);
   }
 
-  auto snap = vector_store_->GetCompactSnapshot();
-  if (snap.count == 0 || snap.matrix == nullptr) {
-    return std::vector<SimilarityResult>{};
-  }
-
   // Compute query norm using SIMD
   float query_norm = vectors::simd::GetOptimalImpl().l2_norm(query_vector.data(), query_vector.size());
 
@@ -399,26 +406,38 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
   constexpr int kOversamplingFactor = 3;
   int fetch_k = has_filter ? validated_top_k.value() * kOversamplingFactor : validated_top_k.value();
 
-  // ANN accelerated path (HNSW or IVF)
+  // ANN accelerated path (HNSW or IVF). The query vector is caller-owned, so
+  // no snapshot is needed for the search itself; the IVF adapter takes its own
+  // snapshot internally. Take a snapshot only to map result indices to IDs.
   if (ann_index_ && IsAnnIndexReady()) {
     auto ann_results = ann_index_->Search(query_vector.data(), static_cast<uint32_t>(fetch_k));
 
+    auto map_snap = vector_store_->GetCompactSnapshot();
+    if (map_snap.Empty()) {
+      return std::vector<SimilarityResult>{};
+    }
     std::vector<SimilarityResult> results;
     results.reserve(ann_results.size());
     for (const auto& [compact_idx, score] : ann_results) {
-      if (vector_store_->IsDeleted(compact_idx)) {
+      if (compact_idx >= map_snap.count || map_snap.IsDeleted(compact_idx)) {
         continue;
       }
       if (has_filter && !metadata_store_->Matches(compact_idx, filter)) {
         continue;
       }
-      results.emplace_back((*snap.idx_to_id)[compact_idx], score);
+      results.emplace_back((*map_snap.idx_to_id)[compact_idx], score);
       if (static_cast<int>(results.size()) >= validated_top_k.value()) {
         break;
       }
     }
     std::sort(results.begin(), results.end());
     return results;
+  }
+
+  // Brute-force path: hold a snapshot (read lock) for the full scan.
+  auto snap = vector_store_->GetCompactSnapshot();
+  if (snap.Empty()) {
+    return std::vector<SimilarityResult>{};
   }
 
   // Bounded min-heap: track top-k (score, index) pairs without string allocation
@@ -429,7 +448,7 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
 
   // Lambda to push a candidate into the min-heap
   auto push_candidate = [&](size_t idx) {
-    if (vector_store_->IsDeleted(idx)) {
+    if (snap.IsDeleted(idx)) {
       return;
     }
     if (has_filter && !metadata_store_->Matches(static_cast<uint32_t>(idx), filter)) {
@@ -534,10 +553,10 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
   std::vector<SimilarityResult> results;
   results.reserve(candidate_ids.size());
 
-  if (vector_store_->GetVectorCount() > 0) {
+  {
     auto snap = vector_store_->GetCompactSnapshot();
-    if (snap.count == 0 || snap.matrix == nullptr) {
-      return std::vector<SimilarityResult>{};
+    if (snap.Empty()) {
+      return MergeAndSelectTopK(std::move(results), validated_top_k.value());
     }
 
     auto query_it = snap.id_to_idx->find(item_id);
@@ -565,7 +584,7 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
         continue;  // candidate not in vector store
       }
       size_t cidx = cidx_it->second;
-      if (vector_store_->IsDeleted(cidx)) {
+      if (snap.IsDeleted(cidx)) {
         continue;
       }
       if (has_filter && !metadata_store_->Matches(static_cast<uint32_t>(cidx), filter)) {
@@ -751,69 +770,82 @@ void SimilarityEngine::MaybeTrainIvfIndex() {
   }
 
   // Take a snapshot and copy only a sample of vectors for k-means training.
-  // After centroids are learned, the write buffer is sealed to assign
-  // buffered entries to clusters.
-  auto snap = vector_store_->GetCompactSnapshot();
-  if (snap.count == 0 || snap.matrix == nullptr) {
-    ivf_training_.store(false);
-    return;
-  }
-
-  uint32_t dim = static_cast<uint32_t>(snap.dim);
-
-  // Build valid indices array (non-deleted entries)
-  std::vector<size_t> valid_indices;
-  valid_indices.reserve(snap.count);
-  for (size_t i = 0; i < snap.count; ++i) {
-    if (!vector_store_->IsDeleted(i)) {
-      valid_indices.push_back(i);
+  // The snapshot holds a read lock; we COPY the sampled rows into a private
+  // heap buffer (sample_matrix) while the lock is held, then RELEASE the
+  // snapshot before launching the CPU-bound k-means thread. This prevents a
+  // heap-use-after-free if a concurrent SetVector/DeleteVector reallocates the
+  // matrix, while avoiding holding the read lock during the long k-means
+  // compute (which would starve writers).
+  uint32_t dim = 0;
+  std::shared_ptr<std::vector<float>> sample_matrix;
+  std::vector<size_t> sample_indices;
+  size_t valid_count = 0;
+  {
+    auto snap = vector_store_->GetCompactSnapshot();
+    if (snap.Empty()) {
+      ivf_training_.store(false);
+      return;
     }
-  }
 
-  if (valid_indices.empty()) {
-    ivf_training_.store(false);
-    return;
-  }
+    dim = static_cast<uint32_t>(snap.dim);
 
-  // Copy only the vectors we need for training (sample up to 50K).
-  constexpr size_t kMaxCopyForTrain = 50000;
-  std::vector<size_t> train_indices;
-  if (valid_indices.size() <= kMaxCopyForTrain) {
-    train_indices = valid_indices;
-  } else {
-    // Reservoir sample
-    train_indices.resize(kMaxCopyForTrain);
-    std::copy(valid_indices.begin(), valid_indices.begin() + kMaxCopyForTrain, train_indices.begin());
-    std::mt19937 rng(42);
-    for (size_t i = kMaxCopyForTrain; i < valid_indices.size(); ++i) {
-      size_t j = rng() % (i + 1);
-      if (j < kMaxCopyForTrain) {
-        train_indices[j] = valid_indices[i];
+    // Build valid indices array (non-deleted entries)
+    std::vector<size_t> valid_indices;
+    valid_indices.reserve(snap.count);
+    for (size_t i = 0; i < snap.count; ++i) {
+      if (!snap.IsDeleted(i)) {
+        valid_indices.push_back(i);
       }
     }
-  }
 
-  // Copy sample vectors into a compact matrix (contiguous, re-indexed 0..N-1)
-  auto sample_matrix = std::make_shared<std::vector<float>>(train_indices.size() * dim);
-  std::vector<size_t> sample_indices(train_indices.size());
-  for (size_t i = 0; i < train_indices.size(); ++i) {
-    size_t src_idx = train_indices[i];
-    std::copy(snap.matrix + src_idx * dim, snap.matrix + (src_idx + 1) * dim, sample_matrix->data() + i * dim);
-    sample_indices[i] = i;  // Re-index to [0, N)
+    if (valid_indices.empty()) {
+      ivf_training_.store(false);
+      return;
+    }
+    valid_count = valid_indices.size();
+
+    // Copy only the vectors we need for training (sample up to 50K).
+    constexpr size_t kMaxCopyForTrain = 50000;
+    std::vector<size_t> train_indices;
+    if (valid_indices.size() <= kMaxCopyForTrain) {
+      train_indices = valid_indices;
+    } else {
+      // Reservoir sample
+      train_indices.resize(kMaxCopyForTrain);
+      std::copy(valid_indices.begin(), valid_indices.begin() + kMaxCopyForTrain, train_indices.begin());
+      std::mt19937 rng(42);
+      for (size_t i = kMaxCopyForTrain; i < valid_indices.size(); ++i) {
+        size_t j = rng() % (i + 1);
+        if (j < kMaxCopyForTrain) {
+          train_indices[j] = valid_indices[i];
+        }
+      }
+    }
+
+    // Copy sample vectors into a compact matrix (contiguous, re-indexed 0..N-1).
+    // This read of snap.matrix happens entirely under the snapshot's read lock.
+    sample_matrix = std::make_shared<std::vector<float>>(train_indices.size() * dim);
+    sample_indices.resize(train_indices.size());
+    for (size_t i = 0; i < train_indices.size(); ++i) {
+      size_t src_idx = train_indices[i];
+      std::copy(snap.matrix + src_idx * dim, snap.matrix + (src_idx + 1) * dim, sample_matrix->data() + i * dim);
+      sample_indices[i] = i;  // Re-index to [0, N)
+    }
+    // snap (and its read lock) is released here, before k-means launch.
   }
 
   // Pre-compute nlist based on TOTAL vector count (not sample size).
   // This ensures the number of clusters scales with the full dataset.
   if (config_.ivf_nlist == 0) {
-    auto sqrt_n = static_cast<uint32_t>(std::max(1.0, std::sqrt(static_cast<double>(valid_indices.size()))));
+    auto sqrt_n = static_cast<uint32_t>(std::max(1.0, std::sqrt(static_cast<double>(valid_count))));
     uint32_t nlist = std::min(sqrt_n, vectors::IvfIndex::kMaxAutoNlist);
     ivf_index->SetNlist(nlist);
   }
 
   utils::StructuredLog()
       .Event("ivf_training_start_async")
-      .Field("vector_count", static_cast<int64_t>(valid_indices.size()))
-      .Field("sample_size", static_cast<int64_t>(train_indices.size()))
+      .Field("vector_count", static_cast<int64_t>(valid_count))
+      .Field("sample_size", static_cast<int64_t>(sample_indices.size()))
       .Info();
 
   // Join any previous training thread before launching a new one

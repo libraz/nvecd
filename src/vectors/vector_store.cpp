@@ -266,9 +266,15 @@ std::shared_lock<std::shared_mutex> VectorStore::AcquireReadLock() const {
 }
 
 VectorStore::CompactSnapshot VectorStore::GetCompactSnapshot() const {
-  std::shared_lock lock(mutex_);
+  // Acquire the read lock and move it into the snapshot so it is held for the
+  // snapshot's entire lifetime. This keeps matrix_/norms_/maps from being
+  // reallocated or defragmented out from under the consumer.
+  std::shared_lock<std::shared_mutex> lock(mutex_);
   CompactSnapshot snap;
   if (matrix_.empty()) {
+    // Still move the lock so the Empty() snapshot's contract is uniform;
+    // an empty store has nothing to protect but holding the lock is harmless.
+    snap.lock = std::move(lock);
     return snap;
   }
   snap.matrix = matrix_.data();
@@ -277,10 +283,16 @@ VectorStore::CompactSnapshot VectorStore::GetCompactSnapshot() const {
   snap.dim = dimension_.load(std::memory_order_relaxed);
   snap.id_to_idx = &id_to_idx_;
   snap.idx_to_id = &idx_to_id_;
+  snap.deleted = &deleted_;
+  snap.lock = std::move(lock);
   return snap;
 }
 
 std::optional<size_t> VectorStore::GetCompactIndex(const std::string& id) const {
+  // Acquire a read lock: this method is called standalone (not via a snapshot)
+  // from request handlers and snapshot serialization, concurrently with
+  // SetVector/DeleteVector which mutate id_to_idx_.
+  std::shared_lock lock(mutex_);
   auto it = id_to_idx_.find(id);
   if (it == id_to_idx_.end()) {
     return std::nullopt;
