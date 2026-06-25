@@ -11,9 +11,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <numeric>
 #include <queue>
 #include <random>
+#include <string>
 #include <unordered_set>
 
 #include "utils/structured_log.h"
@@ -33,11 +35,41 @@ constexpr size_t kPrefetchAhead = 4;
 /// Minimum norm threshold to avoid division by zero
 constexpr float kNormEpsilon = 1e-7F;
 
+/// Sentinel "worse than any real score" for max-selection across all metrics
+constexpr float kWorstScore = -std::numeric_limits<float>::infinity();
+
 }  // namespace
+
+IvfMetric IvfMetricFromString(const std::string& metric) {
+  if (metric == "dot") {
+    return IvfMetric::kDot;
+  }
+  if (metric == "l2") {
+    return IvfMetric::kL2;
+  }
+  return IvfMetric::kCosine;
+}
 
 IvfIndex::IvfIndex(uint32_t dimension) : config_(), dimension_(dimension) {}
 
 IvfIndex::IvfIndex(uint32_t dimension, const Config& config) : config_(config), dimension_(dimension) {}
+
+float IvfIndex::Similarity(const float* a, float norm_a, const float* b, float norm_b, uint32_t dim) const {
+  const auto& simd_impl = simd::GetOptimalImpl();
+  switch (config_.metric) {
+    case IvfMetric::kDot:
+      return simd_impl.dot_product(a, b, dim);
+    case IvfMetric::kL2:
+      // Monotonic decreasing in distance, so larger score == nearer.
+      return 1.0F / (1.0F + simd_impl.l2_distance(a, b, dim));
+    case IvfMetric::kCosine:
+    default:
+      if (norm_a < kNormEpsilon || norm_b < kNormEpsilon) {
+        return kWorstScore;  // Cosine undefined for zero-norm vectors
+      }
+      return simd_impl.dot_product(a, b, dim) / (norm_a * norm_b);
+  }
+}
 
 void IvfIndex::Train(const float* matrix, const size_t* valid_indices, size_t num_valid, uint32_t dimension,
                      bool assign_vectors) {
@@ -59,7 +91,7 @@ void IvfIndex::Train(const float* matrix, const size_t* valid_indices, size_t nu
     return;
   }
 
-  dimension_ = dimension;
+  dimension_.store(dimension, std::memory_order_relaxed);
 
   // Auto-scale nlist if set to 0: use sqrt(n), capped at kMaxAutoNlist
   if (config_.nlist == 0) {
@@ -112,19 +144,22 @@ void IvfIndex::Train(const float* matrix, const size_t* valid_indices, size_t nu
       float vec_norm = simd_impl.l2_norm(vec, dimension);
 
       size_t best = 0;
-      float best_sim = -2.0F;
+      float best_sim = kWorstScore;
 
       for (uint32_t c = 0; c < nlist; ++c) {
-        float cn = centroid_norms_[c];
-        if (cn < kNormEpsilon || vec_norm < kNormEpsilon) {
-          continue;
-        }
-        float dot = simd_impl.dot_product(vec, centroids_.data() + static_cast<size_t>(c) * dimension, dimension);
-        float sim = dot / (vec_norm * cn);
+        float sim = Similarity(vec, vec_norm, centroids_.data() + static_cast<size_t>(c) * dimension,
+                               centroid_norms_[c], dimension);
         if (sim > best_sim) {
           best_sim = sim;
           best = c;
         }
+      }
+
+      // Zero-norm vectors have no meaningful nearest centroid under cosine
+      // (Similarity returns -inf for every cluster). Spread them deterministically
+      // instead of dumping them all into cluster 0, which would skew recall (bug #8).
+      if (best_sim == kWorstScore) {
+        best = idx % nlist;
       }
 
       inverted_lists_[best].push_back(idx);
@@ -174,19 +209,20 @@ void IvfIndex::BulkAddVectors(const size_t* compact_indices, const float* vector
     float vec_norm = simd_impl.l2_norm(vec, dimension);
 
     size_t best = 0;
-    float best_sim = -2.0F;
+    float best_sim = kWorstScore;
 
     for (uint32_t c = 0; c < nlist; ++c) {
-      float cn = centroid_norms_[c];
-      if (cn < kNormEpsilon || vec_norm < kNormEpsilon) {
-        continue;
-      }
-      float dot = simd_impl.dot_product(vec, centroids_.data() + static_cast<size_t>(c) * dimension, dimension);
-      float sim = dot / (vec_norm * cn);
+      float sim = Similarity(vec, vec_norm, centroids_.data() + static_cast<size_t>(c) * dimension, centroid_norms_[c],
+                             dimension);
       if (sim > best_sim) {
         best_sim = sim;
         best = c;
       }
+    }
+
+    // Spread zero-norm (cosine-undefined) vectors deterministically (bug #8).
+    if (best_sim == kWorstScore) {
+      best = idx % nlist;
     }
 
     inverted_lists_[best].push_back(idx);
@@ -197,6 +233,7 @@ void IvfIndex::RemoveVector(size_t compact_index) {
   // First check the write buffer
   {
     std::unique_lock buf_lock(buffer_mutex_);
+    const size_t dim = dimension_.load(std::memory_order_relaxed);
     for (size_t i = 0; i < buffer_indices_.size(); ++i) {
       if (buffer_indices_[i] == compact_index) {
         // Swap with last and pop for O(1) removal
@@ -204,11 +241,11 @@ void IvfIndex::RemoveVector(size_t compact_index) {
         if (i != last) {
           buffer_indices_[i] = buffer_indices_[last];
           // Swap vector data
-          std::copy(buffer_vectors_.data() + last * dimension_, buffer_vectors_.data() + (last + 1) * dimension_,
-                    buffer_vectors_.data() + i * dimension_);
+          std::copy(buffer_vectors_.data() + last * dim, buffer_vectors_.data() + (last + 1) * dim,
+                    buffer_vectors_.data() + i * dim);
         }
         buffer_indices_.pop_back();
-        buffer_vectors_.resize(buffer_indices_.size() * dimension_);
+        buffer_vectors_.resize(buffer_indices_.size() * dim);
         return;
       }
     }
@@ -254,8 +291,6 @@ std::vector<std::pair<float, size_t>> IvfIndex::Search(const float* query_vec, f
       auto cmp = [](const ScoreIdx& a, const ScoreIdx& b) { return a.first > b.first; };
       std::priority_queue<ScoreIdx, std::vector<ScoreIdx>, decltype(cmp)> min_heap(cmp);
 
-      const auto& simd_impl = simd::GetOptimalImpl();
-
       // Scan vectors in the selected clusters
       for (size_t cluster_id : probe_clusters) {
         const auto& list = inverted_lists_[cluster_id];
@@ -275,12 +310,10 @@ std::vector<std::pair<float, size_t>> IvfIndex::Search(const float* query_vec, f
           }
 
           float cand_norm = norms[idx];
-          if (cand_norm < kNormEpsilon || query_norm < kNormEpsilon) {
-            continue;
+          float score = Similarity(query_vec, query_norm, matrix + idx * dimension, cand_norm, dimension);
+          if (score == kWorstScore) {
+            continue;  // Cosine undefined (zero norm); skip candidate
           }
-
-          float dot = simd_impl.dot_product(query_vec, matrix + idx * dimension, dimension);
-          float score = dot / (query_norm * cand_norm);
 
           if (min_heap.size() < top_k) {
             min_heap.push({score, idx});
@@ -402,9 +435,10 @@ void IvfIndex::AppendToBuffer(size_t compact_index, const float* vector) {
     return;
   }
 
+  const uint32_t dim = dimension_.load(std::memory_order_relaxed);
   std::unique_lock lock(buffer_mutex_);
   buffer_indices_.push_back(compact_index);
-  buffer_vectors_.insert(buffer_vectors_.end(), vector, vector + dimension_);
+  buffer_vectors_.insert(buffer_vectors_.end(), vector, vector + dim);
 }
 
 size_t IvfIndex::GetBufferSize() const {
@@ -444,26 +478,27 @@ void IvfIndex::SealBuffer() {
 
   const auto& simd_impl = simd::GetOptimalImpl();
   const uint32_t nlist = config_.nlist;
+  const uint32_t dim = dimension_.load(std::memory_order_relaxed);
   size_t sealed_count = seal_indices.size();
 
   for (size_t i = 0; i < sealed_count; ++i) {
-    const float* vec = seal_vectors.data() + i * dimension_;
-    float vec_norm = simd_impl.l2_norm(vec, dimension_);
+    const float* vec = seal_vectors.data() + i * dim;
+    float vec_norm = simd_impl.l2_norm(vec, dim);
 
     size_t best = 0;
-    float best_sim = -2.0F;
+    float best_sim = kWorstScore;
 
     for (uint32_t c = 0; c < nlist; ++c) {
-      float cn = centroid_norms_[c];
-      if (cn < kNormEpsilon || vec_norm < kNormEpsilon) {
-        continue;
-      }
-      float dot = simd_impl.dot_product(vec, centroids_.data() + static_cast<size_t>(c) * dimension_, dimension_);
-      float sim = dot / (vec_norm * cn);
+      float sim = Similarity(vec, vec_norm, centroids_.data() + static_cast<size_t>(c) * dim, centroid_norms_[c], dim);
       if (sim > best_sim) {
         best_sim = sim;
         best = c;
       }
+    }
+
+    // Spread zero-norm (cosine-undefined) vectors deterministically (bug #8).
+    if (best_sim == kWorstScore) {
+      best = seal_indices[i] % nlist;
     }
 
     inverted_lists_[best].push_back(seal_indices[i]);
@@ -476,7 +511,9 @@ std::vector<std::pair<float, size_t>> IvfIndex::SearchBuffer(const float* query_
                                                              uint32_t dimension, size_t top_k) const {
   std::shared_lock lock(buffer_mutex_);
 
-  if (buffer_indices_.empty() || query_vec == nullptr || query_norm < kNormEpsilon) {
+  // A zero-norm query is only meaningless for cosine; dot/L2 remain well-defined.
+  bool cosine_undefined = (config_.metric == IvfMetric::kCosine) && query_norm < kNormEpsilon;
+  if (buffer_indices_.empty() || query_vec == nullptr || cosine_undefined) {
     return {};
   }
 
@@ -496,12 +533,10 @@ std::vector<std::pair<float, size_t>> IvfIndex::SearchBuffer(const float* query_
     const float* vec = buffer_vectors_.data() + i * dimension;
     float vec_norm = simd_impl.l2_norm(vec, dimension);
 
-    if (vec_norm < kNormEpsilon) {
-      continue;
+    float score = Similarity(query_vec, query_norm, vec, vec_norm, dimension);
+    if (score == kWorstScore) {
+      continue;  // Cosine undefined (zero norm); skip candidate
     }
-
-    float dot = simd_impl.dot_product(query_vec, vec, dimension);
-    float score = dot / (query_norm * vec_norm);
 
     if (min_heap.size() < top_k) {
       min_heap.push({score, buffer_indices_[i]});
@@ -626,40 +661,35 @@ void IvfIndex::KMeansTrain(const float* matrix, const size_t* sample_indices, si
 
 size_t IvfIndex::FindNearestCentroid(const float* vec) const {
   const auto& simd_impl = simd::GetOptimalImpl();
-  float vec_norm = simd_impl.l2_norm(vec, dimension_);
+  const uint32_t dim = dimension_.load(std::memory_order_relaxed);
+  float vec_norm = simd_impl.l2_norm(vec, dim);
 
   size_t best = 0;
-  float best_sim = -2.0F;  // Cosine similarity range is [-1, 1]
+  float best_sim = kWorstScore;
 
   for (uint32_t c = 0; c < config_.nlist; ++c) {
-    float cn = centroid_norms_[c];
-    if (cn < kNormEpsilon || vec_norm < kNormEpsilon) {
-      continue;
-    }
-    float dot = simd_impl.dot_product(vec, centroids_.data() + static_cast<size_t>(c) * dimension_, dimension_);
-    float sim = dot / (vec_norm * cn);
+    float sim = Similarity(vec, vec_norm, centroids_.data() + static_cast<size_t>(c) * dim, centroid_norms_[c], dim);
     if (sim > best_sim) {
       best_sim = sim;
       best = c;
     }
   }
 
+  // Zero-norm vectors under cosine score -inf everywhere and fall back to
+  // cluster 0. This single-vector path (AddVector / k-means assignment) has no
+  // index to spread by; bulk paths handle the spreading explicitly (bug #8).
   return best;
 }
 
 std::vector<size_t> IvfIndex::FindNearestCentroids(const float* vec, uint32_t nprobe) const {
   const auto& simd_impl = simd::GetOptimalImpl();
-  float vec_norm = simd_impl.l2_norm(vec, dimension_);
+  const uint32_t dim = dimension_.load(std::memory_order_relaxed);
+  float vec_norm = simd_impl.l2_norm(vec, dim);
 
-  // Compute similarity to all centroids
+  // Compute similarity to all centroids (higher == nearer for every metric)
   std::vector<std::pair<float, size_t>> centroid_sims(config_.nlist);
   for (uint32_t c = 0; c < config_.nlist; ++c) {
-    float cn = centroid_norms_[c];
-    float sim = 0.0F;
-    if (cn >= kNormEpsilon && vec_norm >= kNormEpsilon) {
-      float dot = simd_impl.dot_product(vec, centroids_.data() + static_cast<size_t>(c) * dimension_, dimension_);
-      sim = dot / (vec_norm * cn);
-    }
+    float sim = Similarity(vec, vec_norm, centroids_.data() + static_cast<size_t>(c) * dim, centroid_norms_[c], dim);
     centroid_sims[c] = {sim, c};
   }
 

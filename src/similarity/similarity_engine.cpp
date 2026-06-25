@@ -61,6 +61,8 @@ SimilarityEngine::SimilarityEngine(events::EventStore* event_store, events::CoOc
     ivf_config.nprobe = config_.ivf_nprobe;
     ivf_config.train_threshold = config_.ivf_train_threshold;
     ivf_config.seal_threshold = config_.ivf_seal_threshold;
+    // Use the same metric as flat/HNSW so IVF ranking stays consistent (C-2).
+    ivf_config.metric = vectors::IvfMetricFromString(vectors_config.distance_metric);
 
     auto ivf = std::make_unique<vectors::IvfIndex>(vectors_config.default_dimension, ivf_config);
     auto* raw = ivf.get();

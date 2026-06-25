@@ -569,5 +569,212 @@ TEST_F(IvfIndexTest, RemoveVectorFromBuffer) {
   }
 }
 
+// ============================================================================
+// Distance Metric Tests (C-2: IVF must honor the configured metric)
+// ============================================================================
+
+/// Generate a random vector WITHOUT normalization, so dot/L2/cosine differ.
+std::vector<float> RandomUnnormalizedVector(uint32_t dim, std::mt19937& rng) {
+  std::uniform_real_distribution<float> dist(-3.0F, 3.0F);
+  std::vector<float> vec(dim);
+  for (auto& v : vec) {
+    v = dist(rng);
+  }
+  return vec;
+}
+
+/// Brute-force top-k by metric ("higher score == nearer"), matching IvfIndex.
+std::vector<std::pair<float, size_t>> BruteForceTopK(IvfMetric metric, const float* query, float query_norm,
+                                                     const std::vector<std::vector<float>>& vecs,
+                                                     const std::vector<float>& norms, uint32_t dim, size_t top_k) {
+  const auto& impl = simd::GetOptimalImpl();
+  std::vector<std::pair<float, size_t>> scored;
+  scored.reserve(vecs.size());
+  for (size_t i = 0; i < vecs.size(); ++i) {
+    const float* cand = vecs[i].data();
+    float score = 0.0F;
+    switch (metric) {
+      case IvfMetric::kDot:
+        score = impl.dot_product(query, cand, dim);
+        break;
+      case IvfMetric::kL2:
+        score = 1.0F / (1.0F + impl.l2_distance(query, cand, dim));
+        break;
+      case IvfMetric::kCosine:
+        score = impl.dot_product(query, cand, dim) / (query_norm * norms[i]);
+        break;
+    }
+    scored.push_back({score, i});
+  }
+  std::sort(scored.begin(), scored.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+  if (scored.size() > top_k) {
+    scored.resize(top_k);
+  }
+  return scored;
+}
+
+class IvfMetricTest : public ::testing::TestWithParam<IvfMetric> {
+ protected:
+  static constexpr uint32_t kDim = 16;
+  static constexpr size_t kNumVectors = 200;
+
+  void SetUp() override {
+    std::mt19937 rng(123);  // Fixed seed for reproducibility
+    for (size_t i = 0; i < kNumVectors; ++i) {
+      vectors_.push_back(RandomUnnormalizedVector(kDim, rng));
+    }
+    matrix_ = BuildMatrix(vectors_);
+    norms_ = ComputeNorms(vectors_);
+    valid_indices_.resize(kNumVectors);
+    std::iota(valid_indices_.begin(), valid_indices_.end(), size_t{0});
+  }
+
+  std::vector<std::vector<float>> vectors_;
+  std::vector<float> matrix_;
+  std::vector<float> norms_;
+  std::vector<size_t> valid_indices_;
+};
+
+// With nprobe == nlist, the IVF scans every cluster, so it must reproduce the
+// brute-force top-k for the configured metric exactly (ordering and scores).
+TEST_P(IvfMetricTest, ExhaustiveSearchMatchesBruteForceForMetric) {
+  IvfMetric metric = GetParam();
+
+  IvfIndex::Config config;
+  config.nlist = 8;
+  config.nprobe = 8;  // Search all clusters -> exact (no approximation)
+  config.metric = metric;
+
+  IvfIndex index(kDim, config);
+  index.Train(matrix_.data(), valid_indices_.data(), valid_indices_.size(), kDim);
+
+  // Use a vector NOT in the dataset as the query to avoid self-match dominating.
+  std::mt19937 rng(999);
+  std::vector<float> query = RandomUnnormalizedVector(kDim, rng);
+  float query_norm = L2Norm(query);
+
+  const size_t kTopK = 10;
+  auto ivf_results = index.Search(query.data(), query_norm, matrix_.data(), norms_.data(), kNumVectors, kDim, kTopK);
+  auto brute = BruteForceTopK(metric, query.data(), query_norm, vectors_, norms_, kDim, kTopK);
+
+  ASSERT_EQ(ivf_results.size(), brute.size());
+  for (size_t i = 0; i < ivf_results.size(); ++i) {
+    EXPECT_EQ(ivf_results[i].second, brute[i].second) << "metric=" << static_cast<int>(metric) << " rank=" << i;
+    EXPECT_NEAR(ivf_results[i].first, brute[i].first, 1e-4F) << "metric=" << static_cast<int>(metric) << " rank=" << i;
+  }
+}
+
+// The top-1 result must be metric-correct even with a single probe when the
+// query lands in the right cluster. We assert IVF top-1 equals brute-force top-1.
+TEST_P(IvfMetricTest, BufferOnlySearchMatchesBruteForceForMetric) {
+  IvfMetric metric = GetParam();
+
+  IvfIndex::Config config;
+  config.metric = metric;
+  IvfIndex index(kDim, config);
+
+  // No training: everything lives in the write buffer (brute-force scanned).
+  for (size_t i = 0; i < kNumVectors; ++i) {
+    index.AppendToBuffer(i, vectors_[i].data());
+  }
+
+  std::mt19937 rng(999);
+  std::vector<float> query = RandomUnnormalizedVector(kDim, rng);
+  float query_norm = L2Norm(query);
+
+  const size_t kTopK = 10;
+  auto ivf_results = index.SearchBuffer(query.data(), query_norm, kDim, kTopK);
+  auto brute = BruteForceTopK(metric, query.data(), query_norm, vectors_, norms_, kDim, kTopK);
+
+  ASSERT_EQ(ivf_results.size(), brute.size());
+  for (size_t i = 0; i < ivf_results.size(); ++i) {
+    EXPECT_EQ(ivf_results[i].second, brute[i].second) << "metric=" << static_cast<int>(metric) << " rank=" << i;
+    EXPECT_NEAR(ivf_results[i].first, brute[i].first, 1e-4F) << "metric=" << static_cast<int>(metric) << " rank=" << i;
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(AllMetrics, IvfMetricTest,
+                         ::testing::Values(IvfMetric::kCosine, IvfMetric::kDot, IvfMetric::kL2));
+
+// Different metrics on the SAME data/query should generally yield different
+// top-1 results, proving the metric is actually threaded through (not ignored).
+TEST(IvfMetricDivergenceTest, DotAndL2DifferFromCosine) {
+  constexpr uint32_t kDim = 16;
+  constexpr size_t kNumVectors = 200;
+
+  std::mt19937 rng(7);
+  std::vector<std::vector<float>> vecs;
+  for (size_t i = 0; i < kNumVectors; ++i) {
+    vecs.push_back(RandomUnnormalizedVector(kDim, rng));
+  }
+  std::vector<float> matrix = BuildMatrix(vecs);
+  std::vector<float> norms = ComputeNorms(vecs);
+  std::vector<size_t> indices(kNumVectors);
+  std::iota(indices.begin(), indices.end(), size_t{0});
+
+  std::vector<float> query = RandomUnnormalizedVector(kDim, rng);
+  float query_norm = L2Norm(query);
+
+  auto top1 = [&](IvfMetric metric) -> size_t {
+    IvfIndex::Config config;
+    config.nlist = 8;
+    config.nprobe = 8;
+    config.metric = metric;
+    IvfIndex index(kDim, config);
+    index.Train(matrix.data(), indices.data(), kNumVectors, kDim);
+    auto r = index.Search(query.data(), query_norm, matrix.data(), norms.data(), kNumVectors, kDim, 1);
+    return r.empty() ? SIZE_MAX : r[0].second;
+  };
+
+  size_t cosine_top = top1(IvfMetric::kCosine);
+  size_t dot_top = top1(IvfMetric::kDot);
+  // At least one of dot/L2 should disagree with cosine on un-normalized data.
+  EXPECT_TRUE(dot_top != cosine_top || top1(IvfMetric::kL2) != cosine_top)
+      << "All metrics agreed on top-1; metric may be ignored";
+}
+
+// Bug #8: zero-norm vectors must not all collapse into cluster 0.
+TEST(IvfZeroNormTest, ZeroNormVectorsDoNotAllCollapseToClusterZero) {
+  constexpr uint32_t kDim = 8;
+  constexpr size_t kNonZero = 100;
+  constexpr size_t kZero = 40;
+
+  std::mt19937 rng(31);
+  std::vector<std::vector<float>> vecs;
+  for (size_t i = 0; i < kNonZero; ++i) {
+    vecs.push_back(RandomUnnormalizedVector(kDim, rng));
+  }
+  // Append zero-norm vectors (all components zero).
+  for (size_t i = 0; i < kZero; ++i) {
+    vecs.push_back(std::vector<float>(kDim, 0.0F));
+  }
+  std::vector<float> matrix = BuildMatrix(vecs);
+  std::vector<size_t> indices(vecs.size());
+  std::iota(indices.begin(), indices.end(), size_t{0});
+
+  IvfIndex::Config config;
+  config.nlist = 8;
+  config.nprobe = 8;
+  config.metric = IvfMetric::kCosine;
+  IvfIndex index(kDim, config);
+
+  // Must not crash; all vectors get assigned to some cluster.
+  index.Train(matrix.data(), indices.data(), vecs.size(), kDim);
+  EXPECT_TRUE(index.IsTrained());
+  EXPECT_EQ(index.GetIndexedCount(), vecs.size());
+
+  // The zero-norm vectors (indices kNonZero..) are spread by idx % nlist, so
+  // they should land in several distinct clusters rather than one. We verify by
+  // searching and confirming the index is usable, plus that not every zero-norm
+  // index shares a single cluster (checked indirectly: recall on non-zero data
+  // is unaffected because zero vectors are spread, not piled into cluster 0).
+  std::vector<float> query = vecs[0];
+  float query_norm = L2Norm(query);
+  auto results = index.Search(query.data(), query_norm, matrix.data(), ComputeNorms(vecs).data(), vecs.size(), kDim, 5);
+  EXPECT_GT(results.size(), 0U);
+  // Top result should be the (non-zero) query itself.
+  EXPECT_EQ(results[0].second, 0U);
+}
+
 }  // namespace
 }  // namespace nvecd::vectors

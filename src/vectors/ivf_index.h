@@ -24,10 +24,31 @@
 #include <cstddef>
 #include <cstdint>
 #include <shared_mutex>
+#include <string>
 #include <utility>
 #include <vector>
 
 namespace nvecd::vectors {
+
+/**
+ * @brief Distance metric used by the IVF index
+ *
+ * Mirrors the metric selected for flat/HNSW search (see GetDistanceFunc in
+ * distance.h). All metrics are evaluated as "higher score = more similar" so
+ * that centroid assignment and top-k selection share a single max-heap
+ * convention:
+ * - kCosine: dot(a,b) / (||a|| * ||b||)
+ * - kDot:    dot(a,b)
+ * - kL2:     1 / (1 + L2_distance(a,b))  (monotonic decreasing in distance)
+ */
+enum class IvfMetric { kCosine, kDot, kL2 };
+
+/**
+ * @brief Map a metric name ("cosine", "dot", "l2") to an IvfMetric
+ * @param metric Metric name (defaults to cosine for unknown/empty values)
+ * @return Corresponding IvfMetric
+ */
+IvfMetric IvfMetricFromString(const std::string& metric);
 
 /**
  * @brief IVF (Inverted File) index for approximate nearest neighbor search
@@ -73,12 +94,13 @@ class IvfIndex {
    * @brief IVF index configuration
    */
   struct Config {
-    uint32_t nlist = 256;                  ///< Number of Voronoi cells/clusters
-    uint32_t nprobe = 8;                   ///< Clusters to search at query time
-    uint32_t train_threshold = 10000;      ///< Min vectors before training
-    uint32_t max_iterations = 10;          ///< K-means max iterations
-    float convergence_threshold = 0.001F;  ///< K-means convergence threshold
-    uint32_t seal_threshold = 100000;      ///< Seal write buffer at this size
+    uint32_t nlist = 256;                   ///< Number of Voronoi cells/clusters
+    uint32_t nprobe = 8;                    ///< Clusters to search at query time
+    uint32_t train_threshold = 10000;       ///< Min vectors before training
+    uint32_t max_iterations = 10;           ///< K-means max iterations
+    float convergence_threshold = 0.001F;   ///< K-means convergence threshold
+    uint32_t seal_threshold = 100000;       ///< Seal write buffer at this size
+    IvfMetric metric = IvfMetric::kCosine;  ///< Distance metric (must match engine)
   };
 
   /**
@@ -276,8 +298,25 @@ class IvfIndex {
    */
   std::vector<size_t> FindNearestCentroids(const float* vec, uint32_t nprobe) const;
 
+  /**
+   * @brief Compute the configured-metric similarity between two vectors
+   *
+   * Returns a "higher = more similar" score for the index's metric, so that
+   * the same max-selection logic works for cosine, dot, and L2.
+   *
+   * @param a First vector
+   * @param norm_a Pre-computed L2 norm of @p a (used by cosine only)
+   * @param b Second vector
+   * @param norm_b Pre-computed L2 norm of @p b (used by cosine only)
+   * @param dim Vector dimension
+   * @return Similarity score, or -infinity when cosine is undefined (zero norm)
+   */
+  float Similarity(const float* a, float norm_a, const float* b, float norm_b, uint32_t dim) const;
+
   Config config_;
-  uint32_t dimension_;
+  /// Vector dimension. Atomic because AppendToBuffer (buffer_mutex_ only) reads
+  /// it concurrently with Train (mutex_ only) writing it; see bug #7.
+  std::atomic<uint32_t> dimension_;
   bool trained_ = false;
 
   /// Centroids: nlist x dimension contiguous matrix
