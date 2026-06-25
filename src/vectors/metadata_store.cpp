@@ -7,65 +7,64 @@
 
 namespace nvecd::vectors {
 
-void MetadataStore::Set(uint32_t compact_index, Metadata meta) {
+void MetadataStore::Set(const std::string& id, Metadata meta) {
   std::unique_lock lock(mutex_);
-  if (compact_index >= metadata_.size()) {
-    metadata_.resize(compact_index + 1);
+  if (meta.empty()) {
+    // An empty metadata set is equivalent to having no metadata.
+    metadata_.erase(id);
+    return;
   }
-  metadata_[compact_index] = std::move(meta);
+  metadata_[id] = std::move(meta);
 }
 
-const Metadata* MetadataStore::Get(uint32_t compact_index) const {
+const Metadata* MetadataStore::Get(const std::string& id) const {
   std::shared_lock lock(mutex_);
-  if (compact_index >= metadata_.size()) {
+  auto it = metadata_.find(id);
+  if (it == metadata_.end() || it->second.empty()) {
     return nullptr;
   }
-  if (metadata_[compact_index].empty()) {
-    return nullptr;
-  }
-  return &metadata_[compact_index];
+  return &it->second;
 }
 
-void MetadataStore::Delete(uint32_t compact_index) {
+void MetadataStore::Delete(const std::string& id) {
   std::unique_lock lock(mutex_);
-  if (compact_index < metadata_.size()) {
-    metadata_[compact_index].clear();
-  }
+  metadata_.erase(id);
 }
 
-std::vector<uint32_t> MetadataStore::Filter(const MetadataFilter& filter,
-                                            const std::vector<uint32_t>& candidates) const {
+std::vector<std::string> MetadataStore::Filter(const MetadataFilter& filter,
+                                               const std::vector<std::string>& candidates) const {
   std::shared_lock lock(mutex_);
-  std::vector<uint32_t> result;
+  std::vector<std::string> result;
 
   if (filter.Empty()) {
-    // No filter: return all candidates or all items
+    // No filter: return all candidates or all items with metadata.
     if (!candidates.empty()) {
       return candidates;
     }
     result.reserve(metadata_.size());
-    for (uint32_t i = 0; i < metadata_.size(); ++i) {
-      if (!metadata_[i].empty()) {
-        result.push_back(i);
+    for (const auto& [id, meta] : metadata_) {
+      if (!meta.empty()) {
+        result.push_back(id);
       }
     }
     return result;
   }
 
   if (!candidates.empty()) {
-    // Filter only candidates
+    // Filter only the given candidates.
     result.reserve(candidates.size());
-    for (uint32_t idx : candidates) {
-      if (idx < metadata_.size() && filter.Match(metadata_[idx])) {
-        result.push_back(idx);
+    for (const auto& id : candidates) {
+      auto it = metadata_.find(id);
+      if (it != metadata_.end() && filter.Match(it->second)) {
+        result.push_back(id);
       }
     }
   } else {
-    // Linear scan all items
+    // Linear scan all items.
     result.reserve(metadata_.size() / 4);  // Heuristic
-    for (uint32_t i = 0; i < metadata_.size(); ++i) {
-      if (!metadata_[i].empty() && filter.Match(metadata_[i])) {
-        result.push_back(i);
+    for (const auto& [id, meta] : metadata_) {
+      if (!meta.empty() && filter.Match(meta)) {
+        result.push_back(id);
       }
     }
   }
@@ -73,22 +72,23 @@ std::vector<uint32_t> MetadataStore::Filter(const MetadataFilter& filter,
   return result;
 }
 
-bool MetadataStore::Matches(uint32_t compact_index, const MetadataFilter& filter) const {
+bool MetadataStore::Matches(const std::string& id, const MetadataFilter& filter) const {
   std::shared_lock lock(mutex_);
   if (filter.Empty()) {
     return true;
   }
-  if (compact_index >= metadata_.size()) {
+  auto it = metadata_.find(id);
+  if (it == metadata_.end()) {
     return false;
   }
-  return filter.Match(metadata_[compact_index]);
+  return filter.Match(it->second);
 }
 
 uint32_t MetadataStore::Size() const {
   std::shared_lock lock(mutex_);
   uint32_t count = 0;
-  for (const auto& m : metadata_) {
-    if (!m.empty()) {
+  for (const auto& [id, meta] : metadata_) {
+    if (!meta.empty()) {
       count++;
     }
   }

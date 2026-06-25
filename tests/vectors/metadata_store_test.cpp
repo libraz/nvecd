@@ -7,6 +7,8 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+
 namespace nvecd::vectors {
 namespace {
 
@@ -17,62 +19,72 @@ class MetadataStoreTest : public ::testing::Test {
 
 TEST_F(MetadataStoreTest, SetAndGet) {
   Metadata meta = {{"status", std::string("active")}, {"count", int64_t(42)}};
-  store_.Set(0, meta);
+  store_.Set("item0", meta);
 
-  const auto* result = store_.Get(0);
+  const auto* result = store_.Get("item0");
   ASSERT_NE(result, nullptr);
   EXPECT_EQ(std::get<std::string>(result->at("status")), "active");
   EXPECT_EQ(std::get<int64_t>(result->at("count")), 42);
 }
 
 TEST_F(MetadataStoreTest, GetNonExistent) {
-  EXPECT_EQ(store_.Get(0), nullptr);
-  EXPECT_EQ(store_.Get(999), nullptr);
+  EXPECT_EQ(store_.Get("item0"), nullptr);
+  EXPECT_EQ(store_.Get("missing"), nullptr);
 }
 
 TEST_F(MetadataStoreTest, Delete) {
-  store_.Set(0, {{"key", std::string("value")}});
-  EXPECT_NE(store_.Get(0), nullptr);
+  store_.Set("item0", {{"key", std::string("value")}});
+  EXPECT_NE(store_.Get("item0"), nullptr);
 
-  store_.Delete(0);
-  EXPECT_EQ(store_.Get(0), nullptr);
+  store_.Delete("item0");
+  EXPECT_EQ(store_.Get("item0"), nullptr);
 }
 
 TEST_F(MetadataStoreTest, DeleteNonExistent) {
-  store_.Delete(999);  // Should not crash
+  store_.Delete("missing");  // Should not crash
 }
 
 TEST_F(MetadataStoreTest, Update) {
-  store_.Set(0, {{"status", std::string("draft")}});
-  store_.Set(0, {{"status", std::string("published")}});
+  store_.Set("item0", {{"status", std::string("draft")}});
+  store_.Set("item0", {{"status", std::string("published")}});
 
-  const auto* result = store_.Get(0);
+  const auto* result = store_.Get("item0");
   ASSERT_NE(result, nullptr);
   EXPECT_EQ(std::get<std::string>(result->at("status")), "published");
+}
+
+TEST_F(MetadataStoreTest, SetEmptyRemovesEntry) {
+  store_.Set("item0", {{"status", std::string("active")}});
+  EXPECT_NE(store_.Get("item0"), nullptr);
+
+  // Setting empty metadata is equivalent to deleting the entry.
+  store_.Set("item0", {});
+  EXPECT_EQ(store_.Get("item0"), nullptr);
+  EXPECT_EQ(store_.Size(), 0U);
 }
 
 TEST_F(MetadataStoreTest, Size) {
   EXPECT_EQ(store_.Size(), 0U);
 
-  store_.Set(0, {{"a", std::string("1")}});
-  store_.Set(5, {{"b", std::string("2")}});
+  store_.Set("a", {{"a", std::string("1")}});
+  store_.Set("b", {{"b", std::string("2")}});
   EXPECT_EQ(store_.Size(), 2U);
 
-  store_.Delete(0);
+  store_.Delete("a");
   EXPECT_EQ(store_.Size(), 1U);
 }
 
 TEST_F(MetadataStoreTest, Clear) {
-  store_.Set(0, {{"a", std::string("1")}});
-  store_.Set(1, {{"b", std::string("2")}});
+  store_.Set("a", {{"a", std::string("1")}});
+  store_.Set("b", {{"b", std::string("2")}});
   store_.Clear();
   EXPECT_EQ(store_.Size(), 0U);
-  EXPECT_EQ(store_.Get(0), nullptr);
+  EXPECT_EQ(store_.Get("a"), nullptr);
 }
 
 TEST_F(MetadataStoreTest, FilterEmpty) {
-  store_.Set(0, {{"status", std::string("active")}});
-  store_.Set(1, {{"status", std::string("deleted")}});
+  store_.Set("a", {{"status", std::string("active")}});
+  store_.Set("b", {{"status", std::string("deleted")}});
 
   MetadataFilter filter;  // Empty filter
   auto result = store_.Filter(filter);
@@ -80,9 +92,9 @@ TEST_F(MetadataStoreTest, FilterEmpty) {
 }
 
 TEST_F(MetadataStoreTest, FilterSingleCondition) {
-  store_.Set(0, {{"status", std::string("active")}});
-  store_.Set(1, {{"status", std::string("deleted")}});
-  store_.Set(2, {{"status", std::string("active")}});
+  store_.Set("a", {{"status", std::string("active")}});
+  store_.Set("b", {{"status", std::string("deleted")}});
+  store_.Set("c", {{"status", std::string("active")}});
 
   MetadataFilter filter;
   FilterCondition cond;
@@ -93,14 +105,15 @@ TEST_F(MetadataStoreTest, FilterSingleCondition) {
 
   auto result = store_.Filter(filter);
   ASSERT_EQ(result.size(), 2U);
-  EXPECT_EQ(result[0], 0U);
-  EXPECT_EQ(result[1], 2U);
+  std::sort(result.begin(), result.end());
+  EXPECT_EQ(result[0], "a");
+  EXPECT_EQ(result[1], "c");
 }
 
 TEST_F(MetadataStoreTest, FilterWithCandidates) {
-  store_.Set(0, {{"status", std::string("active")}});
-  store_.Set(1, {{"status", std::string("active")}});
-  store_.Set(2, {{"status", std::string("active")}});
+  store_.Set("a", {{"status", std::string("active")}});
+  store_.Set("b", {{"status", std::string("active")}});
+  store_.Set("c", {{"status", std::string("active")}});
 
   MetadataFilter filter;
   FilterCondition cond;
@@ -109,16 +122,17 @@ TEST_F(MetadataStoreTest, FilterWithCandidates) {
   cond.value = std::string("active");
   filter.conditions.push_back(cond);
 
-  // Only check candidates {0, 2}
-  std::vector<uint32_t> candidates = {0, 2};
+  // Only check candidates {a, c}
+  std::vector<std::string> candidates = {"a", "c"};
   auto result = store_.Filter(filter, candidates);
   ASSERT_EQ(result.size(), 2U);
-  EXPECT_EQ(result[0], 0U);
-  EXPECT_EQ(result[1], 2U);
+  std::sort(result.begin(), result.end());
+  EXPECT_EQ(result[0], "a");
+  EXPECT_EQ(result[1], "c");
 }
 
 TEST_F(MetadataStoreTest, MatchesSingle) {
-  store_.Set(0, {{"status", std::string("active")}, {"price", 9.99}});
+  store_.Set("item0", {{"status", std::string("active")}, {"price", 9.99}});
 
   MetadataFilter filter;
   FilterCondition cond;
@@ -127,24 +141,23 @@ TEST_F(MetadataStoreTest, MatchesSingle) {
   cond.value = std::string("active");
   filter.conditions.push_back(cond);
 
-  EXPECT_TRUE(store_.Matches(0, filter));
-  EXPECT_FALSE(store_.Matches(1, filter));  // Non-existent
+  EXPECT_TRUE(store_.Matches("item0", filter));
+  EXPECT_FALSE(store_.Matches("missing", filter));  // Non-existent
 
   MetadataFilter empty;
-  EXPECT_TRUE(store_.Matches(0, empty));
-  EXPECT_TRUE(store_.Matches(999, empty));  // Empty filter always matches
+  EXPECT_TRUE(store_.Matches("item0", empty));
+  EXPECT_TRUE(store_.Matches("missing", empty));  // Empty filter always matches
 }
 
-TEST_F(MetadataStoreTest, SparseIndices) {
-  // Non-contiguous compact indices
-  store_.Set(0, {{"a", std::string("x")}});
-  store_.Set(100, {{"b", std::string("y")}});
-  store_.Set(50, {{"c", std::string("z")}});
+TEST_F(MetadataStoreTest, MultipleIds) {
+  store_.Set("alpha", {{"a", std::string("x")}});
+  store_.Set("beta", {{"b", std::string("y")}});
+  store_.Set("gamma", {{"c", std::string("z")}});
 
-  EXPECT_NE(store_.Get(0), nullptr);
-  EXPECT_NE(store_.Get(50), nullptr);
-  EXPECT_NE(store_.Get(100), nullptr);
-  EXPECT_EQ(store_.Get(25), nullptr);
+  EXPECT_NE(store_.Get("alpha"), nullptr);
+  EXPECT_NE(store_.Get("beta"), nullptr);
+  EXPECT_NE(store_.Get("gamma"), nullptr);
+  EXPECT_EQ(store_.Get("delta"), nullptr);
   EXPECT_EQ(store_.Size(), 3U);
 }
 

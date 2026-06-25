@@ -703,18 +703,16 @@ Expected<void, Error> DeserializeVectorStore(std::istream& input_stream, vectors
 // ============================================================================
 
 Expected<void, Error> SerializeMetadataStore(std::ostream& output_stream, const vectors::MetadataStore& metadata_store,
-                                             const vectors::VectorStore& vector_store) {
+                                             const vectors::VectorStore& /*vector_store*/) {
+  // Snapshot the id -> metadata map under a read lock so the iteration is
+  // consistent with concurrent writers.
+  auto read_lock = metadata_store.AcquireReadLock();
   std::vector<std::pair<std::string, vectors::Metadata>> entries;
-  auto ids = vector_store.GetAllIds();
-  entries.reserve(ids.size());
-  for (const auto& id : ids) {
-    auto compact_idx = vector_store.GetCompactIndex(id);
-    if (!compact_idx.has_value()) {
-      continue;
-    }
-    const auto* metadata = metadata_store.Get(compact_idx.value());
-    if (metadata != nullptr && !metadata->empty()) {
-      entries.emplace_back(id, *metadata);
+  const auto& all = metadata_store.GetAll();
+  entries.reserve(all.size());
+  for (const auto& [id, metadata] : all) {
+    if (!metadata.empty()) {
+      entries.emplace_back(id, metadata);
     }
   }
 
@@ -769,7 +767,7 @@ Expected<void, Error> SerializeMetadataStore(std::ostream& output_stream, const 
 }
 
 Expected<void, Error> DeserializeMetadataStore(std::istream& input_stream, vectors::MetadataStore& metadata_store,
-                                               const vectors::VectorStore& vector_store) {
+                                               const vectors::VectorStore& /*vector_store*/) {
   metadata_store.Clear();
 
   uint32_t item_count = 0;
@@ -839,9 +837,8 @@ Expected<void, Error> DeserializeMetadataStore(std::istream& input_stream, vecto
       }
     }
 
-    auto compact_idx = vector_store.GetCompactIndex(id);
-    if (compact_idx.has_value() && !metadata.empty()) {
-      metadata_store.Set(compact_idx.value(), std::move(metadata));
+    if (!metadata.empty()) {
+      metadata_store.Set(id, std::move(metadata));
     }
   }
 

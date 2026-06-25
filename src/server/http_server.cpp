@@ -83,18 +83,16 @@ std::vector<std::pair<std::string, float>> ApplyMinScore(const std::vector<simil
 }
 
 std::vector<similarity::SimilarityResult> ApplyMetadataFilter(const std::vector<similarity::SimilarityResult>& results,
-                                                              vectors::VectorStore* vector_store,
                                                               vectors::MetadataStore* metadata_store,
                                                               const vectors::MetadataFilter& filter) {
-  if (filter.Empty() || vector_store == nullptr || metadata_store == nullptr) {
+  if (filter.Empty() || metadata_store == nullptr) {
     return results;
   }
 
   std::vector<similarity::SimilarityResult> filtered;
   filtered.reserve(results.size());
   for (const auto& item : results) {
-    auto compact_idx = vector_store->GetCompactIndex(item.item_id);
-    if (compact_idx.has_value() && metadata_store->Matches(compact_idx.value(), filter)) {
+    if (metadata_store->Matches(item.item_id, filter)) {
       filtered.push_back(item);
     }
   }
@@ -828,7 +826,7 @@ void HttpServer::HandleVecset(const httplib::Request& req, httplib::Response& re
     auto compact_idx = handler_context_->vector_store->GetCompactIndex(id);
     if (compact_idx.has_value()) {
       if (has_metadata && handler_context_->metadata_store != nullptr) {
-        handler_context_->metadata_store->Set(compact_idx.value(), std::move(metadata));
+        handler_context_->metadata_store->Set(id, std::move(metadata));
       }
 
       if (handler_context_->similarity_engine != nullptr) {
@@ -944,7 +942,7 @@ void HttpServer::HandleSim(const httplib::Request& req, httplib::Response& res) 
       }
       return;
     }
-    *result = ApplyMetadataFilter(*result, handler_context_->vector_store, handler_context_->metadata_store, filter);
+    *result = ApplyMetadataFilter(*result, handler_context_->metadata_store, filter);
 
     stats_.sim_commands.fetch_add(1);
     stats_.total_commands.fetch_add(1);

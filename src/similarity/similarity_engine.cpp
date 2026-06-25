@@ -186,10 +186,11 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
       if (compact_idx >= map_snap.count || map_snap.IsDeleted(compact_idx)) {
         continue;
       }
-      if (has_filter && !metadata_store_->Matches(compact_idx, filter)) {
+      const std::string& cand_id = (*map_snap.idx_to_id)[compact_idx];
+      if (has_filter && !metadata_store_->Matches(cand_id, filter)) {
         continue;
       }
-      results.emplace_back((*map_snap.idx_to_id)[compact_idx], score);
+      results.emplace_back(cand_id, score);
       if (static_cast<int>(results.size()) >= validated_top_k.value()) {
         break;
       }
@@ -218,7 +219,7 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
     if (snap.IsDeleted(idx)) {
       return;
     }
-    if (has_filter && !metadata_store_->Matches(static_cast<uint32_t>(idx), filter)) {
+    if (has_filter && !metadata_store_->Matches((*snap.idx_to_id)[idx], filter)) {
       return;
     }
     float score;
@@ -348,11 +349,8 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
   results.reserve(fusion_scores.size());
 
   for (const auto& [fused_id, score] : fusion_scores) {
-    if (has_filter) {
-      auto compact_idx = vector_store_->GetCompactIndex(fused_id);
-      if (!compact_idx.has_value() || !metadata_store_->Matches(compact_idx.value(), filter)) {
-        continue;
-      }
+    if (has_filter && !metadata_store_->Matches(fused_id, filter)) {
+      continue;
     }
     results.emplace_back(fused_id, score);
   }
@@ -422,10 +420,11 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
       if (compact_idx >= map_snap.count || map_snap.IsDeleted(compact_idx)) {
         continue;
       }
-      if (has_filter && !metadata_store_->Matches(compact_idx, filter)) {
+      const std::string& cand_id = (*map_snap.idx_to_id)[compact_idx];
+      if (has_filter && !metadata_store_->Matches(cand_id, filter)) {
         continue;
       }
-      results.emplace_back((*map_snap.idx_to_id)[compact_idx], score);
+      results.emplace_back(cand_id, score);
       if (static_cast<int>(results.size()) >= validated_top_k.value()) {
         break;
       }
@@ -451,7 +450,7 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
     if (snap.IsDeleted(idx)) {
       return;
     }
-    if (has_filter && !metadata_store_->Matches(static_cast<uint32_t>(idx), filter)) {
+    if (has_filter && !metadata_store_->Matches((*snap.idx_to_id)[idx], filter)) {
       return;
     }
     float score;
@@ -587,7 +586,7 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
       if (snap.IsDeleted(cidx)) {
         continue;
       }
-      if (has_filter && !metadata_store_->Matches(static_cast<uint32_t>(cidx), filter)) {
+      if (has_filter && !metadata_store_->Matches(cid, filter)) {
         continue;
       }
       float score;

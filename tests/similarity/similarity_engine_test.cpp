@@ -11,6 +11,8 @@
 
 #include "events/co_occurrence_index.h"
 #include "events/event_store.h"
+#include "vectors/metadata_filter.h"
+#include "vectors/metadata_store.h"
 #include "vectors/vector_store.h"
 
 namespace nvecd::similarity {
@@ -580,6 +582,113 @@ TEST_F(SimilarityEngineTest, FusionNormalization_SingleResult) {
   // All fusion scores should be non-negative
   for (const auto& r : *results) {
     EXPECT_GE(r.score, 0.0f);
+  }
+}
+
+// ============================================================================
+// Metadata Filter Desync Regression (C-1)
+// ============================================================================
+
+// Regression test for the MetadataStore desync bug: metadata used to be keyed
+// by the VectorStore compact_index, which is unstable across tombstone-slot
+// reuse and defragmentation. After re-keying by the stable item ID, deleting a
+// vector and reusing its slot must NOT leak the deleted item's metadata onto a
+// different item, and the deleted item's metadata must be gone.
+class MetadataDesyncTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    events_config_ = MakeEventsConfig();
+    vectors_config_ = MakeVectorsConfig();
+    similarity_config_ = MakeSimilarityConfig();
+    // Disable sampling so the brute-force scan visits every candidate.
+    similarity_config_.sample_size = 0;
+
+    event_store_ = std::make_unique<events::EventStore>(events_config_);
+    co_index_ = std::make_unique<events::CoOccurrenceIndex>();
+    vector_store_ = std::make_unique<vectors::VectorStore>(vectors_config_);
+    metadata_store_ = std::make_unique<vectors::MetadataStore>();
+
+    engine_ = std::make_unique<SimilarityEngine>(event_store_.get(), co_index_.get(), vector_store_.get(),
+                                                 similarity_config_, vectors_config_, metadata_store_.get());
+  }
+
+  // Build a filter that matches items whose "owner" field equals the given value.
+  static vectors::MetadataFilter OwnerFilter(const std::string& owner) {
+    vectors::MetadataFilter filter;
+    vectors::FilterCondition cond;
+    cond.field = "owner";
+    cond.op = vectors::FilterOp::kEq;
+    cond.value = owner;
+    filter.conditions.push_back(cond);
+    return filter;
+  }
+
+  config::EventsConfig events_config_;
+  config::VectorsConfig vectors_config_;
+  config::SimilarityConfig similarity_config_;
+
+  std::unique_ptr<events::EventStore> event_store_;
+  std::unique_ptr<events::CoOccurrenceIndex> co_index_;
+  std::unique_ptr<vectors::VectorStore> vector_store_;
+  std::unique_ptr<vectors::MetadataStore> metadata_store_;
+  std::unique_ptr<SimilarityEngine> engine_;
+};
+
+TEST_F(MetadataDesyncTest, SlotReuseDoesNotLeakDeletedMetadata) {
+  // Insert several vectors. "alice_item" carries owner=alice metadata.
+  ASSERT_TRUE(vector_store_->SetVector("alice_item", {1.0f, 0.0f, 0.0f}).has_value());
+  ASSERT_TRUE(vector_store_->SetVector("bob_item", {0.0f, 1.0f, 0.0f}).has_value());
+  ASSERT_TRUE(vector_store_->SetVector("carol_item", {0.0f, 0.0f, 1.0f}).has_value());
+
+  metadata_store_->Set("alice_item", {{"owner", std::string("alice")}});
+  metadata_store_->Set("bob_item", {{"owner", std::string("bob")}});
+
+  // Sanity: querying owner=alice returns only alice_item.
+  {
+    auto results = engine_->SearchByVector({1.0f, 1.0f, 1.0f}, 10, OwnerFilter("alice"));
+    ASSERT_TRUE(results.has_value());
+    ASSERT_EQ(results->size(), 1U);
+    EXPECT_EQ((*results)[0].item_id, "alice_item");
+  }
+
+  // Delete alice_item from the vector store and, as a delete handler must,
+  // delete its metadata too. With auto-defrag (>25% tombstones) the underlying
+  // slot index is recycled; a newly inserted vector reuses alice's old index.
+  ASSERT_TRUE(vector_store_->DeleteVector("alice_item"));
+  metadata_store_->Delete("alice_item");
+  // Force a defragment to guarantee index churn regardless of the auto-defrag
+  // threshold heuristic.
+  vector_store_->Defragment();
+
+  // Insert a new vector that has NO metadata. Under the old compact-index
+  // keying it would inherit alice's metadata from the recycled slot.
+  ASSERT_TRUE(vector_store_->SetVector("dave_item", {0.5f, 0.5f, 0.5f}).has_value());
+
+  // The deleted item's metadata must be gone.
+  EXPECT_EQ(metadata_store_->Get("alice_item"), nullptr);
+  // The new item must not have inherited any metadata.
+  EXPECT_EQ(metadata_store_->Get("dave_item"), nullptr);
+
+  // A filter for owner=alice must now return nothing: alice_item is deleted and
+  // no live item should match. This property holds purely from id-keying even
+  // if metadata Delete were skipped, because the leaked entry is keyed by a
+  // now-dead id that no live vector references.
+  {
+    auto results = engine_->SearchByVector({1.0f, 1.0f, 1.0f}, 10, OwnerFilter("alice"));
+    ASSERT_TRUE(results.has_value());
+    for (const auto& r : *results) {
+      EXPECT_NE(r.item_id, "alice_item");
+      EXPECT_NE(r.item_id, "dave_item");
+    }
+    EXPECT_TRUE(results->empty());
+  }
+
+  // bob_item's metadata must still be intact and correctly associated.
+  {
+    auto results = engine_->SearchByVector({1.0f, 1.0f, 1.0f}, 10, OwnerFilter("bob"));
+    ASSERT_TRUE(results.has_value());
+    ASSERT_EQ(results->size(), 1U);
+    EXPECT_EQ((*results)[0].item_id, "bob_item");
   }
 }
 

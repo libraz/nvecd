@@ -154,11 +154,8 @@ TEST_F(SnapshotFormatV1Test, WriteAndRead_RoundTrip) {
 TEST_F(SnapshotFormatV1Test, WriteAndRead_MetadataRoundTrip) {
   PopulateStores();
 
-  auto item2_idx = vector_store_->GetCompactIndex("item2");
-  ASSERT_TRUE(item2_idx.has_value());
   metadata_store_->Set(
-      item2_idx.value(),
-      {{"category", std::string("electronics")}, {"active", true}, {"rank", int64_t{10}}, {"score", 0.75}});
+      "item2", {{"category", std::string("electronics")}, {"active", true}, {"rank", int64_t{10}}, {"score", 0.75}});
 
   const std::string path = TestFilePath("metadata_round_trip.dmp");
   auto write_result = WriteSnapshotV1(path, config_, *event_store_, *co_index_, *vector_store_, nullptr, nullptr,
@@ -177,9 +174,7 @@ TEST_F(SnapshotFormatV1Test, WriteAndRead_MetadataRoundTrip) {
                                     nullptr, &loaded_metadata);
   ASSERT_TRUE(read_result.has_value()) << "ReadSnapshotV1 failed: " << read_result.error().message();
 
-  auto loaded_idx = loaded_vectors.GetCompactIndex("item2");
-  ASSERT_TRUE(loaded_idx.has_value());
-  const auto* metadata = loaded_metadata.Get(loaded_idx.value());
+  const auto* metadata = loaded_metadata.Get("item2");
   ASSERT_NE(metadata, nullptr);
   EXPECT_EQ(std::get<std::string>(metadata->at("category")), "electronics");
   EXPECT_EQ(std::get<bool>(metadata->at("active")), true);

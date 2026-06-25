@@ -56,18 +56,16 @@ std::string AdaptiveCachePart(std::optional<bool> adaptive) {
 }
 
 std::vector<similarity::SimilarityResult> ApplyMetadataFilter(const std::vector<similarity::SimilarityResult>& results,
-                                                              vectors::VectorStore* vector_store,
                                                               vectors::MetadataStore* metadata_store,
                                                               const vectors::MetadataFilter& filter) {
-  if (filter.Empty() || vector_store == nullptr || metadata_store == nullptr) {
+  if (filter.Empty() || metadata_store == nullptr) {
     return results;
   }
 
   std::vector<similarity::SimilarityResult> filtered;
   filtered.reserve(results.size());
   for (const auto& result : results) {
-    auto compact_idx = vector_store->GetCompactIndex(result.item_id);
-    if (compact_idx.has_value() && metadata_store->Matches(compact_idx.value(), filter)) {
+    if (metadata_store->Matches(result.item_id, filter)) {
       filtered.push_back(result);
     }
   }
@@ -327,8 +325,8 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleMetaset(cons
     return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kInternalError, "MetadataStore not initialized"));
   }
 
-  auto compact_idx = ctx_.vector_store->GetCompactIndex(cmd.id);
-  if (!compact_idx.has_value()) {
+  // Validate that the target vector exists; METASET must fail for unknown IDs.
+  if (!ctx_.vector_store->GetCompactIndex(cmd.id).has_value()) {
     return utils::MakeUnexpected(
         utils::MakeError(utils::ErrorCode::kVectorNotFound, "Vector not found for metadata: " + cmd.id));
   }
@@ -346,7 +344,7 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleMetaset(cons
     }
     metadata[condition.field] = condition.value;
   }
-  ctx_.metadata_store->Set(compact_idx.value(), std::move(metadata));
+  ctx_.metadata_store->Set(cmd.id, std::move(metadata));
 
   auto* cache_ptr = ctx_.cache.load(std::memory_order_acquire);
   if (cache_ptr != nullptr) {
@@ -411,7 +409,7 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSim(const Co
   if (!result) {
     return utils::MakeUnexpected(result.error());
   }
-  *result = ApplyMetadataFilter(*result, ctx_.vector_store, ctx_.metadata_store, filter);
+  *result = ApplyMetadataFilter(*result, ctx_.metadata_store, filter);
 
   // Cache store
   if (cache_enabled) {
@@ -480,7 +478,7 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSimv(const C
   if (!result) {
     return utils::MakeUnexpected(result.error());
   }
-  *result = ApplyMetadataFilter(*result, ctx_.vector_store, ctx_.metadata_store, filter);
+  *result = ApplyMetadataFilter(*result, ctx_.metadata_store, filter);
 
   // Cache store
   if (cache_enabled) {

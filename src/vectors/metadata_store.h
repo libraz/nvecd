@@ -2,7 +2,11 @@
  * @file metadata_store.h
  * @brief Per-item metadata storage with filter support
  *
- * Stores metadata for each item (keyed by compact_index from VectorStore).
+ * Stores metadata for each item keyed by the stable external string item ID.
+ * Keying by ID (rather than by VectorStore compact_index) keeps metadata
+ * correctly associated with its item across defragmentation and tombstone-slot
+ * reuse, which both change the compact_index of an item without notice.
+ *
  * Provides linear-scan filtering (Phase 1) with planned inverted index
  * support (Phase 2).
  *
@@ -16,6 +20,8 @@
 #include <cstdint>
 #include <mutex>
 #include <shared_mutex>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "vectors/metadata.h"
@@ -24,7 +30,7 @@
 namespace nvecd::vectors {
 
 /**
- * @brief Thread-safe metadata store indexed by compact_index
+ * @brief Thread-safe metadata store keyed by stable item ID
  */
 class MetadataStore {
  public:
@@ -32,39 +38,39 @@ class MetadataStore {
 
   /**
    * @brief Set metadata for an item
-   * @param compact_index Item's compact index in VectorStore
+   * @param id Item's stable external ID
    * @param meta Metadata key-value pairs
    */
-  void Set(uint32_t compact_index, Metadata meta);
+  void Set(const std::string& id, Metadata meta);
 
   /**
    * @brief Get metadata for an item
-   * @param compact_index Item's compact index
+   * @param id Item's stable external ID
    * @return Pointer to metadata (null if not found), valid while holding read lock
    */
-  const Metadata* Get(uint32_t compact_index) const;
+  const Metadata* Get(const std::string& id) const;
 
   /**
    * @brief Delete metadata for an item
-   * @param compact_index Item's compact index
+   * @param id Item's stable external ID
    */
-  void Delete(uint32_t compact_index);
+  void Delete(const std::string& id);
 
   /**
    * @brief Filter items by metadata conditions (linear scan)
    * @param filter AND-combined filter conditions
-   * @param candidates If non-empty, only check these compact_indices
-   * @return Compact indices that match all conditions
+   * @param candidates If non-empty, only check these item IDs
+   * @return Item IDs that match all conditions
    */
-  std::vector<uint32_t> Filter(const MetadataFilter& filter, const std::vector<uint32_t>& candidates = {}) const;
+  std::vector<std::string> Filter(const MetadataFilter& filter, const std::vector<std::string>& candidates = {}) const;
 
   /**
    * @brief Check if a single item matches the filter
-   * @param compact_index Item to check
+   * @param id Item to check
    * @param filter Filter conditions
    * @return True if matches (or filter is empty)
    */
-  bool Matches(uint32_t compact_index, const MetadataFilter& filter) const;
+  bool Matches(const std::string& id, const MetadataFilter& filter) const;
 
   /**
    * @brief Get number of items with metadata
@@ -87,13 +93,14 @@ class MetadataStore {
   std::unique_lock<std::shared_mutex> AcquireWriteLock();
 
   /**
-   * @brief Get all metadata (for serialization). Caller must hold read lock.
+   * @brief Get all metadata as (id -> metadata) pairs (for serialization).
+   *        Caller must hold read lock.
    */
-  const std::vector<Metadata>& GetAll() const { return metadata_; }
+  const std::unordered_map<std::string, Metadata>& GetAll() const { return metadata_; }
 
  private:
   mutable std::shared_mutex mutex_;
-  std::vector<Metadata> metadata_;  ///< Indexed by compact_index
+  std::unordered_map<std::string, Metadata> metadata_;  ///< Keyed by item ID
 };
 
 }  // namespace nvecd::vectors

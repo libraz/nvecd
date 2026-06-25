@@ -234,13 +234,8 @@ TEST_F(RequestDispatcherTest, SimFilterUsesMetadataStore) {
   ASSERT_NE(Dispatch("VECSET active 0.9 0.1\r\n").find("OK"), std::string::npos);
   ASSERT_NE(Dispatch("VECSET draft 0.8 0.2\r\n").find("OK"), std::string::npos);
 
-  auto active_idx = vector_store_->GetCompactIndex("active");
-  auto draft_idx = vector_store_->GetCompactIndex("draft");
-  ASSERT_TRUE(active_idx.has_value());
-  ASSERT_TRUE(draft_idx.has_value());
-
-  metadata_store_->Set(active_idx.value(), {{"status", std::string("active")}});
-  metadata_store_->Set(draft_idx.value(), {{"status", std::string("draft")}});
+  metadata_store_->Set("active", {{"status", std::string("active")}});
+  metadata_store_->Set("draft", {{"status", std::string("draft")}});
 
   auto response = Dispatch("SIM query 10 using=vectors filter=status:draft\r\n");
   EXPECT_NE(response.find("OK RESULTS 1"), std::string::npos);
@@ -272,13 +267,8 @@ TEST_F(RequestDispatcherTest, SimvFilterUsesMetadataStore) {
   ASSERT_NE(Dispatch("VECSET active 1 0\r\n").find("OK"), std::string::npos);
   ASSERT_NE(Dispatch("VECSET draft 0.9 0.1\r\n").find("OK"), std::string::npos);
 
-  auto active_idx = vector_store_->GetCompactIndex("active");
-  auto draft_idx = vector_store_->GetCompactIndex("draft");
-  ASSERT_TRUE(active_idx.has_value());
-  ASSERT_TRUE(draft_idx.has_value());
-
-  metadata_store_->Set(active_idx.value(), {{"status", std::string("active")}});
-  metadata_store_->Set(draft_idx.value(), {{"status", std::string("draft")}});
+  metadata_store_->Set("active", {{"status", std::string("active")}});
+  metadata_store_->Set("draft", {{"status", std::string("draft")}});
 
   auto response = Dispatch("SIMV 10 filter=status:draft 1 0\r\n");
   EXPECT_NE(response.find("OK RESULTS 1"), std::string::npos);
