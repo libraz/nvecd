@@ -462,6 +462,124 @@ TEST_F(HttpServerTest, CacheClearInvalidScope) {
   EXPECT_EQ(res->status, 400);
 }
 
+// Default SIM mode is fusion when the request omits "mode"
+TEST_F(HttpServerTest, SimDefaultModeIsFusion) {
+  json vec1;
+  vec1["id"] = "test1";
+  vec1["vector"] = {0.1f, 0.9f, 0.2f, 0.5f};
+  ASSERT_EQ(client_->Post("/vecset", vec1.dump(), "application/json")->status, 200);
+
+  json req_body;
+  req_body["id"] = "test1";
+  req_body["top_k"] = 5;
+  // mode intentionally omitted
+
+  auto res = client_->Post("/sim", req_body.dump(), "application/json");
+  ASSERT_TRUE(res);
+  ASSERT_EQ(res->status, 200);
+  auto body = json::parse(res->body);
+  EXPECT_EQ(body["mode"], "fusion");
+}
+
+// POST /metaset sets metadata that subsequently affects filtered search
+TEST_F(HttpServerTest, MetasetAffectsFilteredSearch) {
+  json vec1;
+  vec1["id"] = "item_a";
+  vec1["vector"] = {1.0f, 0.0f, 0.0f, 0.0f};
+  ASSERT_EQ(client_->Post("/vecset", vec1.dump(), "application/json")->status, 200);
+
+  json vec2;
+  vec2["id"] = "item_b";
+  vec2["vector"] = {0.9f, 0.1f, 0.0f, 0.0f};
+  ASSERT_EQ(client_->Post("/vecset", vec2.dump(), "application/json")->status, 200);
+
+  // Tag item_b via METASET
+  json meta;
+  meta["id"] = "item_b";
+  meta["metadata"] = {{"status", "draft"}};
+  auto meta_res = client_->Post("/metaset", meta.dump(), "application/json");
+  ASSERT_TRUE(meta_res);
+  ASSERT_EQ(meta_res->status, 200);
+
+  // Filtered search should now return only item_b
+  json req_body;
+  req_body["id"] = "item_a";
+  req_body["top_k"] = 5;
+  req_body["mode"] = "vectors";
+  req_body["filter"] = "status:draft";
+
+  auto res = client_->Post("/sim", req_body.dump(), "application/json");
+  ASSERT_TRUE(res);
+  ASSERT_EQ(res->status, 200);
+  auto body = json::parse(res->body);
+  ASSERT_EQ(body["count"], 1);
+  EXPECT_EQ(body["results"][0]["id"], "item_b");
+}
+
+// METASET on an unknown id returns 404
+TEST_F(HttpServerTest, MetasetUnknownIdReturns404) {
+  json meta;
+  meta["id"] = "does_not_exist";
+  meta["metadata"] = {{"status", "draft"}};
+  auto res = client_->Post("/metaset", meta.dump(), "application/json");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(res->status, 404);
+}
+
+// /info exposes the documented cache block keys
+TEST_F(HttpServerTest, InfoIncludesCacheBlock) {
+  auto res = client_->Get("/info");
+  ASSERT_TRUE(res);
+  ASSERT_EQ(res->status, 200);
+  auto body = json::parse(res->body);
+  ASSERT_TRUE(body.contains("cache"));
+  EXPECT_TRUE(body["cache"].contains("hit_rate"));
+  EXPECT_TRUE(body["cache"].contains("total_queries"));
+  EXPECT_TRUE(body["cache"].contains("cache_hits"));
+}
+
+// HTTP SIM populates the query cache: a second identical query is a cache hit
+TEST_F(HttpServerTest, SimPopulatesCache) {
+  // Cache trivial queries too (the default min-cost threshold would skip them).
+  cache_->SetMinQueryCost(0.0);
+
+  json vec1;
+  vec1["id"] = "c1";
+  vec1["vector"] = {0.1f, 0.9f, 0.2f, 0.5f};
+  ASSERT_EQ(client_->Post("/vecset", vec1.dump(), "application/json")->status, 200);
+  json vec2;
+  vec2["id"] = "c2";
+  vec2["vector"] = {0.9f, 0.1f, 0.8f, 0.3f};
+  ASSERT_EQ(client_->Post("/vecset", vec2.dump(), "application/json")->status, 200);
+
+  json req_body;
+  req_body["id"] = "c1";
+  req_body["top_k"] = 5;
+  req_body["mode"] = "vectors";
+
+  uint64_t hits_before = cache_->GetStatistics().cache_hits;
+  ASSERT_EQ(client_->Post("/sim", req_body.dump(), "application/json")->status, 200);
+  // Second identical query should be served from cache.
+  ASSERT_EQ(client_->Post("/sim", req_body.dump(), "application/json")->status, 200);
+
+  uint64_t hits_after = cache_->GetStatistics().cache_hits;
+  EXPECT_GT(hits_after, hits_before);
+}
+
+// DUMP SAVE failure returns a non-2xx with a real error (not 200 ok)
+TEST_F(HttpServerTest, DumpSaveFailureReturnsError) {
+  // dump_dir points at a non-existent directory, so the save must fail.
+  handler_ctx_.dump_dir = "/nonexistent_nvecd_dir_xyz";
+
+  json req_body;  // empty filepath -> auto-generated name under dump_dir
+  auto res = client_->Post("/dump/save", req_body.dump(), "application/json");
+  ASSERT_TRUE(res);
+  EXPECT_NE(res->status, 200);
+  EXPECT_GE(res->status, 400);
+  auto body = json::parse(res->body);
+  EXPECT_TRUE(body.contains("error"));
+}
+
 // Integration test: Full workflow
 TEST_F(HttpServerTest, FullWorkflow) {
   // 1. Add vectors
@@ -527,6 +645,141 @@ TEST_F(HttpServerTest, FullWorkflow) {
   auto info = json::parse(res8->body);
   EXPECT_EQ(info["stores"]["vector_store"]["vectors"], 2);
   EXPECT_EQ(info["stores"]["event_store"]["total_events"], 2);
+}
+
+// Authentication tests: requirepass gates write/admin endpoints over HTTP
+class HttpServerAuthTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    config_ = std::make_unique<config::Config>();
+    config_->vectors.default_dimension = 4;
+    config_->similarity.default_top_k = 10;
+
+    event_store_ = std::make_unique<events::EventStore>(config_->events);
+    co_index_ = std::make_unique<events::CoOccurrenceIndex>();
+    vector_store_ = std::make_unique<vectors::VectorStore>(config_->vectors);
+    metadata_store_ = std::make_unique<vectors::MetadataStore>();
+    similarity_engine_ =
+        std::make_unique<similarity::SimilarityEngine>(event_store_.get(), co_index_.get(), vector_store_.get(),
+                                                       config_->similarity, config_->vectors, metadata_store_.get());
+    cache_ = std::make_unique<cache::SimilarityCache>(10 * 1024 * 1024, 0.1);
+
+    handler_ctx_.event_store = event_store_.get();
+    handler_ctx_.co_index = co_index_.get();
+    handler_ctx_.vector_store = vector_store_.get();
+    handler_ctx_.metadata_store = metadata_store_.get();
+    handler_ctx_.similarity_engine = similarity_engine_.get();
+    handler_ctx_.cache = cache_.get();
+    handler_ctx_.config = config_.get();
+    handler_ctx_.requirepass = kPassword;
+
+    server::HttpServerConfig http_config;
+    http_config.bind = "127.0.0.1";
+    http_config.port = 18082;
+    http_config.allow_cidrs = {"127.0.0.0/8"};
+    http_config.requirepass = kPassword;
+
+    http_server_ = std::make_unique<server::HttpServer>(http_config, &handler_ctx_, config_.get(), &loading_, &stats_);
+    ASSERT_TRUE(http_server_->Start());
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    client_ = std::make_unique<httplib::Client>("http://127.0.0.1:18082");
+  }
+
+  void TearDown() override {
+    client_.reset();
+    if (http_server_) {
+      http_server_->Stop();
+    }
+  }
+
+  static constexpr const char* kPassword = "s3cret";
+
+  std::unique_ptr<config::Config> config_;
+  std::unique_ptr<events::EventStore> event_store_;
+  std::unique_ptr<events::CoOccurrenceIndex> co_index_;
+  std::unique_ptr<vectors::VectorStore> vector_store_;
+  std::unique_ptr<vectors::MetadataStore> metadata_store_;
+  std::unique_ptr<similarity::SimilarityEngine> similarity_engine_;
+  std::unique_ptr<cache::SimilarityCache> cache_;
+
+  server::ServerStats stats_;
+  std::atomic<bool> loading_{false};
+  std::atomic<bool> read_only_{false};
+  server::HandlerContext handler_ctx_{
+      .event_store = nullptr,
+      .co_index = nullptr,
+      .vector_store = nullptr,
+      .metadata_store = nullptr,
+      .similarity_engine = nullptr,
+      .cache = nullptr,
+      .stats = stats_,
+      .config = nullptr,
+      .loading = loading_,
+      .read_only = read_only_,
+      .dump_dir = "",
+  };
+
+  std::unique_ptr<server::HttpServer> http_server_;
+  std::unique_ptr<httplib::Client> client_;
+};
+
+TEST_F(HttpServerAuthTest, UnauthenticatedWriteRejected) {
+  json vec;
+  vec["id"] = "x";
+  vec["vector"] = {0.1f, 0.2f, 0.3f, 0.4f};
+  auto res = client_->Post("/vecset", vec.dump(), "application/json");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(res->status, 401);
+}
+
+TEST_F(HttpServerAuthTest, WrongPasswordRejected) {
+  httplib::Headers headers = {{"Authorization", "Bearer wrong"}};
+  json vec;
+  vec["id"] = "x";
+  vec["vector"] = {0.1f, 0.2f, 0.3f, 0.4f};
+  auto res = client_->Post("/vecset", headers, vec.dump(), "application/json");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(res->status, 401);
+}
+
+TEST_F(HttpServerAuthTest, BearerTokenAllowsWrite) {
+  httplib::Headers headers = {{"Authorization", std::string("Bearer ") + kPassword}};
+  json vec;
+  vec["id"] = "x";
+  vec["vector"] = {0.1f, 0.2f, 0.3f, 0.4f};
+  auto res = client_->Post("/vecset", headers, vec.dump(), "application/json");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(res->status, 200);
+}
+
+TEST_F(HttpServerAuthTest, BasicAuthAllowsWrite) {
+  // base64("user:s3cret") = dXNlcjpzM2NyZXQ=
+  httplib::Headers headers = {{"Authorization", "Basic dXNlcjpzM2NyZXQ="}};
+  json vec;
+  vec["id"] = "y";
+  vec["vector"] = {0.1f, 0.2f, 0.3f, 0.4f};
+  auto res = client_->Post("/vecset", headers, vec.dump(), "application/json");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(res->status, 200);
+}
+
+TEST_F(HttpServerAuthTest, ReadEndpointsStayOpen) {
+  // Read-only endpoints are not gated even when a password is configured.
+  auto res = client_->Get("/info");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(res->status, 200);
+
+  auto health = client_->Get("/health/live");
+  ASSERT_TRUE(health);
+  EXPECT_EQ(health->status, 200);
+}
+
+TEST_F(HttpServerAuthTest, UnauthenticatedDumpSaveRejected) {
+  json req;
+  req["filepath"] = "test.dmp";
+  auto res = client_->Post("/dump/save", req.dump(), "application/json");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(res->status, 401);
 }
 
 }  // namespace

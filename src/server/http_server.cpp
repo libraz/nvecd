@@ -12,17 +12,21 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <optional>
 #include <sstream>
+#include <string_view>
 
+#include "cache/cache_key.h"
+#include "cache/cache_key_generator.h"
 #include "cache/similarity_cache.h"
 #include "events/co_occurrence_index.h"
 #include "events/event_store.h"
 #include "server/command_parser.h"
 #include "server/filter_parser.h"
-#include "server/request_dispatcher.h"
+#include "server/handlers/dump_handler.h"
 #include "similarity/similarity_engine.h"
 #include "storage/snapshot_fork.h"
 #include "utils/memory_utils.h"
@@ -42,6 +46,7 @@ namespace {
 constexpr int kHttpOk = 200;
 constexpr int kHttpNoContent = 204;
 constexpr int kHttpBadRequest = 400;
+constexpr int kHttpUnauthorized = 401;
 constexpr int kHttpForbidden = 403;
 constexpr int kHttpNotFound = 404;
 constexpr int kHttpInternalServerError = 500;
@@ -49,6 +54,65 @@ constexpr int kHttpServiceUnavailable = 503;
 
 // Server startup delay (milliseconds)
 constexpr int kStartupDelayMs = 100;
+
+/**
+ * @brief Decode a base64 string.
+ * @return Decoded bytes, or nullopt if the input is not valid base64.
+ */
+std::optional<std::string> Base64Decode(const std::string& input) {
+  static constexpr std::string_view kAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::array<int, 256> lookup{};
+  lookup.fill(-1);
+  for (size_t i = 0; i < kAlphabet.size(); ++i) {
+    lookup[static_cast<unsigned char>(kAlphabet[i])] = static_cast<int>(i);
+  }
+
+  std::string out;
+  int accum = 0;
+  int bits = 0;
+  for (char ch : input) {
+    if (ch == '=') {
+      break;
+    }
+    int value = lookup[static_cast<unsigned char>(ch)];
+    if (value < 0) {
+      return std::nullopt;
+    }
+    accum = (accum << 6) | value;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      out.push_back(static_cast<char>((accum >> bits) & 0xFF));
+    }
+  }
+  return out;
+}
+
+/**
+ * @brief Map a domain error code to an appropriate HTTP status code.
+ *
+ * Keeps HTTP status semantics aligned with the typed error returned by the
+ * shared handlers, instead of sniffing POSIX error strings.
+ */
+int ErrorCodeToHttpStatus(utils::ErrorCode code) {
+  switch (code) {
+    case utils::ErrorCode::kVectorNotFound:
+    case utils::ErrorCode::kNotFound:
+    case utils::ErrorCode::kStorageFileNotFound:
+    case utils::ErrorCode::kConfigFileNotFound:
+      return kHttpNotFound;
+    case utils::ErrorCode::kInvalidArgument:
+    case utils::ErrorCode::kCommandInvalidArgument:
+    case utils::ErrorCode::kCommandMissingArgument:
+    case utils::ErrorCode::kVectorDimensionMismatch:
+    case utils::ErrorCode::kVectorInvalidDimension:
+      return kHttpBadRequest;
+    case utils::ErrorCode::kPermissionDenied:
+      return kHttpForbidden;
+    default:
+      return kHttpInternalServerError;
+  }
+}
 
 std::vector<utils::CIDR> ParseAllowCidrs(const std::vector<std::string>& allow_cidrs) {
   std::vector<utils::CIDR> parsed;
@@ -176,6 +240,7 @@ void HttpServer::SetupRoutes() {
   // nvecd-specific operations
   server_->Post("/event", [this](const httplib::Request& req, httplib::Response& res) { HandleEvent(req, res); });
   server_->Post("/vecset", [this](const httplib::Request& req, httplib::Response& res) { HandleVecset(req, res); });
+  server_->Post("/metaset", [this](const httplib::Request& req, httplib::Response& res) { HandleMetaset(req, res); });
   server_->Post("/sim", [this](const httplib::Request& req, httplib::Response& res) { HandleSim(req, res); });
   server_->Post("/simv", [this](const httplib::Request& req, httplib::Response& res) { HandleSimv(req, res); });
 
@@ -345,6 +410,39 @@ void HttpServer::SendError(httplib::Response& res, int status_code, const std::s
   json error_obj;
   error_obj["error"] = message;
   SendJson(res, status_code, error_obj);
+}
+
+bool HttpServer::IsAuthorized(const httplib::Request& req) const {
+  // No password configured: every request is authorized (matches TCP behavior).
+  if (config_.requirepass.empty()) {
+    return true;
+  }
+
+  if (!req.has_header("Authorization")) {
+    return false;
+  }
+  const std::string auth = req.get_header_value("Authorization");
+
+  // "Bearer <password>"
+  static constexpr std::string_view kBearerPrefix = "Bearer ";
+  if (auth.size() > kBearerPrefix.size() && auth.compare(0, kBearerPrefix.size(), kBearerPrefix) == 0) {
+    return auth.substr(kBearerPrefix.size()) == config_.requirepass;
+  }
+
+  // "Basic base64(user:password)" - the username is ignored, only the password
+  // is compared, mirroring TCP AUTH which validates the password alone.
+  static constexpr std::string_view kBasicPrefix = "Basic ";
+  if (auth.size() > kBasicPrefix.size() && auth.compare(0, kBasicPrefix.size(), kBasicPrefix) == 0) {
+    auto decoded = Base64Decode(auth.substr(kBasicPrefix.size()));
+    if (!decoded) {
+      return false;
+    }
+    auto colon = decoded->find(':');
+    const std::string password = (colon == std::string::npos) ? *decoded : decoded->substr(colon + 1);
+    return password == config_.requirepass;
+  }
+
+  return false;
 }
 
 //
@@ -576,6 +674,26 @@ void HttpServer::HandleInfo(const httplib::Request& /*req*/, httplib::Response& 
 
     response["stores"] = stores_obj;
 
+    // Cache statistics (matches the field names used by /cache/stats).
+    auto* info_cache =
+        (handler_context_ != nullptr) ? handler_context_->cache.load(std::memory_order_acquire) : nullptr;
+    json cache_obj;
+    if (info_cache != nullptr) {
+      auto cache_stats = info_cache->GetStatistics();
+      cache_obj["enabled"] = info_cache->IsEnabled();
+      cache_obj["total_queries"] = cache_stats.total_queries;
+      cache_obj["cache_hits"] = cache_stats.cache_hits;
+      cache_obj["cache_misses"] = cache_stats.cache_misses;
+      cache_obj["hit_rate"] = cache_stats.HitRate();
+      cache_obj["current_entries"] = cache_stats.current_entries;
+      cache_obj["current_memory_bytes"] = cache_stats.current_memory_bytes;
+      cache_obj["evictions"] = cache_stats.evictions;
+      cache_obj["time_saved_ms"] = cache_stats.TotalTimeSaved();
+    } else {
+      cache_obj["enabled"] = false;
+    }
+    response["cache"] = cache_obj;
+
     SendJson(res, kHttpOk, response);
 
   } catch (const std::exception& e) {
@@ -630,10 +748,16 @@ void HttpServer::HandleConfig(const httplib::Request& /*req*/, httplib::Response
 
 //
 // nvecd-specific operation handlers
-// These delegate to RequestDispatcher for consistency with TCP protocol
+// These reuse the same stores, cache key components, and typed handlers as the
+// TCP path so behavior stays consistent across surfaces.
 //
 
 void HttpServer::HandleEvent(const httplib::Request& req, httplib::Response& res) {
+  if (!IsAuthorized(req)) {
+    SendError(res, kHttpUnauthorized, "Authentication required");
+    return;
+  }
+
   // Check if server is loading
   if (loading_ != nullptr && loading_->load()) {
     SendError(res, kHttpServiceUnavailable, "Server is loading, please try again later");
@@ -731,8 +855,8 @@ void HttpServer::HandleEvent(const httplib::Request& req, httplib::Response& res
       cache_ptr->InvalidateByItemId(id);
     }
 
-    stats_.event_commands.fetch_add(1);
-    stats_.total_commands.fetch_add(1);
+    handler_context_->stats.event_commands.fetch_add(1);
+    handler_context_->stats.total_commands.fetch_add(1);
 
     json response;
     response["status"] = "ok";
@@ -745,6 +869,11 @@ void HttpServer::HandleEvent(const httplib::Request& req, httplib::Response& res
 }
 
 void HttpServer::HandleVecset(const httplib::Request& req, httplib::Response& res) {
+  if (!IsAuthorized(req)) {
+    SendError(res, kHttpUnauthorized, "Authentication required");
+    return;
+  }
+
   // Check if server is loading
   if (loading_ != nullptr && loading_->load()) {
     SendError(res, kHttpServiceUnavailable, "Server is loading, please try again later");
@@ -833,8 +962,8 @@ void HttpServer::HandleVecset(const httplib::Request& req, httplib::Response& re
       }
     }
 
-    stats_.vecset_commands.fetch_add(1);
-    stats_.total_commands.fetch_add(1);
+    handler_context_->stats.vecset_commands.fetch_add(1);
+    handler_context_->stats.total_commands.fetch_add(1);
 
     json response;
     response["status"] = "ok";
@@ -843,6 +972,81 @@ void HttpServer::HandleVecset(const httplib::Request& req, httplib::Response& re
 
   } catch (const std::exception& e) {
     spdlog::error("Unexpected exception in HandleVecset: {}", e.what());
+    SendError(res, kHttpInternalServerError, R"({"error":"Internal server error"})");
+  }
+}
+
+void HttpServer::HandleMetaset(const httplib::Request& req, httplib::Response& res) {
+  if (!IsAuthorized(req)) {
+    SendError(res, kHttpUnauthorized, "Authentication required");
+    return;
+  }
+
+  // Check if server is loading
+  if (loading_ != nullptr && loading_->load()) {
+    SendError(res, kHttpServiceUnavailable, "Server is loading, please try again later");
+    return;
+  }
+
+  // Safety net at httplib library boundary - catches unexpected exceptions only
+  try {
+    // Parse JSON body (non-throwing)
+    auto body = json::parse(req.body, nullptr, false);
+    if (body.is_discarded()) {
+      SendError(res, kHttpBadRequest, "Invalid JSON body");
+      return;
+    }
+
+    // Validate required fields
+    if (!body.contains("id") || !body.contains("metadata")) {
+      SendError(res, kHttpBadRequest, "Missing required fields: id, metadata");
+      return;
+    }
+    if (!body["id"].is_string()) {
+      SendError(res, kHttpBadRequest, "Field 'id' must be a string");
+      return;
+    }
+
+    std::string id = body["id"];
+
+    auto metadata_result = ParseMetadataJson(body["metadata"]);
+    if (!metadata_result) {
+      SendError(res, kHttpBadRequest, metadata_result.error().message());
+      return;
+    }
+
+    if (handler_context_->vector_store == nullptr) {
+      SendError(res, kHttpInternalServerError, "Vector store not initialized");
+      return;
+    }
+    if (handler_context_->metadata_store == nullptr) {
+      SendError(res, kHttpInternalServerError, "Metadata store not initialized");
+      return;
+    }
+
+    // Metadata is keyed by item id; the target vector must already exist
+    // (mirrors the TCP METASET behavior in RequestDispatcher).
+    if (!handler_context_->vector_store->GetCompactIndex(id).has_value()) {
+      SendError(res, kHttpNotFound, "Vector not found for metadata: " + id);
+      return;
+    }
+
+    handler_context_->metadata_store->Set(id, std::move(*metadata_result));
+
+    // Metadata changes affect filtered results broadly: clear the cache, as TCP does.
+    auto* cache_ptr = handler_context_->cache.load(std::memory_order_acquire);
+    if (cache_ptr != nullptr) {
+      cache_ptr->Clear();
+    }
+
+    handler_context_->stats.total_commands.fetch_add(1);
+
+    json response;
+    response["status"] = "ok";
+    SendJson(res, kHttpOk, response);
+
+  } catch (const std::exception& e) {
+    spdlog::error("Unexpected exception in HandleMetaset: {}", e.what());
     SendError(res, kHttpInternalServerError, R"({"error":"Internal server error"})");
   }
 }
@@ -883,13 +1087,15 @@ void HttpServer::HandleSim(const httplib::Request& req, httplib::Response& res) 
       return;
     }
 
+    std::string filter_expr;
     vectors::MetadataFilter filter;
     if (body.contains("filter")) {
       if (!body["filter"].is_string()) {
         SendError(res, kHttpBadRequest, "Field 'filter' must be a string");
         return;
       }
-      auto filter_result = ParseSimpleFilter(body["filter"].get<std::string>());
+      filter_expr = body["filter"].get<std::string>();
+      auto filter_result = ParseSimpleFilter(filter_expr);
       if (!filter_result) {
         SendError(res, kHttpBadRequest, filter_result.error().message());
         return;
@@ -906,11 +1112,57 @@ void HttpServer::HandleSim(const httplib::Request& req, httplib::Response& res) 
       adaptive = body["adaptive"].get<bool>();
     }
 
+    if (mode != "events" && mode != "vectors" && mode != "fusion") {
+      SendError(res, kHttpBadRequest, "Invalid mode. Must be one of: events, vectors, fusion");
+      return;
+    }
+
     // Check if similarity engine is initialized
     if (!handler_context_->similarity_engine) {
       SendError(res, kHttpInternalServerError, "Similarity engine not initialized");
       return;
     }
+
+    // Cache lookup (same key components and search type as the TCP path).
+    auto* cache_ptr = handler_context_->cache.load(std::memory_order_acquire);
+    const bool cache_enabled = (cache_ptr != nullptr && cache_ptr->IsEnabled());
+    auto search_type = filter_expr.empty() ? cache::SearchType::kItemSearch : cache::SearchType::kFilteredSearch;
+    cache::CacheKey cache_key;
+
+    if (cache_enabled) {
+      const std::string adaptive_part = adaptive.has_value() ? (*adaptive ? "on" : "off") : "default";
+      auto generation = handler_context_->co_index != nullptr ? handler_context_->co_index->GetGeneration() : 0;
+      std::string key_str = "SIM:" + id + ":" + std::to_string(top_k) + ":" + mode + ":a" + adaptive_part + ":g" +
+                            std::to_string(generation);
+      if (!filter_expr.empty()) {
+        key_str += ":f" + filter_expr;
+      }
+      cache_key = cache::CacheKeyGenerator::Generate(key_str);
+
+      auto cached = cache_ptr->Lookup(cache_key, search_type);
+      if (cached.has_value()) {
+        handler_context_->stats.sim_commands.fetch_add(1);
+        handler_context_->stats.total_commands.fetch_add(1);
+
+        json response;
+        response["status"] = "ok";
+        auto cached_results = ApplyMinScore(*cached, min_score);
+        response["count"] = cached_results.size();
+        response["mode"] = mode;
+        json results_array = json::array();
+        for (const auto& sim_result : cached_results) {
+          json item;
+          item["id"] = sim_result.first;
+          item["score"] = sim_result.second;
+          results_array.push_back(item);
+        }
+        response["results"] = results_array;
+        SendJson(res, kHttpOk, response);
+        return;
+      }
+    }
+
+    auto start = std::chrono::steady_clock::now();
 
     // Call appropriate search method based on mode
     utils::Expected<std::vector<similarity::SimilarityResult>, utils::Error> result;
@@ -918,11 +1170,8 @@ void HttpServer::HandleSim(const httplib::Request& req, httplib::Response& res) 
       result = handler_context_->similarity_engine->SearchByIdEvents(id, top_k);
     } else if (mode == "vectors") {
       result = handler_context_->similarity_engine->SearchByIdVectors(id, top_k, filter);
-    } else if (mode == "fusion") {
+    } else {  // fusion
       result = handler_context_->similarity_engine->SearchByIdFusion(id, top_k, adaptive, filter);
-    } else {
-      SendError(res, kHttpBadRequest, "Invalid mode. Must be one of: events, vectors, fusion");
-      return;
     }
 
     if (!result) {
@@ -935,8 +1184,23 @@ void HttpServer::HandleSim(const httplib::Request& req, httplib::Response& res) 
     }
     *result = ApplyMetadataFilter(*result, handler_context_->metadata_store, filter);
 
-    stats_.sim_commands.fetch_add(1);
-    stats_.total_commands.fetch_add(1);
+    // Cache store (mirrors the TCP path: cache full results, register items).
+    if (cache_enabled) {
+      auto elapsed = std::chrono::steady_clock::now() - start;
+      double elapsed_ms = std::chrono::duration<double, std::milli>(elapsed).count();
+      cache_ptr->Insert(cache_key, *result, elapsed_ms, search_type);
+
+      std::vector<std::string> item_ids;
+      item_ids.reserve(result->size() + 1);
+      item_ids.push_back(id);
+      for (const auto& item : *result) {
+        item_ids.push_back(item.item_id);
+      }
+      cache_ptr->RegisterResultItems(cache_key, item_ids);
+    }
+
+    handler_context_->stats.sim_commands.fetch_add(1);
+    handler_context_->stats.total_commands.fetch_add(1);
 
     // Build JSON response
     json response;
@@ -1005,13 +1269,15 @@ void HttpServer::HandleSimv(const httplib::Request& req, httplib::Response& res)
       return;
     }
 
+    std::string filter_expr;
     vectors::MetadataFilter filter;
     if (body.contains("filter")) {
       if (!body["filter"].is_string()) {
         SendError(res, kHttpBadRequest, "Field 'filter' must be a string");
         return;
       }
-      auto filter_result = ParseSimpleFilter(body["filter"].get<std::string>());
+      filter_expr = body["filter"].get<std::string>();
+      auto filter_result = ParseSimpleFilter(filter_expr);
       if (!filter_result) {
         SendError(res, kHttpBadRequest, filter_result.error().message());
         return;
@@ -1025,14 +1291,68 @@ void HttpServer::HandleSimv(const httplib::Request& req, httplib::Response& res)
       return;
     }
 
+    // Cache lookup (same key components and search type as the TCP path).
+    auto* cache_ptr = handler_context_->cache.load(std::memory_order_acquire);
+    const bool cache_enabled = (cache_ptr != nullptr && cache_ptr->IsEnabled());
+    auto search_type = filter_expr.empty() ? cache::SearchType::kVectorSearch : cache::SearchType::kFilteredSearch;
+    cache::CacheKey cache_key;
+
+    if (cache_enabled) {
+      std::string key_str = "SIMV:" + cache::HashVector(vector) + ":" + std::to_string(top_k);
+      if (!filter_expr.empty()) {
+        key_str += ":f" + filter_expr;
+      }
+      cache_key = cache::CacheKeyGenerator::Generate(key_str);
+
+      auto cached = cache_ptr->Lookup(cache_key, search_type);
+      if (cached.has_value()) {
+        handler_context_->stats.sim_commands.fetch_add(1);
+        handler_context_->stats.total_commands.fetch_add(1);
+
+        json response;
+        response["status"] = "ok";
+        auto cached_results = ApplyMinScore(*cached, min_score);
+        response["count"] = cached_results.size();
+        response["dimension"] = vector.size();
+        json results_array = json::array();
+        for (const auto& sim_result : cached_results) {
+          json item;
+          item["id"] = sim_result.first;
+          item["score"] = sim_result.second;
+          results_array.push_back(item);
+        }
+        response["results"] = results_array;
+        SendJson(res, kHttpOk, response);
+        return;
+      }
+    }
+
+    auto start = std::chrono::steady_clock::now();
+
     // Search by vector
     auto result = handler_context_->similarity_engine->SearchByVector(vector, top_k, filter);
     if (!result) {
       SendError(res, kHttpInternalServerError, result.error().message());
       return;
     }
+    *result = ApplyMetadataFilter(*result, handler_context_->metadata_store, filter);
 
-    stats_.total_commands.fetch_add(1);
+    // Cache store (mirrors the TCP path).
+    if (cache_enabled) {
+      auto elapsed = std::chrono::steady_clock::now() - start;
+      double elapsed_ms = std::chrono::duration<double, std::milli>(elapsed).count();
+      cache_ptr->Insert(cache_key, *result, elapsed_ms, search_type);
+
+      std::vector<std::string> item_ids;
+      item_ids.reserve(result->size());
+      for (const auto& item : *result) {
+        item_ids.push_back(item.item_id);
+      }
+      cache_ptr->RegisterResultItems(cache_key, item_ids);
+    }
+
+    handler_context_->stats.sim_commands.fetch_add(1);
+    handler_context_->stats.total_commands.fetch_add(1);
 
     // Build JSON response
     json response;
@@ -1060,10 +1380,33 @@ void HttpServer::HandleSimv(const httplib::Request& req, httplib::Response& res)
 
 //
 // Snapshot management handlers
-// Delegate to RequestDispatcher for consistency with TCP protocol
+// Delegate to the same typed handlers used by the TCP path. Responses are
+// built from the structured Expected<> result so that the HTTP status reflects
+// the real outcome (no string-sniffing, no hardcoded success flags).
 //
 
+namespace {
+/// Extract the resolved path token that the dump handlers append after their
+/// status keyword (e.g. "OK DUMP_SAVED <path>\r\n").
+std::string ExtractDumpPath(const std::string& response, const std::string& fallback) {
+  std::istringstream iss(response);
+  std::string keyword;
+  std::string verb;
+  std::string path;
+  // Response shape: "OK <VERB> <path>"
+  if ((iss >> keyword >> verb >> path) && keyword == "OK" && !path.empty()) {
+    return path;
+  }
+  return fallback;
+}
+}  // namespace
+
 void HttpServer::HandleDumpSave(const httplib::Request& req, httplib::Response& res) {
+  if (!IsAuthorized(req)) {
+    SendError(res, kHttpUnauthorized, "Authentication required");
+    return;
+  }
+
   // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
     // Parse JSON body (filepath is optional)
@@ -1077,23 +1420,18 @@ void HttpServer::HandleDumpSave(const httplib::Request& req, httplib::Response& 
       filepath = body.value("filepath", "");
     }
 
-    // Create Command and use RequestDispatcher
-    Command cmd;
-    cmd.type = CommandType::kDumpSave;
-    cmd.path = filepath;
+    auto result = handlers::HandleDumpSave(*handler_context_, filepath);
+    if (!result) {
+      SendError(res, ErrorCodeToHttpStatus(result.error().code()), result.error().message());
+      return;
+    }
 
-    RequestDispatcher dispatcher(*handler_context_);
-    ConnectionContext conn_ctx;  // Dummy context for HTTP
+    handler_context_->stats.dump_commands.fetch_add(1);
+    handler_context_->stats.total_commands.fetch_add(1);
 
-    auto result_str = dispatcher.Dispatch("DUMP SAVE " + filepath, conn_ctx);
-
-    // Parse result (RequestDispatcher returns formatted text response)
     json response;
     response["status"] = "ok";
-    response["message"] = result_str;
-    if (!filepath.empty()) {
-      response["filepath"] = filepath;
-    }
+    response["filepath"] = ExtractDumpPath(*result, filepath);
     SendJson(res, kHttpOk, response);
 
   } catch (const std::exception& e) {
@@ -1103,6 +1441,11 @@ void HttpServer::HandleDumpSave(const httplib::Request& req, httplib::Response& 
 }
 
 void HttpServer::HandleDumpLoad(const httplib::Request& req, httplib::Response& res) {
+  if (!IsAuthorized(req)) {
+    SendError(res, kHttpUnauthorized, "Authentication required");
+    return;
+  }
+
   // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
     // Parse JSON body (non-throwing)
@@ -1124,26 +1467,18 @@ void HttpServer::HandleDumpLoad(const httplib::Request& req, httplib::Response& 
 
     std::string filepath = body["filepath"];
 
-    // Use RequestDispatcher
-    RequestDispatcher dispatcher(*handler_context_);
-    ConnectionContext conn_ctx;  // Dummy context for HTTP
-
-    auto result_str = dispatcher.Dispatch("DUMP LOAD " + filepath, conn_ctx);
-
-    // Check if result indicates error
-    if (result_str.find("ERROR") != std::string::npos) {
-      if (result_str.find("not found") != std::string::npos) {
-        SendError(res, kHttpNotFound, result_str);
-      } else {
-        SendError(res, kHttpInternalServerError, result_str);
-      }
+    auto result = handlers::HandleDumpLoad(*handler_context_, filepath);
+    if (!result) {
+      SendError(res, ErrorCodeToHttpStatus(result.error().code()), result.error().message());
       return;
     }
 
+    handler_context_->stats.dump_commands.fetch_add(1);
+    handler_context_->stats.total_commands.fetch_add(1);
+
     json response;
     response["status"] = "ok";
-    response["message"] = result_str;
-    response["filepath"] = filepath;
+    response["filepath"] = ExtractDumpPath(*result, filepath);
     SendJson(res, kHttpOk, response);
 
   } catch (const std::exception& e) {
@@ -1153,6 +1488,11 @@ void HttpServer::HandleDumpLoad(const httplib::Request& req, httplib::Response& 
 }
 
 void HttpServer::HandleDumpVerify(const httplib::Request& req, httplib::Response& res) {
+  if (!IsAuthorized(req)) {
+    SendError(res, kHttpUnauthorized, "Authentication required");
+    return;
+  }
+
   // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
     // Parse JSON body (non-throwing)
@@ -1174,26 +1514,21 @@ void HttpServer::HandleDumpVerify(const httplib::Request& req, httplib::Response
 
     std::string filepath = body["filepath"];
 
-    // Use RequestDispatcher
-    RequestDispatcher dispatcher(*handler_context_);
-    ConnectionContext conn_ctx;  // Dummy context for HTTP
-
-    auto result_str = dispatcher.Dispatch("DUMP VERIFY " + filepath, conn_ctx);
-
-    // Check if result indicates error
-    if (result_str.find("ERROR") != std::string::npos) {
-      if (result_str.find("not found") != std::string::npos) {
-        SendError(res, kHttpNotFound, result_str);
-      } else {
-        SendError(res, kHttpInternalServerError, result_str);
-      }
+    auto result = handlers::HandleDumpVerify(handler_context_->dump_dir, filepath);
+    if (!result) {
+      // Verification failed: report a concrete, non-success response.
+      json response;
+      response["status"] = "error";
+      response["filepath"] = filepath;
+      response["valid"] = false;
+      response["error"] = result.error().message();
+      SendJson(res, ErrorCodeToHttpStatus(result.error().code()), response);
       return;
     }
 
     json response;
     response["status"] = "ok";
-    response["message"] = result_str;
-    response["filepath"] = filepath;
+    response["filepath"] = ExtractDumpPath(*result, filepath);
     response["valid"] = true;
     SendJson(res, kHttpOk, response);
 
@@ -1204,6 +1539,11 @@ void HttpServer::HandleDumpVerify(const httplib::Request& req, httplib::Response
 }
 
 void HttpServer::HandleDumpInfo(const httplib::Request& req, httplib::Response& res) {
+  if (!IsAuthorized(req)) {
+    SendError(res, kHttpUnauthorized, "Authentication required");
+    return;
+  }
+
   // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
     // Parse JSON body (non-throwing)
@@ -1225,26 +1565,32 @@ void HttpServer::HandleDumpInfo(const httplib::Request& req, httplib::Response& 
 
     std::string filepath = body["filepath"];
 
-    // Use RequestDispatcher
-    RequestDispatcher dispatcher(*handler_context_);
-    ConnectionContext conn_ctx;  // Dummy context for HTTP
-
-    auto result_str = dispatcher.Dispatch("DUMP INFO " + filepath, conn_ctx);
-
-    // Check if result indicates error
-    if (result_str.find("ERROR") != std::string::npos) {
-      if (result_str.find("not found") != std::string::npos) {
-        SendError(res, kHttpNotFound, result_str);
-      } else {
-        SendError(res, kHttpInternalServerError, result_str);
-      }
+    auto result = handlers::HandleDumpInfo(handler_context_->dump_dir, filepath);
+    if (!result) {
+      SendError(res, ErrorCodeToHttpStatus(result.error().code()), result.error().message());
       return;
+    }
+
+    // The structured handler returns a "key: value" block; surface the parsed
+    // fields as JSON so callers get a typed shape rather than a raw text blob.
+    json info = json::object();
+    std::istringstream iss(*result);
+    std::string line;
+    while (std::getline(iss, line)) {
+      if (!line.empty() && line.back() == '\r') {
+        line.pop_back();
+      }
+      auto sep = line.find(": ");
+      if (sep == std::string::npos) {
+        continue;
+      }
+      info[line.substr(0, sep)] = line.substr(sep + 2);
     }
 
     json response;
     response["status"] = "ok";
     response["filepath"] = filepath;
-    response["info"] = result_str;
+    response["info"] = info;
     SendJson(res, kHttpOk, response);
 
   } catch (const std::exception& e) {
@@ -1419,6 +1765,11 @@ void HttpServer::HandleCacheStats(const httplib::Request& /*req*/, httplib::Resp
 }
 
 void HttpServer::HandleCacheClear(const httplib::Request& req, httplib::Response& res) {
+  if (!IsAuthorized(req)) {
+    SendError(res, kHttpUnauthorized, "Authentication required");
+    return;
+  }
+
   // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
     auto* clear_cache =
@@ -1463,7 +1814,12 @@ void HttpServer::HandleCacheClear(const httplib::Request& req, httplib::Response
   }
 }
 
-void HttpServer::HandleCacheEnable(const httplib::Request& /*req*/, httplib::Response& res) {
+void HttpServer::HandleCacheEnable(const httplib::Request& req, httplib::Response& res) {
+  if (!IsAuthorized(req)) {
+    SendError(res, kHttpUnauthorized, "Authentication required");
+    return;
+  }
+
   // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
     auto* cache_ptr = (handler_context_ != nullptr) ? handler_context_->cache.load(std::memory_order_acquire) : nullptr;
@@ -1485,7 +1841,12 @@ void HttpServer::HandleCacheEnable(const httplib::Request& /*req*/, httplib::Res
   }
 }
 
-void HttpServer::HandleCacheDisable(const httplib::Request& /*req*/, httplib::Response& res) {
+void HttpServer::HandleCacheDisable(const httplib::Request& req, httplib::Response& res) {
+  if (!IsAuthorized(req)) {
+    SendError(res, kHttpUnauthorized, "Authentication required");
+    return;
+  }
+
   // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
     auto* cache_ptr = (handler_context_ != nullptr) ? handler_context_->cache.load(std::memory_order_acquire) : nullptr;

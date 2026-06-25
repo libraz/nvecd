@@ -43,6 +43,7 @@ struct HttpServerConfig {
   bool enable_cors = false;
   std::string cors_allow_origin;
   std::vector<std::string> allow_cidrs;
+  std::string requirepass;  ///< Required password for write/admin endpoints (empty = no auth)
 };
 
 /**
@@ -157,6 +158,11 @@ class HttpServer {
    * @brief Handle POST /vecset
    */
   void HandleVecset(const httplib::Request& req, httplib::Response& res);
+
+  /**
+   * @brief Handle POST /metaset
+   */
+  void HandleMetaset(const httplib::Request& req, httplib::Response& res);
 
   /**
    * @brief Handle POST /sim
@@ -275,6 +281,20 @@ class HttpServer {
    * @brief Send error response
    */
   static void SendError(httplib::Response& res, int status_code, const std::string& message);
+
+  /**
+   * @brief Check whether a request is authorized for a non-read endpoint
+   *
+   * When no password is configured (requirepass empty) every request is
+   * authorized. Otherwise the request must present a matching credential via
+   * the Authorization header, either "Bearer <password>" or
+   * "Basic base64(user:<password>)" (the username is ignored, mirroring TCP
+   * AUTH which only compares the password).
+   *
+   * @param req Incoming request
+   * @return true if authorized
+   */
+  bool IsAuthorized(const httplib::Request& req) const;
 };
 
 }  // namespace nvecd::server

@@ -127,6 +127,7 @@ utils::Expected<void, utils::Error> NvecdServer::Start() {
     http_config.enable_cors = config_.api.http.enable_cors;
     http_config.cors_allow_origin = config_.api.http.cors_allow_origin;
     http_config.allow_cidrs = config_.network.allow_cidrs;
+    http_config.requirepass = config_.security.requirepass;
 
     http_server_ = std::make_unique<HttpServer>(http_config, &handler_ctx_, &config_, &loading_, &stats_);
 
