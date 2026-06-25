@@ -288,6 +288,178 @@ TEST_F(NvecdClientTest, SimvSuccess) {
 }
 
 //
+// METASET command tests
+//
+
+TEST_F(NvecdClientTest, MetasetSuccess) {
+  ClientConfig config;
+  config.host = "127.0.0.1";
+  config.port = port_;
+
+  NvecdClient client(config);
+  ASSERT_TRUE(client.Connect());
+
+  // The item must exist before metadata can be attached.
+  std::vector<float> vec = {0.1F, 0.2F, 0.3F};
+  ASSERT_TRUE(client.Vecset("item1", vec));
+
+  auto result = client.Metaset("item1", "category:electronics,active:true");
+  EXPECT_TRUE(result) << "Metaset failed: " << result.error().message();
+}
+
+TEST_F(NvecdClientTest, MetasetUnknownItemFails) {
+  ClientConfig config;
+  config.host = "127.0.0.1";
+  config.port = port_;
+
+  NvecdClient client(config);
+  ASSERT_TRUE(client.Connect());
+
+  // No VECSET for this ID — server must reject the metadata.
+  auto result = client.Metaset("ghost", "category:electronics");
+  EXPECT_FALSE(result);
+}
+
+TEST_F(NvecdClientTest, MetasetEnablesFilteredSim) {
+  ClientConfig config;
+  config.host = "127.0.0.1";
+  config.port = port_;
+
+  NvecdClient client(config);
+  ASSERT_TRUE(client.Connect());
+
+  std::vector<float> vec1 = {1.0F, 0.0F, 0.0F};
+  std::vector<float> vec2 = {0.9F, 0.1F, 0.0F};  // NOLINT
+  ASSERT_TRUE(client.Vecset("vec1", vec1));
+  ASSERT_TRUE(client.Vecset("vec2", vec2));
+  ASSERT_TRUE(client.Metaset("vec2", "category:books"));
+
+  // Filter to a category vec2 does not have — vec2 must be excluded.
+  SearchOptions options;
+  options.filter = "category:music";
+  auto result = client.Sim("vec1", 10, "vectors", options);  // NOLINT
+  ASSERT_TRUE(result) << "Sim failed: " << result.error().message();
+  for (const auto& item : result->results) {
+    EXPECT_NE(item.id, "vec2") << "vec2 should be filtered out by category:music";
+  }
+}
+
+//
+// AUTH command tests
+//
+
+TEST_F(NvecdClientTest, AuthNoPasswordConfigured) {
+  // The test server has no requirepass set, so AUTH returns "+OK (no password
+  // required)". The client must accept the Redis-style "+OK" prefix.
+  ClientConfig config;
+  config.host = "127.0.0.1";
+  config.port = port_;
+
+  NvecdClient client(config);
+  ASSERT_TRUE(client.Connect());
+
+  auto result = client.Auth("anything");
+  EXPECT_TRUE(result) << "Auth failed: " << result.error().message();
+}
+
+//
+// CACHE command tests
+//
+
+TEST_F(NvecdClientTest, CacheCommands) {
+  ClientConfig config;
+  config.host = "127.0.0.1";
+  config.port = port_;
+
+  NvecdClient client(config);
+  ASSERT_TRUE(client.Connect());
+
+  auto stats = client.CacheStats();
+  ASSERT_TRUE(stats) << "CacheStats failed: " << stats.error().message();
+  EXPECT_NE(stats->find("CACHE_STATS"), std::string::npos);
+
+  EXPECT_TRUE(client.CacheClear()) << "CacheClear failed";
+  EXPECT_TRUE(client.CacheEnable()) << "CacheEnable failed";
+  EXPECT_TRUE(client.CacheDisable()) << "CacheDisable failed";
+}
+
+//
+// DUMP STATUS command tests
+//
+
+TEST_F(NvecdClientTest, DumpStatusSuccess) {
+  ClientConfig config;
+  config.host = "127.0.0.1";
+  config.port = port_;
+
+  NvecdClient client(config);
+  ASSERT_TRUE(client.Connect());
+
+  auto result = client.DumpStatus();
+  ASSERT_TRUE(result) << "DumpStatus failed: " << result.error().message();
+  EXPECT_NE(result->find("status:"), std::string::npos);
+}
+
+//
+// SIMV options / float precision tests
+//
+
+TEST_F(NvecdClientTest, SimvWithMinScoreOption) {
+  ClientConfig config;
+  config.host = "127.0.0.1";
+  config.port = port_;
+
+  NvecdClient client(config);
+  ASSERT_TRUE(client.Connect());
+
+  std::vector<float> vec1 = {1.0F, 0.0F, 0.0F};
+  std::vector<float> vec2 = {0.0F, 1.0F, 0.0F};  // Orthogonal to the query
+  ASSERT_TRUE(client.Vecset("vec1", vec1));
+  ASSERT_TRUE(client.Vecset("vec2", vec2));
+
+  // A high min_score must exclude the orthogonal/low-score item. This only
+  // works if the client actually serialized "min_score=" into the SIMV command.
+  std::vector<float> query = {1.0F, 0.0F, 0.0F};
+  SearchOptions options;
+  options.min_score = 0.99F;                                 // NOLINT
+  auto result = client.Simv(query, 10, "vectors", options);  // NOLINT
+  ASSERT_TRUE(result) << "Simv failed: " << result.error().message();
+  for (const auto& item : result->results) {
+    EXPECT_GE(item.score, 0.99F) << "min_score filter was not applied server-side";
+    EXPECT_NE(item.id, "vec2") << "orthogonal vec2 should be excluded by min_score";
+  }
+}
+
+TEST_F(NvecdClientTest, FloatPrecisionRoundTrips) {
+  // A value whose 9th significant digit matters: 6-digit serialization would
+  // perturb the stored vector. With round-trippable precision, a self-query
+  // against the identical stored vector yields a near-perfect score.
+  ClientConfig config;
+  config.host = "127.0.0.1";
+  config.port = port_;
+
+  NvecdClient client(config);
+  ASSERT_TRUE(client.Connect());
+
+  std::vector<float> precise = {0.123456789F, 0.987654321F, 0.135792468F};
+  ASSERT_TRUE(client.Vecset("precise1", precise));
+
+  // Query with the exact same components. If serialization round-trips, the
+  // normalized self-similarity is ~1.0.
+  auto result = client.Simv(precise, 5, "vectors");  // NOLINT
+  ASSERT_TRUE(result) << "Simv failed: " << result.error().message();
+  ASSERT_FALSE(result->results.empty());
+  bool found = false;
+  for (const auto& item : result->results) {
+    if (item.id == "precise1") {
+      found = true;
+      EXPECT_NEAR(item.score, 1.0F, 1e-4F) << "stored vector was perturbed during serialization";
+    }
+  }
+  EXPECT_TRUE(found) << "precise1 should be returned for its own query vector";
+}
+
+//
 // INFO command tests
 //
 
@@ -304,6 +476,34 @@ TEST_F(NvecdClientTest, InfoSuccess) {
 
   EXPECT_FALSE(result->version.empty());
   EXPECT_GE(result->uptime_seconds, 0);
+}
+
+TEST_F(NvecdClientTest, InfoParsesRealKeysToNonZero) {
+  // Regression for the key-name drift: the client previously read keys the
+  // server never emits (total_requests / co_occurrence_entries), leaving the
+  // fields at 0. Drive some traffic and confirm the correctly named fields are
+  // populated from the server's actual INFO output.
+  ClientConfig config;
+  config.host = "127.0.0.1";
+  config.port = port_;
+
+  NvecdClient client(config);
+  ASSERT_TRUE(client.Connect());
+
+  // Generate commands and an indexed item so id_count/command counters move.
+  std::vector<float> vec = {0.5F, 0.5F, 0.5F};
+  ASSERT_TRUE(client.Vecset("metric_item", vec));
+  // Two distinct items in one context register a co-occurrence pair, so
+  // id_count becomes non-zero.
+  ASSERT_TRUE(client.Event("ctxA", "ADD", "metric_item", 50));   // NOLINT
+  ASSERT_TRUE(client.Event("ctxA", "ADD", "metric_item2", 60));  // NOLINT
+
+  auto result = client.Info();
+  ASSERT_TRUE(result) << "Info failed: " << result.error().message();
+
+  EXPECT_GT(result->total_commands_processed, 0U) << "total_commands_processed should be parsed from INFO";
+  EXPECT_GT(result->vector_count, 0U) << "vector_count should reflect the registered vector";
+  EXPECT_GT(result->id_count, 0U) << "id_count should reflect co-occurrence IDs";
 }
 
 //

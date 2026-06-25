@@ -40,6 +40,74 @@ static char* strdup_safe(const std::string& str) {
   return result;
 }
 
+// Helper: Translate C search options to the C++ SearchOptions struct.
+static SearchOptions to_cpp_options(const NvecdSearchOptions_C* options) {
+  SearchOptions cpp_options;
+  if (options == nullptr) {
+    return cpp_options;
+  }
+  if (options->filter != nullptr) {
+    cpp_options.filter = options->filter;
+  }
+  if (options->has_min_score != 0) {
+    cpp_options.min_score = options->min_score;
+  }
+  if (options->has_adaptive != 0) {
+    cpp_options.adaptive = (options->adaptive != 0);
+  }
+  return cpp_options;
+}
+
+// Helper: Marshal a C++ SimResponse into a freshly allocated C result struct.
+// On success *out is set and 0 is returned; on allocation failure last_error is
+// set, *out is left untouched, and -1 is returned. Ownership of the returned
+// struct transfers to the caller (free via nvecdclient_free_sim_response).
+static int build_sim_response(const SimResponse& src, NvecdSimResponse_C** out, std::string& last_error) {
+  auto* c_result = static_cast<NvecdSimResponse_C*>(malloc(sizeof(NvecdSimResponse_C)));
+  if (c_result == nullptr) {
+    last_error = "Memory allocation failed";
+    return -1;
+  }
+
+  c_result->count = src.results.size();
+  c_result->mode = strdup_safe(src.mode);
+  if (c_result->mode == nullptr) {
+    free(c_result);
+    last_error = "Memory allocation failed";
+    return -1;
+  }
+
+  if (c_result->count > 0) {
+    c_result->results = static_cast<NvecdSimResultItem_C*>(malloc(sizeof(NvecdSimResultItem_C) * c_result->count));
+    if (c_result->results == nullptr) {
+      free(c_result->mode);
+      free(c_result);
+      last_error = "Memory allocation failed";
+      return -1;
+    }
+
+    for (size_t i = 0; i < c_result->count; ++i) {
+      c_result->results[i].id = strdup_safe(src.results[i].id);
+      if (c_result->results[i].id == nullptr) {
+        for (size_t j = 0; j < i; ++j) {
+          free(c_result->results[j].id);
+        }
+        free(c_result->results);
+        free(c_result->mode);
+        free(c_result);
+        last_error = "Memory allocation failed";
+        return -1;
+      }
+      c_result->results[i].score = src.results[i].score;
+    }
+  } else {
+    c_result->results = nullptr;
+  }
+
+  *out = c_result;
+  return 0;
+}
+
 NvecdClient_C* nvecdclient_create(const NvecdClientConfig_C* config) {
   if (config == nullptr) {
     return nullptr;
@@ -126,130 +194,80 @@ int nvecdclient_vecset(NvecdClient_C* client, const char* id, const float* vecto
   return 0;
 }
 
+int nvecdclient_metaset(NvecdClient_C* client, const char* id, const char* metadata) {
+  if (client == nullptr || client->client == nullptr || id == nullptr || metadata == nullptr) {
+    return -1;
+  }
+
+  auto result = client->client->Metaset(id, metadata);
+  if (!result) {
+    client->last_error = result.error().to_string();
+    return -1;
+  }
+
+  return 0;
+}
+
 int nvecdclient_sim(NvecdClient_C* client, const char* id, uint32_t top_k, const char* mode,
                     NvecdSimResponse_C** result) {
+  return nvecdclient_sim_ex(client, id, top_k, mode, nullptr, result);
+}
+
+int nvecdclient_sim_ex(NvecdClient_C* client, const char* id, uint32_t top_k, const char* mode,
+                       const NvecdSearchOptions_C* options, NvecdSimResponse_C** result) {
   if (client == nullptr || client->client == nullptr || id == nullptr || result == nullptr) {
     return -1;
   }
 
   std::string mode_str = (mode != nullptr) ? mode : "fusion";
-  auto cpp_result = client->client->Sim(id, top_k, mode_str);
+  auto cpp_result = client->client->Sim(id, top_k, mode_str, to_cpp_options(options));
   if (!cpp_result) {
     client->last_error = cpp_result.error().to_string();
     return -1;
   }
 
-  // Allocate C result structure
-  auto* c_result = static_cast<NvecdSimResponse_C*>(malloc(sizeof(NvecdSimResponse_C)));
-  if (c_result == nullptr) {
-    client->last_error = "Memory allocation failed";
-    return -1;
-  }
-
-  c_result->count = cpp_result->results.size();
-  c_result->mode = strdup_safe(cpp_result->mode);
-  if (c_result->mode == nullptr) {
-    free(c_result);
-    client->last_error = "Memory allocation failed";
-    return -1;
-  }
-
-  if (c_result->count > 0) {
-    c_result->results = static_cast<NvecdSimResultItem_C*>(malloc(sizeof(NvecdSimResultItem_C) * c_result->count));
-    if (c_result->results == nullptr) {
-      free(c_result->mode);
-      free(c_result);
-      client->last_error = "Memory allocation failed";
-      return -1;
-    }
-
-    for (size_t i = 0; i < c_result->count; ++i) {
-      c_result->results[i].id = strdup_safe(cpp_result->results[i].id);
-      if (c_result->results[i].id == nullptr) {
-        // Cleanup previously allocated IDs
-        for (size_t j = 0; j < i; ++j) {
-          free(c_result->results[j].id);
-        }
-        free(c_result->results);
-        free(c_result->mode);
-        free(c_result);
-        client->last_error = "Memory allocation failed";
-        return -1;
-      }
-      c_result->results[i].score = cpp_result->results[i].score;
-    }
-  } else {
-    c_result->results = nullptr;
-  }
-
-  *result = c_result;
-  return 0;
+  return build_sim_response(*cpp_result, result, client->last_error);
 }
 
 int nvecdclient_simv(NvecdClient_C* client, const float* vector, size_t dimension, uint32_t top_k, const char* mode,
                      NvecdSimResponse_C** result) {
+  return nvecdclient_simv_ex(client, vector, dimension, top_k, mode, nullptr, result);
+}
+
+int nvecdclient_simv_ex(NvecdClient_C* client, const float* vector, size_t dimension, uint32_t top_k, const char* mode,
+                        const NvecdSearchOptions_C* options, NvecdSimResponse_C** result) {
   if (client == nullptr || client->client == nullptr || vector == nullptr || dimension == 0 || result == nullptr) {
     return -1;
   }
 
   std::vector<float> vec(vector, vector + dimension);
   std::string mode_str = (mode != nullptr) ? mode : "vectors";
-  auto cpp_result = client->client->Simv(vec, top_k, mode_str);
+  auto cpp_result = client->client->Simv(vec, top_k, mode_str, to_cpp_options(options));
   if (!cpp_result) {
     client->last_error = cpp_result.error().to_string();
     return -1;
   }
 
-  // Allocate C result structure
-  auto* c_result = static_cast<NvecdSimResponse_C*>(malloc(sizeof(NvecdSimResponse_C)));
-  if (c_result == nullptr) {
-    client->last_error = "Memory allocation failed";
-    return -1;
-  }
-
-  c_result->count = cpp_result->results.size();
-  c_result->mode = strdup_safe(cpp_result->mode);
-  if (c_result->mode == nullptr) {
-    free(c_result);
-    client->last_error = "Memory allocation failed";
-    return -1;
-  }
-
-  if (c_result->count > 0) {
-    c_result->results = static_cast<NvecdSimResultItem_C*>(malloc(sizeof(NvecdSimResultItem_C) * c_result->count));
-    if (c_result->results == nullptr) {
-      free(c_result->mode);
-      free(c_result);
-      client->last_error = "Memory allocation failed";
-      return -1;
-    }
-
-    for (size_t i = 0; i < c_result->count; ++i) {
-      c_result->results[i].id = strdup_safe(cpp_result->results[i].id);
-      if (c_result->results[i].id == nullptr) {
-        // Cleanup previously allocated IDs
-        for (size_t j = 0; j < i; ++j) {
-          free(c_result->results[j].id);
-        }
-        free(c_result->results);
-        free(c_result->mode);
-        free(c_result);
-        client->last_error = "Memory allocation failed";
-        return -1;
-      }
-      c_result->results[i].score = cpp_result->results[i].score;
-    }
-  } else {
-    c_result->results = nullptr;
-  }
-
-  *result = c_result;
-  return 0;
+  return build_sim_response(*cpp_result, result, client->last_error);
 }
 
 //
 // MygramDB-compatible commands
 //
+
+int nvecdclient_auth(NvecdClient_C* client, const char* password) {
+  if (client == nullptr || client->client == nullptr || password == nullptr) {
+    return -1;
+  }
+
+  auto result = client->client->Auth(password);
+  if (!result) {
+    client->last_error = result.error().to_string();
+    return -1;
+  }
+
+  return 0;
+}
 
 int nvecdclient_info(NvecdClient_C* client, NvecdServerInfo_C** info) {
   if (client == nullptr || client->client == nullptr || info == nullptr) {
@@ -276,11 +294,14 @@ int nvecdclient_info(NvecdClient_C* client, NvecdServerInfo_C** info) {
     return -1;
   }
   c_info->uptime_seconds = cpp_result->uptime_seconds;
-  c_info->total_requests = cpp_result->total_requests;
+  c_info->total_commands_processed = cpp_result->total_commands_processed;
+  c_info->failed_commands = cpp_result->failed_commands;
+  c_info->total_connections = cpp_result->total_connections;
   c_info->active_connections = cpp_result->active_connections;
   c_info->event_count = cpp_result->event_count;
   c_info->vector_count = cpp_result->vector_count;
-  c_info->co_occurrence_entries = cpp_result->co_occurrence_entries;
+  c_info->id_count = cpp_result->id_count;
+  c_info->ctx_count = cpp_result->ctx_count;
 
   *info = c_info;
   return 0;
@@ -359,6 +380,78 @@ int nvecdclient_dump_info(NvecdClient_C* client, const char* filepath, char** in
   }
 
   *info_str = strdup_safe(*result);
+  return 0;
+}
+
+int nvecdclient_dump_status(NvecdClient_C* client, char** status_str) {
+  if (client == nullptr || client->client == nullptr || status_str == nullptr) {
+    return -1;
+  }
+
+  auto result = client->client->DumpStatus();
+  if (!result) {
+    client->last_error = result.error().to_string();
+    return -1;
+  }
+
+  *status_str = strdup_safe(*result);
+  return 0;
+}
+
+int nvecdclient_cache_stats(NvecdClient_C* client, char** stats_str) {
+  if (client == nullptr || client->client == nullptr || stats_str == nullptr) {
+    return -1;
+  }
+
+  auto result = client->client->CacheStats();
+  if (!result) {
+    client->last_error = result.error().to_string();
+    return -1;
+  }
+
+  *stats_str = strdup_safe(*result);
+  return 0;
+}
+
+int nvecdclient_cache_clear(NvecdClient_C* client) {
+  if (client == nullptr || client->client == nullptr) {
+    return -1;
+  }
+
+  auto result = client->client->CacheClear();
+  if (!result) {
+    client->last_error = result.error().to_string();
+    return -1;
+  }
+
+  return 0;
+}
+
+int nvecdclient_cache_enable(NvecdClient_C* client) {
+  if (client == nullptr || client->client == nullptr) {
+    return -1;
+  }
+
+  auto result = client->client->CacheEnable();
+  if (!result) {
+    client->last_error = result.error().to_string();
+    return -1;
+  }
+
+  return 0;
+}
+
+int nvecdclient_cache_disable(NvecdClient_C* client) {
+  if (client == nullptr || client->client == nullptr) {
+    return -1;
+  }
+
+  auto result = client->client->CacheDisable();
+  if (!result) {
+    client->last_error = result.error().to_string();
+    return -1;
+  }
+
   return 0;
 }
 

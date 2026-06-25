@@ -61,16 +61,38 @@ typedef struct {
 
 /**
  * @brief Server information
+ *
+ * Field names mirror the keys emitted by the server's INFO command.
  */
 typedef struct {
-  char* version;
-  uint64_t uptime_seconds;
-  uint64_t total_requests;
-  uint64_t active_connections;
-  uint64_t event_count;
-  uint64_t vector_count;
-  uint64_t co_occurrence_entries;
+  char* version;                      ///< Caller frees via nvecdclient_free_server_info
+  uint64_t uptime_seconds;            ///< INFO key: uptime_seconds
+  uint64_t total_commands_processed;  ///< INFO key: total_commands_processed
+  uint64_t failed_commands;           ///< INFO key: failed_commands
+  uint64_t total_connections;         ///< INFO key: total_connections_received
+  uint64_t active_connections;        ///< INFO key: active_connections
+  uint64_t event_count;               ///< INFO key: event_count
+  uint64_t vector_count;              ///< INFO key: vector_count
+  uint64_t id_count;                  ///< INFO key: id_count
+  uint64_t ctx_count;                 ///< INFO key: ctx_count
 } NvecdServerInfo_C;
+
+/**
+ * @brief Optional SIM/SIMV search parameters.
+ *
+ * Pass NULL to the *_ex functions to use server defaults. When non-NULL:
+ * - @c filter: NULL or empty string means no metadata filter.
+ * - @c has_min_score: set non-zero to apply @c min_score.
+ * - @c has_adaptive: set non-zero to apply @c adaptive (SIM fusion only;
+ *   ignored by SIMV).
+ */
+typedef struct {
+  const char* filter;  ///< Metadata filter expression (NULL/"" = none)
+  float min_score;     ///< Minimum score threshold (used when has_min_score != 0)
+  int has_min_score;   ///< Non-zero to apply min_score
+  int adaptive;        ///< Non-zero = adaptive on, zero = off (used when has_adaptive != 0)
+  int has_adaptive;    ///< Non-zero to apply adaptive
+} NvecdSearchOptions_C;
 
 /**
  * @brief Create a new nvecd client
@@ -138,6 +160,16 @@ int nvecdclient_event(NvecdClient_C* client, const char* ctx, const char* type, 
 int nvecdclient_vecset(NvecdClient_C* client, const char* id, const float* vector, size_t dimension);
 
 /**
+ * @brief Attach metadata to an existing item (METASET command)
+ *
+ * @param client Client handle
+ * @param id Item ID (must already exist via VECSET)
+ * @param metadata Metadata expression, e.g. "category:books,active:true"
+ * @return 0 on success, -1 on error
+ */
+int nvecdclient_metaset(NvecdClient_C* client, const char* id, const char* metadata);
+
+/**
  * @brief Similarity search by ID (SIM command)
  *
  * @param client Client handle
@@ -149,6 +181,20 @@ int nvecdclient_vecset(NvecdClient_C* client, const char* id, const float* vecto
  */
 int nvecdclient_sim(NvecdClient_C* client, const char* id, uint32_t top_k, const char* mode,
                     NvecdSimResponse_C** result);
+
+/**
+ * @brief Similarity search by ID with filter/min_score/adaptive options (SIM command)
+ *
+ * @param client Client handle
+ * @param id Document/vector ID
+ * @param top_k Number of results to return
+ * @param mode Search mode ("events", "vectors", or "fusion"; NULL for default "fusion")
+ * @param options Optional search parameters (NULL for none)
+ * @param result Output search results (caller must free with nvecdclient_free_sim_response)
+ * @return 0 on success, -1 on error
+ */
+int nvecdclient_sim_ex(NvecdClient_C* client, const char* id, uint32_t top_k, const char* mode,
+                       const NvecdSearchOptions_C* options, NvecdSimResponse_C** result);
 
 /**
  * @brief Similarity search by vector (SIMV command)
@@ -164,9 +210,36 @@ int nvecdclient_sim(NvecdClient_C* client, const char* id, uint32_t top_k, const
 int nvecdclient_simv(NvecdClient_C* client, const float* vector, size_t dimension, uint32_t top_k, const char* mode,
                      NvecdSimResponse_C** result);
 
+/**
+ * @brief Similarity search by vector with filter/min_score options (SIMV command)
+ *
+ * @param client Client handle
+ * @param vector Query vector array
+ * @param dimension Vector dimension
+ * @param top_k Number of results to return
+ * @param mode Search mode ("vectors" only; NULL for default "vectors")
+ * @param options Optional search parameters (NULL for none; adaptive is ignored)
+ * @param result Output search results (caller must free with nvecdclient_free_sim_response)
+ * @return 0 on success, -1 on error
+ */
+int nvecdclient_simv_ex(NvecdClient_C* client, const float* vector, size_t dimension, uint32_t top_k, const char* mode,
+                        const NvecdSearchOptions_C* options, NvecdSimResponse_C** result);
+
 //
 // MygramDB-compatible commands
 //
+
+/**
+ * @brief Authenticate the connection (AUTH command)
+ *
+ * Required when the server has security.requirepass set. Call after connect and
+ * before write/admin commands.
+ *
+ * @param client Client handle
+ * @param password Server password
+ * @return 0 on success, -1 on error
+ */
+int nvecdclient_auth(NvecdClient_C* client, const char* password);
 
 /**
  * @brief Get server information (INFO command)
@@ -225,6 +298,48 @@ int nvecdclient_verify(NvecdClient_C* client, const char* filepath, char** resul
  * @return 0 on success, -1 on error
  */
 int nvecdclient_dump_info(NvecdClient_C* client, const char* filepath, char** info_str);
+
+/**
+ * @brief Query background snapshot status (DUMP STATUS command)
+ *
+ * @param client Client handle
+ * @param status_str Output status block (caller must free with nvecdclient_free_string)
+ * @return 0 on success, -1 on error
+ */
+int nvecdclient_dump_status(NvecdClient_C* client, char** status_str);
+
+/**
+ * @brief Get cache statistics (CACHE STATS command)
+ *
+ * @param client Client handle
+ * @param stats_str Output stats block (caller must free with nvecdclient_free_string)
+ * @return 0 on success, -1 on error
+ */
+int nvecdclient_cache_stats(NvecdClient_C* client, char** stats_str);
+
+/**
+ * @brief Clear all cache entries (CACHE CLEAR command)
+ *
+ * @param client Client handle
+ * @return 0 on success, -1 on error
+ */
+int nvecdclient_cache_clear(NvecdClient_C* client);
+
+/**
+ * @brief Enable the query result cache (CACHE ENABLE command)
+ *
+ * @param client Client handle
+ * @return 0 on success, -1 on error
+ */
+int nvecdclient_cache_enable(NvecdClient_C* client);
+
+/**
+ * @brief Disable the query result cache (CACHE DISABLE command)
+ *
+ * @param client Client handle
+ * @return 0 on success, -1 on error
+ */
+int nvecdclient_cache_disable(NvecdClient_C* client);
 
 /**
  * @brief Enable debug mode (DEBUG ON command)

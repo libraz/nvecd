@@ -197,6 +197,164 @@ TEST_F(NvecdClientCTest, SimvCommand) {
 }
 
 //
+// METASET command tests
+//
+
+TEST_F(NvecdClientCTest, MetasetCommand) {
+  NvecdClientConfig_C config = {};
+  config.host = "127.0.0.1";
+  config.port = port_;
+
+  NvecdClient_C* client = nvecdclient_create(&config);
+  ASSERT_NE(client, nullptr);
+  ASSERT_EQ(nvecdclient_connect(client), 0);
+
+  float vec[] = {0.1F, 0.2F, 0.3F};  // NOLINT
+  ASSERT_EQ(nvecdclient_vecset(client, "item1", vec, 3), 0);
+
+  EXPECT_EQ(nvecdclient_metaset(client, "item1", "category:books,active:true"), 0)
+      << "Metaset failed: " << nvecdclient_get_last_error(client);
+
+  // Unknown item must fail.
+  EXPECT_EQ(nvecdclient_metaset(client, "ghost", "category:books"), -1);
+
+  nvecdclient_destroy(client);
+}
+
+//
+// AUTH command tests
+//
+
+TEST_F(NvecdClientCTest, AuthCommand) {
+  // No requirepass configured: the server returns "+OK (no password required)".
+  NvecdClientConfig_C config = {};
+  config.host = "127.0.0.1";
+  config.port = port_;
+
+  NvecdClient_C* client = nvecdclient_create(&config);
+  ASSERT_NE(client, nullptr);
+  ASSERT_EQ(nvecdclient_connect(client), 0);
+
+  EXPECT_EQ(nvecdclient_auth(client, "anything"), 0) << "Auth failed: " << nvecdclient_get_last_error(client);
+
+  nvecdclient_destroy(client);
+}
+
+//
+// SIM/SIMV options tests
+//
+
+TEST_F(NvecdClientCTest, SimExWithFilter) {
+  NvecdClientConfig_C config = {};
+  config.host = "127.0.0.1";
+  config.port = port_;
+
+  NvecdClient_C* client = nvecdclient_create(&config);
+  ASSERT_NE(client, nullptr);
+  ASSERT_EQ(nvecdclient_connect(client), 0);
+
+  float vec1[] = {1.0F, 0.0F, 0.0F};  // NOLINT
+  float vec2[] = {0.9F, 0.1F, 0.0F};  // NOLINT
+  ASSERT_EQ(nvecdclient_vecset(client, "vec1", vec1, 3), 0);
+  ASSERT_EQ(nvecdclient_vecset(client, "vec2", vec2, 3), 0);
+  ASSERT_EQ(nvecdclient_metaset(client, "vec2", "category:books"), 0);
+
+  NvecdSearchOptions_C options = {};
+  options.filter = "category:music";  // vec2 does not match
+
+  NvecdSimResponse_C* response = nullptr;
+  int result = nvecdclient_sim_ex(client, "vec1", 10, "vectors", &options, &response);  // NOLINT
+  ASSERT_EQ(result, 0) << "sim_ex failed: " << nvecdclient_get_last_error(client);
+  ASSERT_NE(response, nullptr);
+  for (size_t i = 0; i < response->count; ++i) {
+    EXPECT_STRNE(response->results[i].id, "vec2");
+  }
+
+  nvecdclient_free_sim_response(response);
+  nvecdclient_destroy(client);
+}
+
+TEST_F(NvecdClientCTest, SimvExWithMinScore) {
+  NvecdClientConfig_C config = {};
+  config.host = "127.0.0.1";
+  config.port = port_;
+
+  NvecdClient_C* client = nvecdclient_create(&config);
+  ASSERT_NE(client, nullptr);
+  ASSERT_EQ(nvecdclient_connect(client), 0);
+
+  float vec1[] = {1.0F, 0.0F, 0.0F};  // NOLINT
+  float vec2[] = {0.0F, 1.0F, 0.0F};  // NOLINT - orthogonal
+  ASSERT_EQ(nvecdclient_vecset(client, "vec1", vec1, 3), 0);
+  ASSERT_EQ(nvecdclient_vecset(client, "vec2", vec2, 3), 0);
+
+  float query[] = {1.0F, 0.0F, 0.0F};  // NOLINT
+  NvecdSearchOptions_C options = {};
+  options.min_score = 0.99F;  // NOLINT
+  options.has_min_score = 1;
+
+  NvecdSimResponse_C* response = nullptr;
+  int result = nvecdclient_simv_ex(client, query, 3, 10, "vectors", &options, &response);  // NOLINT
+  ASSERT_EQ(result, 0) << "simv_ex failed: " << nvecdclient_get_last_error(client);
+  ASSERT_NE(response, nullptr);
+  for (size_t i = 0; i < response->count; ++i) {
+    EXPECT_GE(response->results[i].score, 0.99F);
+    EXPECT_STRNE(response->results[i].id, "vec2");
+  }
+
+  nvecdclient_free_sim_response(response);
+  nvecdclient_destroy(client);
+}
+
+//
+// CACHE command tests
+//
+
+TEST_F(NvecdClientCTest, CacheCommands) {
+  NvecdClientConfig_C config = {};
+  config.host = "127.0.0.1";
+  config.port = port_;
+
+  NvecdClient_C* client = nvecdclient_create(&config);
+  ASSERT_NE(client, nullptr);
+  ASSERT_EQ(nvecdclient_connect(client), 0);
+
+  char* stats = nullptr;
+  ASSERT_EQ(nvecdclient_cache_stats(client, &stats), 0) << "cache_stats failed: " << nvecdclient_get_last_error(client);
+  ASSERT_NE(stats, nullptr);
+  nvecdclient_free_string(stats);
+
+  EXPECT_EQ(nvecdclient_cache_clear(client), 0);
+  EXPECT_EQ(nvecdclient_cache_enable(client), 0);
+  EXPECT_EQ(nvecdclient_cache_disable(client), 0);
+
+  nvecdclient_destroy(client);
+}
+
+//
+// DUMP STATUS command tests
+//
+
+TEST_F(NvecdClientCTest, DumpStatusCommand) {
+  NvecdClientConfig_C config = {};
+  config.host = "127.0.0.1";
+  config.port = port_;
+
+  NvecdClient_C* client = nvecdclient_create(&config);
+  ASSERT_NE(client, nullptr);
+  ASSERT_EQ(nvecdclient_connect(client), 0);
+
+  char* status = nullptr;
+  ASSERT_EQ(nvecdclient_dump_status(client, &status), 0)
+      << "dump_status failed: " << nvecdclient_get_last_error(client);
+  ASSERT_NE(status, nullptr);
+  EXPECT_NE(std::string(status).find("status:"), std::string::npos);
+  nvecdclient_free_string(status);
+
+  nvecdclient_destroy(client);
+}
+
+//
 // INFO command tests
 //
 
@@ -209,6 +367,13 @@ TEST_F(NvecdClientCTest, InfoCommand) {
   ASSERT_NE(client, nullptr);
   ASSERT_EQ(nvecdclient_connect(client), 0);
 
+  // Drive some traffic so the correctly named INFO fields become non-zero.
+  // Two distinct items in one context register a co-occurrence pair (id_count).
+  float vec[] = {0.5F, 0.5F, 0.5F};  // NOLINT
+  ASSERT_EQ(nvecdclient_vecset(client, "metric_item", vec, 3), 0);
+  ASSERT_EQ(nvecdclient_event(client, "ctxA", "ADD", "metric_item", 50), 0);   // NOLINT
+  ASSERT_EQ(nvecdclient_event(client, "ctxA", "ADD", "metric_item2", 60), 0);  // NOLINT
+
   NvecdServerInfo_C* info = nullptr;
   int result = nvecdclient_info(client, &info);
   ASSERT_EQ(result, 0) << "Info failed: " << nvecdclient_get_last_error(client);
@@ -216,6 +381,9 @@ TEST_F(NvecdClientCTest, InfoCommand) {
 
   EXPECT_NE(info->version, nullptr);
   EXPECT_GE(info->uptime_seconds, 0);
+  EXPECT_GT(info->total_commands_processed, 0U);
+  EXPECT_GT(info->vector_count, 0U);
+  EXPECT_GT(info->id_count, 0U);
 
   nvecdclient_free_server_info(info);
   nvecdclient_destroy(client);

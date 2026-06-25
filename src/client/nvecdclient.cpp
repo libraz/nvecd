@@ -17,6 +17,7 @@
 #include <unistd.h>
 
 #include <cctype>
+#include <charconv>
 #include <cstring>
 #include <iomanip>
 #include <sstream>
@@ -36,6 +37,57 @@ namespace {
 constexpr size_t kErrorPrefixLen = 6;  // Length of "ERROR "
 constexpr int kMillisecondsPerSecond = 1000;
 constexpr int kMicrosecondsPerMillisecond = 1000;
+
+// Round-trippable precision for IEEE-754 single precision floats: a 9-digit
+// decimal mantissa uniquely identifies any float, so serialized vectors parse
+// back to the exact same value on the server.
+constexpr int kFloatRoundTripPrecision = 9;
+
+/**
+ * @brief Parse an unsigned 64-bit integer without throwing.
+ *
+ * Replaces std::stoull, which throws on malformed input. On a parse failure the
+ * supplied default is returned, keeping the no-exceptions contract intact (this
+ * matters across the C ABI boundary, where a thrown exception is undefined).
+ *
+ * @param value Text to parse.
+ * @param fallback Value returned when @p value is not a valid integer.
+ * @return Parsed integer, or @p fallback on failure.
+ */
+uint64_t ParseUint64(const std::string& value, uint64_t fallback = 0) {
+  uint64_t parsed = 0;
+  const char* begin = value.data();
+  const char* end = begin + value.size();
+  auto [ptr, ec] = std::from_chars(begin, end, parsed);
+  if (ec != std::errc() || ptr != end) {
+    return fallback;
+  }
+  return parsed;
+}
+
+/**
+ * @brief Serialize a float with full round-trippable precision.
+ */
+std::string FormatFloat(float value) {
+  std::ostringstream oss;
+  oss << std::setprecision(kFloatRoundTripPrecision) << value;
+  return oss.str();
+}
+
+/**
+ * @brief Append SIM/SIMV optional tokens (filter/min_score) to a command.
+ *
+ * @c adaptive is intentionally not handled here because its position differs
+ * between SIM and SIMV; callers append it explicitly where supported.
+ */
+void AppendSearchOptions(std::ostringstream& cmd, const SearchOptions& options) {
+  if (!options.filter.empty()) {
+    cmd << " filter=" << options.filter;
+  }
+  if (options.min_score.has_value()) {
+    cmd << " min_score=" << FormatFloat(*options.min_score);
+  }
+}
 
 /**
  * @brief Validate that a string does not contain ASCII control characters
@@ -331,10 +383,9 @@ class NvecdClient::Impl {
     }
 
     std::ostringstream cmd;
-    cmd << std::fixed;  // Use fixed-point notation
     cmd << "VECSET " << EscapeString(id);
     for (float val : vector) {
-      cmd << " " << val;
+      cmd << " " << FormatFloat(val);
     }
 
     auto result = SendCommand(cmd.str());
@@ -353,7 +404,38 @@ class NvecdClient::Impl {
     return {};
   }
 
-  Expected<SimResponse, Error> Sim(const std::string& id, uint32_t top_k, const std::string& mode) const {
+  Expected<void, Error> Metaset(const std::string& id, const std::string& metadata) const {
+    if (auto err = ValidateNoControlCharacters(id, "item ID")) {
+      return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, *err));
+    }
+    if (auto err = ValidateNoControlCharacters(metadata, "metadata")) {
+      return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, *err));
+    }
+    if (metadata.empty()) {
+      return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, "Metadata cannot be empty"));
+    }
+
+    std::ostringstream cmd;
+    cmd << "METASET " << EscapeString(id) << " " << metadata;
+
+    auto result = SendCommand(cmd.str());
+    if (!result) {
+      return MakeUnexpected(result.error());
+    }
+
+    if (result->find("ERROR") == 0) {
+      return MakeUnexpected(MakeError(ErrorCode::kClientServerError, result->substr(kErrorPrefixLen)));
+    }
+
+    if (result->find("OK") != 0) {
+      return MakeUnexpected(MakeError(ErrorCode::kClientProtocolError, "Unexpected response: " + *result));
+    }
+
+    return {};
+  }
+
+  Expected<SimResponse, Error> Sim(const std::string& id, uint32_t top_k, const std::string& mode,
+                                   const SearchOptions& options) const {
     if (auto err = ValidateNoControlCharacters(id, "document ID")) {
       return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, *err));
     }
@@ -365,6 +447,10 @@ class NvecdClient::Impl {
     cmd << "SIM " << EscapeString(id) << " " << top_k;
     if (!mode.empty()) {
       cmd << " using=" << mode;
+    }
+    AppendSearchOptions(cmd, options);
+    if (options.adaptive.has_value()) {
+      cmd << " adaptive=" << (*options.adaptive ? "on" : "off");
     }
 
     auto result = SendCommand(cmd.str());
@@ -400,7 +486,8 @@ class NvecdClient::Impl {
     return resp;
   }
 
-  Expected<SimResponse, Error> Simv(const std::vector<float>& vector, uint32_t top_k, const std::string& mode) const {
+  Expected<SimResponse, Error> Simv(const std::vector<float>& vector, uint32_t top_k, const std::string& mode,
+                                    const SearchOptions& options) const {
     if (vector.empty()) {
       return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, "Vector cannot be empty"));
     }
@@ -408,11 +495,12 @@ class NvecdClient::Impl {
       return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, *err));
     }
 
+    // SIMV wire syntax places filter=/min_score= before the vector components.
     std::ostringstream cmd;
-    cmd << std::fixed;  // Use fixed-point notation
     cmd << "SIMV " << top_k;
+    AppendSearchOptions(cmd, options);
     for (float val : vector) {
-      cmd << " " << val;
+      cmd << " " << FormatFloat(val);
     }
 
     auto result = SendCommand(cmd.str());
@@ -484,20 +572,28 @@ class NvecdClient::Impl {
       value.erase(0, value.find_first_not_of(" \t\r\n"));
       value.erase(value.find_last_not_of(" \t\r\n") + 1);
 
+      // Keys mirror the server's INFO output (info_handler.cpp). Values are
+      // parsed without throwing so malformed input cannot crash the client.
       if (key == "version") {
         info.version = value;
       } else if (key == "uptime_seconds") {
-        info.uptime_seconds = std::stoull(value);
-      } else if (key == "total_requests") {
-        info.total_requests = std::stoull(value);
+        info.uptime_seconds = ParseUint64(value);
+      } else if (key == "total_commands_processed") {
+        info.total_commands_processed = ParseUint64(value);
+      } else if (key == "failed_commands") {
+        info.failed_commands = ParseUint64(value);
+      } else if (key == "total_connections_received") {
+        info.total_connections = ParseUint64(value);
       } else if (key == "active_connections") {
-        info.active_connections = std::stoull(value);
+        info.active_connections = ParseUint64(value);
       } else if (key == "event_count") {
-        info.event_count = std::stoull(value);
+        info.event_count = ParseUint64(value);
       } else if (key == "vector_count") {
-        info.vector_count = std::stoull(value);
-      } else if (key == "co_occurrence_entries") {
-        info.co_occurrence_entries = std::stoull(value);
+        info.vector_count = ParseUint64(value);
+      } else if (key == "id_count") {
+        info.id_count = ParseUint64(value);
+      } else if (key == "ctx_count") {
+        info.ctx_count = ParseUint64(value);
       }
     }
 
@@ -641,7 +737,90 @@ class NvecdClient::Impl {
     return {};
   }
 
+  Expected<void, Error> Auth(const std::string& password) const {
+    if (auto err = ValidateNoControlCharacters(password, "password")) {
+      return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, *err));
+    }
+
+    std::ostringstream cmd;
+    cmd << "AUTH " << EscapeString(password);
+
+    auto result = SendCommand(cmd.str());
+    if (!result) {
+      return MakeUnexpected(result.error());
+    }
+
+    return CheckOkResponse(*result);
+  }
+
+  Expected<std::string, Error> DumpStatus() const {
+    auto result = SendCommand("DUMP STATUS");
+    if (!result) {
+      return MakeUnexpected(result.error());
+    }
+
+    if (IsErrorResponse(*result)) {
+      return MakeUnexpected(MakeError(ErrorCode::kClientServerError, ErrorBody(*result)));
+    }
+
+    return *result;
+  }
+
+  Expected<std::string, Error> CacheStats() const {
+    auto result = SendCommand("CACHE STATS");
+    if (!result) {
+      return MakeUnexpected(result.error());
+    }
+
+    if (IsErrorResponse(*result)) {
+      return MakeUnexpected(MakeError(ErrorCode::kClientServerError, ErrorBody(*result)));
+    }
+
+    return *result;
+  }
+
+  Expected<void, Error> CacheClear() const { return SimpleCacheCommand("CACHE CLEAR"); }
+
+  Expected<void, Error> CacheEnable() const { return SimpleCacheCommand("CACHE ENABLE"); }
+
+  Expected<void, Error> CacheDisable() const { return SimpleCacheCommand("CACHE DISABLE"); }
+
  private:
+  // Whether a response is an error, accepting both "ERROR ..." and Redis-style
+  // "-ERR ..." / "(error) ..." prefixes the server may emit.
+  static bool IsErrorResponse(const std::string& response) {
+    return response.find("ERROR") == 0 || response.find("-ERR") == 0 || response.find("(error)") == 0;
+  }
+
+  // Extract the human-readable body of an error response for the Error message.
+  static std::string ErrorBody(const std::string& response) {
+    if (response.find("ERROR ") == 0) {
+      return response.substr(kErrorPrefixLen);
+    }
+    return response;
+  }
+
+  // Validate a generic success response, accepting both "OK ..." and the
+  // Redis-style "+OK ..." prefix (AUTH returns "+OK").
+  static Expected<void, Error> CheckOkResponse(const std::string& response) {
+    if (IsErrorResponse(response)) {
+      return MakeUnexpected(MakeError(ErrorCode::kClientServerError, ErrorBody(response)));
+    }
+    if (response.find("OK") != 0 && response.find("+OK") != 0) {
+      return MakeUnexpected(MakeError(ErrorCode::kClientProtocolError, "Unexpected response: " + response));
+    }
+    return {};
+  }
+
+  // Issue a CACHE command whose success response is a single "OK ..." line.
+  Expected<void, Error> SimpleCacheCommand(const std::string& command) const {
+    auto result = SendCommand(command);
+    if (!result) {
+      return MakeUnexpected(result.error());
+    }
+    return CheckOkResponse(*result);
+  }
+
   ClientConfig config_;
   mutable int sock_ = -1;
 };
@@ -679,13 +858,22 @@ Expected<void, Error> NvecdClient::Vecset(const std::string& id, const std::vect
   return impl_->Vecset(id, vector);
 }
 
-Expected<SimResponse, Error> NvecdClient::Sim(const std::string& id, uint32_t top_k, const std::string& mode) const {
-  return impl_->Sim(id, top_k, mode);
+Expected<void, Error> NvecdClient::Metaset(const std::string& id, const std::string& metadata) const {
+  return impl_->Metaset(id, metadata);
+}
+
+Expected<SimResponse, Error> NvecdClient::Sim(const std::string& id, uint32_t top_k, const std::string& mode,
+                                              const SearchOptions& options) const {
+  return impl_->Sim(id, top_k, mode, options);
 }
 
 Expected<SimResponse, Error> NvecdClient::Simv(const std::vector<float>& vector, uint32_t top_k,
-                                               const std::string& mode) const {
-  return impl_->Simv(vector, top_k, mode);
+                                               const std::string& mode, const SearchOptions& options) const {
+  return impl_->Simv(vector, top_k, mode, options);
+}
+
+Expected<void, Error> NvecdClient::Auth(const std::string& password) const {
+  return impl_->Auth(password);
 }
 
 Expected<ServerInfo, Error> NvecdClient::Info() const {
@@ -710,6 +898,26 @@ Expected<std::string, Error> NvecdClient::Verify(const std::string& filepath) co
 
 Expected<std::string, Error> NvecdClient::DumpInfo(const std::string& filepath) const {
   return impl_->DumpInfo(filepath);
+}
+
+Expected<std::string, Error> NvecdClient::DumpStatus() const {
+  return impl_->DumpStatus();
+}
+
+Expected<std::string, Error> NvecdClient::CacheStats() const {
+  return impl_->CacheStats();
+}
+
+Expected<void, Error> NvecdClient::CacheClear() const {
+  return impl_->CacheClear();
+}
+
+Expected<void, Error> NvecdClient::CacheEnable() const {
+  return impl_->CacheEnable();
+}
+
+Expected<void, Error> NvecdClient::CacheDisable() const {
+  return impl_->CacheDisable();
 }
 
 Expected<void, Error> NvecdClient::EnableDebug() const {

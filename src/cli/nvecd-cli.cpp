@@ -189,17 +189,29 @@ char** CommandCompletion(const char* text, int start, int /* end */) {
 
   size_t token_count = tokens.size();
 
-  // EVENT <ctx> <id> <score>
+  // EVENT <ctx> ADD|SET|DEL <id> [<score>]
   if (command == "EVENT") {
     if (token_count == 1) {
       current_keywords = {"<context_id>"};
       return rl_completion_matches(text, KeywordGeneratorWrapper);
     }
     if (token_count == 2) {
-      current_keywords = {"<item_id>"};
+      current_keywords = {"ADD", "SET", "DEL"};
       return rl_completion_matches(text, KeywordGeneratorWrapper);
     }
     if (token_count == 3) {
+      current_keywords = {"<item_id>"};
+      return rl_completion_matches(text, KeywordGeneratorWrapper);
+    }
+    if (token_count == 4) {
+      // Score is required for ADD/SET, omitted for DEL.
+      std::string type = tokens[2];
+      for (char& character : type) {
+        character = static_cast<char>(toupper(character));
+      }
+      if (type == "DEL") {
+        return nullptr;
+      }
       current_keywords = {"<score>"};
       return rl_completion_matches(text, KeywordGeneratorWrapper);
     }
@@ -553,12 +565,33 @@ class NvecdClient {
     }
   }
 
-  void RunSingleCommand(const std::string& command) const {
+  /**
+   * @brief Execute a single command and return a process exit code.
+   *
+   * Returns 0 when the server replied with success and non-zero when it
+   * returned an error (or the connection failed), so the CLI is usable in
+   * scripts and CI pipelines.
+   *
+   * @param command Command line to send.
+   * @return 0 on success, 1 on an error response.
+   */
+  [[nodiscard]] int RunSingleCommand(const std::string& command) const {
     std::string response = SendCommand(command);
     PrintResponse(response);
+    return IsErrorResponse(response) ? 1 : 0;
   }
 
  private:
+  /**
+   * @brief Classify a server/transport response as an error.
+   *
+   * Recognizes the server's "ERROR ..." replies as well as the locally
+   * synthesized "(error) ..." transport messages produced by SendCommand.
+   */
+  static bool IsErrorResponse(const std::string& response) {
+    return response.find("ERROR") == 0 || response.find("(error)") == 0 || response.find("-ERR") == 0;
+  }
+
   static void PrintHelp() {
     std::cout << "Available commands:" << '\n';
     std::cout << "  EVENT <ctx> ADD <id> <score>      - Track user behavior event" << '\n';
@@ -749,17 +782,17 @@ int main(int argc, char* argv[]) {
   // Run interactive or single command mode
   if (config.interactive) {
     client.RunInteractive();
-  } else {
-    // Build command from args
-    std::ostringstream command;
-    for (size_t i = 0; i < command_args.size(); ++i) {
-      if (i > 0) {
-        command << " ";
-      }
-      command << command_args[i];
-    }
-    client.RunSingleCommand(command.str());
+    return 0;
   }
 
-  return 0;
+  // Build command from args
+  std::ostringstream command;
+  for (size_t i = 0; i < command_args.size(); ++i) {
+    if (i > 0) {
+      command << " ";
+    }
+    command << command_args[i];
+  }
+  // Propagate an error response as a non-zero exit code for scripting/CI.
+  return client.RunSingleCommand(command.str());
 }

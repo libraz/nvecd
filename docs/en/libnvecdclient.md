@@ -54,16 +54,16 @@ int main() {
     // Create client
     NvecdClient client(config);
 
-    // Connect
-    if (auto err = client.Connect()) {
-        std::cerr << "Connection failed: " << err->message << std::endl;
+    // Connect (Expected is truthy on success; check with !)
+    if (auto result = client.Connect(); !result) {
+        std::cerr << "Connection failed: " << result.error().message() << std::endl;
         return 1;
     }
 
     // Register vectors
     std::vector<float> vec1 = {0.1f, 0.2f, 0.3f, 0.4f};
-    if (auto err = client.Vecset("item123", vec1)) {
-        std::cerr << "Vecset failed: " << err->message << std::endl;
+    if (auto result = client.Vecset("item123", vec1); !result) {
+        std::cerr << "Vecset failed: " << result.error().message() << std::endl;
         return 1;
     }
 
@@ -88,11 +88,18 @@ g++ -std=c++17 -o myapp myapp.cpp -lnvecdclient
 
 ### Event Tracking
 
+The `Event` signature is `Event(ctx, type, id, score)`, where `type` is
+`"ADD"`, `"SET"`, or `"DEL"` (score is ignored for `DEL`).
+
 ```cpp
-// Track user behavior
-client.Event("user_alice", "product123", 100);  // score: 0-100
-client.Event("user_alice", "product456", 80);
-client.Event("user_bob", "product123", 100);
+// Track user behavior (ADD = stream event such as a click/view)
+client.Event("user_alice", "ADD", "product123", 100);  // score: 0-100
+client.Event("user_alice", "ADD", "product456", 80);
+client.Event("user_bob", "ADD", "product123", 100);
+
+// State event (SET) and deletion (DEL)
+client.Event("user_alice", "SET", "like:product123", 100);
+client.Event("user_alice", "DEL", "like:product123");
 
 // Get recommendations based on co-occurrence
 auto result = client.Sim("product123", 10, "events");
@@ -107,8 +114,8 @@ std::vector<float> product1_embedding = {...};  // From ML model
 client.Vecset("product123", product1_embedding);
 
 // Track user behavior
-client.Event("user_alice", "product123", 100);
-client.Event("user_alice", "product456", 80);
+client.Event("user_alice", "ADD", "product123", 100);
+client.Event("user_alice", "ADD", "product456", 80);
 
 // Fusion search: content + behavior
 auto result = client.Sim("product123", 10, "fusion");
@@ -136,7 +143,7 @@ auto info = client.Info();
 if (info) {
     std::cout << "Version: " << info->version << "\n";
     std::cout << "Uptime: " << info->uptime_seconds << "s\n";
-    std::cout << "Total requests: " << info->total_requests << "\n";
+    std::cout << "Commands processed: " << info->total_commands_processed << "\n";
 }
 ```
 
@@ -144,13 +151,13 @@ if (info) {
 
 ```cpp
 // Save snapshot
-if (auto err = client.Save("/backup/snapshot.dmp")) {
-    std::cerr << "Save failed: " << err->message << std::endl;
+if (auto result = client.Save("/backup/snapshot.dmp"); !result) {
+    std::cerr << "Save failed: " << result.error().message() << std::endl;
 }
 
 // Load snapshot
-if (auto err = client.Load("/backup/snapshot.dmp")) {
-    std::cerr << "Load failed: " << err->message << std::endl;
+if (auto result = client.Load("/backup/snapshot.dmp"); !result) {
+    std::cerr << "Load failed: " << result.error().message() << std::endl;
 }
 ```
 
@@ -194,7 +201,7 @@ int main() {
     // Connect
     if (nvecdclient_connect(client) != 0) {
         fprintf(stderr, "Connection failed: %s\n",
-                nvecdclient_get_last_error());
+                nvecdclient_get_last_error(client));
         nvecdclient_destroy(client);
         return 1;
     }
@@ -203,7 +210,7 @@ int main() {
     float vector[] = {0.1f, 0.2f, 0.3f, 0.4f};
     if (nvecdclient_vecset(client, "item123", vector, 4) != 0) {
         fprintf(stderr, "Vecset failed: %s\n",
-                nvecdclient_get_last_error());
+                nvecdclient_get_last_error(client));
     }
 
     // Search
@@ -211,7 +218,7 @@ int main() {
     if (nvecdclient_sim(client, "item123", 10, "vectors", &result) == 0) {
         printf("Found %zu results:\n", result->count);
         for (size_t i = 0; i < result->count; i++) {
-            printf("  %s: %f\n", result->ids[i], result->scores[i]);
+            printf("  %s: %f\n", result->results[i].id, result->results[i].score);
         }
         nvecdclient_free_sim_response(result);
     }
@@ -233,9 +240,9 @@ gcc -o myapp myapp.c -lnvecdclient
 ### Event Tracking (C API)
 
 ```c
-// Track events
-nvecdclient_event(client, "user_alice", "product123", 100);
-nvecdclient_event(client, "user_alice", "product456", 80);
+// Track events: nvecdclient_event(client, ctx, type, id, score)
+nvecdclient_event(client, "user_alice", "ADD", "product123", 100);
+nvecdclient_event(client, "user_alice", "ADD", "product456", 80);
 
 // Search by co-occurrence
 NvecdSimResponse_C* result = NULL;
@@ -252,7 +259,7 @@ NvecdSimResponse_C* result = NULL;
 
 if (nvecdclient_simv(client, query_vector, 4, 10, "vectors", &result) == 0) {
     for (size_t i = 0; i < result->count; i++) {
-        printf("%s: %f\n", result->ids[i], result->scores[i]);
+        printf("%s: %f\n", result->results[i].id, result->results[i].score);
     }
     nvecdclient_free_sim_response(result);
 }
@@ -363,8 +370,8 @@ Napi::Value Search(const Napi::CallbackInfo& info) {
     Napi::Array jsResults = Napi::Array::New(env, result->count);
     for (size_t i = 0; i < result->count; i++) {
         Napi::Object obj = Napi::Object::New(env);
-        obj.Set("id", Napi::String::New(env, result->ids[i]));
-        obj.Set("score", Napi::Number::New(env, result->scores[i]));
+        obj.Set("id", Napi::String::New(env, result->results[i].id));
+        obj.Set("score", Napi::Number::New(env, result->results[i].score));
         jsResults[i] = obj;
     }
 
@@ -404,15 +411,30 @@ console.log(results);
 - `recv_buffer_size` - Receive buffer size (default: 65536)
 
 #### SimResponse
-- `results` - Vector of SimilarityResult (id, score pairs)
+- `results` - Vector of SimResultItem (`id`, `score`)
+- `mode` - Search mode used
+
+#### SearchOptions
+Optional parameters for `Sim`/`Simv`:
+- `filter` - Metadata filter expression (e.g. `"category:books"`)
+- `min_score` - `std::optional<float>` minimum score threshold
+- `adaptive` - `std::optional<bool>` adaptive fusion toggle (SIM fusion only)
 
 #### ServerInfo
+Field names mirror the keys emitted by the server's `INFO` command:
 - `version` - Server version string
 - `uptime_seconds` - Server uptime in seconds
-- `total_requests` - Total requests processed
+- `total_commands_processed` - Total commands processed
+- `failed_commands` - Commands that returned an error
+- `total_connections` - Connections received
+- `active_connections` - Currently open connections
+- `event_count` - Total events stored
+- `vector_count` - Total vectors stored
+- `id_count` - Distinct co-occurrence IDs
+- `ctx_count` - Distinct event contexts
 
 #### Error
-- `message` - Error message string
+- `message()` - Error message string
 
 ### C++ API Methods
 
@@ -422,16 +444,25 @@ console.log(results);
 - `bool IsConnected()` - Check connection status
 
 #### nvecd Commands
-- `Expected<void, Error> Event(ctx, id, score)` - Track event
+- `Expected<void, Error> Event(ctx, type, id, score)` - Track event (`type`: "ADD"/"SET"/"DEL")
 - `Expected<void, Error> Vecset(id, vector)` - Register vector
-- `Expected<SimResponse, Error> Sim(id, top_k, mode)` - Search by ID
-- `Expected<SimResponse, Error> Simv(vector, top_k, mode)` - Search by vector
+- `Expected<void, Error> Metaset(id, metadata)` - Attach metadata for filtered search
+- `Expected<SimResponse, Error> Sim(id, top_k, mode, options)` - Search by ID
+- `Expected<SimResponse, Error> Simv(vector, top_k, mode, options)` - Search by vector
 
 #### Admin Commands
+- `Expected<void, Error> Auth(password)` - Authenticate the connection
 - `Expected<ServerInfo, Error> Info()` - Get server info
 - `Expected<std::string, Error> GetConfig()` - Get configuration
 - `Expected<std::string, Error> Save(filepath)` - Save snapshot
 - `Expected<std::string, Error> Load(filepath)` - Load snapshot
+- `Expected<std::string, Error> Verify(filepath)` - Verify snapshot integrity
+- `Expected<std::string, Error> DumpInfo(filepath)` - Snapshot metadata
+- `Expected<std::string, Error> DumpStatus()` - Background snapshot status
+- `Expected<std::string, Error> CacheStats()` - Cache statistics
+- `Expected<void, Error> CacheClear()` - Clear cache
+- `Expected<void, Error> CacheEnable()` - Enable cache
+- `Expected<void, Error> CacheDisable()` - Disable cache
 - `Expected<void, Error> EnableDebug()` - Enable debug mode
 - `Expected<void, Error> DisableDebug()` - Disable debug mode
 
@@ -442,12 +473,23 @@ See `nvecdclient_c.h` for full function documentation.
 Key functions:
 - `nvecdclient_create()` - Create client
 - `nvecdclient_connect()` - Connect to server
-- `nvecdclient_event()` - Track event
+- `nvecdclient_auth()` - Authenticate the connection
+- `nvecdclient_event()` - Track event (`ctx, type, id, score`)
 - `nvecdclient_vecset()` - Register vector
-- `nvecdclient_sim()` - Search by ID
-- `nvecdclient_simv()` - Search by vector
+- `nvecdclient_metaset()` - Attach metadata
+- `nvecdclient_sim()` / `nvecdclient_sim_ex()` - Search by ID (the `_ex` form takes `NvecdSearchOptions_C`)
+- `nvecdclient_simv()` / `nvecdclient_simv_ex()` - Search by vector
 - `nvecdclient_info()` - Get server info
+- `nvecdclient_cache_stats()` / `_clear()` / `_enable()` / `_disable()` - Cache management
+- `nvecdclient_dump_status()` - Background snapshot status
 - `nvecdclient_free_*()` - Free result structures
+
+**C API memory ownership:** functions returning a string via a `char**` out-parameter
+(e.g. `nvecdclient_get_config`, `nvecdclient_dump_status`, `nvecdclient_cache_stats`)
+transfer ownership to the caller, who must free it with `nvecdclient_free_string()`.
+`NvecdSimResponse_C` is freed with `nvecdclient_free_sim_response()` and
+`NvecdServerInfo_C` with `nvecdclient_free_server_info()`. The string returned by
+`nvecdclient_get_last_error()` is owned by the client and must **not** be freed.
 
 ## Thread Safety
 
@@ -466,8 +508,8 @@ Use the `operator bool()` to check for errors:
 ```cpp
 auto result = client.Sim("item123", 10, "vectors");
 if (!result) {
-    // Error: result.error().message
-    std::cerr << "Error: " << result.error().message << "\n";
+    // Error: result.error().message()
+    std::cerr << "Error: " << result.error().message() << "\n";
 } else {
     // Success: result.value()
     for (const auto& item : result->results) {
@@ -515,14 +557,14 @@ for (const auto& query : queries) {
 
 ✅ **Good:** Check all errors
 ```cpp
-if (auto err = client.Connect()) {
-    std::cerr << "Connection failed: " << err->message << "\n";
+if (auto result = client.Connect(); !result) {
+    std::cerr << "Connection failed: " << result.error().message() << "\n";
     return 1;
 }
 
 auto result = client.Sim("item123", 10, "vectors");
 if (!result) {
-    std::cerr << "Search failed: " << result.error().message << "\n";
+    std::cerr << "Search failed: " << result.error().message() << "\n";
     return 1;
 }
 ```
@@ -574,8 +616,8 @@ int main() {
     NvecdClient client(config);
 
     // Connect
-    if (auto err = client.Connect()) {
-        std::cerr << "Connection failed: " << err->message << "\n";
+    if (auto result = client.Connect(); !result) {
+        std::cerr << "Connection failed: " << result.error().message() << "\n";
         return 1;
     }
 
@@ -589,19 +631,19 @@ int main() {
     };
 
     for (const auto& [id, vector] : products) {
-        if (auto err = client.Vecset(id, vector)) {
+        if (auto result = client.Vecset(id, vector); !result) {
             std::cerr << "Vecset failed for " << id << ": "
-                      << err->message << "\n";
+                      << result.error().message() << "\n";
         } else {
             std::cout << "Registered: " << id << "\n";
         }
     }
 
-    // Track user behavior
-    client.Event("user_alice", "laptop_001", 100);  // Purchased
-    client.Event("user_alice", "laptop_002", 80);   // Viewed
-    client.Event("user_bob", "laptop_001", 100);    // Purchased
-    client.Event("user_bob", "phone_001", 90);      // Viewed
+    // Track user behavior: Event(ctx, type, id, score)
+    client.Event("user_alice", "ADD", "laptop_001", 100);  // Purchased
+    client.Event("user_alice", "ADD", "laptop_002", 80);   // Viewed
+    client.Event("user_bob", "ADD", "laptop_001", 100);    // Purchased
+    client.Event("user_bob", "ADD", "phone_001", 90);      // Viewed
 
     // Get content-based recommendations
     std::cout << "\nContent-based recommendations for laptop_001:\n";
@@ -636,7 +678,7 @@ int main() {
         std::cout << "\nServer Info:\n";
         std::cout << "  Version: " << info->version << "\n";
         std::cout << "  Uptime: " << info->uptime_seconds << "s\n";
-        std::cout << "  Total requests: " << info->total_requests << "\n";
+        std::cout << "  Commands processed: " << info->total_commands_processed << "\n";
     }
 
     client.Disconnect();

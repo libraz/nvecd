@@ -77,16 +77,39 @@ struct SimResponse {
 };
 
 /**
+ * @brief Optional search parameters for SIM/SIMV.
+ *
+ * These map directly to the optional tokens of the SIM/SIMV wire commands:
+ * @code
+ *   SIM  <id>   <top_k> [using=<mode>] [filter=<expr>] [min_score=<f>] [adaptive=on|off]
+ *   SIMV <top_k> [filter=<expr>] [min_score=<f>] <f1> <f2> ...
+ * @endcode
+ * Empty/unset fields are omitted from the command, preserving server defaults.
+ * Note: @c adaptive applies only to fusion-mode SIM (ignored by SIMV).
+ */
+struct SearchOptions {
+  std::string filter;              ///< Metadata filter expression, e.g. "category:books"
+  std::optional<float> min_score;  ///< Minimum score threshold (min_score=)
+  std::optional<bool> adaptive;    ///< Adaptive fusion toggle (adaptive=on|off); SIM fusion only
+};
+
+/**
  * @brief Server information
+ *
+ * Field names mirror the keys emitted by the server's INFO command
+ * (see src/server/handlers/info_handler.cpp).
  */
 struct ServerInfo {
   std::string version;
   uint64_t uptime_seconds = 0;
-  uint64_t total_requests = 0;
-  uint64_t active_connections = 0;
-  uint64_t event_count = 0;            ///< Total events stored
-  uint64_t vector_count = 0;           ///< Total vectors stored
-  uint64_t co_occurrence_entries = 0;  ///< Co-occurrence index entries
+  uint64_t total_commands_processed = 0;  ///< INFO key: total_commands_processed
+  uint64_t failed_commands = 0;           ///< INFO key: failed_commands
+  uint64_t total_connections = 0;         ///< INFO key: total_connections_received
+  uint64_t active_connections = 0;        ///< INFO key: active_connections
+  uint64_t event_count = 0;               ///< Total events stored (INFO key: event_count)
+  uint64_t vector_count = 0;              ///< Total vectors stored (INFO key: vector_count)
+  uint64_t id_count = 0;                  ///< Distinct co-occurrence IDs (INFO key: id_count)
+  uint64_t ctx_count = 0;                 ///< Distinct event contexts (INFO key: ctx_count)
 };
 
 /**
@@ -206,18 +229,31 @@ class NvecdClient {
                                                            const std::vector<float>& vector) const;
 
   /**
+   * @brief Attach metadata to an existing item (METASET command)
+   *
+   * Sends @c "METASET <id> <key:value[,key:value...]>". The item must already
+   * exist via Vecset(). Stored metadata enables filtered SIM/SIMV queries.
+   *
+   * @param id Item ID (must already exist in the vector store)
+   * @param metadata Metadata expression, e.g. "category:books,active:true"
+   * @return Expected<void, Error>
+   */
+  nvecd::utils::Expected<void, nvecd::utils::Error> Metaset(const std::string& id, const std::string& metadata) const;
+
+  /**
    * @brief Similarity search by ID (SIM command)
    *
    * @param id Document/vector ID
    * @param top_k Number of results to return (default: 10)
    * @param mode Search mode: "events", "vectors", or "fusion" (default: "fusion")
+   * @param options Optional filter/min_score/adaptive parameters
    * @return Expected<SimResponse, Error>
    */
   nvecd::utils::Expected<SimResponse, nvecd::utils::Error> Sim(
       const std::string& id,
       uint32_t top_k = 10,  // NOLINT(readability-magic-numbers,cppcoreguidelines-avoid-magic-numbers)
                             // - Default result limit
-      const std::string& mode = "fusion") const;
+      const std::string& mode = "fusion", const SearchOptions& options = {}) const;
 
   /**
    * @brief Similarity search by vector (SIMV command)
@@ -225,17 +261,30 @@ class NvecdClient {
    * @param vector Query vector
    * @param top_k Number of results to return (default: 10)
    * @param mode Search mode: "vectors" only (default: "vectors")
+   * @param options Optional filter/min_score parameters (adaptive is ignored)
    * @return Expected<SimResponse, Error>
    */
   nvecd::utils::Expected<SimResponse, nvecd::utils::Error> Simv(
       const std::vector<float>& vector,
       uint32_t top_k = 10,  // NOLINT(readability-magic-numbers,cppcoreguidelines-avoid-magic-numbers)
                             // - Default result limit
-      const std::string& mode = "vectors") const;
+      const std::string& mode = "vectors", const SearchOptions& options = {}) const;
 
   //
   // MygramDB-compatible commands
   //
+
+  /**
+   * @brief Authenticate the connection (AUTH command)
+   *
+   * Required when the server is configured with @c security.requirepass. Must be
+   * called after Connect() and before issuing write/admin commands. Read
+   * commands work without authentication.
+   *
+   * @param password Server password
+   * @return Expected<void, Error> - success, or an error on invalid password
+   */
+  nvecd::utils::Expected<void, nvecd::utils::Error> Auth(const std::string& password) const;
 
   /**
    * @brief Get server information (INFO command)
@@ -276,6 +325,36 @@ class NvecdClient {
    * @return Expected<std::string, Error> - snapshot metadata or error
    */
   nvecd::utils::Expected<std::string, nvecd::utils::Error> DumpInfo(const std::string& filepath) const;
+
+  /**
+   * @brief Query background snapshot status (DUMP STATUS command)
+   * @return Expected<std::string, Error> - raw status block or error
+   */
+  nvecd::utils::Expected<std::string, nvecd::utils::Error> DumpStatus() const;
+
+  /**
+   * @brief Get cache statistics (CACHE STATS command)
+   * @return Expected<std::string, Error> - raw stats block or error
+   */
+  nvecd::utils::Expected<std::string, nvecd::utils::Error> CacheStats() const;
+
+  /**
+   * @brief Clear all cache entries (CACHE CLEAR command)
+   * @return Expected<void, Error>
+   */
+  nvecd::utils::Expected<void, nvecd::utils::Error> CacheClear() const;
+
+  /**
+   * @brief Enable the query result cache (CACHE ENABLE command)
+   * @return Expected<void, Error>
+   */
+  nvecd::utils::Expected<void, nvecd::utils::Error> CacheEnable() const;
+
+  /**
+   * @brief Disable the query result cache (CACHE DISABLE command)
+   * @return Expected<void, Error>
+   */
+  nvecd::utils::Expected<void, nvecd::utils::Error> CacheDisable() const;
 
   /**
    * @brief Enable debug mode for this connection (DEBUG ON command)
