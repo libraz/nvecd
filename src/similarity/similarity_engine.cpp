@@ -158,10 +158,14 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
   const float* query_ptr = snap.matrix + query_idx * snap.dim;
   float query_norm = snap.norms[query_idx];
 
-  // Oversampling factor for post-filter: fetch more candidates then filter
+  // Oversampling factor for post-filter: fetch more candidates then filter.
+  // The product is computed in int64_t and clamped to max_top_k so the
+  // oversampling cannot overflow int even if a large top_k slips through.
   bool has_filter = !filter.Empty() && metadata_store_ != nullptr;
-  constexpr int kOversamplingFactor = 3;
-  int fetch_k = has_filter ? validated_top_k.value() * kOversamplingFactor : validated_top_k.value();
+  constexpr int64_t kOversamplingFactor = 3;
+  int64_t oversampled =
+      has_filter ? static_cast<int64_t>(validated_top_k.value()) * kOversamplingFactor : validated_top_k.value();
+  int fetch_k = static_cast<int>(std::min<int64_t>(oversampled, config_.max_top_k));
 
   // ANN accelerated path (HNSW or IVF)
   if (ann_index_ && IsAnnIndexReady()) {
@@ -309,8 +313,11 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
     return utils::MakeUnexpected(validated_top_k.error());
   }
 
-  // Get results from both sources (request more to ensure good coverage)
-  int fetch_k = std::min(validated_top_k.value() * 3, static_cast<int>(config_.max_top_k));
+  // Get results from both sources (request more to ensure good coverage).
+  // The oversampling product is computed in int64_t and clamped to max_top_k so
+  // it cannot overflow int even if a large top_k slips through.
+  int fetch_k =
+      static_cast<int>(std::min<int64_t>(static_cast<int64_t>(validated_top_k.value()) * 3, config_.max_top_k));
 
   auto event_results = SearchByIdEvents(item_id, fetch_k);
 
@@ -448,9 +455,13 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
   // Compute query norm using SIMD
   float query_norm = vectors::simd::GetOptimalImpl().l2_norm(query_vector.data(), query_vector.size());
 
+  // The oversampling product is computed in int64_t and clamped to max_top_k so
+  // it cannot overflow int even if a large top_k slips through.
   bool has_filter = !filter.Empty() && metadata_store_ != nullptr;
-  constexpr int kOversamplingFactor = 3;
-  int fetch_k = has_filter ? validated_top_k.value() * kOversamplingFactor : validated_top_k.value();
+  constexpr int64_t kOversamplingFactor = 3;
+  int64_t oversampled =
+      has_filter ? static_cast<int64_t>(validated_top_k.value()) * kOversamplingFactor : validated_top_k.value();
+  int fetch_k = static_cast<int>(std::min<int64_t>(oversampled, config_.max_top_k));
 
   // ANN accelerated path (HNSW or IVF). The query vector is caller-owned, so
   // no snapshot is needed for the search itself; the IVF adapter takes its own
@@ -610,12 +621,12 @@ std::vector<size_t> SimilarityEngine::SampleIndices(size_t total, size_t sample_
 
 utils::Expected<int, utils::Error> SimilarityEngine::ValidateTopK(int top_k) const {
   if (top_k <= 0) {
-    auto error = utils::MakeError(utils::ErrorCode::kInvalidArgument, "top_k must be positive");
+    auto error = utils::MakeError(utils::ErrorCode::kCommandInvalidTopK, "top_k must be positive");
     return utils::MakeUnexpected(error);
   }
 
   if (top_k > static_cast<int>(config_.max_top_k)) {
-    auto error = utils::MakeError(utils::ErrorCode::kInvalidArgument,
+    auto error = utils::MakeError(utils::ErrorCode::kCommandInvalidTopK,
                                   "top_k exceeds maximum allowed: " + std::to_string(config_.max_top_k));
     return utils::MakeUnexpected(error);
   }

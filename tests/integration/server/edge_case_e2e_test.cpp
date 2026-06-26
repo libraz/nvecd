@@ -140,14 +140,16 @@ TEST_F(EdgeCaseE2ETest, ZeroScore) {
 }
 
 // ---------------------------------------------------------------------------
-// Test 8: Very large score
+// Test 8: Out-of-range score is rejected
 // ---------------------------------------------------------------------------
 
 TEST_F(EdgeCaseE2ETest, VeryLargeScore) {
   TcpClient client("127.0.0.1", port_);
 
+  // Scores must fall in the documented [0, 100] range; an out-of-range score
+  // is rejected rather than silently corrupting co-occurrence weights.
   auto resp = client.SendCommand("EVENT ctx1 ADD item1 999999999");
-  EXPECT_TRUE(ContainsOK(resp)) << "EVENT with very large score should succeed, got: " + resp;
+  EXPECT_FALSE(ContainsOK(resp)) << "EVENT with out-of-range score should be rejected, got: " + resp;
 }
 
 // ---------------------------------------------------------------------------

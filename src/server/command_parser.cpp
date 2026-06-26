@@ -25,6 +25,9 @@ constexpr size_t kAdaptivePrefixLength = 9;    // Length of "adaptive=" prefix
 constexpr size_t kFilterPrefixLength = 7;      // Length of "filter=" prefix
 constexpr size_t kMinScorePrefixLength = 10;   // Length of "min_score=" prefix
 
+constexpr int kMinEventScore = 0;    // Minimum valid event score (inclusive)
+constexpr int kMaxEventScore = 100;  // Maximum valid event score (inclusive)
+
 /**
  * @brief Split string_view by delimiter, returning owned strings
  */
@@ -87,6 +90,28 @@ utils::Expected<int, utils::Error> ParseInt(const std::string& str) {
 }
 
 /**
+ * @brief Parse an event score and validate its documented [0, 100] range
+ *
+ * Scores are integers in the inclusive range [0, 100]. Negative or otherwise
+ * out-of-range values are rejected with kEventInvalidScore so the same contract
+ * is enforced at parse time on every protocol surface.
+ *
+ * @param str Token to parse as an event score
+ * @return Expected<int, Error> Validated score or error
+ */
+utils::Expected<int, utils::Error> ParseEventScore(const std::string& str) {
+  auto value = ParseInt(str);
+  if (!value) {
+    return utils::MakeUnexpected(value.error());
+  }
+  if (*value < kMinEventScore || *value > kMaxEventScore) {
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kEventInvalidScore,
+                                                  "Score must be in range [0, 100], got " + std::to_string(*value)));
+  }
+  return *value;
+}
+
+/**
  * @brief Parse float from string
  */
 utils::Expected<float, utils::Error> ParseFloat(const std::string& str) {
@@ -102,6 +127,34 @@ utils::Expected<float, utils::Error> ParseFloat(const std::string& str) {
     return utils::MakeUnexpected(
         utils::MakeError(utils::ErrorCode::kCommandInvalidArgument, "Failed to parse float: " + str));
   }
+}
+
+/**
+ * @brief Parse a top_k token and validate it against the configured maximum
+ *
+ * top_k must be a positive integer. When @p max_top_k is non-zero, values that
+ * exceed it are rejected at parse time with kCommandInvalidTopK so the upper
+ * bound is enforced before the request reaches the similarity engine.
+ *
+ * @param str Token to parse as top_k
+ * @param max_top_k Maximum allowed top_k (0 = no upper-bound check)
+ * @return Expected<int, Error> Validated top_k or error
+ */
+utils::Expected<int, utils::Error> ParseTopK(const std::string& str, uint32_t max_top_k) {
+  auto value = ParseInt(str);
+  if (!value) {
+    return utils::MakeUnexpected(value.error());
+  }
+  if (*value <= 0) {
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandInvalidTopK,
+                                                  "top_k must be positive, got " + std::to_string(*value)));
+  }
+  if (max_top_k > 0 && static_cast<uint32_t>(*value) > max_top_k) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kCommandInvalidTopK,
+                         "top_k " + std::to_string(*value) + " exceeds maximum allowed: " + std::to_string(max_top_k)));
+  }
+  return *value;
 }
 
 /**
@@ -151,7 +204,7 @@ utils::Expected<std::vector<float>, utils::Error> ParseVector(const std::string&
   return vec;
 }
 
-utils::Expected<Command, utils::Error> ParseCommand(const std::string& request) {
+utils::Expected<Command, utils::Error> ParseCommand(const std::string& request, uint32_t max_top_k) {
   if (request.empty()) {
     return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "Empty command"));
   }
@@ -195,7 +248,7 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request) 
                              "EVENT ADD requires 4-5 arguments: <ctx> ADD <id> <score> [timestamp=<value>]"));
       }
       cmd.id = tokens[3];
-      auto score_result = ParseInt(tokens[4]);
+      auto score_result = ParseEventScore(tokens[4]);
       if (!score_result) {
         return utils::MakeUnexpected(score_result.error());
       }
@@ -216,7 +269,7 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request) 
                              "EVENT SET requires 4-5 arguments: <ctx> SET <id> <score> [timestamp=<value>]"));
       }
       cmd.id = tokens[3];
-      auto score_result = ParseInt(tokens[4]);
+      auto score_result = ParseEventScore(tokens[4]);
       if (!score_result) {
         return utils::MakeUnexpected(score_result.error());
       }
@@ -293,7 +346,7 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request) 
     cmd.type = CommandType::kSim;
     cmd.id = tokens[1];
 
-    auto top_k_result = ParseInt(tokens[2]);
+    auto top_k_result = ParseTopK(tokens[2], max_top_k);
     if (!top_k_result) {
       return utils::MakeUnexpected(top_k_result.error());
     }
@@ -346,7 +399,7 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request) 
     }
     cmd.type = CommandType::kSimv;
 
-    auto top_k_result = ParseInt(tokens[1]);
+    auto top_k_result = ParseTopK(tokens[1], max_top_k);
     if (!top_k_result) {
       return utils::MakeUnexpected(top_k_result.error());
     }

@@ -809,13 +809,22 @@ void HttpServer::HandleEvent(const httplib::Request& req, httplib::Response& res
       return;
     }
 
+    constexpr int kMinEventScore = 0;
+    constexpr int kMaxEventScore = 100;
     int score = 0;
     if (event_type != events::EventType::DEL) {
-      if (!JsonNumberIsFinite(body["score"])) {
-        SendError(res, kHttpBadRequest, "Field 'score' must be a number");
+      // Scores are integers in [0, 100]. Reject non-integer (float) values
+      // instead of silently truncating, to match the TCP integer contract.
+      if (!body["score"].is_number_integer()) {
+        SendError(res, kHttpBadRequest, "Field 'score' must be an integer");
         return;
       }
-      score = body["score"];
+      int64_t raw_score = body["score"].get<int64_t>();
+      if (raw_score < kMinEventScore || raw_score > kMaxEventScore) {
+        SendError(res, kHttpBadRequest, "Field 'score' must be in range [0, 100], got " + std::to_string(raw_score));
+        return;
+      }
+      score = static_cast<int>(raw_score);
     }
 
     uint64_t timestamp = 0;

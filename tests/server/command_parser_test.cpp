@@ -33,6 +33,28 @@ TEST(CommandParserTest, ParseEvent_InvalidScore) {
   EXPECT_EQ(result.error().code(), ErrorCode::kCommandInvalidArgument);
 }
 
+TEST(CommandParserTest, ParseEvent_NegativeScoreRejected) {
+  auto result = ParseCommand("EVENT user123 ADD item456 -5");
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), ErrorCode::kEventInvalidScore);
+}
+
+TEST(CommandParserTest, ParseEvent_ScoreAboveMaxRejected) {
+  auto result = ParseCommand("EVENT user123 SET item456 101");
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), ErrorCode::kEventInvalidScore);
+}
+
+TEST(CommandParserTest, ParseEvent_BoundaryScoresAccepted) {
+  auto low = ParseCommand("EVENT user123 ADD item456 0");
+  ASSERT_TRUE(low.has_value());
+  EXPECT_EQ(low->score, 0);
+
+  auto high = ParseCommand("EVENT user123 ADD item456 100");
+  ASSERT_TRUE(high.has_value());
+  EXPECT_EQ(high->score, 100);
+}
+
 // VECSET command tests
 TEST(CommandParserTest, ParseVecset_Valid) {
   auto result = ParseCommand("VECSET item123 0.1 0.2 0.3 0.4");
@@ -103,6 +125,30 @@ TEST(CommandParserTest, ParseSim_WithMode) {
   EXPECT_EQ(result->id, "item123");
   EXPECT_EQ(result->top_k, 20);
   EXPECT_EQ(result->mode, "events");
+}
+
+TEST(CommandParserTest, ParseSim_TopKExceedsMaxRejected) {
+  auto result = ParseCommand("SIM item123 200", /*max_top_k=*/100);
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), ErrorCode::kCommandInvalidTopK);
+}
+
+TEST(CommandParserTest, ParseSim_TopKWithinMaxAccepted) {
+  auto result = ParseCommand("SIM item123 100", /*max_top_k=*/100);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->top_k, 100);
+}
+
+TEST(CommandParserTest, ParseSim_TopKZeroRejected) {
+  auto result = ParseCommand("SIM item123 0");
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), ErrorCode::kCommandInvalidTopK);
+}
+
+TEST(CommandParserTest, ParseSimv_TopKExceedsMaxRejected) {
+  auto result = ParseCommand("SIMV 200 0.1 0.2", /*max_top_k=*/100);
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), ErrorCode::kCommandInvalidTopK);
 }
 
 TEST(CommandParserTest, ParseSim_MissingArgs) {

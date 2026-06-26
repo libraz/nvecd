@@ -284,7 +284,7 @@ TEST_F(SimilarityE2ETest, EventSetViaTCP) {
   ASSERT_TRUE(ContainsOK(client.SendCommand("EVENT ctx1 ADD item2 50")));
 
   // SET updates item2's score
-  auto resp = client.SendCommand("EVENT ctx1 SET item2 200");
+  auto resp = client.SendCommand("EVENT ctx1 SET item2 100");
   EXPECT_TRUE(ContainsOK(resp)) << "EVENT SET should return OK";
 
   // Verify search still works after SET

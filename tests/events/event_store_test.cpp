@@ -142,7 +142,7 @@ TEST(EventStoreTest, EmptyContext) {
 
   auto result = store.AddEvent("", "item1", 10);
   ASSERT_FALSE(result.has_value());
-  EXPECT_EQ(result.error().code(), utils::ErrorCode::kInvalidArgument);
+  EXPECT_EQ(result.error().code(), utils::ErrorCode::kEventStoreError);
   EXPECT_NE(result.error().message().find("Context"), std::string::npos);
 
   EXPECT_EQ(store.GetContextCount(), 0);
@@ -155,7 +155,7 @@ TEST(EventStoreTest, EmptyId) {
 
   auto result = store.AddEvent("user1", "", 10);
   ASSERT_FALSE(result.has_value());
-  EXPECT_EQ(result.error().code(), utils::ErrorCode::kInvalidArgument);
+  EXPECT_EQ(result.error().code(), utils::ErrorCode::kEventStoreError);
   EXPECT_NE(result.error().message().find("ID"), std::string::npos);
 
   EXPECT_EQ(store.GetContextCount(), 0);
@@ -166,26 +166,50 @@ TEST(EventStoreTest, NegativeScore) {
   auto config = MakeConfig();
   EventStore store(config);
 
-  // Negative scores should be allowed
+  // Negative scores are out of the documented [0, 100] range and rejected.
   auto result = store.AddEvent("user1", "item1", -5);
-  ASSERT_TRUE(result.has_value());
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), utils::ErrorCode::kEventInvalidScore);
 
-  auto events = store.GetEvents("user1");
-  ASSERT_EQ(events.size(), 1);
-  EXPECT_EQ(events[0].score, -5);
+  EXPECT_EQ(store.GetContextCount(), 0);
+}
+
+TEST(EventStoreTest, ScoreAboveMaxRejected) {
+  auto config = MakeConfig();
+  EventStore store(config);
+
+  // Scores above the documented maximum of 100 are rejected.
+  auto result = store.AddEvent("user1", "item1", 101);
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), utils::ErrorCode::kEventInvalidScore);
+
+  EXPECT_EQ(store.GetContextCount(), 0);
 }
 
 TEST(EventStoreTest, ZeroScore) {
   auto config = MakeConfig();
   EventStore store(config);
 
-  // Zero scores should be allowed
+  // Zero scores are at the lower bound of the valid range and accepted.
   auto result = store.AddEvent("user1", "item1", 0);
   ASSERT_TRUE(result.has_value());
 
   auto events = store.GetEvents("user1");
   ASSERT_EQ(events.size(), 1);
   EXPECT_EQ(events[0].score, 0);
+}
+
+TEST(EventStoreTest, MaxScoreAccepted) {
+  auto config = MakeConfig();
+  EventStore store(config);
+
+  // The documented maximum of 100 is accepted.
+  auto result = store.AddEvent("user1", "item1", 100);
+  ASSERT_TRUE(result.has_value());
+
+  auto events = store.GetEvents("user1");
+  ASSERT_EQ(events.size(), 1);
+  EXPECT_EQ(events[0].score, 100);
 }
 
 // ============================================================================
@@ -314,7 +338,8 @@ TEST(EventStoreTest, ConcurrentReadsAndWrites) {
   std::thread writer([&store, &stop]() {
     int counter = 100;
     while (!stop.load()) {
-      store.AddEvent("user1", "item" + std::to_string(counter), counter);
+      // Keep the score within the valid [0, 100] range while item IDs stay unique.
+      store.AddEvent("user1", "item" + std::to_string(counter), counter % 101);
       ++counter;
       std::this_thread::sleep_for(std::chrono::microseconds(10));
     }

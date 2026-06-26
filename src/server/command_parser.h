@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <vector>
@@ -77,9 +78,10 @@ struct Command {
  * - DEBUG ON|OFF
  *
  * @param request Raw request string (may contain multiple lines for VECSET/SIMV)
+ * @param max_top_k Maximum allowed top_k for SIM/SIMV (0 = no upper-bound check)
  * @return Expected<Command, Error> Parsed command or error
  */
-utils::Expected<Command, utils::Error> ParseCommand(const std::string& request);
+utils::Expected<Command, utils::Error> ParseCommand(const std::string& request, uint32_t max_top_k = 0);
 
 /**
  * @brief Parse a vector from string (space-separated floats)

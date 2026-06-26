@@ -26,6 +26,11 @@ EventStore::EventStore(const config::EventsConfig& config) : config_(config) {
 
 namespace {
 
+/// @brief Minimum valid event score (inclusive).
+constexpr int kMinEventScore = 0;
+/// @brief Maximum valid event score (inclusive).
+constexpr int kMaxEventScore = 100;
+
 /// @brief Resolve a request timestamp, substituting current time for 0.
 uint64_t ResolveTimestamp(uint64_t timestamp) {
   if (timestamp != 0) {
@@ -52,13 +57,24 @@ utils::Expected<EventStore::IngestResult, utils::Error> EventStore::AddEventAndG
                                                                                         uint64_t timestamp) {
   // Validate inputs
   if (ctx.empty()) {
-    auto error = utils::MakeError(utils::ErrorCode::kInvalidArgument, "Context cannot be empty");
+    auto error = utils::MakeError(utils::ErrorCode::kEventStoreError, "Context cannot be empty");
     utils::LogEventStoreError("add_event", ctx, error.message());
     return utils::MakeUnexpected(error);
   }
 
   if (id.empty()) {
-    auto error = utils::MakeError(utils::ErrorCode::kInvalidArgument, "ID cannot be empty");
+    auto error = utils::MakeError(utils::ErrorCode::kEventStoreError, "ID cannot be empty");
+    utils::LogEventStoreError("add_event", ctx, error.message());
+    return utils::MakeUnexpected(error);
+  }
+
+  // Validate score range defensively. DEL events ignore the score (it is forced
+  // to 0 below), so only ADD/SET scores are range-checked. Out-of-range scores
+  // are rejected here so the co-occurrence product (score1 * score2) cannot be
+  // driven out of its expected [0, 10000] range.
+  if (type != EventType::DEL && (score < kMinEventScore || score > kMaxEventScore)) {
+    auto error = utils::MakeError(utils::ErrorCode::kEventInvalidScore,
+                                  "Score must be in range [0, 100], got " + std::to_string(score));
     utils::LogEventStoreError("add_event", ctx, error.message());
     return utils::MakeUnexpected(error);
   }

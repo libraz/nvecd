@@ -298,7 +298,7 @@ TEST_F(CacheE2ETest, CacheAfterEventMutation) {
   EXPECT_TRUE(ContainsOK(resp));
 
   // Mutate event data (this affects events, not vectors)
-  auto event_resp = client.SendCommand("EVENT ctx2 ADD item1 200");
+  auto event_resp = client.SendCommand("EVENT ctx2 ADD item1 100");
   EXPECT_TRUE(ContainsOK(event_resp));
 
   // Query again with same parameters

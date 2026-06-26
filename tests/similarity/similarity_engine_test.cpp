@@ -113,12 +113,15 @@ TEST_F(SimilarityEngineTest, SearchByIdEvents_TopK) {
 TEST_F(SimilarityEngineTest, SearchByIdEvents_InvalidTopK) {
   auto result1 = engine_->SearchByIdEvents("item1", 0);
   EXPECT_FALSE(result1.has_value());
+  EXPECT_EQ(result1.error().code(), utils::ErrorCode::kCommandInvalidTopK);
 
   auto result2 = engine_->SearchByIdEvents("item1", -1);
   EXPECT_FALSE(result2.has_value());
+  EXPECT_EQ(result2.error().code(), utils::ErrorCode::kCommandInvalidTopK);
 
   auto result3 = engine_->SearchByIdEvents("item1", 10000);
   EXPECT_FALSE(result3.has_value());
+  EXPECT_EQ(result3.error().code(), utils::ErrorCode::kCommandInvalidTopK);
 }
 
 // ============================================================================
