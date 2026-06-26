@@ -18,6 +18,8 @@
 #include "storage/snapshot_fork.h"
 #include "storage/snapshot_format_v1.h"
 #include "storage/snapshot_lock.h"
+#include "storage/wal.h"
+#include "storage/wal_checkpoint.h"
 #include "utils/flag_guard.h"
 #include "utils/path_utils.h"
 #include "utils/structured_log.h"
@@ -90,11 +92,29 @@ utils::Expected<std::string, utils::Error> HandleDumpSave(HandlerContext& ctx, c
     // Lock mode: synchronous blocking save
     utils::FlagGuard read_only_guard(ctx.read_only);
 
-    auto result = storage::WriteSnapshotWithLock(resolved_path, *ctx.config, *ctx.event_store, *ctx.co_index,
-                                                 *ctx.vector_store, nullptr, nullptr, ctx.metadata_store);
+    uint64_t captured_wal_sequence = 0;
+    auto result =
+        storage::WriteSnapshotWithLock(resolved_path, *ctx.config, *ctx.event_store, *ctx.co_index, *ctx.vector_store,
+                                       nullptr, nullptr, ctx.metadata_store, ctx.wal, &captured_wal_sequence);
 
     if (result) {
       utils::LogStorageInfo("dump_save", "Successfully saved snapshot to: " + resolved_path);
+      // Record the checkpoint sidecar then truncate the WAL up to the sequence
+      // captured under the snapshot's write-lock barrier. Skipped entirely when
+      // the WAL is disabled (ctx.wal == nullptr).
+      if (ctx.wal != nullptr) {
+        auto checkpoint = storage::WriteWalCheckpoint(resolved_path, captured_wal_sequence);
+        if (!checkpoint) {
+          utils::LogStorageError("dump_save", resolved_path,
+                                 "Failed to write WAL checkpoint: " + checkpoint.error().message());
+        } else {
+          auto truncated = ctx.wal->Truncate(captured_wal_sequence);
+          if (!truncated) {
+            utils::LogStorageError("dump_save", resolved_path,
+                                   "Failed to truncate WAL: " + truncated.error().message());
+          }
+        }
+      }
       return std::string("OK DUMP_SAVED " + resolved_path + "\r\n");
     }
 

@@ -119,7 +119,7 @@ Cache hit: **0.21us** (4.8M ops/sec). See [Benchmarks](docs/en/benchmarks.md) fo
 - **Client Library** - C++ and C client libraries for language bindings
 - **Metadata Filtering** - Attribute-based post-filtering for SIM/SIMV queries (`filter=key:value`)
 - **Score Thresholding** - Minimum score cutoff (`min_score=0.5`) to filter low-confidence results
-- **Write-Ahead Log** - CRC32-verified operation log for crash recovery
+- **Write-Ahead Log** - Optional CRC32-verified operation log (`wal.enabled`); on restart, writes since the last snapshot are recovered by replaying the WAL
 - **Tiered Vector Store** - Two-tier architecture with delta buffer and background merge
 - **Co-occurrence Pruning** - Configurable max neighbors and minimum support thresholds
 

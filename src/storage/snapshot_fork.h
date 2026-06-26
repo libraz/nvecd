@@ -26,6 +26,8 @@
 
 namespace nvecd::storage {
 
+class WriteAheadLog;
+
 /// Status of a background snapshot operation
 enum class SnapshotStatus : uint8_t {
   kIdle,        ///< No snapshot in progress
@@ -42,6 +44,7 @@ struct SnapshotResult {
   pid_t child_pid = -1;       ///< PID of fork child (while in progress)
   uint64_t start_time = 0;    ///< When snapshot started (unix timestamp)
   uint64_t end_time = 0;      ///< When snapshot completed (unix timestamp)
+  uint64_t wal_sequence = 0;  ///< WAL sequence captured under the pre-fork barrier (0 = WAL disabled)
 };
 
 /**
@@ -64,6 +67,18 @@ class ForkSnapshotWriter {
  public:
   ForkSnapshotWriter() = default;
   ~ForkSnapshotWriter();
+
+  /**
+   * @brief Wire the Write-Ahead Log for post-snapshot checkpoint and truncation
+   *
+   * When set, StartBackgroundSave() captures the WAL's current sequence under
+   * the pre-fork write-lock barrier (so it equals the maximum op included in the
+   * frozen snapshot), and CheckChild() writes the checkpoint sidecar and
+   * truncates the WAL up to that sequence once the child completes successfully.
+   *
+   * @param wal Write-Ahead Log (non-owning, may be null to disable)
+   */
+  void SetWal(WriteAheadLog* wal) { wal_ = wal; }
 
   // Non-copyable, non-movable
   ForkSnapshotWriter(const ForkSnapshotWriter&) = delete;
@@ -132,6 +147,9 @@ class ForkSnapshotWriter {
  private:
   mutable std::mutex status_mutex_;
   SnapshotResult current_result_;
+
+  /// Write-Ahead Log for checkpoint/truncate (non-owning, may be null).
+  WriteAheadLog* wal_ = nullptr;
 
   /**
    * @brief Child process entry point (runs after fork)

@@ -14,12 +14,16 @@
 
 #include <chrono>
 #include <filesystem>
+#include <optional>
+#include <string>
 #include <thread>
 
 #include "cache/similarity_cache.h"
 #include "server/connection_io_handler.h"
 #include "server/http_server.h"
 #include "server/request_dispatcher.h"
+#include "storage/snapshot_format_v1.h"
+#include "storage/wal_checkpoint.h"
 #include "utils/error.h"
 #include "utils/structured_log.h"
 
@@ -28,6 +32,58 @@ namespace nvecd::server {
 namespace {
 constexpr int kShutdownCheckIntervalMs = 100;
 constexpr size_t kBytesPerMegabyte = 1024 * 1024;  // Bytes in a megabyte
+
+/**
+ * @brief Find the newest snapshot in @p dir that has a WAL checkpoint sidecar.
+ *
+ * Startup recovery must replay the WAL relative to the exact snapshot the WAL
+ * was last truncated against. Every snapshot that triggered a truncation wrote a
+ * "<snapshot>.walseq" checkpoint sidecar (see WriteWalCheckpoint), so the set of
+ * files with a sidecar is precisely the set of valid recovery bases. Among them
+ * the newest by modification time is chosen, mirroring the mtime ordering the
+ * SnapshotScheduler uses for cleanup. Snapshots without a sidecar are ignored:
+ * the WAL was not truncated for them, so replaying the full WAL tail already
+ * reconstructs their contents.
+ *
+ * @param dir Snapshot directory to scan
+ * @return Path of the newest checkpointed snapshot, or std::nullopt if none
+ */
+std::optional<std::string> FindLatestSnapshot(const std::string& dir) {
+  std::error_code ec;
+  std::filesystem::path snapshot_dir(dir);
+  if (!std::filesystem::is_directory(snapshot_dir, ec)) {
+    return std::nullopt;
+  }
+
+  std::optional<std::string> newest_path;
+  std::filesystem::file_time_type newest_time{};
+  for (const auto& entry : std::filesystem::directory_iterator(snapshot_dir, ec)) {
+    if (ec) {
+      break;
+    }
+    if (!entry.is_regular_file(ec)) {
+      continue;
+    }
+    // The checkpoint sidecar itself must not be treated as a snapshot.
+    if (entry.path().extension() == storage::kWalCheckpointSuffix) {
+      continue;
+    }
+    // Only snapshots with a checkpoint sidecar are valid recovery bases.
+    const std::string sidecar = entry.path().string() + storage::kWalCheckpointSuffix;
+    if (!std::filesystem::exists(sidecar, ec)) {
+      continue;
+    }
+    auto mtime = std::filesystem::last_write_time(entry, ec);
+    if (ec) {
+      continue;
+    }
+    if (!newest_path.has_value() || mtime > newest_time) {
+      newest_path = entry.path().string();
+      newest_time = mtime;
+    }
+  }
+  return newest_path;
+}
 }  // namespace
 
 NvecdServer::NvecdServer(config::Config config) : config_(std::move(config)) {}
@@ -207,6 +263,13 @@ void NvecdServer::Stop() {
     thread_pool_.reset();
   }
 
+  // Close the WAL last: all surfaces (TCP worker threads, HTTP server) are now
+  // stopped and the fork child has been reaped, so no write can race the close.
+  // Close() flushes pending writes and joins the background sync thread.
+  if (wal_.IsOpen()) {
+    wal_.Close();
+  }
+
   spdlog::info("nvecd server stopped");
   spdlog::info("Total commands processed: {}", stats_.total_commands.load());
   spdlog::info("Total connections: {}", stats_.total_connections.load());
@@ -309,6 +372,83 @@ utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
   // Create RequestDispatcher
   dispatcher_ = std::make_unique<RequestDispatcher>(handler_ctx_);
   spdlog::info("RequestDispatcher initialized");
+
+  // Crash recovery (durability) once the stores are populated.
+  //
+  // Ordering is load-bearing, and handler_ctx_.wal stays null through both the
+  // snapshot load AND the WAL replay so neither re-appends to the WAL:
+  //   1. Load the latest checkpointed snapshot (if any) into the stores. This
+  //      restores all state up to the snapshot's WAL checkpoint sequence; the
+  //      WAL was truncated against that snapshot, so its records alone would not
+  //      reconstruct the pre-snapshot state.
+  //   2. Open() recovers CurrentSequence from existing WAL files.
+  //   3. Replay() re-applies records strictly after the snapshot's checkpoint
+  //      (floor = ReadWalCheckpoint + 1, or 0 when no snapshot was loaded), so
+  //      no event the snapshot already absorbed is double-counted.
+  //   4. Only after replay is handler_ctx_.wal published, so live writes append
+  //      sequences strictly greater than the recovered maximum.
+  //
+  // The fork-snapshot writer is also given the WAL pointer so it can write the
+  // checkpoint sidecar and truncate the WAL once a background snapshot lands.
+  if (config_.wal.enabled) {
+    // 1. Load the latest checkpointed snapshot, if one exists.
+    std::string loaded_snapshot_path;
+    auto latest = FindLatestSnapshot(config_.snapshot.dir);
+    if (latest.has_value()) {
+      config::Config loaded_config;
+      storage::snapshot_format::IntegrityError integrity_error;
+      auto load =
+          storage::snapshot_v1::ReadSnapshotV1(*latest, loaded_config, *event_store_, *co_index_, *vector_store_,
+                                               nullptr, nullptr, &integrity_error, metadata_store_.get());
+      if (!load) {
+        // Recovery was requested but the chosen snapshot is unreadable: fail
+        // startup rather than silently losing the pre-snapshot state.
+        std::string msg = load.error().message();
+        if (!integrity_error.message.empty()) {
+          msg += " (" + integrity_error.message + ")";
+        }
+        spdlog::error("Failed to load snapshot {} during WAL recovery: {}", *latest, msg);
+        return utils::MakeUnexpected(load.error());
+      }
+      loaded_snapshot_path = *latest;
+      spdlog::info("Recovery loaded snapshot: {}", loaded_snapshot_path);
+    }
+
+    // 2. Open the WAL (recovers CurrentSequence from existing files).
+    storage::WriteAheadLog::Config wal_config;
+    wal_config.directory = config_.wal.dir;
+    wal_config.max_file_size = config_.wal.max_file_size;
+    wal_config.sync_on_write = config_.wal.sync_on_write;
+    wal_config.sync_interval_ms = config_.wal.sync_interval_ms;
+    wal_config.include_vectors = config_.wal.include_vectors;
+
+    auto wal_open = wal_.Open(wal_config);
+    if (!wal_open) {
+      // Durability was requested but the WAL is unavailable: fail startup rather
+      // than silently degrading to non-durable operation.
+      spdlog::error("Failed to open WAL at {}: {}", config_.wal.dir, wal_open.error().message());
+      return utils::MakeUnexpected(wal_open.error());
+    }
+
+    // 3. Replay only records beyond the loaded snapshot's checkpoint.
+    const uint64_t checkpoint = loaded_snapshot_path.empty() ? 0 : storage::ReadWalCheckpoint(loaded_snapshot_path);
+    const uint64_t from = (checkpoint == 0) ? 0 : checkpoint + 1;
+
+    // Replay BEFORE publishing handler_ctx_.wal so replayed records are not
+    // re-appended.
+    auto replayed = wal_.Replay(from, [this](const storage::WalRecord& record) { dispatcher_->ReplayRecord(record); });
+    if (!replayed) {
+      spdlog::error("WAL replay failed from sequence {}: {}", from, replayed.error().message());
+      return utils::MakeUnexpected(replayed.error());
+    }
+    spdlog::info("WAL replay applied {} record(s) from sequence {}", *replayed, from);
+
+    // 4. Publish the WAL so both surfaces append live writes, and wire it into
+    // the fork writer for post-snapshot checkpoint + truncate.
+    handler_ctx_.wal = &wal_;
+    fork_writer_->SetWal(&wal_);
+    spdlog::info("WAL enabled (dir={}, current_sequence={})", config_.wal.dir, wal_.CurrentSequence());
+  }
 
   // Create and start SnapshotScheduler (if auto-snapshot is enabled)
   if (config_.snapshot.interval_sec > 0) {

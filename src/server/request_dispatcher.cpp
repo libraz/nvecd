@@ -27,7 +27,9 @@
 #include "server/handlers/variable_handler.h"
 #include "server/request_dispatcher.h"
 #include "server/score_format.h"
+#include "server/wal_codec.h"
 #include "similarity/similarity_engine.h"
+#include "storage/wal.h"
 #include "utils/error.h"
 #include "utils/structured_log.h"
 #include "vectors/metadata_store.h"
@@ -294,8 +296,14 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleEvent(const 
     return utils::MakeUnexpected(result.error());
   }
 
+  // Deduped events caused no state change, so they must not be logged: replaying
+  // them would re-run dedup against a different buffer state and could diverge.
+  if (result->deduped) {
+    return FormatOK("EVENT");
+  }
+
   // Update co-occurrence index incrementally (only new pairs, once each).
-  if (ctx_.co_index != nullptr && !result->deduped) {
+  if (ctx_.co_index != nullptr) {
     events::CoOccurrenceIndex::IngestOptions options;
     options.temporal_enabled = ctx_.config->events.temporal_cooccurrence;
     options.half_life_sec = ctx_.config->events.temporal_half_life_sec;
@@ -303,6 +311,15 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleEvent(const 
     options.negative_weight = ctx_.config->events.negative_weight;
     ctx_.co_index->ApplyIngestedEvent(cmd.ctx, result->prior_events, result->stored_event, options);
   }
+
+  // Persist the event using the EFFECTIVE stored fields. EventStore may assign a
+  // timestamp (when cmd.timestamp is absent/0); logging the resolved value lets
+  // replay reproduce identical temporal-decay and ordering state.
+  Command wal_cmd = cmd;
+  wal_cmd.score = result->stored_event.score;
+  wal_cmd.event_type = result->stored_event.type;
+  wal_cmd.timestamp = result->stored_event.timestamp;
+  AppendToWal(wal_cmd);
 
   // Selective cache invalidation for mutated item
   auto* cache_ptr = ctx_.cache.load(std::memory_order_acquire);
@@ -355,6 +372,9 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleVecset(const
   // in both SIM and SIMV keys, invalidating that space on any vector mutation.
   ctx_.vector_generation.fetch_add(1, std::memory_order_acq_rel);
 
+  // Persist the vector registration for crash recovery.
+  AppendToWal(cmd);
+
   // Selective cache invalidation for mutated item
   auto* cache_ptr = ctx_.cache.load(std::memory_order_acquire);
   if (cache_ptr != nullptr) {
@@ -392,6 +412,9 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleMetaset(cons
     metadata[condition.field] = condition.value;
   }
   ctx_.metadata_store->Set(cmd.id, std::move(metadata));
+
+  // Persist the metadata assignment for crash recovery (filter_expr verbatim).
+  AppendToWal(cmd);
 
   auto* cache_ptr = ctx_.cache.load(std::memory_order_acquire);
   if (cache_ptr != nullptr) {
@@ -719,6 +742,66 @@ std::string RequestDispatcher::HandleAuth(const Command& cmd, ConnectionContext&
 
   ctx_.stats.failed_commands++;
   return FormatError("ERR invalid password");
+}
+
+//
+// Write-Ahead Log integration
+//
+
+void RequestDispatcher::AppendToWal(const Command& cmd) const {
+  if (ctx_.wal == nullptr) {
+    return;
+  }
+
+  std::vector<uint8_t> payload = EncodeCommand(cmd);
+  auto appended = ctx_.wal->Append(WalOpForCommand(cmd), payload.data(), payload.size());
+  if (!appended) {
+    // Durability is best-effort: a failed log write is reported but the client
+    // write still succeeds, since the in-memory mutation already happened.
+    utils::StructuredLog()
+        .Event("wal_append_failed")
+        .Field("command", CommandTypeToString(cmd.type))
+        .Field("error", appended.error().message())
+        .Warn();
+  }
+}
+
+void RequestDispatcher::ReplayRecord(const storage::WalRecord& record) {
+  auto decoded = DecodeWalRecord(record);
+  if (!decoded) {
+    utils::StructuredLog()
+        .Event("wal_replay_decode_failed")
+        .Field("sequence", static_cast<int64_t>(record.sequence))
+        .Field("error", decoded.error().message())
+        .Warn();
+    return;
+  }
+
+  // Re-apply via the matching write handler. ctx_.wal is null during replay, so
+  // these handlers will not re-append the record to the WAL.
+  utils::Expected<std::string, utils::Error> applied =
+      utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandUnknown, "Unsupported WAL command"));
+  switch (decoded->type) {
+    case CommandType::kEvent:
+      applied = HandleEvent(*decoded);
+      break;
+    case CommandType::kVecset:
+      applied = HandleVecset(*decoded);
+      break;
+    case CommandType::kMetaset:
+      applied = HandleMetaset(*decoded);
+      break;
+    default:
+      break;
+  }
+
+  if (!applied) {
+    utils::StructuredLog()
+        .Event("wal_replay_apply_failed")
+        .Field("sequence", static_cast<int64_t>(record.sequence))
+        .Field("error", applied.error().message())
+        .Warn();
+  }
 }
 
 }  // namespace nvecd::server

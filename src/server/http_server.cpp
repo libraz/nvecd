@@ -28,8 +28,10 @@
 #include "server/filter_parser.h"
 #include "server/handlers/dump_handler.h"
 #include "server/score_format.h"
+#include "server/wal_codec.h"
 #include "similarity/similarity_engine.h"
 #include "storage/snapshot_fork.h"
+#include "storage/wal.h"
 #include "utils/memory_utils.h"
 #include "utils/network_utils.h"
 #include "utils/string_utils.h"
@@ -230,6 +232,64 @@ utils::Expected<vectors::Metadata, utils::Error> ParseMetadataJson(const json& v
   }
 
   return metadata;
+}
+
+/**
+ * @brief Append an already-applied write command to the WAL (best-effort).
+ *
+ * Mirrors the TCP dispatcher: the in-memory mutation has already succeeded, so a
+ * failed log write is logged as a warning and swallowed rather than failing the
+ * client request. No-op when the WAL is not wired (ctx->wal == nullptr).
+ */
+void AppendCommandToWal(const HandlerContext* ctx, const Command& cmd) {
+  if (ctx == nullptr || ctx->wal == nullptr) {
+    return;
+  }
+  std::vector<uint8_t> payload = EncodeCommand(cmd);
+  auto appended = ctx->wal->Append(WalOpForCommand(cmd), payload.data(), payload.size());
+  if (!appended) {
+    nvecd::utils::StructuredLog()
+        .Event("wal_append_failed")
+        .Field("surface", "http")
+        .Field("command", CommandTypeToString(cmd.type))
+        .Field("error", appended.error().message())
+        .Warn();
+  }
+}
+
+/**
+ * @brief Render a typed metadata map into the simple "key:value,..." filter form.
+ *
+ * The WAL METASET codec stores the command's filter_expr verbatim and replay
+ * re-runs the metadata handler, which re-parses it via ParseSimpleFilter. The
+ * HTTP surface receives typed JSON metadata, so it is serialized back into the
+ * canonical filter grammar (numeric/bool values render without quotes so
+ * ParseSimpleFilter auto-types them identically on replay).
+ */
+std::string MetadataToFilterExpr(const vectors::Metadata& metadata) {
+  std::string expr;
+  bool first = true;
+  for (const auto& [key, value] : metadata) {
+    if (!first) {
+      expr += ",";
+    }
+    first = false;
+    expr += key;
+    expr += ":";
+    std::visit(
+        [&expr](const auto& held) {
+          using T = std::decay_t<decltype(held)>;
+          if constexpr (std::is_same_v<T, std::string>) {
+            expr += held;
+          } else if constexpr (std::is_same_v<T, bool>) {
+            expr += held ? "true" : "false";
+          } else {
+            expr += std::to_string(held);
+          }
+        },
+        value);
+  }
+  return expr;
 }
 }  // namespace
 
@@ -892,16 +952,31 @@ void HttpServer::HandleEvent(const httplib::Request& req, httplib::Response& res
       return;
     }
 
-    // Update co-occurrence index incrementally (only new pairs, once each).
-    if (handler_context_->co_index != nullptr && !result->deduped) {
-      events::CoOccurrenceIndex::IngestOptions options;
-      if (handler_context_->config != nullptr) {
-        options.temporal_enabled = handler_context_->config->events.temporal_cooccurrence;
-        options.half_life_sec = handler_context_->config->events.temporal_half_life_sec;
-        options.negative_signals = handler_context_->config->events.negative_signals;
-        options.negative_weight = handler_context_->config->events.negative_weight;
+    // Deduped events caused no state change and must not be logged; replaying
+    // them would re-run dedup against a different buffer state. Apply the
+    // co-occurrence delta and persist only when the event was actually stored.
+    if (!result->deduped) {
+      if (handler_context_->co_index != nullptr) {
+        events::CoOccurrenceIndex::IngestOptions options;
+        if (handler_context_->config != nullptr) {
+          options.temporal_enabled = handler_context_->config->events.temporal_cooccurrence;
+          options.half_life_sec = handler_context_->config->events.temporal_half_life_sec;
+          options.negative_signals = handler_context_->config->events.negative_signals;
+          options.negative_weight = handler_context_->config->events.negative_weight;
+        }
+        handler_context_->co_index->ApplyIngestedEvent(ctx, result->prior_events, result->stored_event, options);
       }
-      handler_context_->co_index->ApplyIngestedEvent(ctx, result->prior_events, result->stored_event, options);
+
+      // Persist using the EFFECTIVE stored fields (EventStore may assign the
+      // timestamp) so replay reproduces identical temporal state.
+      Command wal_cmd;
+      wal_cmd.type = CommandType::kEvent;
+      wal_cmd.ctx = ctx;
+      wal_cmd.id = id;
+      wal_cmd.score = result->stored_event.score;
+      wal_cmd.event_type = result->stored_event.type;
+      wal_cmd.timestamp = result->stored_event.timestamp;
+      AppendCommandToWal(handler_context_, wal_cmd);
     }
 
     auto* cache_ptr = handler_context_->cache.load(std::memory_order_acquire);
@@ -1013,11 +1088,35 @@ void HttpServer::HandleVecset(const httplib::Request& req, httplib::Response& re
     auto compact_idx = handler_context_->vector_store->GetCompactIndex(id);
     if (compact_idx.has_value()) {
       if (has_metadata && handler_context_->metadata_store != nullptr) {
+        // Copy metadata before moving it into the store so it can also be
+        // serialized into the WAL METASET record below.
+        vectors::Metadata wal_metadata = metadata;
         handler_context_->metadata_store->Set(id, std::move(metadata));
+        metadata = std::move(wal_metadata);
       }
 
       if (handler_context_->similarity_engine != nullptr) {
         handler_context_->similarity_engine->NotifyVectorAdded(compact_idx.value(), vector.data());
+      }
+    }
+
+    // Persist the vector registration, then (if present) the metadata. The WAL
+    // records are independent ops so replay reconstructs both; the VECSET must
+    // precede the METASET because METASET requires the vector to exist.
+    {
+      Command wal_vecset;
+      wal_vecset.type = CommandType::kVecset;
+      wal_vecset.id = id;
+      wal_vecset.vector = vector;
+      wal_vecset.dimension = static_cast<int>(vector.size());
+      AppendCommandToWal(handler_context_, wal_vecset);
+
+      if (has_metadata && handler_context_->metadata_store != nullptr) {
+        Command wal_metaset;
+        wal_metaset.type = CommandType::kMetaset;
+        wal_metaset.id = id;
+        wal_metaset.filter_expr = MetadataToFilterExpr(metadata);
+        AppendCommandToWal(handler_context_, wal_metaset);
       }
     }
 
@@ -1098,7 +1197,19 @@ void HttpServer::HandleMetaset(const httplib::Request& req, httplib::Response& r
       return;
     }
 
+    // Serialize the metadata into the canonical filter form before moving it
+    // into the store so the same value can be persisted to the WAL.
+    std::string wal_filter_expr = MetadataToFilterExpr(*metadata_result);
     handler_context_->metadata_store->Set(id, std::move(*metadata_result));
+
+    // Persist the metadata assignment for crash recovery.
+    {
+      Command wal_metaset;
+      wal_metaset.type = CommandType::kMetaset;
+      wal_metaset.id = id;
+      wal_metaset.filter_expr = wal_filter_expr;
+      AppendCommandToWal(handler_context_, wal_metaset);
+    }
 
     // Metadata changes affect filtered results broadly: clear the cache, as TCP does.
     auto* cache_ptr = handler_context_->cache.load(std::memory_order_acquire);

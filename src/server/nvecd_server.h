@@ -26,6 +26,7 @@
 #include "server/thread_pool.h"
 #include "similarity/similarity_engine.h"
 #include "storage/snapshot_fork.h"
+#include "storage/wal.h"
 #include "utils/error.h"
 #include "utils/expected.h"
 #include "vectors/metadata_store.h"
@@ -191,7 +192,13 @@ class NvecdServer {
   std::unique_ptr<RateLimiter> rate_limiter_;                 // Per-client rate limiter (optional)
   std::unique_ptr<storage::ForkSnapshotWriter> fork_writer_;  ///< Fork-based snapshot writer
   std::unique_ptr<SnapshotScheduler> snapshot_scheduler_;     ///< Background auto-snapshot scheduler
-  std::unique_ptr<DecayScheduler> decay_scheduler_;          ///< Background co-occurrence decay scheduler
+  std::unique_ptr<DecayScheduler> decay_scheduler_;           ///< Background co-occurrence decay scheduler
+
+  /// Write-Ahead Log for durability (owned). Opened after stores are populated
+  /// when config.wal.enabled; closed in Stop()/destructor (flushes pending
+  /// writes and joins its background sync thread). Declared last so it is
+  /// destroyed first, after the schedulers that may reference it are stopped.
+  storage::WriteAheadLog wal_;
 };
 
 }  // namespace nvecd::server

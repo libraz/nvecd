@@ -12,6 +12,7 @@
 
 #include "server/command_parser.h"
 #include "server/server_types.h"
+#include "storage/wal.h"
 #include "utils/error.h"
 #include "utils/expected.h"
 
@@ -60,6 +61,20 @@ class RequestDispatcher {
    */
   std::string Dispatch(const std::string& request, ConnectionContext& conn_ctx);
 
+  /**
+   * @brief Re-apply a single WAL record during crash recovery
+   *
+   * Decodes @p record into a Command and routes it to the matching write
+   * handler so the in-memory state is reconstructed. This path must never
+   * re-append to the WAL: callers perform replay while HandlerContext::wal is
+   * still null, so the append in the write handlers is skipped. Decode and
+   * apply errors are logged and skipped so a single corrupt record does not
+   * abort the rest of recovery.
+   *
+   * @param record WAL record produced by WriteAheadLog::Replay
+   */
+  void ReplayRecord(const storage::WalRecord& record);
+
  private:
   // Handler methods
   utils::Expected<std::string, utils::Error> HandleEvent(const Command& cmd) const;
@@ -86,6 +101,18 @@ class RequestDispatcher {
   utils::Expected<std::string, utils::Error> HandleSet(const Command& cmd);
   utils::Expected<std::string, utils::Error> HandleGet(const Command& cmd);
   utils::Expected<std::string, utils::Error> HandleShowVariables(const Command& cmd);
+
+  /**
+   * @brief Best-effort append of a write command to the WAL
+   *
+   * Encodes @p cmd and appends it to ctx_.wal when the log is wired. A failed
+   * append is logged as a warning but never propagated to the caller: durability
+   * is best-effort and a log-write failure must not fail an already-applied
+   * client write.
+   *
+   * @param cmd Effective write command to persist (timestamps already resolved)
+   */
+  void AppendToWal(const Command& cmd) const;
 
   // Format response helpers
   static std::string FormatOK(const std::string& msg = "");

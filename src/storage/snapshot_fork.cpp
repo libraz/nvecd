@@ -19,6 +19,8 @@
 #include <thread>
 
 #include "storage/snapshot_format_v1.h"
+#include "storage/wal.h"
+#include "storage/wal_checkpoint.h"
 #include "utils/structured_log.h"
 
 #ifdef __linux__
@@ -62,7 +64,9 @@ void ChildWriteStderr(const char* msg) {
  * leaves the spdlog sinks in a quiescent state. The child never touches spdlog
  * again (see ChildProcess), so no spdlog lock can deadlock the child.
  */
-void AtForkPrepare() { spdlog::details::registry::instance().flush_all(); }
+void AtForkPrepare() {
+  spdlog::details::registry::instance().flush_all();
+}
 
 /**
  * @brief Register the pthread_atfork handlers exactly once.
@@ -104,6 +108,13 @@ utils::Expected<void, utils::Error> ForkSnapshotWriter::StartBackgroundSave(
   auto lock_co = co_index.AcquireWriteLock();
   auto lock_vs = vector_store.AcquireWriteLock();
   auto lock_ms = metadata_store != nullptr ? metadata_store->AcquireWriteLock() : std::unique_lock<std::shared_mutex>();
+
+  // Capture the WAL sequence WHILE the write-lock barrier is held. Writes are
+  // serialized behind these locks, so the captured value is exactly the maximum
+  // op reflected in the about-to-be-frozen (COW) snapshot. It is recorded in the
+  // checkpoint sidecar and used to truncate the WAL only after the child
+  // succeeds, so the WAL never drops a record the snapshot does not contain.
+  const uint64_t captured_wal_sequence = (wal_ != nullptr) ? wal_->CurrentSequence() : 0;
 
   // Ensure SIGCHLD is not SIG_IGN (macOS auto-reaps children when ignored)
   signal(SIGCHLD, SIG_DFL);  // NOLINT(cppcoreguidelines-pro-type-cstyle-cast)
@@ -159,6 +170,7 @@ utils::Expected<void, utils::Error> ForkSnapshotWriter::StartBackgroundSave(
     current_result_.child_pid = pid;
     current_result_.start_time = static_cast<uint64_t>(std::time(nullptr));
     current_result_.end_time = 0;
+    current_result_.wal_sequence = captured_wal_sequence;
   }
 
   utils::LogStorageInfo("snapshot_fork", "Fork snapshot started (child pid: " + std::to_string(pid) + ")");
@@ -238,45 +250,68 @@ void ForkSnapshotWriter::CheckChild() {
     return;  // Child still running
   }
 
-  std::lock_guard lock(status_mutex_);
-  current_result_.end_time = static_cast<uint64_t>(std::time(nullptr));
+  bool completed = false;
+  std::string completed_filepath;
+  uint64_t completed_wal_sequence = 0;
+  {
+    std::lock_guard lock(status_mutex_);
+    current_result_.end_time = static_cast<uint64_t>(std::time(nullptr));
 
-  if (result < 0) {
-    if (errno == ECHILD) {
-      // Child was already reaped (e.g., SIGCHLD was SIG_IGN or handled externally).
-      // Determine success by checking if the snapshot file exists.
-      if (std::filesystem::exists(current_result_.filepath)) {
-        current_result_.status = SnapshotStatus::kCompleted;
-        utils::LogStorageInfo("snapshot_fork", "Fork snapshot completed (auto-reaped): " + current_result_.filepath);
+    if (result < 0) {
+      if (errno == ECHILD) {
+        // Child was already reaped (e.g., SIGCHLD was SIG_IGN or handled externally).
+        // Determine success by checking if the snapshot file exists.
+        if (std::filesystem::exists(current_result_.filepath)) {
+          current_result_.status = SnapshotStatus::kCompleted;
+          utils::LogStorageInfo("snapshot_fork", "Fork snapshot completed (auto-reaped): " + current_result_.filepath);
+        } else {
+          current_result_.status = SnapshotStatus::kFailed;
+          current_result_.error_message = "Child was auto-reaped and snapshot file not found";
+          utils::LogStorageError("snapshot_fork", current_result_.filepath, current_result_.error_message);
+        }
       } else {
         current_result_.status = SnapshotStatus::kFailed;
-        current_result_.error_message = "Child was auto-reaped and snapshot file not found";
+        current_result_.error_message = "waitpid failed: " + std::string(strerror(errno));
         utils::LogStorageError("snapshot_fork", current_result_.filepath, current_result_.error_message);
       }
-    } else {
+    } else if (WIFEXITED(status)) {
+      int exit_code = WEXITSTATUS(status);
+      if (exit_code == kChildExitSuccess) {
+        current_result_.status = SnapshotStatus::kCompleted;
+        utils::LogStorageInfo("snapshot_fork", "Fork snapshot completed: " + current_result_.filepath);
+      } else {
+        current_result_.status = SnapshotStatus::kFailed;
+        current_result_.error_message = "Child exited with code " + std::to_string(exit_code);
+        utils::LogStorageError("snapshot_fork", current_result_.filepath, current_result_.error_message);
+      }
+    } else if (WIFSIGNALED(status)) {
+      int sig = WTERMSIG(status);
       current_result_.status = SnapshotStatus::kFailed;
-      current_result_.error_message = "waitpid failed: " + std::string(strerror(errno));
+      current_result_.error_message = "Child killed by signal " + std::to_string(sig);
       utils::LogStorageError("snapshot_fork", current_result_.filepath, current_result_.error_message);
     }
-    return;
+
+    completed = (current_result_.status == SnapshotStatus::kCompleted);
+    completed_filepath = current_result_.filepath;
+    completed_wal_sequence = current_result_.wal_sequence;
   }
 
-  // Child exited
-  if (WIFEXITED(status)) {
-    int exit_code = WEXITSTATUS(status);
-    if (exit_code == kChildExitSuccess) {
-      current_result_.status = SnapshotStatus::kCompleted;
-      utils::LogStorageInfo("snapshot_fork", "Fork snapshot completed: " + current_result_.filepath);
-    } else {
-      current_result_.status = SnapshotStatus::kFailed;
-      current_result_.error_message = "Child exited with code " + std::to_string(exit_code);
-      utils::LogStorageError("snapshot_fork", current_result_.filepath, current_result_.error_message);
+  // On a successful snapshot, record the checkpoint sidecar then truncate the
+  // WAL up to the sequence captured under the pre-fork barrier. Truncation only
+  // removes WAL files whose records are entirely contained in the snapshot, so
+  // any record beyond the captured sequence is preserved for the next recovery.
+  if (completed && wal_ != nullptr) {
+    auto checkpoint = WriteWalCheckpoint(completed_filepath, completed_wal_sequence);
+    if (!checkpoint) {
+      utils::LogStorageError("snapshot_fork", completed_filepath,
+                             "Failed to write WAL checkpoint: " + checkpoint.error().message());
+      return;  // Do not truncate without a durable checkpoint.
     }
-  } else if (WIFSIGNALED(status)) {
-    int sig = WTERMSIG(status);
-    current_result_.status = SnapshotStatus::kFailed;
-    current_result_.error_message = "Child killed by signal " + std::to_string(sig);
-    utils::LogStorageError("snapshot_fork", current_result_.filepath, current_result_.error_message);
+    auto truncated = wal_->Truncate(completed_wal_sequence);
+    if (!truncated) {
+      utils::LogStorageError("snapshot_fork", completed_filepath,
+                             "Failed to truncate WAL: " + truncated.error().message());
+    }
   }
 }
 
