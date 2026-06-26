@@ -346,6 +346,27 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
     return utils::MakeUnexpected(error);
   }
 
+  // Only one source failed: the fusion can still proceed on the surviving
+  // signal, but the failure must not be swallowed silently. Emit a warning so
+  // operators can see that the result is single-source (and thus weighted only
+  // by one side) rather than a true fusion.
+  if (!event_results) {
+    utils::StructuredLog()
+        .Event("fusion_source_failed")
+        .Field("item_id", item_id)
+        .Field("source", "events")
+        .Field("error", event_results.error().message())
+        .Warn();
+  }
+  if (!vector_results) {
+    utils::StructuredLog()
+        .Event("fusion_source_failed")
+        .Field("item_id", item_id)
+        .Field("source", "vectors")
+        .Field("error", vector_results.error().message())
+        .Warn();
+  }
+
   // Normalize scores for each source
   if (event_results) {
     NormalizeScores(*event_results);
