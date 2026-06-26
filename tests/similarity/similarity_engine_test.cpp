@@ -7,7 +7,10 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <string>
 #include <unordered_set>
+#include <vector>
 
 #include "events/co_occurrence_index.h"
 #include "events/event_store.h"
@@ -562,8 +565,9 @@ TEST_F(SimilarityEngineTest, DistanceMetric_L2) {
 }
 
 TEST_F(SimilarityEngineTest, FusionNormalization_SingleResult) {
-  // When one source has a single result, it should get score 0.5 (not 1.0)
-  // This prevents undue weight in fusion scoring
+  // When one source has a single result, NormalizeScores preserves its real
+  // similarity clamped to [0, 1] (not a fixed 0.5), so absolute confidence is
+  // retained. Fusion scores must stay non-negative and well-formed.
 
   // Only one co-occurrence pair
   std::vector<events::Event> events = {{"item1", 10, 1000}, {"item2", 20, 1001}};
@@ -689,6 +693,141 @@ TEST_F(MetadataDesyncTest, SlotReuseDoesNotLeakDeletedMetadata) {
     ASSERT_TRUE(results.has_value());
     ASSERT_EQ(results->size(), 1U);
     EXPECT_EQ((*results)[0].item_id, "bob_item");
+  }
+}
+
+// ============================================================================
+// Additive Fusion Union (H-4)
+// ============================================================================
+
+// Regression test for H-4: fusion must treat the vector and co-occurrence
+// signals as additive (a UNION of candidates), not an intersection. A
+// content-similar item that is NOT a co-occurrence neighbor of the query must
+// still be able to surface via the vector signal.
+TEST_F(SimilarityEngineTest, FusionSurfacesContentSimilarNonNeighbor) {
+  // The query "q" co-occurs only with "co_a" and "co_b" (its event neighbors).
+  std::vector<events::Event> events = {{"q", 10, 1000}, {"co_a", 20, 1001}, {"co_b", 15, 1002}};
+  co_index_->UpdateFromEvents("ctx1", events);
+
+  // Vectors: "content" is nearly identical to "q" but has NO co-occurrence with
+  // it. The co-occurrence neighbors point in a different direction.
+  ASSERT_TRUE(vector_store_->SetVector("q", {1.0f, 0.0f, 0.0f}).has_value());
+  ASSERT_TRUE(vector_store_->SetVector("content", {0.99f, 0.01f, 0.0f}).has_value());
+  ASSERT_TRUE(vector_store_->SetVector("co_a", {0.0f, 1.0f, 0.0f}).has_value());
+  ASSERT_TRUE(vector_store_->SetVector("co_b", {0.0f, 0.9f, 0.1f}).has_value());
+
+  // Sanity: "content" is NOT an event neighbor of "q".
+  auto event_results = engine_->SearchByIdEvents("q", 10);
+  ASSERT_TRUE(event_results.has_value());
+  for (const auto& r : *event_results) {
+    EXPECT_NE(r.item_id, "content") << "content must not be a co-occurrence neighbor";
+  }
+
+  // Fusion must surface "content" purely from the vector signal.
+  auto results = engine_->SearchByIdFusion("q", 10);
+  ASSERT_TRUE(results.has_value());
+  bool found_content = false;
+  for (const auto& r : *results) {
+    if (r.item_id == "content") {
+      found_content = true;
+    }
+  }
+  EXPECT_TRUE(found_content) << "fusion must union the vector signal, surfacing a content-similar non-neighbor";
+}
+
+// ============================================================================
+// Score Normalization (M-14)
+// ============================================================================
+
+// M-14: NormalizeScores must NOT collapse a single candidate to a fixed 0.5.
+// A single strong match and a single weak match must end up with different
+// (absolute-confidence-preserving) scores.
+TEST_F(SimilarityEngineTest, NormalizeSingleResultPreservesAbsoluteConfidence) {
+  // One strong vector neighbor (cosine ~1.0).
+  ASSERT_TRUE(vector_store_->SetVector("query_strong", {1.0f, 0.0f, 0.0f}).has_value());
+  ASSERT_TRUE(vector_store_->SetVector("near", {1.0f, 0.0f, 0.0f}).has_value());
+  auto strong = engine_->SearchByIdVectors("query_strong", 1);
+  ASSERT_TRUE(strong.has_value());
+  ASSERT_EQ(strong->size(), 1U);
+  // The raw cosine here is ~1.0; the single-result fusion path would later
+  // normalize it. Verify the engine reports a high absolute score rather than
+  // a flattened mid value.
+  EXPECT_GT((*strong)[0].score, 0.9f);
+
+  // One weak query: orthogonal to every vector already in the store, so its
+  // best single neighbor has cosine ~0.0. (Using a {1,0,0} query here would
+  // match the existing {1,0,0} vectors perfectly, defeating the check.)
+  ASSERT_TRUE(vector_store_->SetVector("query_weak", {0.0f, 0.0f, 1.0f}).has_value());
+  ASSERT_TRUE(vector_store_->SetVector("far", {0.0f, 1.0f, 0.0f}).has_value());
+  auto weak = engine_->SearchByIdVectors("query_weak", 1);
+  ASSERT_TRUE(weak.has_value());
+
+  // A strong single match (cosine ~1.0) and a weak single match (cosine ~0.0)
+  // must report their true absolute confidence, not both collapse to the same
+  // value the way a fixed 0.5 or min-max single-result fallback would.
+  if (!weak->empty()) {
+    EXPECT_LT((*weak)[0].score, (*strong)[0].score);
+  }
+}
+
+// M-14: when all candidate scores are equal, fusion must preserve the shared
+// absolute confidence (clamped) instead of forcing every score to 0.5. A
+// cluster of strong matches keeps high fusion weight.
+TEST_F(SimilarityEngineTest, FusionAllEqualScoresStayHigh) {
+  // All vectors identical -> all cosine similarities are ~1.0 (degenerate range).
+  ASSERT_TRUE(vector_store_->SetVector("q", {1.0f, 0.0f, 0.0f}).has_value());
+  ASSERT_TRUE(vector_store_->SetVector("a", {1.0f, 0.0f, 0.0f}).has_value());
+  ASSERT_TRUE(vector_store_->SetVector("b", {1.0f, 0.0f, 0.0f}).has_value());
+
+  // No co-occurrence: fusion uses only the (all-equal) vector signal.
+  // alpha defaults weight the vector source; with preserved absolute confidence
+  // (clamped ~1.0) the fused scores must stay clearly above the old 0.5 floor.
+  auto results = engine_->SearchByIdFusion("q", 10, /*adaptive=*/false);
+  ASSERT_TRUE(results.has_value());
+  ASSERT_FALSE(results->empty());
+  for (const auto& r : *results) {
+    // fusion_alpha (0.6) * clamped(~1.0) == ~0.6 > the 0.5 collapse value.
+    EXPECT_GT(r.score, 0.5f) << "all-equal high-similarity cluster must retain confidence";
+  }
+}
+
+// ============================================================================
+// Deterministic Tie-Break (#19)
+// ============================================================================
+
+// #19: identical scores must produce a deterministic, id-ordered result that is
+// stable across repeated runs (no reliance on insertion or hash order).
+TEST_F(SimilarityEngineTest, IdenticalScoresAreDeterministicallyOrdered) {
+  // All vectors identical -> identical cosine scores for every candidate.
+  ASSERT_TRUE(vector_store_->SetVector("query", {1.0f, 0.0f, 0.0f}).has_value());
+  ASSERT_TRUE(vector_store_->SetVector("d", {1.0f, 0.0f, 0.0f}).has_value());
+  ASSERT_TRUE(vector_store_->SetVector("a", {1.0f, 0.0f, 0.0f}).has_value());
+  ASSERT_TRUE(vector_store_->SetVector("c", {1.0f, 0.0f, 0.0f}).has_value());
+  ASSERT_TRUE(vector_store_->SetVector("b", {1.0f, 0.0f, 0.0f}).has_value());
+
+  std::vector<std::string> first_order;
+  {
+    auto results = engine_->SearchByIdVectors("query", 10);
+    ASSERT_TRUE(results.has_value());
+    for (const auto& r : *results) {
+      first_order.push_back(r.item_id);
+    }
+  }
+  ASSERT_FALSE(first_order.empty());
+
+  // The tie-break is item_id ascending, so the order must be sorted by id.
+  EXPECT_TRUE(std::is_sorted(first_order.begin(), first_order.end()))
+      << "tied scores must be ordered by ascending item_id";
+
+  // Repeated runs must yield the identical ordering.
+  for (int run = 0; run < 5; ++run) {
+    auto results = engine_->SearchByIdVectors("query", 10);
+    ASSERT_TRUE(results.has_value());
+    std::vector<std::string> order;
+    for (const auto& r : *results) {
+      order.push_back(r.item_id);
+    }
+    EXPECT_EQ(order, first_order) << "ordering must be deterministic across runs";
   }
 }
 

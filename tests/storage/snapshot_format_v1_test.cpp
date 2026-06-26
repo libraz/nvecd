@@ -188,6 +188,135 @@ TEST_F(SnapshotFormatV1Test, WriteAndRead_MetadataRoundTrip) {
 }
 
 // ---------------------------------------------------------------------------
+// 1c. EventTypeAndTimestamp_RoundTrip (H-7)
+//
+// Events must reload with their ORIGINAL timestamps and types. The old
+// deserializer dropped both (collapsing temporal-decay weights and forcing
+// every event to ADD), which silently changed rankings and lost DEL/SET
+// semantics.
+// ---------------------------------------------------------------------------
+TEST_F(SnapshotFormatV1Test, EventTypeAndTimestamp_RoundTrip) {
+  // Use explicit, distinct timestamps and a mix of event types. RestoreEvent
+  // (used on load) bypasses dedup, so even a DEL after a SET on the same item
+  // is preserved verbatim in insertion order.
+  constexpr uint64_t kTs1 = 1'000'000'000;
+  constexpr uint64_t kTs2 = 1'000'000'100;
+  constexpr uint64_t kTs3 = 1'000'000'200;
+
+  ASSERT_TRUE(event_store_->AddEvent("ctxA", "item1", 50, events::EventType::ADD, kTs1).has_value());
+  ASSERT_TRUE(event_store_->AddEvent("ctxA", "item2", 60, events::EventType::SET, kTs2).has_value());
+  ASSERT_TRUE(event_store_->AddEvent("ctxA", "item2", 0, events::EventType::DEL, kTs3).has_value());
+
+  const std::string path = TestFilePath("event_type_ts_round_trip.dmp");
+  auto write_result = WriteSnapshotV1(path, config_, *event_store_, *co_index_, *vector_store_);
+  ASSERT_TRUE(write_result.has_value()) << "WriteSnapshotV1 failed: " << write_result.error().message();
+
+  config::EventsConfig events_cfg;
+  config::VectorsConfig vectors_cfg;
+  events::EventStore loaded_events(events_cfg);
+  events::CoOccurrenceIndex loaded_co;
+  vectors::VectorStore loaded_vectors(vectors_cfg);
+  config::Config loaded_config;
+
+  auto read_result = ReadSnapshotV1(path, loaded_config, loaded_events, loaded_co, loaded_vectors);
+  ASSERT_TRUE(read_result.has_value()) << "ReadSnapshotV1 failed: " << read_result.error().message();
+
+  auto orig = event_store_->GetEvents("ctxA");
+  auto loaded = loaded_events.GetEvents("ctxA");
+  ASSERT_EQ(loaded.size(), orig.size());
+  ASSERT_EQ(loaded.size(), 3u);
+
+  // Order, item_id, score, type, and timestamp must all match exactly.
+  for (size_t i = 0; i < orig.size(); ++i) {
+    EXPECT_EQ(loaded[i].item_id, orig[i].item_id) << "at index " << i;
+    EXPECT_EQ(loaded[i].score, orig[i].score) << "at index " << i;
+    EXPECT_EQ(loaded[i].type, orig[i].type) << "at index " << i;
+    EXPECT_EQ(loaded[i].timestamp, orig[i].timestamp) << "at index " << i;
+  }
+
+  // Explicitly assert the types/timestamps survived (not defaulted to ADD/now).
+  EXPECT_EQ(loaded[0].type, events::EventType::ADD);
+  EXPECT_EQ(loaded[1].type, events::EventType::SET);
+  EXPECT_EQ(loaded[2].type, events::EventType::DEL);
+  EXPECT_EQ(loaded[0].timestamp, kTs1);
+  EXPECT_EQ(loaded[1].timestamp, kTs2);
+  EXPECT_EQ(loaded[2].timestamp, kTs3);
+}
+
+// ---------------------------------------------------------------------------
+// 1d. CoOccurrenceNegative_RoundTrip (M-3)
+//
+// Co-occurrence pairs with zero/negative scores are negative-signal baselines
+// and must survive SAVE/LOAD. The old serializer enumerated via GetSimilar()
+// which filters score > 0, dropping them on reload.
+// ---------------------------------------------------------------------------
+TEST_F(SnapshotFormatV1Test, CoOccurrenceNegative_RoundTrip) {
+  // Set scores directly: one positive, one zero, one negative.
+  co_index_->SetScore("a", "pos", 5.0f);
+  co_index_->SetScore("a", "zero", 0.0f);
+  co_index_->SetScore("a", "neg", -3.0f);
+
+  const std::string path = TestFilePath("cooc_negative_round_trip.dmp");
+  auto write_result = WriteSnapshotV1(path, config_, *event_store_, *co_index_, *vector_store_);
+  ASSERT_TRUE(write_result.has_value()) << "WriteSnapshotV1 failed: " << write_result.error().message();
+
+  config::EventsConfig events_cfg;
+  config::VectorsConfig vectors_cfg;
+  events::EventStore loaded_events(events_cfg);
+  events::CoOccurrenceIndex loaded_co;
+  vectors::VectorStore loaded_vectors(vectors_cfg);
+  config::Config loaded_config;
+
+  auto read_result = ReadSnapshotV1(path, loaded_config, loaded_events, loaded_co, loaded_vectors);
+  ASSERT_TRUE(read_result.has_value()) << "ReadSnapshotV1 failed: " << read_result.error().message();
+
+  // All three pairs (including zero and negative) must reload exactly, in both
+  // directions (symmetric).
+  EXPECT_FLOAT_EQ(loaded_co.GetScore("a", "pos"), 5.0f);
+  EXPECT_FLOAT_EQ(loaded_co.GetScore("a", "zero"), 0.0f);
+  EXPECT_FLOAT_EQ(loaded_co.GetScore("a", "neg"), -3.0f);
+  EXPECT_FLOAT_EQ(loaded_co.GetScore("neg", "a"), -3.0f);
+  EXPECT_FLOAT_EQ(loaded_co.GetScore("zero", "a"), 0.0f);
+
+  // GetSimilar still filters to positive scores only (query semantics intact).
+  auto similar = loaded_co.GetSimilar("a", 10);
+  ASSERT_EQ(similar.size(), 1u);
+  EXPECT_EQ(similar[0].first, "pos");
+}
+
+// ---------------------------------------------------------------------------
+// 1e. VectorDimension_RoundTrip (M-7)
+//
+// The vector dimension is now serialized as a fixed-width uint64_t. The
+// existing round-trip already covers vector data; this asserts the dimension
+// itself is preserved across SAVE/LOAD.
+// ---------------------------------------------------------------------------
+TEST_F(SnapshotFormatV1Test, VectorDimension_RoundTrip) {
+  PopulateStores();  // 3-dimensional vectors
+
+  const std::string path = TestFilePath("vector_dimension_round_trip.dmp");
+  auto write_result = WriteSnapshotV1(path, config_, *event_store_, *co_index_, *vector_store_);
+  ASSERT_TRUE(write_result.has_value()) << "WriteSnapshotV1 failed: " << write_result.error().message();
+
+  config::EventsConfig events_cfg;
+  config::VectorsConfig vectors_cfg;
+  events::EventStore loaded_events(events_cfg);
+  events::CoOccurrenceIndex loaded_co;
+  vectors::VectorStore loaded_vectors(vectors_cfg);
+  config::Config loaded_config;
+
+  auto read_result = ReadSnapshotV1(path, loaded_config, loaded_events, loaded_co, loaded_vectors);
+  ASSERT_TRUE(read_result.has_value()) << "ReadSnapshotV1 failed: " << read_result.error().message();
+
+  EXPECT_EQ(loaded_vectors.GetDimension(), vector_store_->GetDimension());
+  EXPECT_EQ(loaded_vectors.GetVectorCount(), vector_store_->GetVectorCount());
+
+  auto loaded_vec = loaded_vectors.GetVector("item1");
+  ASSERT_TRUE(loaded_vec.has_value());
+  EXPECT_EQ(loaded_vec->data.size(), vector_store_->GetDimension());
+}
+
+// ---------------------------------------------------------------------------
 // 2. WriteAndVerify_IntegrityOk
 // ---------------------------------------------------------------------------
 TEST_F(SnapshotFormatV1Test, WriteAndVerify_IntegrityOk) {

@@ -24,9 +24,15 @@ struct SimilarityResult {
 
   /**
    * @brief Compare for sorting (descending by score)
+   *
+   * Ties on score are broken by item_id (ascending) so that ordering is
+   * deterministic across runs and nodes regardless of insertion order.
    */
   bool operator<(const SimilarityResult& other) const {
-    return score > other.score;  // Descending order
+    if (score != other.score) {
+      return score > other.score;  // Primary: descending score
+    }
+    return item_id < other.item_id;  // Secondary: ascending id for stable order
   }
 };
 

@@ -230,6 +230,21 @@ class CoOccurrenceIndex {
   std::vector<std::string> GetAllItems() const;
 
   /**
+   * @brief Get all stored neighbors for an item, unfiltered
+   *
+   * Unlike GetSimilar(), this returns every neighbor recorded in the matrix
+   * including zero and negative scores, and applies no top-k limit or sorting.
+   * It exists for faithful serialization: negative-signal baselines (scores
+   * <= 0) must survive a SAVE/LOAD round trip, whereas GetSimilar() filters
+   * them out for query results. Do not use this for query paths.
+   *
+   * @param item_id Item ID whose neighbors to enumerate
+   * @return Vector of (neighbor_id, score) pairs in unspecified order (empty if
+   *         the item has no recorded neighbors)
+   */
+  std::vector<std::pair<std::string, float>> GetAllNeighbors(const std::string& item_id) const;
+
+  /**
    * @brief Directly set co-occurrence score between two items
    *
    * Sets the score in both directions (symmetric). This bypasses

@@ -223,11 +223,6 @@ class SimilarityEngine {
   /// @brief Generate random sample indices using reservoir sampling
   std::vector<size_t> SampleIndices(size_t total, size_t sample_size) const;
 
-  /// @brief Search vectors only among candidate IDs (pre-filtered)
-  utils::Expected<std::vector<SimilarityResult>, utils::Error> SearchByIdVectorsFiltered(
-      const std::string& item_id, const std::unordered_set<std::string>& candidate_ids, int top_k,
-      const vectors::MetadataFilter& filter = {});
-
   /**
    * @brief Compute adaptive fusion weights based on item maturity
    * @param neighbor_count Number of co-occurrence neighbors

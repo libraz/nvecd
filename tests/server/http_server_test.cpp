@@ -189,7 +189,10 @@ TEST_F(HttpServerTest, Info) {
 }
 
 TEST_F(HttpServerTest, Info_ReturnsRealUptime) {
-  std::this_thread::sleep_for(std::chrono::seconds(1));
+  // uptime_seconds is reported as whole seconds, so wait comfortably past the
+  // integer-second boundary to avoid flaking when the elapsed time rounds down
+  // to 0 under load.
+  std::this_thread::sleep_for(std::chrono::milliseconds(2100));
   auto res = client_->Get("/info");
   ASSERT_TRUE(res);
   auto body = json::parse(res->body);

@@ -76,8 +76,20 @@ HnswIndex& HnswIndex::operator=(HnswIndex&& other) noexcept {
 uint32_t HnswIndex::RandomLevel() {
   std::uniform_real_distribution<double> dist(0.0, 1.0);
   double r = dist(rng_);
-  auto level = static_cast<uint32_t>(-std::log(r) * level_mult_);
-  return level;
+  // uniform_real_distribution can return exactly 0.0, which would make
+  // -log(r) == +inf and overflow the uint32_t cast (UB). Clamp r to a tiny
+  // positive minimum so the level stays finite.
+  constexpr double kMinR = 1e-12;
+  if (r < kMinR) {
+    r = kMinR;
+  }
+  double level_f = -std::log(r) * level_mult_;
+  // Also clamp the resulting level to a safe maximum to bound graph height.
+  constexpr double kMaxLevel = 64.0;
+  if (level_f > kMaxLevel) {
+    level_f = kMaxLevel;
+  }
+  return static_cast<uint32_t>(level_f);
 }
 
 uint32_t HnswIndex::MaxNeighbors(uint32_t level) const {

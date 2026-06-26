@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <random>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "vectors/merge_scheduler.h"
@@ -195,6 +196,51 @@ TEST_F(TieredVectorStoreTest, SearchExcludesDeletedFromMain) {
   // v0 should not appear in results
   for (const auto& r : results) {
     EXPECT_NE(r.id, "v0");
+  }
+}
+
+// Regression test for H-3: after overwriting/deleting several vectors in MAIN,
+// the ANN post-filter must not consume its candidate budget on tombstones and
+// return fewer than top_k results when enough live vectors still exist.
+TEST_F(TieredVectorStoreTest, SearchReturnsTopKLiveResultsAfterMainDeletions) {
+  constexpr uint32_t kBigDim = 32;
+  constexpr uint32_t kCount = 200;
+  TieredVectorStore::Config cfg = DefaultConfig();
+  cfg.distance_metric = "cosine";
+  TieredVectorStore store(cfg);
+
+  std::mt19937 rng(12345);
+  std::vector<std::vector<float>> vecs;
+  vecs.reserve(kCount);
+  for (uint32_t i = 0; i < kCount; ++i) {
+    auto v = MakeRandomVector(kBigDim, rng);
+    vecs.push_back(v);
+    ASSERT_TRUE(store.Add("v" + std::to_string(i), v).has_value());
+  }
+
+  // Move everything into MAIN so the HNSW index drives the search.
+  ASSERT_TRUE(store.MergeDeltaToMain().has_value());
+  EXPECT_EQ(store.MainSize(), kCount);
+
+  // Overwrite (delete-in-main + re-add-to-delta) the first 100 ids. This leaves
+  // 100 tombstones in MAIN while their live copies live in DELTA, plus 100
+  // untouched live MAIN vectors. Plenty of live vectors remain for top_k=20.
+  for (uint32_t i = 0; i < 100; ++i) {
+    ASSERT_TRUE(store.Add("v" + std::to_string(i), vecs[i]).has_value());
+  }
+  EXPECT_EQ(store.DeletedCount(), 100U);
+  EXPECT_EQ(store.TotalSize(), kCount);  // No net change in live count.
+
+  constexpr uint32_t kTopK = 20;
+  auto query = MakeRandomVector(kBigDim, rng);
+  auto results = store.Search(query.data(), kTopK);
+
+  // Enough live vectors exist (200), so we must get a full top_k back, and no
+  // tombstoned MAIN row may appear.
+  EXPECT_EQ(results.size(), kTopK);
+  std::unordered_set<std::string> seen;
+  for (const auto& r : results) {
+    EXPECT_TRUE(seen.insert(r.id).second) << "duplicate id: " << r.id;
   }
 }
 

@@ -244,18 +244,36 @@ std::vector<TieredSearchResult> TieredVectorStore::SearchMain(const float* query
   std::vector<TieredSearchResult> results;
 
   if (main_.index) {
-    // ANN search: request extra candidates to compensate for deleted entries
-    uint32_t fetch_k = top_k + static_cast<uint32_t>(main_.deleted.size());
-    auto ann_results = main_.index->Search(query, fetch_k);
+    // ANN search: oversample to compensate for deleted entries. The ANN still
+    // returns tombstoned rows as candidates, so the post-filter can consume the
+    // budget on deleted rows and return fewer than top_k live results even when
+    // enough live vectors exist. Start from (top_k + deleted) * factor and grow
+    // fetch_k until we collect top_k live results or exhaust the index.
+    const auto active = static_cast<uint32_t>(main_.ActiveSize());
+    const uint32_t want = std::min<uint32_t>(top_k, active);
+    constexpr uint32_t kOversampleFactor = 2;
+    uint32_t fetch_k = (top_k + static_cast<uint32_t>(main_.deleted.size())) * kOversampleFactor;
+    const uint32_t total_slots = main_.TotalSlots();
 
-    for (const auto& [idx, score] : ann_results) {
-      if (main_.deleted.count(idx) > 0) {
-        continue;
+    while (true) {
+      results.clear();
+      auto ann_results = main_.index->Search(query, fetch_k);
+      for (const auto& [idx, score] : ann_results) {
+        if (main_.deleted.count(idx) > 0) {
+          continue;
+        }
+        results.push_back({main_.ids[idx], score});
+        if (results.size() >= want) {
+          break;
+        }
       }
-      results.push_back({main_.ids[idx], score});
-      if (results.size() >= top_k) {
+      // Stop if we gathered enough live results, or the ANN cannot return more
+      // candidates (fetch_k already covers every slot, or it returned fewer
+      // candidates than requested meaning the index is exhausted).
+      if (results.size() >= want || fetch_k >= total_slots || ann_results.size() < fetch_k) {
         break;
       }
+      fetch_k *= 2;
     }
   } else {
     // Brute-force search on main matrix

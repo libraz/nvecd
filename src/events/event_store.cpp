@@ -143,6 +143,33 @@ utils::Expected<EventStore::IngestResult, utils::Error> EventStore::AddEventAndG
   return result;
 }
 
+utils::Expected<void, utils::Error> EventStore::RestoreEvent(const std::string& ctx, const Event& event) {
+  if (ctx.empty()) {
+    auto error = utils::MakeError(utils::ErrorCode::kInvalidArgument, "Context cannot be empty");
+    utils::LogEventStoreError("restore_event", ctx, error.message());
+    return utils::MakeUnexpected(error);
+  }
+  if (event.item_id.empty()) {
+    auto error = utils::MakeError(utils::ErrorCode::kInvalidArgument, "ID cannot be empty");
+    utils::LogEventStoreError("restore_event", ctx, error.message());
+    return utils::MakeUnexpected(error);
+  }
+
+  total_events_.fetch_add(1, std::memory_order_relaxed);
+
+  std::unique_lock lock(mutex_);
+  auto it = ctx_events_.find(ctx);
+  if (it == ctx_events_.end()) {
+    auto [new_it, inserted] = ctx_events_.emplace(ctx, RingBuffer<Event>(config_.ctx_buffer_size));
+    it = new_it;
+  }
+  // Push verbatim: preserve the original score, type, and timestamp so
+  // temporal-decay weights and DEL/SET semantics survive the reload exactly.
+  it->second.Push(event);
+
+  return {};
+}
+
 std::vector<Event> EventStore::GetEvents(const std::string& ctx) const {
   std::shared_lock lock(mutex_);
 

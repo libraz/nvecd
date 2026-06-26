@@ -170,32 +170,58 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
     // snapshot internally; holding our snapshot across that call would attempt
     // a recursive shared_lock on the same mutex (UB under C++17).
     std::vector<float> query_copy(query_ptr, query_ptr + snap.dim);
+    const size_t total_count = snap.count;
     snap.lock.unlock();
 
-    auto ann_results = ann_index_->Search(query_copy.data(), static_cast<uint32_t>(fetch_k) + 1);
-
-    // Re-acquire a snapshot to map result indices to IDs consistently.
-    auto map_snap = vector_store_->GetCompactSnapshot();
-    if (map_snap.Empty()) {
-      return std::vector<SimilarityResult>{};
-    }
+    // When a metadata filter is active the post-filter can discard most ANN
+    // candidates, so a single fetch_k under-fetches relative to a flat scan.
+    // Grow fetch_k until top_k filtered results are gathered or the index is
+    // exhausted (ANN returned fewer candidates than requested, or fetch_k
+    // already covers every stored vector). Without a filter we keep the single
+    // fetch: re-fetching would only multiply ANN cost on the hot path without
+    // changing the (already filter-free) result count.
+    //
+    // IMPORTANT: ann_index_->Search() acquires its own CompactSnapshot
+    // internally, so it must run with NO snapshot held here, otherwise the
+    // second shared_lock deadlocks against a waiting writer (e.g. IVF training).
+    // We therefore call Search without a lock, then take a short-lived snapshot
+    // purely to map result indices to IDs, releasing it before the next Search.
     std::vector<SimilarityResult> results;
-    results.reserve(ann_results.size());
-    for (const auto& [compact_idx, score] : ann_results) {
-      if (static_cast<size_t>(compact_idx) == query_idx) {
-        continue;  // Exclude self
+    uint32_t current_fetch = static_cast<uint32_t>(fetch_k) + 1;
+    while (true) {
+      auto ann_results = ann_index_->Search(query_copy.data(), current_fetch);
+
+      bool grow = false;
+      {
+        auto map_snap = vector_store_->GetCompactSnapshot();
+        if (map_snap.Empty()) {
+          return std::vector<SimilarityResult>{};
+        }
+        results.clear();
+        results.reserve(ann_results.size());
+        for (const auto& [compact_idx, score] : ann_results) {
+          if (static_cast<size_t>(compact_idx) == query_idx) {
+            continue;  // Exclude self
+          }
+          if (compact_idx >= map_snap.count || map_snap.IsDeleted(compact_idx)) {
+            continue;
+          }
+          const std::string& cand_id = (*map_snap.idx_to_id)[compact_idx];
+          if (has_filter && !metadata_store_->Matches(cand_id, filter)) {
+            continue;
+          }
+          results.emplace_back(cand_id, score);
+          if (static_cast<int>(results.size()) >= validated_top_k.value()) {
+            break;
+          }
+        }
+        grow = has_filter && static_cast<int>(results.size()) < validated_top_k.value() &&
+               current_fetch < static_cast<uint32_t>(total_count) && ann_results.size() >= current_fetch;
       }
-      if (compact_idx >= map_snap.count || map_snap.IsDeleted(compact_idx)) {
-        continue;
-      }
-      const std::string& cand_id = (*map_snap.idx_to_id)[compact_idx];
-      if (has_filter && !metadata_store_->Matches(cand_id, filter)) {
-        continue;
-      }
-      results.emplace_back(cand_id, score);
-      if (static_cast<int>(results.size()) >= validated_top_k.value()) {
+      if (!grow) {
         break;
       }
+      current_fetch *= 2;
     }
     std::sort(results.begin(), results.end());
     return results;
@@ -288,31 +314,30 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
 
   auto event_results = SearchByIdEvents(item_id, fetch_k);
 
-  // Determine adaptive fusion weights
+  // Determine adaptive fusion weights. Maturity is derived from the
+  // co-occurrence index directly (true neighbor count), NOT from the truncated
+  // event_results list: a small top_k must not make a mature item look new and
+  // suppress the vector weight. The neighbor count is independent of fetch_k.
   bool use_adaptive = adaptive.value_or(config_.adaptive_fusion);
   float alpha;
   float beta;
-  if (use_adaptive && event_results) {
-    // Use event_results size as neighbor count proxy (avoids extra lock)
-    std::tie(alpha, beta) = ComputeAdaptiveWeights(event_results->size());
+  if (use_adaptive) {
+    size_t neighbor_count = co_index_->GetNeighborCount(item_id);
+    std::tie(alpha, beta) = ComputeAdaptiveWeights(neighbor_count);
   } else {
     alpha = static_cast<float>(config_.fusion_alpha);
     beta = static_cast<float>(config_.fusion_beta);
   }
 
-  // Pre-filtering: use event results as candidate set for vector search
-  utils::Expected<std::vector<SimilarityResult>, utils::Error> vector_results;
-  if (event_results && event_results->size() >= static_cast<size_t>(fetch_k)) {
-    // Use event results as candidate set (pre-filter)
-    std::unordered_set<std::string> candidate_ids;
-    for (const auto& r : *event_results) {
-      candidate_ids.insert(r.item_id);
-    }
-    vector_results = SearchByIdVectorsFiltered(item_id, candidate_ids, fetch_k, filter);
-  } else {
-    // Not enough event candidates, fall back to full vector scan
-    vector_results = SearchByIdVectors(item_id, fetch_k, filter);
-  }
+  // Additive fusion: run the vector search over the FULL store (top-fetch_k) and
+  // UNION it with the event/co-occurrence candidates. The two signals are
+  // additive, not an intersection: restricting the vector search to event
+  // neighbors (the old pre-filter) made it impossible for a content-similar
+  // item that is not a co-occurrence neighbor to ever surface, silently
+  // degrading results for popular items. Running the full vector search lets
+  // each signal contribute its own candidates.
+  utils::Expected<std::vector<SimilarityResult>, utils::Error> vector_results =
+      SearchByIdVectors(item_id, fetch_k, filter);
 
   // If both failed, return error
   if (!event_results && !vector_results) {
@@ -410,26 +435,51 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
   // no snapshot is needed for the search itself; the IVF adapter takes its own
   // snapshot internally. Take a snapshot only to map result indices to IDs.
   if (ann_index_ && IsAnnIndexReady()) {
-    auto ann_results = ann_index_->Search(query_vector.data(), static_cast<uint32_t>(fetch_k));
-
-    auto map_snap = vector_store_->GetCompactSnapshot();
-    if (map_snap.Empty()) {
-      return std::vector<SimilarityResult>{};
-    }
+    // With an active metadata filter, the post-filter can discard most ANN
+    // candidates. Grow fetch_k until top_k filtered results are gathered or the
+    // index is exhausted, so ANN matches the flat scan's result count. Without a
+    // filter we keep the single fetch to avoid multiplying ANN cost on the hot
+    // path (re-fetching cannot raise the filter-free result count).
+    //
+    // IMPORTANT: ann_index_->Search() acquires its own CompactSnapshot
+    // internally, so it must run with NO snapshot held here, otherwise the
+    // second shared_lock deadlocks against a waiting writer (e.g. IVF training).
+    // We therefore call Search without a lock, then take a short-lived snapshot
+    // purely to map result indices to IDs, releasing it before the next Search.
     std::vector<SimilarityResult> results;
-    results.reserve(ann_results.size());
-    for (const auto& [compact_idx, score] : ann_results) {
-      if (compact_idx >= map_snap.count || map_snap.IsDeleted(compact_idx)) {
-        continue;
+    uint32_t current_fetch = static_cast<uint32_t>(fetch_k);
+    while (true) {
+      auto ann_results = ann_index_->Search(query_vector.data(), current_fetch);
+
+      bool grow = false;
+      {
+        auto map_snap = vector_store_->GetCompactSnapshot();
+        if (map_snap.Empty()) {
+          return std::vector<SimilarityResult>{};
+        }
+        const auto total_count = static_cast<uint32_t>(map_snap.count);
+        results.clear();
+        results.reserve(ann_results.size());
+        for (const auto& [compact_idx, score] : ann_results) {
+          if (compact_idx >= map_snap.count || map_snap.IsDeleted(compact_idx)) {
+            continue;
+          }
+          const std::string& cand_id = (*map_snap.idx_to_id)[compact_idx];
+          if (has_filter && !metadata_store_->Matches(cand_id, filter)) {
+            continue;
+          }
+          results.emplace_back(cand_id, score);
+          if (static_cast<int>(results.size()) >= validated_top_k.value()) {
+            break;
+          }
+        }
+        grow = has_filter && static_cast<int>(results.size()) < validated_top_k.value() &&
+               current_fetch < total_count && ann_results.size() >= current_fetch;
       }
-      const std::string& cand_id = (*map_snap.idx_to_id)[compact_idx];
-      if (has_filter && !metadata_store_->Matches(cand_id, filter)) {
-        continue;
-      }
-      results.emplace_back(cand_id, score);
-      if (static_cast<int>(results.size()) >= validated_top_k.value()) {
+      if (!grow) {
         break;
       }
+      current_fetch *= 2;
     }
     std::sort(results.begin(), results.end());
     return results;
@@ -534,80 +584,6 @@ std::vector<size_t> SimilarityEngine::SampleIndices(size_t total, size_t sample_
 }
 
 // ============================================================================
-// Pre-filtered Search
-// ============================================================================
-
-utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::SearchByIdVectorsFiltered(
-    const std::string& item_id, const std::unordered_set<std::string>& candidate_ids, int top_k,
-    const vectors::MetadataFilter& filter) {
-  auto validated_top_k = ValidateTopK(top_k);
-  if (!validated_top_k) {
-    return utils::MakeUnexpected(validated_top_k.error());
-  }
-
-  auto query_vec = vector_store_->GetVector(item_id);
-  if (!query_vec) {
-    return utils::MakeUnexpected(
-        utils::MakeError(utils::ErrorCode::kVectorNotFound, "Query vector not found: " + item_id));
-  }
-
-  std::vector<SimilarityResult> results;
-  results.reserve(candidate_ids.size());
-
-  {
-    auto snap = vector_store_->GetCompactSnapshot();
-    if (snap.Empty()) {
-      return MergeAndSelectTopK(std::move(results), validated_top_k.value());
-    }
-
-    auto query_it = snap.id_to_idx->find(item_id);
-    if (query_it == snap.id_to_idx->end()) {
-      return utils::MakeUnexpected(
-          utils::MakeError(utils::ErrorCode::kVectorNotFound, "Query vector not found in compact: " + item_id));
-    }
-    size_t query_idx = query_it->second;
-    const float* query_ptr = snap.matrix + query_idx * snap.dim;
-    float query_norm = snap.norms[query_idx];
-    bool has_filter = !filter.Empty() && metadata_store_ != nullptr;
-
-    // For non-cosine metrics, build query vector once
-    std::vector<float> query_vec_data;
-    if (!use_prenorm_) {
-      query_vec_data.assign(query_ptr, query_ptr + snap.dim);
-    }
-
-    for (const auto& cid : candidate_ids) {
-      if (cid == item_id) {
-        continue;
-      }
-      auto cidx_it = snap.id_to_idx->find(cid);
-      if (cidx_it == snap.id_to_idx->end()) {
-        continue;  // candidate not in vector store
-      }
-      size_t cidx = cidx_it->second;
-      if (snap.IsDeleted(cidx)) {
-        continue;
-      }
-      if (has_filter && !metadata_store_->Matches(cid, filter)) {
-        continue;
-      }
-      float score;
-      if (use_prenorm_) {
-        score = vectors::CosineSimilarityPreNorm(query_ptr, snap.matrix + cidx * snap.dim, snap.dim, query_norm,
-                                                 snap.norms[cidx]);
-      } else {
-        const float* cand_ptr = snap.matrix + cidx * snap.dim;
-        std::vector<float> cand_data(cand_ptr, cand_ptr + snap.dim);
-        score = distance_func_(query_vec_data, cand_data);
-      }
-      results.emplace_back(cid, score);
-    }
-  }
-
-  return MergeAndSelectTopK(std::move(results), validated_top_k.value());
-}
-
-// ============================================================================
 // Helper Methods
 // ============================================================================
 
@@ -627,10 +603,18 @@ utils::Expected<int, utils::Error> SimilarityEngine::ValidateTopK(int top_k) con
 }
 
 void SimilarityEngine::NormalizeScores(std::vector<SimilarityResult>& results) {
+  // Clamp a raw similarity score into the [0, 1] fusion range. Cosine/dot/L2
+  // scores produced upstream are already similarity-like (higher = closer) and
+  // typically land in [0, 1], so clamping preserves absolute confidence: a
+  // strongly-similar candidate (0.99) and a weak one (0.3) are NOT flattened to
+  // the same value the way a fixed 0.5 fallback would do.
+  auto clamp01 = [](float v) { return std::max(0.0F, std::min(1.0F, v)); };
+
   if (results.size() <= 1) {
-    // Single result or empty: set to 0.5 to avoid undue weight in fusion
+    // Single result (or empty): there is nothing to spread, so preserve the
+    // real similarity clamped to [0, 1] instead of discarding it as 0.5.
     for (auto& result : results) {
-      result.score = 0.5F;
+      result.score = clamp01(result.score);
     }
     return;
   }
@@ -644,13 +628,18 @@ void SimilarityEngine::NormalizeScores(std::vector<SimilarityResult>& results) {
     max_score = std::max(max_score, result.score);
   }
 
-  // Normalize to [0, 1]
+  // Min-max normalization spreads the relative ranking across [0, 1]. It is
+  // intentionally relative: it reflects how each candidate compares to the
+  // others in this source, which is what the weighted fusion sum consumes.
   float range = max_score - min_score;
   constexpr float kMinRange = 1e-4F;
   if (range < kMinRange) {
-    // All scores are effectively the same, set to 0.5
+    // All scores are effectively equal: min-max is undefined (range ~ 0).
+    // Preserve the shared absolute confidence (clamped) rather than collapsing
+    // every candidate to 0.5, so a cluster of high-similarity items keeps its
+    // weight in fusion and a cluster of weak matches stays weak.
     for (auto& result : results) {
-      result.score = 0.5F;
+      result.score = clamp01(result.score);
     }
     return;
   }

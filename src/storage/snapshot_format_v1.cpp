@@ -44,8 +44,6 @@ using namespace utils;
 
 namespace {
 
-constexpr int kGetAllItemsLimit = 1000000;  // Large limit to get all co-occurrence items
-
 constexpr uint32_t kMaxConfigSize = 16 * 1024 * 1024;      // 16MB max for config section
 constexpr uint32_t kMaxStatsSize = 16 * 1024 * 1024;       // 16MB max for statistics section
 constexpr uint32_t kMaxStoreDataSize = 512 * 1024 * 1024;  // 512MB max for store data
@@ -444,6 +442,12 @@ Expected<void, Error> SerializeEventStore(std::ostream& output_stream, const eve
       if (!WriteBinary(output_stream, event.score)) {
         return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write event score"));
       }
+      // Serialize the event type (uint8) so DEL negative-signal and SET dedup
+      // semantics survive the reload; without it every event defaults to ADD.
+      auto event_type = static_cast<uint8_t>(event.type);
+      if (!WriteBinary(output_stream, event_type)) {
+        return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write event type"));
+      }
       if (!WriteBinary(output_stream, event.timestamp)) {
         return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write event timestamp"));
       }
@@ -482,6 +486,7 @@ Expected<void, Error> DeserializeEventStore(std::istream& input_stream, events::
     for (uint32_t ev_idx = 0; ev_idx < event_count; ++ev_idx) {
       std::string item_id;
       int score = 0;
+      uint8_t event_type = 0;
       uint64_t timestamp = 0;
 
       if (!ReadString(input_stream, item_id)) {
@@ -490,16 +495,26 @@ Expected<void, Error> DeserializeEventStore(std::istream& input_stream, events::
       if (!ReadBinary(input_stream, score)) {
         return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read event score"));
       }
+      if (!ReadBinary(input_stream, event_type)) {
+        return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read event type"));
+      }
       if (!ReadBinary(input_stream, timestamp)) {
         return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read event timestamp"));
       }
+      if (event_type > static_cast<uint8_t>(events::EventType::DEL)) {
+        return MakeUnexpected(
+            MakeError(ErrorCode::kStorageDumpReadError, "Invalid event type: " + std::to_string(event_type)));
+      }
 
-      // Add event to store
-      // Note: We reconstruct the event with original timestamp, not current time
-      auto result = event_store.AddEvent(ctx, item_id, score);
+      // Restore the event verbatim so its original timestamp (temporal-decay
+      // weight) and type (DEL negative-signal / SET dedup semantics) are
+      // preserved. RestoreEvent bypasses deduplication to keep the buffer
+      // byte-for-byte identical to the snapshot.
+      events::Event event(item_id, score, timestamp, static_cast<events::EventType>(event_type));
+      auto result = event_store.RestoreEvent(ctx, event);
       if (!result) {
         return MakeUnexpected(
-            MakeError(ErrorCode::kStorageDumpReadError, "Failed to add event: " + result.error().message()));
+            MakeError(ErrorCode::kStorageDumpReadError, "Failed to restore event: " + result.error().message()));
       }
     }
   }
@@ -529,8 +544,10 @@ Expected<void, Error> SerializeCoOccurrenceIndex(std::ostream& output_stream,
       return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write item name: " + item1));
     }
 
-    // Get all co-occurring items with their scores
-    std::vector<std::pair<std::string, float>> co_items = co_index.GetSimilar(item1, kGetAllItemsLimit);
+    // Get all co-occurring items with their scores. Use the unfiltered
+    // enumeration (not GetSimilar) so zero/negative-score neighbors -- the
+    // negative-signal baselines -- survive the SAVE/LOAD round trip.
+    std::vector<std::pair<std::string, float>> co_items = co_index.GetAllNeighbors(item1);
 
     // Write co-item count
     auto co_item_count = static_cast<uint32_t>(co_items.size());
@@ -601,8 +618,10 @@ Expected<void, Error> DeserializeCoOccurrenceIndex(std::istream& input_stream, e
 // ============================================================================
 
 Expected<void, Error> SerializeVectorStore(std::ostream& output_stream, const vectors::VectorStore& vector_store) {
-  // Write dimension
-  size_t dimension = vector_store.GetDimension();
+  // Write dimension as a fixed-width integer so snapshots are portable across
+  // 32/64-bit builds (a bare size_t is 8 bytes on LP64, 4 on ILP32, which would
+  // desync the vectors section on a cross-bit load).
+  auto dimension = static_cast<uint64_t>(vector_store.GetDimension());
   if (!WriteBinary(output_stream, dimension)) {
     return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write dimension"));
   }
@@ -652,8 +671,8 @@ Expected<void, Error> DeserializeVectorStore(std::istream& input_stream, vectors
   // Clear existing data
   vector_store.Clear();
 
-  // Read dimension
-  size_t dimension = 0;
+  // Read dimension (fixed-width uint64_t; see SerializeVectorStore).
+  uint64_t dimension = 0;
   if (!ReadBinary(input_stream, dimension)) {
     return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read dimension"));
   }
@@ -680,7 +699,7 @@ Expected<void, Error> DeserializeVectorStore(std::istream& input_stream, vectors
 
     // Read vector data
     std::vector<float> data(dimension);
-    for (size_t i = 0; i < dimension; ++i) {
+    for (uint64_t i = 0; i < dimension; ++i) {
       if (!ReadBinary(input_stream, data[i])) {
         return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read vector component"));
       }

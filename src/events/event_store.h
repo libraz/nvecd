@@ -152,6 +152,26 @@ class EventStore {
                                                                   uint64_t timestamp = 0);
 
   /**
+   * @brief Restore an event verbatim into a context buffer (snapshot load only)
+   *
+   * Appends @p event to the context's ring buffer exactly as given, preserving
+   * its item_id, score, type, and timestamp. Unlike AddEvent(), this bypasses
+   * deduplication and the dedup/state caches so a serialized buffer reloads
+   * byte-for-byte: temporal-decay weights depend on the original timestamps and
+   * DEL/SET semantics depend on the original types, neither of which must be
+   * altered by replaying through the dedup path. The total event counter is
+   * incremented to mirror the original ingestion count.
+   *
+   * Events MUST be restored in their original insertion order (oldest first)
+   * so the ring buffer's eviction order matches the snapshot.
+   *
+   * @param ctx Context identifier
+   * @param event Event to append verbatim
+   * @return Expected<void, Error> Success or error (empty ctx / empty item_id)
+   */
+  utils::Expected<void, utils::Error> RestoreEvent(const std::string& ctx, const Event& event);
+
+  /**
    * @brief Get all events for a context
    *
    * Returns events in insertion order (oldest to newest).

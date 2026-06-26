@@ -46,6 +46,25 @@
  * All multi-byte integers are stored in little-endian format.
  * All strings are UTF-8 encoded with length-prefix (uint32_t).
  * CRC32 checksums use zlib implementation (polynomial: 0xEDB88320).
+ *
+ * Per-store record layouts (Version 1):
+ *   - EventStore: each event is {item_id (string), score (int32), type (uint8),
+ *     timestamp (uint64)}. The type and timestamp are persisted so DEL/SET
+ *     dedup semantics and temporal-decay weights survive a SAVE/LOAD round
+ *     trip exactly.
+ *   - CoOccurrenceIndex: every recorded neighbor pair is serialized, including
+ *     zero and negative scores (negative-signal baselines), not just the
+ *     positive-filtered query view.
+ *   - VectorStore: the vector dimension is a fixed-width uint64_t so snapshots
+ *     are portable across 32/64-bit builds.
+ *
+ * @note Format version is fixed at 1. The on-disk layout above reflects a
+ *       pre-release revision of V1 (added event type/timestamp persistence,
+ *       full co-occurrence enumeration, fixed-width dimension). Because nvecd
+ *       has not shipped a stable release, this is an intentional clean break:
+ *       snapshots written by an earlier pre-release build of V1 are not
+ *       readable and will fail integrity verification (section/file CRC32 or
+ *       a truncated read) rather than load corrupt state.
  */
 
 #pragma once

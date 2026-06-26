@@ -298,6 +298,30 @@ TEST_F(HnswIndexTest, MaxLevelGrowsWithInsertions) {
   EXPECT_GT(index_->GetMaxLevel(), 0U);
 }
 
+// Regression test for M-1: RandomLevel() must not produce +inf / overflow when
+// the underlying uniform draw is near 0. Stress many insertions (each draws a
+// random level) and assert the index stays healthy and the graph height stays
+// bounded by the safe clamp.
+TEST_F(HnswIndexTest, RandomLevelStressStaysBounded) {
+  std::mt19937 rng(987654321);
+
+  constexpr uint32_t kInserts = 5000;
+  for (uint32_t i = 0; i < kInserts; ++i) {
+    auto vec = RandomVector(rng);
+    index_->Add(i, vec.data());
+  }
+
+  EXPECT_EQ(index_->Size(), kInserts);
+  // RandomLevel clamps to a safe maximum (64); the graph height must never
+  // exceed it, which also proves no +inf level was ever cast.
+  EXPECT_LE(index_->GetMaxLevel(), 64U);
+
+  // The index must still answer queries correctly after the stress.
+  auto query = RandomVector(rng);
+  auto results = index_->Search(query.data(), 10);
+  EXPECT_FALSE(results.empty());
+}
+
 TEST_F(HnswIndexTest, TopKExceedsCount) {
   std::vector<float> vec(kDim, 1.0F);
   index_->Add(0, vec.data());

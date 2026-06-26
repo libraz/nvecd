@@ -318,6 +318,24 @@ std::vector<std::string> CoOccurrenceIndex::GetAllItems() const {
   return items;
 }
 
+std::vector<std::pair<std::string, float>> CoOccurrenceIndex::GetAllNeighbors(const std::string& item_id) const {
+  std::shared_lock lock(mutex_);
+
+  auto iter = co_scores_.find(item_id);
+  if (iter == co_scores_.end()) {
+    return {};
+  }
+
+  // Return every recorded neighbor unfiltered (including zero/negative scores)
+  // so serialization preserves negative-signal baselines exactly.
+  std::vector<std::pair<std::string, float>> results;
+  results.reserve(iter->second.size());
+  for (const auto& [other_id, score] : iter->second) {
+    results.emplace_back(other_id, score);
+  }
+  return results;
+}
+
 void CoOccurrenceIndex::SetScore(const std::string& item1, const std::string& item2, float score) {
   std::unique_lock lock(mutex_);
   co_scores_[item1][item2] = score;
