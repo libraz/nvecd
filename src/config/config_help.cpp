@@ -76,6 +76,12 @@ nlohmann::json ConfigToJson(const Config& config) {
       {"ctx_buffer_size", config.events.ctx_buffer_size},
       {"decay_interval_sec", config.events.decay_interval_sec},
       {"decay_alpha", config.events.decay_alpha},
+      {"dedup_window_sec", config.events.dedup_window_sec},
+      {"dedup_cache_size", config.events.dedup_cache_size},
+      {"temporal_cooccurrence", config.events.temporal_cooccurrence},
+      {"temporal_half_life_sec", config.events.temporal_half_life_sec},
+      {"negative_signals", config.events.negative_signals},
+      {"negative_weight", config.events.negative_weight},
   };
 
   // Similarity configuration
@@ -84,6 +90,21 @@ nlohmann::json ConfigToJson(const Config& config) {
       {"max_top_k", config.similarity.max_top_k},
       {"fusion_alpha", config.similarity.fusion_alpha},
       {"fusion_beta", config.similarity.fusion_beta},
+      {"sample_size", config.similarity.sample_size},
+      {"adaptive_fusion", config.similarity.adaptive_fusion},
+      {"adaptive_min_alpha", config.similarity.adaptive_min_alpha},
+      {"adaptive_max_alpha", config.similarity.adaptive_max_alpha},
+      {"adaptive_maturity_threshold", config.similarity.adaptive_maturity_threshold},
+      {"index_type", config.similarity.index_type},
+      {"ivf_enabled", config.similarity.ivf_enabled},
+      {"ivf_nlist", config.similarity.ivf_nlist},
+      {"ivf_nprobe", config.similarity.ivf_nprobe},
+      {"ivf_train_threshold", config.similarity.ivf_train_threshold},
+      {"ivf_seal_threshold", config.similarity.ivf_seal_threshold},
+      {"hnsw_m", config.similarity.hnsw_m},
+      {"hnsw_ef_construction", config.similarity.hnsw_ef_construction},
+      {"hnsw_ef_search", config.similarity.hnsw_ef_search},
+      {"hnsw_max_elements", config.similarity.hnsw_max_elements},
   };
 
   // Snapshot configuration
@@ -123,6 +144,10 @@ nlohmann::json ConfigToJson(const Config& config) {
            {"cors_allow_origin", config.api.http.cors_allow_origin},
            {"timeout_sec", config.api.http.timeout_sec},
        }},
+      {"unix_socket",
+       {
+           {"path", config.api.unix_socket.path},
+       }},
       {"rate_limiting",
        {
            {"enable", config.api.rate_limiting.enable},
@@ -156,6 +181,15 @@ nlohmann::json ConfigToJson(const Config& config) {
       {"compression_enabled", config.cache.compression_enabled},
       {"eviction_batch_size", config.cache.eviction_batch_size},
   };
+
+  // Security configuration
+  // auth_enabled lets operators confirm whether authentication is active
+  // without exposing the secret. The requirepass value itself is masked by
+  // IsSensitiveField before display and is only emitted when a password is set.
+  json["security"]["auth_enabled"] = !config.security.requirepass.empty();
+  if (!config.security.requirepass.empty()) {
+    json["security"]["requirepass"] = config.security.requirepass;
+  }
 
   return json;
 }
@@ -572,7 +606,8 @@ std::vector<std::string> ConfigSchemaExplorer::SplitPath(const std::string& path
 bool IsSensitiveField(const std::string& path) {
   std::string lower_path = ToLower(path);
   return lower_path.find("password") != std::string::npos || lower_path.find("secret") != std::string::npos ||
-         lower_path.find("key") != std::string::npos || lower_path.find("token") != std::string::npos;
+         lower_path.find("key") != std::string::npos || lower_path.find("token") != std::string::npos ||
+         lower_path.find("requirepass") != std::string::npos || lower_path.find("pass") != std::string::npos;
 }
 
 std::string MaskSensitiveValue(const std::string& path, const std::string& value) {
