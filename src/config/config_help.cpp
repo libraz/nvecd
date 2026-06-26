@@ -191,6 +191,16 @@ nlohmann::json ConfigToJson(const Config& config) {
     json["security"]["requirepass"] = config.security.requirepass;
   }
 
+  // WAL configuration
+  json["wal"] = {
+      {"enabled", config.wal.enabled},
+      {"dir", config.wal.dir},
+      {"max_file_size", config.wal.max_file_size},
+      {"sync_on_write", config.wal.sync_on_write},
+      {"sync_interval_ms", config.wal.sync_interval_ms},
+      {"include_vectors", config.wal.include_vectors},
+  };
+
   return json;
 }
 

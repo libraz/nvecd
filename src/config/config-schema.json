@@ -520,6 +520,45 @@
           "default": ""
         }
       }
+    },
+    "wal": {
+      "type": "object",
+      "description": "Write-Ahead Log configuration for crash recovery",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable WAL-based crash recovery",
+          "default": false
+        },
+        "dir": {
+          "type": "string",
+          "description": "Directory holding WAL segment files",
+          "default": "/var/lib/nvecd/wal"
+        },
+        "max_file_size": {
+          "type": "integer",
+          "description": "Maximum size per WAL file in bytes",
+          "default": 67108864,
+          "minimum": 1
+        },
+        "sync_on_write": {
+          "type": "boolean",
+          "description": "fsync after every write (high durability, lower throughput)",
+          "default": false
+        },
+        "sync_interval_ms": {
+          "type": "integer",
+          "description": "Batch fsync interval in milliseconds",
+          "default": 100,
+          "minimum": 0
+        },
+        "include_vectors": {
+          "type": "boolean",
+          "description": "Persist vector bodies in VECSET WAL records",
+          "default": true
+        }
+      }
     }
   }
 }

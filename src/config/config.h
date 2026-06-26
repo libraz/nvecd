@@ -215,6 +215,18 @@ struct SecurityConfig {
 };
 
 /**
+ * @brief Write-Ahead Log (WAL) configuration
+ */
+struct WalConfig {
+  bool enabled = false;                          ///< Enable WAL-based crash recovery (default: disabled)
+  std::string dir = "/var/lib/nvecd/wal";        ///< Directory holding WAL segment files
+  uint64_t max_file_size = 64ULL * 1024 * 1024;  ///< Maximum size per WAL file in bytes (default: 64MB)
+  bool sync_on_write = false;                    ///< fsync after every write (high durability, lower throughput)
+  uint32_t sync_interval_ms = 100;               ///< Batch fsync interval in milliseconds
+  bool include_vectors = true;                   ///< Persist vector bodies in VECSET WAL records
+};
+
+/**
  * @brief Root configuration
  */
 struct Config {
@@ -228,6 +240,7 @@ struct Config {
   LoggingConfig logging;        ///< Logging configuration
   CacheConfig cache;            ///< Cache configuration
   SecurityConfig security;      ///< Security configuration
+  WalConfig wal;                ///< Write-Ahead Log configuration
 };
 
 /**

@@ -199,6 +199,21 @@ target_link_libraries(request_dispatcher_test
 )
 gtest_discover_tests(request_dispatcher_test)
 
+add_executable(wal_codec_test
+  server/wal_codec_test.cpp
+)
+target_link_libraries(wal_codec_test
+  nvecd_server
+  nvecd_storage
+  nvecd_events
+  nvecd_vectors
+  nvecd_config
+  nvecd_utils
+  gtest
+  gtest_main
+)
+gtest_discover_tests(wal_codec_test)
+
 # Events tests
 add_executable(ring_buffer_test
   events/ring_buffer_test.cpp

@@ -32,6 +32,7 @@ add_library(nvecd_server STATIC
   server/filter_parser.cpp
   server/rate_limiter.cpp
   server/request_dispatcher.cpp
+  server/wal_codec.cpp
   server/snapshot_scheduler.cpp
   server/decay_scheduler.cpp
   server/http_server.cpp
@@ -181,6 +182,7 @@ add_library(nvecd_storage STATIC
   storage/snapshot_fork.cpp
   storage/snapshot_lock.cpp
   storage/wal.cpp
+  storage/wal_checkpoint.cpp
 )
 target_link_libraries(nvecd_storage PUBLIC
   nvecd_config

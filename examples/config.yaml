@@ -159,3 +159,19 @@ security:
                                     # - When set, clients must AUTH before write operations
                                     # - Read-only commands (SIM, INFO) are not affected
                                     # - Example: "my-secret-password"
+
+# Write-Ahead Log Configuration (optional)
+wal:
+  enabled: false                    # Enable WAL-based crash recovery (default: false)
+                                    # - Records write operations before applying them
+                                    # - Enables replay of writes lost between snapshots
+  dir: "/var/lib/nvecd/wal"         # Directory holding WAL segment files (default: "/var/lib/nvecd/wal")
+                                    # - Must not be empty when wal.enabled is true
+  max_file_size: 67108864           # Maximum size per WAL file in bytes (default: 67108864 = 64MB)
+                                    # - A new segment is started when this size is reached
+  sync_on_write: false              # fsync after every write (default: false)
+                                    # - true: higher durability, lower throughput
+                                    # - false: rely on batched fsync (sync_interval_ms)
+  sync_interval_ms: 100             # Batch fsync interval in milliseconds (default: 100)
+  include_vectors: true             # Persist vector bodies in VECSET WAL records (default: true)
+                                    # - false: smaller WAL, but vectors are not recoverable from WAL

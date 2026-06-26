@@ -426,6 +426,34 @@ SecurityConfig ParseSecurityConfig(const YAML::Node& node) {
 }
 
 /**
+ * @brief Parse WAL configuration
+ */
+WalConfig ParseWalConfig(const YAML::Node& node) {
+  WalConfig config;
+
+  if (node["enabled"]) {
+    config.enabled = node["enabled"].as<bool>();
+  }
+  if (node["dir"]) {
+    config.dir = node["dir"].as<std::string>();
+  }
+  if (node["max_file_size"]) {
+    config.max_file_size = node["max_file_size"].as<uint64_t>();
+  }
+  if (node["sync_on_write"]) {
+    config.sync_on_write = node["sync_on_write"].as<bool>();
+  }
+  if (node["sync_interval_ms"]) {
+    config.sync_interval_ms = node["sync_interval_ms"].as<uint32_t>();
+  }
+  if (node["include_vectors"]) {
+    config.include_vectors = node["include_vectors"].as<bool>();
+  }
+
+  return config;
+}
+
+/**
  * @brief Validate configuration against JSON Schema
  * Reference: ../mygram-db/src/config/config.cpp:ValidateConfigJson
  *
@@ -512,6 +540,9 @@ utils::Expected<Config, utils::Error> LoadConfig(const std::string& path) {
     }
     if (root["security"]) {
       config.security = ParseSecurityConfig(root["security"]);
+    }
+    if (root["wal"]) {
+      config.wal = ParseWalConfig(root["wal"]);
     }
 
     // Validate configuration (semantic validation)
@@ -728,6 +759,12 @@ utils::Expected<void, utils::Error> ValidateConfig(const Config& config) {
   if (config.cache.ttl_seconds < 0) {
     return utils::MakeUnexpected(
         utils::MakeError(utils::ErrorCode::kConfigInvalidValue, "cache.ttl_seconds must be >= 0 (0 = no TTL)"));
+  }
+
+  // Validate WAL configuration
+  if (config.wal.enabled && config.wal.dir.empty()) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kConfigInvalidValue, "wal.dir must not be empty when wal.enabled is true"));
   }
 
   return {};
