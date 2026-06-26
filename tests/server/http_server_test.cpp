@@ -15,9 +15,12 @@
 #include <gtest/gtest.h>
 #include <httplib.h>
 
+#include <algorithm>
 #include <chrono>
 #include <nlohmann/json.hpp>
+#include <string>
 #include <thread>
+#include <vector>
 
 #include "cache/similarity_cache.h"
 #include "config/config.h"
@@ -650,6 +653,84 @@ TEST_F(HttpServerTest, FullWorkflow) {
   EXPECT_EQ(info["stores"]["event_store"]["total_events"], 2);
 }
 
+TEST_F(HttpServerTest, SimScoresUseFixedFourDecimalPrecision) {
+  json vec1;
+  vec1["id"] = "self";
+  vec1["vector"] = {1.0f, 0.0f, 0.0f, 0.0f};
+  ASSERT_EQ(client_->Post("/vecset", vec1.dump(), "application/json")->status, 200);
+
+  json vec2;
+  vec2["id"] = "other";
+  vec2["vector"] = {0.0f, 1.0f, 0.0f, 0.0f};
+  ASSERT_EQ(client_->Post("/vecset", vec2.dump(), "application/json")->status, 200);
+
+  json req_body;
+  req_body["vector"] = {1.0f, 0.0f, 0.0f, 0.0f};
+  req_body["top_k"] = 1;
+  req_body["min_score"] = 0.0;
+  auto res = client_->Post("/simv", req_body.dump(), "application/json");
+  ASSERT_TRUE(res);
+  ASSERT_EQ(res->status, 200);
+
+  auto body = json::parse(res->body);
+  ASSERT_GE(body["count"].get<int>(), 1);
+  // A self-identical cosine score rounds to 1.0 at the shared 4-decimal policy.
+  EXPECT_DOUBLE_EQ(body["results"][0]["score"].get<double>(), 1.0);
+}
+
+TEST_F(HttpServerTest, EventsModeFilterKeepsVectorlessMatches) {
+  // Seed co-occurrence between "query" and four neighbors in one context. The
+  // neighbors have no stored vectors, exercising the cold-start path.
+  for (const char* id : {"query", "keep1", "drop1", "keep2", "drop2"}) {
+    json evt;
+    evt["ctx"] = "ctx1";
+    evt["type"] = "ADD";
+    evt["id"] = id;
+    evt["score"] = 50;
+    ASSERT_EQ(client_->Post("/event", evt.dump(), "application/json")->status, 200);
+  }
+
+  metadata_store_->Set("keep1", {{"status", std::string("active")}});
+  metadata_store_->Set("drop1", {{"status", std::string("draft")}});
+  metadata_store_->Set("keep2", {{"status", std::string("active")}});
+  metadata_store_->Set("drop2", {{"status", std::string("draft")}});
+
+  json req_body;
+  req_body["id"] = "query";
+  req_body["top_k"] = 2;
+  req_body["mode"] = "events";
+  req_body["filter"] = "status:active";
+
+  auto res = client_->Post("/sim", req_body.dump(), "application/json");
+  ASSERT_TRUE(res);
+  ASSERT_EQ(res->status, 200);
+
+  auto body = json::parse(res->body);
+  EXPECT_EQ(body["count"], 2);
+  std::vector<std::string> ids;
+  for (const auto& item : body["results"]) {
+    ids.push_back(item["id"].get<std::string>());
+  }
+  EXPECT_NE(std::find(ids.begin(), ids.end(), "keep1"), ids.end());
+  EXPECT_NE(std::find(ids.begin(), ids.end(), "keep2"), ids.end());
+  EXPECT_EQ(std::find(ids.begin(), ids.end(), "drop1"), ids.end());
+}
+
+TEST_F(HttpServerTest, VecsetDimensionMismatchRejectedEarly) {
+  json vec1;
+  vec1["id"] = "first";
+  vec1["vector"] = {1.0f, 0.0f, 0.0f, 0.0f};
+  ASSERT_EQ(client_->Post("/vecset", vec1.dump(), "application/json")->status, 200);
+
+  // Store dimension is now fixed at 4; a 2-dim vector must be rejected with 400.
+  json vec2;
+  vec2["id"] = "bad";
+  vec2["vector"] = {1.0f, 0.0f};
+  auto res = client_->Post("/vecset", vec2.dump(), "application/json");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(res->status, 400);
+}
+
 // Authentication tests: requirepass gates write/admin endpoints over HTTP
 class HttpServerAuthTest : public ::testing::Test {
  protected:
@@ -783,6 +864,94 @@ TEST_F(HttpServerAuthTest, UnauthenticatedDumpSaveRejected) {
   auto res = client_->Post("/dump/save", req.dump(), "application/json");
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 401);
+}
+
+// CORS behavior: when enabled but no origin is configured, the
+// Access-Control-Allow-Origin header must be omitted (not emitted as "null").
+class HttpServerCorsTest : public ::testing::Test {
+ protected:
+  void StartServer(int port, const std::string& origin) {
+    config_ = std::make_unique<config::Config>();
+    config_->vectors.default_dimension = 4;
+
+    event_store_ = std::make_unique<events::EventStore>(config_->events);
+    co_index_ = std::make_unique<events::CoOccurrenceIndex>();
+    vector_store_ = std::make_unique<vectors::VectorStore>(config_->vectors);
+    metadata_store_ = std::make_unique<vectors::MetadataStore>();
+    similarity_engine_ =
+        std::make_unique<similarity::SimilarityEngine>(event_store_.get(), co_index_.get(), vector_store_.get(),
+                                                       config_->similarity, config_->vectors, metadata_store_.get());
+
+    handler_ctx_.event_store = event_store_.get();
+    handler_ctx_.co_index = co_index_.get();
+    handler_ctx_.vector_store = vector_store_.get();
+    handler_ctx_.metadata_store = metadata_store_.get();
+    handler_ctx_.similarity_engine = similarity_engine_.get();
+    handler_ctx_.config = config_.get();
+
+    server::HttpServerConfig http_config;
+    http_config.bind = "127.0.0.1";
+    http_config.port = port;
+    http_config.allow_cidrs = {"127.0.0.0/8"};
+    http_config.enable_cors = true;
+    http_config.cors_allow_origin = origin;
+
+    http_server_ = std::make_unique<server::HttpServer>(http_config, &handler_ctx_, config_.get(), &loading_, &stats_);
+    ASSERT_TRUE(http_server_->Start());
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    client_ = std::make_unique<httplib::Client>("http://127.0.0.1:" + std::to_string(port));
+  }
+
+  void TearDown() override {
+    client_.reset();
+    if (http_server_) {
+      http_server_->Stop();
+    }
+  }
+
+  std::unique_ptr<config::Config> config_;
+  std::unique_ptr<events::EventStore> event_store_;
+  std::unique_ptr<events::CoOccurrenceIndex> co_index_;
+  std::unique_ptr<vectors::VectorStore> vector_store_;
+  std::unique_ptr<vectors::MetadataStore> metadata_store_;
+  std::unique_ptr<similarity::SimilarityEngine> similarity_engine_;
+
+  server::ServerStats stats_;
+  std::atomic<bool> loading_{false};
+  std::atomic<bool> read_only_{false};
+  server::HandlerContext handler_ctx_{
+      .event_store = nullptr,
+      .co_index = nullptr,
+      .vector_store = nullptr,
+      .metadata_store = nullptr,
+      .similarity_engine = nullptr,
+      .cache = nullptr,
+      .stats = stats_,
+      .config = nullptr,
+      .loading = loading_,
+      .read_only = read_only_,
+      .dump_dir = "",
+  };
+
+  std::unique_ptr<server::HttpServer> http_server_;
+  std::unique_ptr<httplib::Client> client_;
+};
+
+TEST_F(HttpServerCorsTest, EmptyOriginOmitsAcaoHeader) {
+  StartServer(18083, "");
+  auto res = client_->Get("/health/live");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(res->status, 200);
+  EXPECT_FALSE(res->has_header("Access-Control-Allow-Origin"));
+}
+
+TEST_F(HttpServerCorsTest, ConfiguredOriginEmitsAcaoHeader) {
+  StartServer(18084, "https://example.com");
+  auto res = client_->Get("/health/live");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(res->status, 200);
+  ASSERT_TRUE(res->has_header("Access-Control-Allow-Origin"));
+  EXPECT_EQ(res->get_header_value("Access-Control-Allow-Origin"), "https://example.com");
 }
 
 }  // namespace

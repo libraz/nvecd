@@ -180,6 +180,16 @@ struct HandlerContext {
   // Snapshot fork writer (non-owning, owned by NvecdServer)
   storage::ForkSnapshotWriter* fork_snapshot_writer = nullptr;
 
+  /// Vector-store generation counter.
+  ///
+  /// Bumped on every VECSET so that SIM/SIMV cache keys derived from the vector
+  /// store change whenever a vector is added or updated. This invalidates
+  /// vector-derived cached results even for brand-new item IDs, which the
+  /// per-item reverse index cannot catch (a new ID is referenced by no existing
+  /// cache entry). Shared by the TCP dispatcher and the HTTP server so both
+  /// surfaces observe the same key space.
+  std::atomic<uint64_t> vector_generation{0};
+
   // NOLINTEND(cppcoreguidelines-avoid-const-or-ref-data-members)
 };
 

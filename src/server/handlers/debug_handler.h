@@ -37,4 +37,20 @@ utils::Expected<std::string, utils::Error> HandleDebugOn(ConnectionContext& ctx)
  */
 utils::Expected<std::string, utils::Error> HandleDebugOff(ConnectionContext& ctx);
 
+/**
+ * @brief Build the debug block appended to SIM/SIMV responses in debug mode.
+ *
+ * Produces a concise "# DEBUG" block with the search mode, query timing, and
+ * candidate/result counts. Only appended when the connection has DEBUG mode
+ * enabled. Uses CRLF line endings to stay consistent with the rest of the
+ * protocol framing.
+ *
+ * @param mode Search mode label (e.g. "events", "vectors", "fusion", "vector")
+ * @param query_time_ms Total query execution time in milliseconds
+ * @param candidate_count Number of candidates produced before min_score filtering
+ * @param result_count Number of results actually returned to the client
+ * @return Formatted debug block terminated with CRLF
+ */
+std::string FormatSimDebugBlock(const std::string& mode, double query_time_ms, int candidate_count, int result_count);
+
 }  // namespace nvecd::server::handlers

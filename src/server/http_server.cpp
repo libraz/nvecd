@@ -27,6 +27,7 @@
 #include "server/command_parser.h"
 #include "server/filter_parser.h"
 #include "server/handlers/dump_handler.h"
+#include "server/score_format.h"
 #include "similarity/similarity_engine.h"
 #include "storage/snapshot_fork.h"
 #include "utils/memory_utils.h"
@@ -163,6 +164,33 @@ std::vector<similarity::SimilarityResult> ApplyMetadataFilter(const std::vector<
   return filtered;
 }
 
+/// Oversampling factor for events-mode filtered search (mirrors the TCP path).
+constexpr int kEventsFilterOversampling = 3;
+
+/**
+ * @brief Apply a metadata filter to events-mode results and truncate to top_k.
+ *
+ * Events mode resolves candidates from the metadata-unaware co-occurrence
+ * index, so filtering happens here. Because matching keys off the item ID, a
+ * vectorless item with matching metadata stays eligible (cold-start use case).
+ * The caller over-fetches so up to @p top_k matching items can be returned.
+ */
+std::vector<similarity::SimilarityResult> ApplyEventsFilterTopK(
+    const std::vector<similarity::SimilarityResult>& results, vectors::MetadataStore* metadata_store,
+    const vectors::MetadataFilter& filter, int top_k) {
+  std::vector<similarity::SimilarityResult> filtered;
+  filtered.reserve(results.size());
+  for (const auto& item : results) {
+    if (filter.Empty() || metadata_store == nullptr || metadata_store->Matches(item.item_id, filter)) {
+      filtered.push_back(item);
+      if (top_k > 0 && static_cast<int>(filtered.size()) >= top_k) {
+        break;
+      }
+    }
+  }
+  return filtered;
+}
+
 bool JsonNumberIsFinite(const json& value) {
   if (!value.is_number()) {
     return false;
@@ -219,6 +247,12 @@ HttpServer::HttpServer(HttpServerConfig config, HandlerContext* handler_context,
   // Set timeouts
   server_->set_read_timeout(config_.read_timeout_sec, 0);
   server_->set_write_timeout(config_.write_timeout_sec, 0);
+
+  // Bound the request body size. httplib defaults CPPHTTPLIB_PAYLOAD_MAX_LENGTH
+  // to SIZE_MAX, so without this an unbounded body could exhaust memory.
+  if (config_.max_payload_bytes > 0) {
+    server_->set_payload_max_length(config_.max_payload_bytes);
+  }
 
   // Setup network ACL before registering routes
   SetupAccessControl();
@@ -308,20 +342,31 @@ void HttpServer::SetupAccessControl() {
 }
 
 void HttpServer::SetupCors() {
-  const std::string allow_origin = config_.cors_allow_origin.empty() ? "null" : config_.cors_allow_origin;
+  // When no origin is configured, omit the Access-Control-Allow-Origin header
+  // entirely. Emitting "null" would advertise the special "null" origin (used by
+  // sandboxed iframes, file:// pages, etc.) as allowed, which is a footgun. The
+  // other CORS headers are still set so a deployment can front the server with a
+  // proxy that injects the appropriate origin.
+  const std::string allow_origin = config_.cors_allow_origin;
+  const bool has_origin = !allow_origin.empty();
 
   // CORS preflight
-  server_->Options(".*", [allow_origin](const httplib::Request& /*req*/, httplib::Response& res) {
-    res.set_header("Access-Control-Allow-Origin", allow_origin);
+  server_->Options(".*", [allow_origin, has_origin](const httplib::Request& /*req*/, httplib::Response& res) {
+    if (has_origin) {
+      res.set_header("Access-Control-Allow-Origin", allow_origin);
+    }
     res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     res.set_header("Access-Control-Allow-Headers", "Content-Type");
     res.status = kHttpNoContent;
   });
 
   // Add CORS headers to all responses
-  server_->set_post_routing_handler([allow_origin](const httplib::Request& /*req*/, httplib::Response& res) {
-    res.set_header("Access-Control-Allow-Origin", allow_origin);
-  });
+  server_->set_post_routing_handler(
+      [allow_origin, has_origin](const httplib::Request& /*req*/, httplib::Response& res) {
+        if (has_origin) {
+          res.set_header("Access-Control-Allow-Origin", allow_origin);
+        }
+      });
 }
 
 nvecd::utils::Expected<void, nvecd::utils::Error> HttpServer::Start() {
@@ -929,6 +974,19 @@ void HttpServer::HandleVecset(const httplib::Request& req, httplib::Response& re
       return;
     }
 
+    // Reject an obviously inconsistent dimension early. Once the store has its
+    // dimension fixed (by the first vector), a mismatched length can never be
+    // stored, so fail fast with a clear 400 instead of doing further work.
+    if (handler_context_->vector_store != nullptr) {
+      size_t expected_dim = handler_context_->vector_store->GetDimension();
+      if (expected_dim > 0 && vector.size() != expected_dim) {
+        SendError(res, kHttpBadRequest,
+                  "Field 'vector' dimension mismatch: expected " + std::to_string(expected_dim) + ", got " +
+                      std::to_string(vector.size()));
+        return;
+      }
+    }
+
     vectors::Metadata metadata;
     bool has_metadata = body.contains("metadata");
     if (has_metadata) {
@@ -1162,7 +1220,9 @@ void HttpServer::HandleSim(const httplib::Request& req, httplib::Response& res) 
         for (const auto& sim_result : cached_results) {
           json item;
           item["id"] = sim_result.first;
-          item["score"] = sim_result.second;
+          // Round to the shared score precision so JSON scores match the TCP
+          // surface (which renders with the same fixed precision).
+          item["score"] = RoundScore(sim_result.second);
           results_array.push_back(item);
         }
         response["results"] = results_array;
@@ -1176,7 +1236,25 @@ void HttpServer::HandleSim(const httplib::Request& req, httplib::Response& res) 
     // Call appropriate search method based on mode
     utils::Expected<std::vector<similarity::SimilarityResult>, utils::Error> result;
     if (mode == "events") {
-      result = handler_context_->similarity_engine->SearchByIdEvents(id, top_k);
+      // Events mode is metadata-unaware: over-fetch and filter afterwards so the
+      // response can still reach top_k, keeping vectorless-but-matching items
+      // eligible (cold-start use case). Mirrors the TCP dispatcher.
+      const bool filtering = !filter_expr.empty() && handler_context_->metadata_store != nullptr;
+      // Clamp the over-fetch to the configured maximum so it never trips the
+      // engine's own top_k upper-bound validation.
+      const int max_top_k =
+          handler_context_->config != nullptr ? static_cast<int>(handler_context_->config->similarity.max_top_k) : 0;
+      int fetch_k = top_k;
+      if (filtering) {
+        fetch_k = top_k * kEventsFilterOversampling;
+        if (max_top_k > 0 && fetch_k > max_top_k) {
+          fetch_k = max_top_k;
+        }
+      }
+      result = handler_context_->similarity_engine->SearchByIdEvents(id, fetch_k);
+      if (result && filtering) {
+        *result = ApplyEventsFilterTopK(*result, handler_context_->metadata_store, filter, top_k);
+      }
     } else if (mode == "vectors") {
       result = handler_context_->similarity_engine->SearchByIdVectors(id, top_k, filter);
     } else {  // fusion
@@ -1191,7 +1269,11 @@ void HttpServer::HandleSim(const httplib::Request& req, httplib::Response& res) 
       }
       return;
     }
-    *result = ApplyMetadataFilter(*result, handler_context_->metadata_store, filter);
+    if (mode != "events") {
+      // Non-events modes already filter inside the engine; events mode was
+      // filtered above with over-fetch.
+      *result = ApplyMetadataFilter(*result, handler_context_->metadata_store, filter);
+    }
 
     // Cache store (mirrors the TCP path: cache full results, register items).
     if (cache_enabled) {
@@ -1222,7 +1304,9 @@ void HttpServer::HandleSim(const httplib::Request& req, httplib::Response& res) 
     for (const auto& sim_result : filtered_results) {
       json item;
       item["id"] = sim_result.first;
-      item["score"] = sim_result.second;
+      // Round to the shared score precision so JSON scores match the TCP
+      // surface (which renders with the same fixed precision).
+      item["score"] = RoundScore(sim_result.second);
       results_array.push_back(item);
     }
     response["results"] = results_array;
@@ -1327,7 +1411,9 @@ void HttpServer::HandleSimv(const httplib::Request& req, httplib::Response& res)
         for (const auto& sim_result : cached_results) {
           json item;
           item["id"] = sim_result.first;
-          item["score"] = sim_result.second;
+          // Round to the shared score precision so JSON scores match the TCP
+          // surface (which renders with the same fixed precision).
+          item["score"] = RoundScore(sim_result.second);
           results_array.push_back(item);
         }
         response["results"] = results_array;
@@ -1374,7 +1460,9 @@ void HttpServer::HandleSimv(const httplib::Request& req, httplib::Response& res)
     for (const auto& sim_result : filtered_results) {
       json item;
       item["id"] = sim_result.first;
-      item["score"] = sim_result.second;
+      // Round to the shared score precision so JSON scores match the TCP
+      // surface (which renders with the same fixed precision).
+      item["score"] = RoundScore(sim_result.second);
       results_array.push_back(item);
     }
     response["results"] = results_array;

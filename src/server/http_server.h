@@ -44,6 +44,9 @@ struct HttpServerConfig {
   std::string cors_allow_origin;
   std::vector<std::string> allow_cidrs;
   std::string requirepass;  ///< Required password for write/admin endpoints (empty = no auth)
+  /// Maximum accepted HTTP request body size in bytes. Requests with a larger
+  /// payload are rejected by httplib before reaching a handler. Defaults to 8MB.
+  size_t max_payload_bytes = 8UL * 1024UL * 1024UL;
 };
 
 /**

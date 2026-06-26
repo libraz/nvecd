@@ -128,6 +128,11 @@ utils::Expected<void, utils::Error> NvecdServer::Start() {
     http_config.cors_allow_origin = config_.api.http.cors_allow_origin;
     http_config.allow_cidrs = config_.network.allow_cidrs;
     http_config.requirepass = config_.security.requirepass;
+    // Bound the HTTP request body using the same query-length budget as the TCP
+    // path (which accumulates up to 2x max_query_length per request).
+    if (config_.perf.max_query_length > 0) {
+      http_config.max_payload_bytes = static_cast<size_t>(config_.perf.max_query_length) * 2;
+    }
 
     http_server_ = std::make_unique<HttpServer>(http_config, &handler_ctx_, &config_, &loading_, &stats_);
 

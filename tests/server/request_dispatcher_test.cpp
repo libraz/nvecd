@@ -275,3 +275,124 @@ TEST_F(RequestDispatcherTest, SimvFilterUsesMetadataStore) {
   EXPECT_NE(response.find("draft"), std::string::npos);
   EXPECT_EQ(response.find("active"), std::string::npos);
 }
+
+// ============================================================================
+// VECSET cache invalidation (new vector must appear in subsequent searches)
+// ============================================================================
+
+TEST_F(RequestDispatcherTest, VecsetInvalidatesCachedSimvResultsForNewVector) {
+  nvecd::cache::CachePolicy policy;
+  policy.enabled = true;
+  cache_->SetSearchTypePolicy(nvecd::cache::SearchType::kVectorSearch, policy);
+
+  ASSERT_NE(Dispatch("VECSET item1 1 0\r\n").find("OK"), std::string::npos);
+
+  // Warm the cache for this query vector.
+  auto warm = Dispatch("SIMV 10 min_score=0 1 0\r\n");
+  ASSERT_NE(warm.find("OK RESULTS 1"), std::string::npos);
+  ASSERT_NE(warm.find("item1"), std::string::npos);
+
+  // Add a brand-new vector that should also match the query. The reverse index
+  // cannot evict by item2 (no entry references it yet); the generation bump in
+  // the cache key must invalidate the stale result.
+  ASSERT_NE(Dispatch("VECSET item2 1 0\r\n").find("OK"), std::string::npos);
+
+  auto again = Dispatch("SIMV 10 min_score=0 1 0\r\n");
+  EXPECT_NE(again.find("OK RESULTS 2"), std::string::npos);
+  EXPECT_NE(again.find("item1"), std::string::npos);
+  EXPECT_NE(again.find("item2"), std::string::npos);
+}
+
+TEST_F(RequestDispatcherTest, VecsetInvalidatesCachedSimResultsForNewVector) {
+  nvecd::cache::CachePolicy item_policy;
+  item_policy.enabled = true;
+  cache_->SetSearchTypePolicy(nvecd::cache::SearchType::kItemSearch, item_policy);
+
+  ASSERT_NE(Dispatch("VECSET query 1 0\r\n").find("OK"), std::string::npos);
+  ASSERT_NE(Dispatch("VECSET item1 1 0\r\n").find("OK"), std::string::npos);
+
+  auto warm = Dispatch("SIM query 10 using=vectors min_score=0\r\n");
+  ASSERT_NE(warm.find("OK RESULTS 1"), std::string::npos);
+
+  ASSERT_NE(Dispatch("VECSET item2 1 0\r\n").find("OK"), std::string::npos);
+
+  auto again = Dispatch("SIM query 10 using=vectors min_score=0\r\n");
+  EXPECT_NE(again.find("OK RESULTS 2"), std::string::npos);
+  EXPECT_NE(again.find("item2"), std::string::npos);
+}
+
+// ============================================================================
+// Score formatting (fixed 4-decimal precision on the TCP surface)
+// ============================================================================
+
+TEST_F(RequestDispatcherTest, SimvScoresUseFixedFourDecimalPrecision) {
+  ASSERT_NE(Dispatch("VECSET item1 1 0\r\n").find("OK"), std::string::npos);
+
+  auto response = Dispatch("SIMV 1 min_score=0 1 0\r\n");
+  ASSERT_NE(response.find("OK RESULTS 1"), std::string::npos);
+  // A self-identical cosine score of 1.0 must render as "1.0000".
+  EXPECT_NE(response.find("item1 1.0000"), std::string::npos);
+}
+
+// ============================================================================
+// Events-mode filter over-fetch and vectorless eligibility (H-11)
+// ============================================================================
+
+TEST_F(RequestDispatcherTest, EventsFilterKeepsVectorlessMatchesAndReachesTopK) {
+  // Build co-occurrence between "query" and neighbors via EVENT in one context.
+  ASSERT_NE(Dispatch("EVENT ctx1 ADD query 50\r\n").find("OK"), std::string::npos);
+  ASSERT_NE(Dispatch("EVENT ctx1 ADD keep1 50\r\n").find("OK"), std::string::npos);
+  ASSERT_NE(Dispatch("EVENT ctx1 ADD drop1 50\r\n").find("OK"), std::string::npos);
+  ASSERT_NE(Dispatch("EVENT ctx1 ADD keep2 50\r\n").find("OK"), std::string::npos);
+  ASSERT_NE(Dispatch("EVENT ctx1 ADD drop2 50\r\n").find("OK"), std::string::npos);
+
+  // Tag neighbors with metadata. None of them has a stored vector, exercising
+  // the cold-start (vectorless) path: matching keys off the item ID only.
+  metadata_store_->Set("keep1", {{"status", std::string("active")}});
+  metadata_store_->Set("drop1", {{"status", std::string("draft")}});
+  metadata_store_->Set("keep2", {{"status", std::string("active")}});
+  metadata_store_->Set("drop2", {{"status", std::string("draft")}});
+
+  // Ask for top_k=2 active items. Without over-fetch, filtering after a top-2
+  // truncation could drop below 2; the over-fetch must still deliver both.
+  auto response = Dispatch("SIM query 2 using=events filter=status:active\r\n");
+  EXPECT_NE(response.find("OK RESULTS 2"), std::string::npos);
+  EXPECT_NE(response.find("keep1"), std::string::npos);
+  EXPECT_NE(response.find("keep2"), std::string::npos);
+  EXPECT_EQ(response.find("drop1"), std::string::npos);
+  EXPECT_EQ(response.find("drop2"), std::string::npos);
+}
+
+// ============================================================================
+// Parse-time top_k validation wiring (#42)
+// ============================================================================
+
+TEST_F(RequestDispatcherTest, TopKAboveConfiguredMaxRejectedAtParseTime) {
+  config_->similarity.max_top_k = 5;
+
+  auto response = Dispatch("SIM item1 9999 using=vectors\r\n");
+  EXPECT_NE(response.find("ERROR"), std::string::npos);
+  EXPECT_NE(response.find("exceeds maximum allowed"), std::string::npos);
+}
+
+// ============================================================================
+// DEBUG mode output (M-4)
+// ============================================================================
+
+TEST_F(RequestDispatcherTest, DebugModeAppendsDebugBlockToSim) {
+  ConnectionContext conn_ctx;
+  conn_ctx.authenticated = true;
+
+  ASSERT_NE(Dispatch("VECSET item1 1 0\r\n", conn_ctx).find("OK"), std::string::npos);
+
+  auto before = Dispatch("SIM item1 5 using=vectors\r\n", conn_ctx);
+  EXPECT_EQ(before.find("# DEBUG"), std::string::npos);
+
+  ASSERT_NE(Dispatch("DEBUG ON\r\n", conn_ctx).find("Debug mode enabled"), std::string::npos);
+  EXPECT_TRUE(conn_ctx.debug_mode);
+
+  auto after = Dispatch("SIM item1 5 using=vectors\r\n", conn_ctx);
+  EXPECT_NE(after.find("# DEBUG"), std::string::npos);
+  EXPECT_NE(after.find("query_time_us:"), std::string::npos);
+  EXPECT_NE(after.find("mode: vectors"), std::string::npos);
+}

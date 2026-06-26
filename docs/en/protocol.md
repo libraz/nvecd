@@ -619,16 +619,19 @@ SIM item456 10 using=fusion
 item789 0.9245
 item101 0.8932
 item202 0.8567
-
 # DEBUG
-query_time_us: 850
-event_search_time_us: 320
-vector_search_time_us: 410
-fusion_time_us: 120
 mode: fusion
-event_candidates: 15
-vector_candidates: 12
+query_time_us: 850
+candidates: 15
+results: 3
 ```
+
+The debug block is appended after the normal SIM/SIMV results for connections with
+DEBUG mode enabled. Fields:
+- `mode`: search mode (`events`, `vectors`, `fusion`, or `vector` for SIMV)
+- `query_time_us`: total query execution time in microseconds
+- `candidates`: number of candidates produced before `min_score` filtering
+- `results`: number of results returned to the client
 
 ---
 

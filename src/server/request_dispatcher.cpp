@@ -26,6 +26,7 @@
 #include "server/handlers/info_handler.h"
 #include "server/handlers/variable_handler.h"
 #include "server/request_dispatcher.h"
+#include "server/score_format.h"
 #include "similarity/similarity_engine.h"
 #include "utils/error.h"
 #include "utils/structured_log.h"
@@ -72,13 +73,53 @@ std::vector<similarity::SimilarityResult> ApplyMetadataFilter(const std::vector<
   return filtered;
 }
 
+/// Oversampling factor used when a metadata filter is combined with an
+/// events-mode search. The co-occurrence search has no filter awareness, so we
+/// fetch more candidates than requested and filter afterwards; this keeps the
+/// filtered result able to reach top_k when enough matching neighbors exist.
+constexpr int kEventsFilterOversampling = 3;
+
+/**
+ * @brief Apply a metadata filter to events-mode results and truncate to top_k.
+ *
+ * Events mode resolves candidates purely from the co-occurrence index, which is
+ * metadata-unaware. Filtering is therefore applied here against the metadata
+ * store. Because MetadataStore::Matches keys off the item ID alone, a vectorless
+ * item with matching metadata stays eligible, preserving the cold-start
+ * recommendation use case. The caller over-fetches so that, after filtering,
+ * up to @p top_k matching items can still be returned.
+ *
+ * @param results Over-fetched events-mode results (already score-sorted)
+ * @param metadata_store Metadata store (may be null)
+ * @param filter Filter conditions (empty = no filtering)
+ * @param top_k Maximum number of results to keep
+ * @return Filtered results truncated to top_k
+ */
+std::vector<similarity::SimilarityResult> ApplyEventsFilterTopK(
+    const std::vector<similarity::SimilarityResult>& results, vectors::MetadataStore* metadata_store,
+    const vectors::MetadataFilter& filter, int top_k) {
+  std::vector<similarity::SimilarityResult> filtered;
+  filtered.reserve(results.size());
+  for (const auto& result : results) {
+    if (filter.Empty() || metadata_store == nullptr || metadata_store->Matches(result.item_id, filter)) {
+      filtered.push_back(result);
+      if (top_k > 0 && static_cast<int>(filtered.size()) >= top_k) {
+        break;
+      }
+    }
+  }
+  return filtered;
+}
+
 }  // namespace
 
 RequestDispatcher::RequestDispatcher(HandlerContext& handler_ctx) : ctx_(handler_ctx) {}
 
 std::string RequestDispatcher::Dispatch(const std::string& request, ConnectionContext& conn_ctx) {
-  // Parse command
-  auto cmd = ParseCommand(request);
+  // Parse command. Pass the configured maximum top_k so the upper bound is
+  // enforced at parse time (0 = no check when no config is wired).
+  const uint32_t max_top_k = ctx_.config != nullptr ? ctx_.config->similarity.max_top_k : 0;
+  auto cmd = ParseCommand(request, max_top_k);
   if (!cmd) {
     utils::LogCommandParseError(request, cmd.error().message(), 0);
     return FormatError(cmd.error().message());
@@ -307,6 +348,13 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleVecset(const
     }
   }
 
+  // Bump the vector-store generation so SIM/SIMV cache keys derived from the
+  // vector store change. The per-item reverse index only evicts entries that
+  // already reference an existing ID, so a brand-new item would otherwise be a
+  // no-op and stale cached results could omit it. The generation participates
+  // in both SIM and SIMV keys, invalidating that space on any vector mutation.
+  ctx_.vector_generation.fetch_add(1, std::memory_order_acq_rel);
+
   // Selective cache invalidation for mutated item
   auto* cache_ptr = ctx_.cache.load(std::memory_order_acquire);
   if (cache_ptr != nullptr) {
@@ -355,7 +403,6 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleMetaset(cons
 
 utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSim(const Command& cmd,
                                                                         ConnectionContext& conn_ctx) const {
-  (void)conn_ctx;
   if (ctx_.similarity_engine == nullptr) {
     return utils::MakeUnexpected(
         utils::MakeError(utils::ErrorCode::kInternalError, "SimilarityEngine not initialized"));
@@ -380,8 +427,9 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSim(const Co
 
   if (cache_enabled) {
     auto gen = ctx_.co_index != nullptr ? ctx_.co_index->GetGeneration() : 0;
+    auto vgen = ctx_.vector_generation.load(std::memory_order_acquire);
     std::string key_str = "SIM:" + cmd.id + ":" + std::to_string(cmd.top_k) + ":" + cmd.mode + ":a" +
-                          AdaptiveCachePart(cmd.adaptive) + ":g" + std::to_string(gen);
+                          AdaptiveCachePart(cmd.adaptive) + ":g" + std::to_string(gen) + ":v" + std::to_string(vgen);
     if (!cmd.filter_expr.empty()) {
       key_str += ":f" + cmd.filter_expr;
     }
@@ -389,16 +437,42 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSim(const Co
     auto cached = cache_ptr->Lookup(cache_key, search_type);
     if (cached.has_value()) {
       auto pairs = ApplyMinScore(*cached, cmd.min_score);
-      return FormatSimResults(pairs, static_cast<int>(pairs.size()));
+      std::string response = FormatSimResults(pairs, static_cast<int>(pairs.size()));
+      if (conn_ctx.debug_mode) {
+        // Cache hit: timing reflects the lookup only and the candidate count
+        // equals the cached result count.
+        response += handlers::FormatSimDebugBlock(cmd.mode, 0.0, static_cast<int>(cached->size()),
+                                                  static_cast<int>(pairs.size()));
+      }
+      return response;
     }
   }
 
   auto start = std::chrono::steady_clock::now();
 
-  // Select search method based on mode
+  // Select search method based on mode.
   utils::Expected<std::vector<similarity::SimilarityResult>, utils::Error> result;
   if (cmd.mode == "events") {
-    result = ctx_.similarity_engine->SearchByIdEvents(cmd.id, cmd.top_k);
+    // Events mode resolves candidates from the co-occurrence index, which is
+    // metadata-unaware. When a filter is active, over-fetch and filter against
+    // the metadata store afterwards so the response can still reach top_k. A
+    // vectorless item with matching metadata stays eligible (cold-start use
+    // case), because matching keys off the item ID, not a stored vector row.
+    const bool filtering = !filter.Empty() && ctx_.metadata_store != nullptr;
+    // Clamp the over-fetch to the configured maximum so it never trips the
+    // engine's own top_k upper-bound validation.
+    const int max_top_k = ctx_.config != nullptr ? static_cast<int>(ctx_.config->similarity.max_top_k) : 0;
+    int fetch_k = cmd.top_k;
+    if (filtering) {
+      fetch_k = cmd.top_k * kEventsFilterOversampling;
+      if (max_top_k > 0 && fetch_k > max_top_k) {
+        fetch_k = max_top_k;
+      }
+    }
+    result = ctx_.similarity_engine->SearchByIdEvents(cmd.id, fetch_k);
+    if (result && filtering) {
+      *result = ApplyEventsFilterTopK(*result, ctx_.metadata_store, filter, cmd.top_k);
+    }
   } else if (cmd.mode == "vectors") {
     result = ctx_.similarity_engine->SearchByIdVectors(cmd.id, cmd.top_k, filter);
   } else {  // fusion (default)
@@ -408,12 +482,17 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSim(const Co
   if (!result) {
     return utils::MakeUnexpected(result.error());
   }
-  *result = ApplyMetadataFilter(*result, ctx_.metadata_store, filter);
+  if (cmd.mode != "events") {
+    // Non-events modes already apply the filter inside the engine; this second
+    // pass enforces it consistently for results that bypassed engine filtering.
+    *result = ApplyMetadataFilter(*result, ctx_.metadata_store, filter);
+  }
+
+  auto elapsed = std::chrono::steady_clock::now() - start;
+  double elapsed_ms = std::chrono::duration<double, std::milli>(elapsed).count();
 
   // Cache store
   if (cache_enabled) {
-    auto elapsed = std::chrono::steady_clock::now() - start;
-    double elapsed_ms = std::chrono::duration<double, std::milli>(elapsed).count();
     cache_ptr->Insert(cache_key, *result, elapsed_ms, search_type);
 
     // Register result items for selective cache invalidation
@@ -429,12 +508,16 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSim(const Co
   // Apply min_score filter and convert to pair<string, float>
   auto pairs = ApplyMinScore(*result, cmd.min_score);
 
-  return FormatSimResults(pairs, static_cast<int>(pairs.size()));
+  std::string response = FormatSimResults(pairs, static_cast<int>(pairs.size()));
+  if (conn_ctx.debug_mode) {
+    response += handlers::FormatSimDebugBlock(cmd.mode, elapsed_ms, static_cast<int>(result->size()),
+                                              static_cast<int>(pairs.size()));
+  }
+  return response;
 }
 
 utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSimv(const Command& cmd,
                                                                          ConnectionContext& conn_ctx) const {
-  (void)conn_ctx;
   if (ctx_.similarity_engine == nullptr) {
     return utils::MakeUnexpected(
         utils::MakeError(utils::ErrorCode::kInternalError, "SimilarityEngine not initialized"));
@@ -459,7 +542,8 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSimv(const C
 
   if (cache_enabled) {
     std::string vec_hash = cache::HashVector(cmd.vector);
-    std::string key_str = "SIMV:" + vec_hash + ":" + std::to_string(cmd.top_k);
+    auto vgen = ctx_.vector_generation.load(std::memory_order_acquire);
+    std::string key_str = "SIMV:" + vec_hash + ":" + std::to_string(cmd.top_k) + ":v" + std::to_string(vgen);
     if (!cmd.filter_expr.empty()) {
       key_str += ":f" + cmd.filter_expr;
     }
@@ -467,7 +551,12 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSimv(const C
     auto cached = cache_ptr->Lookup(cache_key, search_type);
     if (cached.has_value()) {
       auto pairs = ApplyMinScore(*cached, cmd.min_score);
-      return FormatSimResults(pairs, static_cast<int>(pairs.size()));
+      std::string response = FormatSimResults(pairs, static_cast<int>(pairs.size()));
+      if (conn_ctx.debug_mode) {
+        response += handlers::FormatSimDebugBlock("vector", 0.0, static_cast<int>(cached->size()),
+                                                  static_cast<int>(pairs.size()));
+      }
+      return response;
     }
   }
 
@@ -479,10 +568,11 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSimv(const C
   }
   *result = ApplyMetadataFilter(*result, ctx_.metadata_store, filter);
 
+  auto elapsed = std::chrono::steady_clock::now() - start;
+  double elapsed_ms = std::chrono::duration<double, std::milli>(elapsed).count();
+
   // Cache store
   if (cache_enabled) {
-    auto elapsed = std::chrono::steady_clock::now() - start;
-    double elapsed_ms = std::chrono::duration<double, std::milli>(elapsed).count();
     cache_ptr->Insert(cache_key, *result, elapsed_ms, search_type);
 
     // Register result items for selective cache invalidation
@@ -497,7 +587,12 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSimv(const C
   // Apply min_score filter and convert to pair<string, float>
   auto pairs = ApplyMinScore(*result, cmd.min_score);
 
-  return FormatSimResults(pairs, static_cast<int>(pairs.size()));
+  std::string response = FormatSimResults(pairs, static_cast<int>(pairs.size()));
+  if (conn_ctx.debug_mode) {
+    response += handlers::FormatSimDebugBlock("vector", elapsed_ms, static_cast<int>(result->size()),
+                                              static_cast<int>(pairs.size()));
+  }
+  return response;
 }
 
 utils::Expected<std::string, utils::Error> RequestDispatcher::HandleInfo(const Command& /* cmd */) {
@@ -584,7 +679,9 @@ std::string RequestDispatcher::FormatSimResults(const std::vector<std::pair<std:
   std::ostringstream oss;
   oss << "OK RESULTS " << count << "\r\n";
   for (const auto& [id, score] : results) {
-    oss << id << " " << score << "\r\n";
+    // Use the shared fixed-precision policy so scores render identically on the
+    // TCP and HTTP surfaces.
+    oss << id << " " << FormatScore(score) << "\r\n";
   }
   return oss.str();
 }

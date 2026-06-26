@@ -283,7 +283,7 @@ TEST_F(HandlerTest, DebugOn_SetsDebugModeTrue) {
 
   auto result = HandleDebugOn(conn_ctx);
   ASSERT_TRUE(result.has_value());
-  EXPECT_THAT(*result, HasSubstr("DEBUG_ON"));
+  EXPECT_THAT(*result, HasSubstr("Debug mode enabled"));
   EXPECT_TRUE(conn_ctx.debug_mode);
 }
 
@@ -293,7 +293,7 @@ TEST_F(HandlerTest, DebugOff_SetsDebugModeFalse) {
 
   auto result = HandleDebugOff(conn_ctx);
   ASSERT_TRUE(result.has_value());
-  EXPECT_THAT(*result, HasSubstr("DEBUG_OFF"));
+  EXPECT_THAT(*result, HasSubstr("Debug mode disabled"));
   EXPECT_FALSE(conn_ctx.debug_mode);
 }
 
