@@ -7,7 +7,6 @@
 
 #include <spdlog/spdlog.h>
 #include <sys/socket.h>
-#include <sys/uio.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -119,52 +118,66 @@ bool ConnectionIOHandler::ProcessBuffer(std::string& accumulated, int client_fd,
   return true;
 }
 
+std::string ConnectionIOHandler::NormalizeResponse(const std::string& response) {
+  // Canonical framing policy: every line is terminated with CRLF and the
+  // response carries exactly one trailing CRLF. Handler bodies historically
+  // mixed bare "\n" (between lines and as a trailing terminator) with the CRLF
+  // that SendResponse used to append unconditionally. That produced an extra
+  // blank line on single-line responses and mis-framed multi-line responses for
+  // clients that split on CRLF. Normalizing here keeps the policy in one place,
+  // independent of how each handler builds its body.
+  //
+  // Strip any trailing newline characters first so we do not emit a blank
+  // terminating line, then rewrite every interior bare "\n" to "\r\n".
+  size_t end = response.size();
+  while (end > 0 && (response[end - 1] == '\n' || response[end - 1] == '\r')) {
+    --end;
+  }
+
+  std::string normalized;
+  normalized.reserve(end + 2);
+  for (size_t i = 0; i < end; ++i) {
+    char ch = response[i];
+    if (ch == '\r') {
+      // Skip a CR; the following LF (or this position) becomes a CRLF below.
+      continue;
+    }
+    if (ch == '\n') {
+      normalized += "\r\n";
+      continue;
+    }
+    normalized += ch;
+  }
+  normalized += "\r\n";
+  return normalized;
+}
+
 // Kept as member function for consistency and potential future extensions
 // NOLINTNEXTLINE(readability-convert-member-functions-to-static)
 bool ConnectionIOHandler::SendResponse(int client_fd, const std::string& response) {
-  // Use writev() to send response + CRLF without string concatenation
-  static constexpr char kCRLF[] = "\r\n";
+  // Normalize line endings once, then send the framed buffer.
+  const std::string framed = NormalizeResponse(response);
 
-  struct iovec iov[2];  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
-  iov[0].iov_base = const_cast<char*>(response.c_str());  // NOLINT(cppcoreguidelines-pro-type-const-cast)
-  iov[0].iov_len = response.size();
-  iov[1].iov_base = const_cast<char*>(kCRLF);  // NOLINT(cppcoreguidelines-pro-type-const-cast)
-  iov[1].iov_len = 2;
-
-  size_t total_to_send = response.size() + 2;
   size_t total_sent = 0;
-
-  while (total_sent < total_to_send) {
-    ssize_t sent = writev(client_fd, iov, 2);
+  while (total_sent < framed.size()) {
+    ssize_t sent = send(client_fd, framed.data() + total_sent, framed.size() - total_sent, 0);
 
     if (sent < 0) {
       if (errno == EINTR) {
         continue;
       }
       if (errno != EPIPE) {
-        spdlog::debug("writev error on fd {}: {}", client_fd, strerror(errno));
+        spdlog::debug("send error on fd {}: {}", client_fd, strerror(errno));
       }
       return false;
     }
 
     if (sent == 0) {
-      spdlog::debug("writev returned 0 on fd {}", client_fd);
+      spdlog::debug("send returned 0 on fd {}", client_fd);
       return false;
     }
 
-    total_sent += sent;
-
-    // Adjust iov for partial writes
-    auto bytes_sent = static_cast<size_t>(sent);
-    if (bytes_sent >= iov[0].iov_len) {
-      bytes_sent -= iov[0].iov_len;
-      iov[0].iov_len = 0;
-      iov[1].iov_base = static_cast<char*>(iov[1].iov_base) + bytes_sent;  // NOLINT
-      iov[1].iov_len -= bytes_sent;
-    } else {
-      iov[0].iov_base = static_cast<char*>(iov[0].iov_base) + bytes_sent;  // NOLINT
-      iov[0].iov_len -= bytes_sent;
-    }
+    total_sent += static_cast<size_t>(sent);
   }
 
   return true;

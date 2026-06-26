@@ -110,6 +110,19 @@ class ConnectionIOHandler {
    */
   // NOLINTNEXTLINE(readability-convert-member-functions-to-static)
   bool SendResponse(int client_fd, const std::string& response);
+
+  /**
+   * @brief Normalize a handler response to canonical CRLF framing.
+   *
+   * Strips any trailing newline characters, rewrites interior bare "\n" to
+   * "\r\n", and appends exactly one trailing "\r\n". This keeps line-ending
+   * policy in one place so single-line responses do not emit a blank line and
+   * multi-line responses frame correctly for CRLF-splitting clients.
+   *
+   * @param response Raw handler response body
+   * @return CRLF-normalized response with a single trailing CRLF
+   */
+  static std::string NormalizeResponse(const std::string& response);
 };
 
 }  // namespace nvecd::server
