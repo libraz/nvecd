@@ -17,6 +17,20 @@
 
 namespace nvecd::vectors {
 
+namespace {
+
+/// Upper bound on the layer a single node may occupy.
+///
+/// The geometric level distribution is unbounded in theory: an unlucky draw of
+/// a near-zero random value produces an arbitrarily large level. Capping the
+/// level keeps the per-node neighbor structure (and the graph height) bounded,
+/// which prevents pathological memory growth from a single insertion. A bound
+/// of 64 comfortably exceeds the height any realistic index reaches, since the
+/// number of nodes required to populate level L grows as M^L.
+constexpr uint32_t kMaxNodeLevel = 64;
+
+}  // namespace
+
 // ============================================================================
 // Construction / Move
 // ============================================================================
@@ -76,18 +90,18 @@ HnswIndex& HnswIndex::operator=(HnswIndex&& other) noexcept {
 uint32_t HnswIndex::RandomLevel() {
   std::uniform_real_distribution<double> dist(0.0, 1.0);
   double r = dist(rng_);
-  // uniform_real_distribution can return exactly 0.0, which would make
-  // -log(r) == +inf and overflow the uint32_t cast (UB). Clamp r to a tiny
-  // positive minimum so the level stays finite.
-  constexpr double kMinR = 1e-12;
-  if (r < kMinR) {
-    r = kMinR;
+  // uniform_real_distribution may return exactly 0.0. Taking -log(0.0) yields
+  // +inf, and converting +inf to uint32_t is undefined behavior that can lead
+  // to an absurd level and a bad_alloc when resizing the neighbor structure.
+  // Clamp r to the smallest positive double so -log(r) stays finite.
+  if (r <= 0.0) {
+    r = std::numeric_limits<double>::min();
   }
-  double level_f = -std::log(r) * level_mult_;
-  // Also clamp the resulting level to a safe maximum to bound graph height.
-  constexpr double kMaxLevel = 64.0;
-  if (level_f > kMaxLevel) {
-    level_f = kMaxLevel;
+  const double level_f = -std::log(r) * level_mult_;
+  // The geometric draw is unbounded; clamp to a safe ceiling so a single
+  // unlucky insertion cannot blow up the graph height.
+  if (!(level_f < static_cast<double>(kMaxNodeLevel))) {
+    return kMaxNodeLevel;
   }
   return static_cast<uint32_t>(level_f);
 }
