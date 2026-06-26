@@ -24,15 +24,21 @@ utils::Expected<std::string, utils::Error> HandleCacheStats(const HandlerContext
   }
 
   auto stats = cache_ptr->GetStatistics();
+  const double current_memory_mb = static_cast<double>(stats.current_memory_bytes) / (1024.0 * 1024.0);
   oss << "cache_enabled: " << (cache_ptr->IsEnabled() ? "true" : "false") << "\n";
   oss << "cache_entries: " << stats.current_entries << "\n";
   oss << "cache_memory_bytes: " << stats.current_memory_bytes << "\n";
+  oss << "current_memory_mb: " << std::fixed << std::setprecision(2) << current_memory_mb << "\n";
   oss << "total_queries: " << stats.total_queries << "\n";
   oss << "cache_hits: " << stats.cache_hits << "\n";
   oss << "cache_misses: " << stats.cache_misses << "\n";
+  oss << "cache_misses_invalidated: " << stats.cache_misses_invalidated << "\n";
+  oss << "cache_misses_not_found: " << stats.cache_misses_not_found << "\n";
   oss << "cache_hit_rate: " << std::fixed << std::setprecision(4) << stats.HitRate() << "\n";
   oss << "evictions: " << stats.evictions << "\n";
   oss << "ttl_expirations: " << stats.ttl_expirations << "\n";
+  oss << "avg_hit_latency_ms: " << std::fixed << std::setprecision(3) << stats.AverageCacheHitLatency() << "\n";
+  oss << "avg_miss_latency_ms: " << std::fixed << std::setprecision(3) << stats.AverageCacheMissLatency() << "\n";
   oss << "total_time_saved_ms: " << std::fixed << std::setprecision(2) << stats.TotalTimeSaved() << "\n";
 
   return oss.str();

@@ -653,34 +653,46 @@ Returns detailed cache statistics.
 **Response**:
 ```
 OK CACHE_STATS
+cache_enabled: true
+cache_entries: 342
+cache_memory_bytes: 12845632
+current_memory_mb: 12.25
 total_queries: 1250
 cache_hits: 985
 cache_misses: 265
 cache_misses_invalidated: 45
 cache_misses_not_found: 220
-hit_rate: 0.7880
-current_entries: 342
-current_memory_bytes: 12845632
-current_memory_mb: 12.25
+cache_hit_rate: 0.7880
 evictions: 15
+ttl_expirations: 8
 avg_hit_latency_ms: 0.125
 avg_miss_latency_ms: 2.450
-time_saved_ms: 2418.75
+total_time_saved_ms: 2418.75
+```
+
+When no cache instance is configured, only the enabled flag and entry count are returned:
+```
+OK CACHE_STATS
+cache_enabled: false
+cache_entries: 0
 ```
 
 **Statistics fields**:
+- `cache_enabled`: Whether the cache is currently enabled (`true`/`false`)
+- `cache_entries`: Number of cached entries
+- `cache_memory_bytes`: Current cache memory usage in bytes
+- `current_memory_mb`: Current cache memory usage in mebibytes
 - `total_queries`: Total number of cache lookups
 - `cache_hits`: Number of cache hits
 - `cache_misses`: Total misses (invalidated + not found)
 - `cache_misses_invalidated`: Misses due to invalidation (VECSET/EVENT)
 - `cache_misses_not_found`: Misses due to key not in cache, TTL expiration, or decompression failure
-- `hit_rate`: Cache hit rate (0.0 to 1.0)
-- `current_entries`: Number of cached entries
-- `current_memory_mb`: Current cache memory usage
+- `cache_hit_rate`: Cache hit rate (0.0 to 1.0)
 - `evictions`: Number of LRU evictions
+- `ttl_expirations`: Number of entries removed due to TTL expiration
 - `avg_hit_latency_ms`: Average cache lookup latency on hit
 - `avg_miss_latency_ms`: Average cache lookup latency on miss
-- `time_saved_ms`: Total query time saved by cache hits
+- `total_time_saved_ms`: Total query time saved by cache hits
 
 #### CACHE CLEAR
 
@@ -688,32 +700,42 @@ Clear all cache entries.
 
 **Response**:
 ```
-OK CACHE CLEARED
+OK CACHE_CLEARED
+```
+
+When no cache instance is configured, the response notes that there was nothing to clear:
+```
+OK CACHE_CLEARED (no cache)
 ```
 
 #### CACHE ENABLE
 
-Enable cache (no-op if cache already initialized).
+Enable the cache at runtime.
 
 **Response**:
 ```
-OK CACHE ENABLED
+OK CACHE_ENABLED
 ```
 
-**Error** (if cache not initialized at startup):
+When no cache instance was configured at startup, the command is acknowledged but has no effect:
 ```
--ERR Cache was not initialized at startup
+OK CACHE_ENABLED (no cache instance)
 ```
 
-**Note**: Cache must be enabled in config.yaml at startup. Runtime enabling is only possible if `cache.enabled=true` in config.
+**Note**: A cache instance must be configured in `config.yaml` at startup. When no instance exists, runtime enabling has no effect.
 
 #### CACHE DISABLE
 
-Runtime cache disable is **not supported**.
+Disable the cache at runtime. Existing entries are retained but no new lookups or insertions are served until the cache is re-enabled with `CACHE ENABLE`.
 
 **Response**:
 ```
--ERR Runtime cache disable not supported. Set cache.enabled=false in config and restart.
+OK CACHE_DISABLED
+```
+
+When no cache instance was configured at startup, the command is acknowledged but has no effect:
+```
+OK CACHE_DISABLED (no cache instance)
 ```
 
 **Cache Behavior**:

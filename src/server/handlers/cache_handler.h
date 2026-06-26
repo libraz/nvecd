@@ -36,6 +36,10 @@ utils::Expected<std::string, utils::Error> HandleCacheEnable(HandlerContext& ctx
 
 /**
  * @brief Handle CACHE DISABLE command
+ *
+ * Disables the cache at runtime. Existing entries are retained but no new
+ * lookups or insertions are served until the cache is re-enabled.
+ *
  * @param ctx Handler context
  * @return OK response or error
  */

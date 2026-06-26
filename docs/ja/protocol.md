@@ -653,34 +653,46 @@ CACHE DISABLE
 **レスポンス**:
 ```
 OK CACHE_STATS
+cache_enabled: true
+cache_entries: 342
+cache_memory_bytes: 12845632
+current_memory_mb: 12.25
 total_queries: 1250
 cache_hits: 985
 cache_misses: 265
 cache_misses_invalidated: 45
 cache_misses_not_found: 220
-hit_rate: 0.7880
-current_entries: 342
-current_memory_bytes: 12845632
-current_memory_mb: 12.25
+cache_hit_rate: 0.7880
 evictions: 15
+ttl_expirations: 8
 avg_hit_latency_ms: 0.125
 avg_miss_latency_ms: 2.450
-time_saved_ms: 2418.75
+total_time_saved_ms: 2418.75
+```
+
+キャッシュインスタンスが構成されていない場合は、有効フラグとエントリ数のみが返されます:
+```
+OK CACHE_STATS
+cache_enabled: false
+cache_entries: 0
 ```
 
 **統計フィールド**:
+- `cache_enabled`: キャッシュが現在有効かどうか（`true`/`false`）
+- `cache_entries`: キャッシュされたエントリ数
+- `cache_memory_bytes`: 現在のキャッシュメモリ使用量（バイト）
+- `current_memory_mb`: 現在のキャッシュメモリ使用量（メビバイト）
 - `total_queries`: キャッシュルックアップの総数
 - `cache_hits`: キャッシュヒット数
 - `cache_misses`: ミスの合計（invalidated + not found）
 - `cache_misses_invalidated`: 無効化（VECSET/EVENT）によるミス
 - `cache_misses_not_found`: キーがキャッシュにない、TTL 期限切れ、またはデコンプレッション失敗によるミス
-- `hit_rate`: キャッシュヒット率（0.0 ~ 1.0）
-- `current_entries`: キャッシュされたエントリ数
-- `current_memory_mb`: 現在のキャッシュメモリ使用量
+- `cache_hit_rate`: キャッシュヒット率（0.0 ~ 1.0）
 - `evictions`: LRU エビクション数
+- `ttl_expirations`: TTL 期限切れにより削除されたエントリ数
 - `avg_hit_latency_ms`: ヒット時の平均キャッシュルックアップレイテンシ
 - `avg_miss_latency_ms`: ミス時の平均キャッシュルックアップレイテンシ
-- `time_saved_ms`: キャッシュヒットにより節約されたクエリ時間の合計
+- `total_time_saved_ms`: キャッシュヒットにより節約されたクエリ時間の合計
 
 #### CACHE CLEAR
 
@@ -688,32 +700,42 @@ time_saved_ms: 2418.75
 
 **レスポンス**:
 ```
-OK CACHE CLEARED
+OK CACHE_CLEARED
+```
+
+キャッシュインスタンスが構成されていない場合は、クリア対象がないことが示されます:
+```
+OK CACHE_CLEARED (no cache)
 ```
 
 #### CACHE ENABLE
 
-キャッシュを有効化します（既に初期化済みの場合は no-op）。
+ランタイムでキャッシュを有効化します。
 
 **レスポンス**:
 ```
-OK CACHE ENABLED
+OK CACHE_ENABLED
 ```
 
-**エラー**（起動時にキャッシュが初期化されていない場合）:
+起動時にキャッシュインスタンスが構成されていない場合、コマンドは受理されますが効果はありません:
 ```
--ERR Cache was not initialized at startup
+OK CACHE_ENABLED (no cache instance)
 ```
 
-**注意**: キャッシュは起動時に config.yaml で有効化されている必要があります。ランタイムでの有効化は、設定で `cache.enabled=true` が設定されている場合のみ可能です。
+**注意**: キャッシュインスタンスは起動時に `config.yaml` で構成されている必要があります。インスタンスが存在しない場合、ランタイムでの有効化は効果がありません。
 
 #### CACHE DISABLE
 
-ランタイムでのキャッシュ無効化は**サポートされていません**。
+ランタイムでキャッシュを無効化します。既存のエントリは保持されますが、`CACHE ENABLE` で再度有効化するまで、新しいルックアップや挿入は処理されません。
 
 **レスポンス**:
 ```
--ERR Runtime cache disable not supported. Set cache.enabled=false in config and restart.
+OK CACHE_DISABLED
+```
+
+起動時にキャッシュインスタンスが構成されていない場合、コマンドは受理されますが効果はありません:
+```
+OK CACHE_DISABLED (no cache instance)
 ```
 
 **キャッシュの動作**:
