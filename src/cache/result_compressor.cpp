@@ -33,9 +33,21 @@ utils::Expected<std::vector<uint8_t>, utils::Error> ResultCompressor::CompressSi
   serialized.reserve(results.size());
 
   for (const auto& result : results) {
+    // The fixed buffer must hold the id plus a null terminator. An id that does
+    // not fit cannot be stored without silent truncation, which would make a
+    // cache hit return a different (truncated) id than the uncached path.
+    // Reject such results so the entry is never cached truncated and lookups
+    // fall through to the authoritative uncached path.
+    if (result.item_id.size() >= sizeof(SerializedSimilarityResult::id)) {
+      return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCacheCompressionFailed,
+                                                    "item_id length " + std::to_string(result.item_id.size()) +
+                                                        " exceeds cache id buffer capacity " +
+                                                        std::to_string(sizeof(SerializedSimilarityResult::id) - 1)));
+    }
+
     SerializedSimilarityResult ser{};
-    std::strncpy(ser.id, result.item_id.c_str(), sizeof(ser.id) - 1);
-    ser.id[sizeof(ser.id) - 1] = '\0';  // Ensure null-termination
+    std::memcpy(ser.id, result.item_id.c_str(), result.item_id.size());
+    ser.id[result.item_id.size()] = '\0';  // Ensure null-termination
     ser.score = result.score;
     serialized.push_back(ser);
   }

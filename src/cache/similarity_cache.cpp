@@ -30,7 +30,19 @@ SimilarityCache::SimilarityCache(size_t max_memory_bytes, double min_query_cost_
   policies_[static_cast<size_t>(SearchType::kFilteredSearch)] = {true, 60};
 }
 
+std::chrono::steady_clock::time_point SimilarityCache::ComputeExpiry(int effective_ttl_seconds) {
+  if (effective_ttl_seconds <= 0) {
+    return std::chrono::steady_clock::time_point::max();
+  }
+  return std::chrono::steady_clock::now() + std::chrono::seconds(effective_ttl_seconds);
+}
+
 std::optional<std::vector<similarity::SimilarityResult>> SimilarityCache::Lookup(const CacheKey& key) {
+  return LookupWithTtl(key, ttl_seconds_.load(std::memory_order_relaxed));
+}
+
+std::optional<std::vector<similarity::SimilarityResult>> SimilarityCache::LookupWithTtl(const CacheKey& key,
+                                                                                        int effective_ttl_seconds) {
   if (!enabled_.load(std::memory_order_relaxed)) {
     return std::nullopt;
   }
@@ -75,12 +87,20 @@ std::optional<std::vector<similarity::SimilarityResult>> SimilarityCache::Lookup
     return std::nullopt;
   }
 
-  // Check TTL expiration
-  const int ttl = ttl_seconds_.load(std::memory_order_relaxed);
-  if (ttl > 0) {
-    auto now = std::chrono::steady_clock::now();
-    auto age_seconds = std::chrono::duration_cast<std::chrono::seconds>(now - iter->second.first.created_at).count();
-    if (age_seconds >= ttl) {
+  // Check TTL expiration.
+  // An entry is expired if either its stored absolute expiry (set from the
+  // effective TTL at insert time) has passed, or the caller-supplied effective
+  // TTL would expire it relative to its creation time. The latter covers a
+  // global TTL that was set or lowered after the entry was inserted.
+  {
+    const auto now = std::chrono::steady_clock::now();
+    const auto& checked_entry = iter->second.first;
+    bool expired = now >= checked_entry.expires_at;
+    if (!expired && effective_ttl_seconds > 0) {
+      auto age_seconds = std::chrono::duration_cast<std::chrono::seconds>(now - checked_entry.created_at).count();
+      expired = age_seconds >= effective_ttl_seconds;
+    }
+    if (expired) {
       // Entry has expired - treat as miss
       stats_.cache_misses++;
       stats_.cache_misses_not_found++;
@@ -173,6 +193,11 @@ std::optional<std::vector<similarity::SimilarityResult>> SimilarityCache::Lookup
 
 bool SimilarityCache::Insert(const CacheKey& key, const std::vector<similarity::SimilarityResult>& results,
                              double query_cost_ms) {
+  return InsertWithTtl(key, results, query_cost_ms, ttl_seconds_.load(std::memory_order_relaxed));
+}
+
+bool SimilarityCache::InsertWithTtl(const CacheKey& key, const std::vector<similarity::SimilarityResult>& results,
+                                    double query_cost_ms, int effective_ttl_seconds) {
   if (!enabled_.load(std::memory_order_relaxed)) {
     return false;
   }
@@ -227,6 +252,9 @@ bool SimilarityCache::Insert(const CacheKey& key, const std::vector<similarity::
   entry.original_size = original_size;
   entry.query_cost_ms = query_cost_ms;
   entry.created_at = std::chrono::steady_clock::now();
+  // Store an absolute expiry from the effective TTL so per-type expiration is
+  // honored independently of the global TTL and works in the background purge.
+  entry.expires_at = ComputeExpiry(effective_ttl_seconds);
   entry.invalidated.store(false);
 
   // Insert into LRU list (front = most recent)
@@ -399,10 +427,10 @@ void SimilarityCache::ClearIf(std::function<bool(const CacheKey&)> predicate) {
 }
 
 size_t SimilarityCache::PurgeExpired() {
-  const int ttl = ttl_seconds_.load(std::memory_order_relaxed);
-  if (ttl <= 0) {
-    return 0;  // No TTL configured
-  }
+  // The global TTL covers entries inserted with no per-type override. Per-type
+  // entries carry their own absolute expiry, so the scan runs even when the
+  // global TTL is disabled.
+  const int global_ttl = ttl_seconds_.load(std::memory_order_relaxed);
 
   std::unique_lock lock(mutex_);
 
@@ -410,8 +438,13 @@ size_t SimilarityCache::PurgeExpired() {
   size_t purged = 0;
 
   for (auto it = cache_map_.begin(); it != cache_map_.end();) {
-    auto age_seconds = std::chrono::duration_cast<std::chrono::seconds>(now - it->second.first.created_at).count();
-    if (age_seconds >= ttl || it->second.first.invalidated.load()) {
+    const auto& entry = it->second.first;
+    bool expired = now >= entry.expires_at;
+    if (!expired && global_ttl > 0) {
+      auto age_seconds = std::chrono::duration_cast<std::chrono::seconds>(now - entry.created_at).count();
+      expired = age_seconds >= global_ttl;
+    }
+    if (expired || entry.invalidated.load()) {
       // Clean up reverse index for purged entry
       for (const auto& ref_id : it->second.first.referenced_item_ids) {
         auto rev_it = item_to_cache_keys_.find(ref_id);
@@ -495,29 +528,22 @@ std::optional<std::vector<similarity::SimilarityResult>> SimilarityCache::Lookup
                                                                                  SearchType search_type) {
   auto idx = static_cast<size_t>(search_type);
 
-  // Check per-type policy
+  // Check per-type policy and compute the effective TTL without mutating shared
+  // state. A positive per-type override wins, otherwise use the global TTL.
+  int effective_ttl = ttl_seconds_.load(std::memory_order_relaxed);
   {
     std::lock_guard<std::mutex> lock(policy_mutex_);
     if (!policies_[idx].enabled) {
       return std::nullopt;
     }
+    if (policies_[idx].ttl_seconds > 0) {
+      effective_ttl = policies_[idx].ttl_seconds;
+    }
   }
 
   stats_.per_type_queries[idx]++;
 
-  // Save current TTL, apply per-type override if set
-  int original_ttl = ttl_seconds_.load(std::memory_order_relaxed);
-  {
-    std::lock_guard<std::mutex> lock(policy_mutex_);
-    if (policies_[idx].ttl_seconds > 0) {
-      ttl_seconds_.store(policies_[idx].ttl_seconds, std::memory_order_relaxed);
-    }
-  }
-
-  auto result = Lookup(key);
-
-  // Restore original TTL
-  ttl_seconds_.store(original_ttl, std::memory_order_relaxed);
+  auto result = LookupWithTtl(key, effective_ttl);
 
   if (result.has_value()) {
     stats_.per_type_hits[idx]++;
@@ -530,15 +556,20 @@ bool SimilarityCache::Insert(const CacheKey& key, const std::vector<similarity::
                              double query_cost_ms, SearchType search_type) {
   auto idx = static_cast<size_t>(search_type);
 
-  // Check per-type policy
+  // Check per-type policy and compute the effective TTL without mutating shared
+  // state. A positive per-type override wins, otherwise use the global TTL.
+  int effective_ttl = ttl_seconds_.load(std::memory_order_relaxed);
   {
     std::lock_guard<std::mutex> lock(policy_mutex_);
     if (!policies_[idx].enabled) {
       return false;
     }
+    if (policies_[idx].ttl_seconds > 0) {
+      effective_ttl = policies_[idx].ttl_seconds;
+    }
   }
 
-  return Insert(key, results, query_cost_ms);
+  return InsertWithTtl(key, results, query_cost_ms, effective_ttl);
 }
 
 void SimilarityCache::SetSearchTypePolicy(SearchType search_type, const CachePolicy& policy) {

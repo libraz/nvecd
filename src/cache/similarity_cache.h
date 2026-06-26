@@ -351,8 +351,11 @@ class SimilarityCache {
     size_t original_size = 0;                          ///< Original size before compression
     double query_cost_ms = 0.0;                        ///< Original query execution time
     std::chrono::steady_clock::time_point created_at;  ///< Creation timestamp
-    std::atomic<bool> invalidated{false};              ///< Invalidation flag (lock-free)
-    std::vector<std::string> referenced_item_ids;      ///< Item IDs in results (for reverse index cleanup)
+    /// Absolute expiry time computed from the effective TTL at insert time.
+    /// Equals time_point::max() when the entry has no expiration.
+    std::chrono::steady_clock::time_point expires_at = std::chrono::steady_clock::time_point::max();
+    std::atomic<bool> invalidated{false};          ///< Invalidation flag (lock-free)
+    std::vector<std::string> referenced_item_ids;  ///< Item IDs in results (for reverse index cleanup)
 
     CachedEntry() = default;
     ~CachedEntry() = default;
@@ -361,6 +364,7 @@ class SimilarityCache {
           original_size(other.original_size),
           query_cost_ms(other.query_cost_ms),
           created_at(other.created_at),
+          expires_at(other.expires_at),
           invalidated(other.invalidated.load()),
           referenced_item_ids(other.referenced_item_ids) {}
     CachedEntry& operator=(const CachedEntry& other) {
@@ -369,6 +373,7 @@ class SimilarityCache {
         original_size = other.original_size;
         query_cost_ms = other.query_cost_ms;
         created_at = other.created_at;
+        expires_at = other.expires_at;
         invalidated.store(other.invalidated.load());
         referenced_item_ids = other.referenced_item_ids;
       }
@@ -379,6 +384,7 @@ class SimilarityCache {
           original_size(other.original_size),
           query_cost_ms(other.query_cost_ms),
           created_at(other.created_at),
+          expires_at(other.expires_at),
           invalidated(other.invalidated.load()),
           referenced_item_ids(std::move(other.referenced_item_ids)) {}
     CachedEntry& operator=(CachedEntry&& other) noexcept {
@@ -387,6 +393,7 @@ class SimilarityCache {
         original_size = other.original_size;
         query_cost_ms = other.query_cost_ms;
         created_at = other.created_at;
+        expires_at = other.expires_at;
         invalidated.store(other.invalidated.load());
         referenced_item_ids = std::move(other.referenced_item_ids);
       }
@@ -424,6 +431,41 @@ class SimilarityCache {
 
   // Statistics
   CacheStatistics stats_;
+
+  /**
+   * @brief Compute the absolute expiry time for an effective TTL
+   * @param effective_ttl_seconds TTL in seconds (<= 0 means no expiration)
+   * @return Absolute expiry time, or time_point::max() when there is no expiration
+   */
+  static std::chrono::steady_clock::time_point ComputeExpiry(int effective_ttl_seconds);
+
+  /**
+   * @brief Lookup cache entry using a precomputed effective TTL
+   *
+   * The effective TTL is passed explicitly so callers can apply a per-type
+   * override without mutating shared cache state.
+   *
+   * @param key Cache key
+   * @param effective_ttl_seconds Effective TTL in seconds (<= 0 means no expiration)
+   * @return Cached results if found and not expired/invalidated, nullopt otherwise
+   */
+  std::optional<std::vector<similarity::SimilarityResult>> LookupWithTtl(const CacheKey& key,
+                                                                         int effective_ttl_seconds);
+
+  /**
+   * @brief Insert cache entry using a precomputed effective TTL
+   *
+   * The effective TTL is passed explicitly and stored as an absolute expiry on
+   * the entry so per-type expiration is honored independently of the global TTL.
+   *
+   * @param key Cache key
+   * @param results Search results to cache
+   * @param query_cost_ms Query execution time
+   * @param effective_ttl_seconds Effective TTL in seconds (<= 0 means no expiration)
+   * @return true if inserted, false if not cached
+   */
+  bool InsertWithTtl(const CacheKey& key, const std::vector<similarity::SimilarityResult>& results,
+                     double query_cost_ms, int effective_ttl_seconds);
 
   /**
    * @brief Erase a cache entry (caller must hold unique_lock on mutex_)
