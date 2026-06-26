@@ -62,6 +62,8 @@ static const std::map<std::string, bool> kVariableMutability = {
     {"events.decay_interval_sec", false},
     {"events.dedup_window_sec", false},
     {"events.dedup_cache_size", false},
+    {"events.temporal_cooccurrence", false},  // Feature flag (startup-only)
+    {"events.negative_signals", false},       // Feature flag (startup-only)
 
     // Vector store (all immutable)
     {"vectors.default_dimension", false},
@@ -72,6 +74,9 @@ static const std::map<std::string, bool> kVariableMutability = {
     {"similarity.fusion_beta", false},
     {"similarity.default_top_k", false},
     {"similarity.max_top_k", false},
+    {"similarity.adaptive_fusion", false},  // Feature flag (startup-only)
+    {"similarity.index_type", false},       // Active ANN index (startup-only)
+    {"similarity.ivf_enabled", false},      // Feature flag (startup-only)
 
     // Snapshot (all immutable)
     {"snapshot.dir", false},
@@ -365,6 +370,12 @@ std::string RuntimeVariableManager::GetVariableInternal(const std::string& varia
   if (variable_name == "events.dedup_cache_size") {
     return std::to_string(base_config_.events.dedup_cache_size);
   }
+  if (variable_name == "events.temporal_cooccurrence") {
+    return base_config_.events.temporal_cooccurrence ? "true" : "false";
+  }
+  if (variable_name == "events.negative_signals") {
+    return base_config_.events.negative_signals ? "true" : "false";
+  }
 
   // Vectors
   if (variable_name == "vectors.default_dimension") {
@@ -386,6 +397,15 @@ std::string RuntimeVariableManager::GetVariableInternal(const std::string& varia
   }
   if (variable_name == "similarity.max_top_k") {
     return std::to_string(base_config_.similarity.max_top_k);
+  }
+  if (variable_name == "similarity.adaptive_fusion") {
+    return base_config_.similarity.adaptive_fusion ? "true" : "false";
+  }
+  if (variable_name == "similarity.index_type") {
+    return base_config_.similarity.index_type;
+  }
+  if (variable_name == "similarity.ivf_enabled") {
+    return base_config_.similarity.ivf_enabled ? "true" : "false";
   }
 
   // Snapshot

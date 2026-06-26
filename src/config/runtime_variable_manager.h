@@ -58,6 +58,12 @@ struct VariableInfo {
  * - cache.max_memory_bytes (memory allocation)
  * - snapshot.* (snapshot configuration)
  * - perf.* (performance tuning)
+ *
+ * Feature flags are surfaced as immutable variables so operators can inspect
+ * them via SHOW VARIABLES while SET attempts are rejected:
+ * - events.temporal_cooccurrence, events.negative_signals
+ * - similarity.adaptive_fusion, similarity.ivf_enabled
+ * - similarity.index_type (active ANN index)
  */
 class RuntimeVariableManager {
  public:
