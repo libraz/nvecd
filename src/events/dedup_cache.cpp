@@ -5,6 +5,7 @@
 
 #include "events/dedup_cache.h"
 
+#include <algorithm>
 #include <mutex>
 
 namespace nvecd::events {
@@ -44,8 +45,11 @@ void DedupCache::Insert(const EventKey& key, uint64_t timestamp) {
   auto it = cache_.find(key);
 
   if (it != cache_.end()) {
-    // Key exists: update timestamp and move to front of LRU
-    it->second.timestamp = timestamp;
+    // Key exists: keep the latest seen timestamp and move to front of LRU.
+    // Using max() guards against out-of-order (non-monotonic) client
+    // timestamps: an earlier-than-stored timestamp must not roll back the
+    // dedup window, otherwise subsequent in-window events could slip through.
+    it->second.timestamp = std::max(it->second.timestamp, timestamp);
     lru_list_.splice(lru_list_.begin(), lru_list_, it->second.lru_iter);
     return;
   }
