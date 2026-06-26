@@ -110,7 +110,10 @@ void CoOccurrenceIndex::AddEventIncrementalInternal(const std::vector<Event>& pr
       continue;  // Skip self-pairs
     }
 
-    auto score = static_cast<float>(new_event.score * prior.score);
+    // Widen to int64_t before the float cast: callers such as snapshot
+    // restore can supply scores outside the validated [0,100] range, and a
+    // 32-bit int*int product could otherwise overflow.
+    auto score = static_cast<float>(static_cast<int64_t>(new_event.score) * prior.score);
     if (!prior_decay.empty()) {
       score *= new_decay * prior_decay[i];
     }
@@ -163,7 +166,10 @@ void CoOccurrenceIndex::UpdateFromEventsInternal(const std::string& ctx [[maybe_
         continue;
       }
 
-      auto score = static_cast<float>(event1.score * event2.score);
+      // Widen to int64_t before the float cast: callers such as snapshot
+      // restore can supply scores outside the validated [0,100] range, and a
+      // 32-bit int*int product could otherwise overflow.
+      auto score = static_cast<float>(static_cast<int64_t>(event1.score) * event2.score);
 
       // Apply temporal decay if enabled
       if (!decay_weights.empty()) {
