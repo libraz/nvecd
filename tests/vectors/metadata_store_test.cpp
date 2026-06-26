@@ -53,14 +53,53 @@ TEST_F(MetadataStoreTest, Update) {
   EXPECT_EQ(std::get<std::string>(result->at("status")), "published");
 }
 
-TEST_F(MetadataStoreTest, SetEmptyRemovesEntry) {
+TEST_F(MetadataStoreTest, SetEmptyIsPresentButEmpty) {
   store_.Set("item0", {{"status", std::string("active")}});
   EXPECT_NE(store_.Get("item0"), nullptr);
 
-  // Setting empty metadata is equivalent to deleting the entry.
+  // Setting an empty metadata map keeps the item present with an empty value,
+  // distinct from an item that was never set. Removal requires Delete().
   store_.Set("item0", {});
+  const auto* result = store_.Get("item0");
+  ASSERT_NE(result, nullptr);
+  EXPECT_TRUE(result->empty());
+  EXPECT_EQ(store_.Size(), 1U);
+
+  // A never-set item reports as absent.
+  EXPECT_EQ(store_.Get("never_set"), nullptr);
+
+  // Delete removes presence.
+  store_.Delete("item0");
   EXPECT_EQ(store_.Get("item0"), nullptr);
   EXPECT_EQ(store_.Size(), 0U);
+}
+
+TEST_F(MetadataStoreTest, EmptyEntryParticipatesInEmptyFilter) {
+  store_.Set("empty", {});
+  store_.Set("full", {{"status", std::string("active")}});
+
+  // An empty (no-condition) filter returns all present items, including the
+  // explicitly empty one.
+  MetadataFilter empty_filter;
+  auto all = store_.Filter(empty_filter);
+  EXPECT_EQ(all.size(), 2U);
+
+  // A non-empty filter never matches an empty metadata map.
+  MetadataFilter filter;
+  FilterCondition cond;
+  cond.field = "status";
+  cond.op = FilterOp::kEq;
+  cond.value = std::string("active");
+  filter.conditions.push_back(cond);
+
+  auto matched = store_.Filter(filter);
+  ASSERT_EQ(matched.size(), 1U);
+  EXPECT_EQ(matched[0], "full");
+  EXPECT_FALSE(store_.Matches("empty", filter));
+  EXPECT_TRUE(store_.Matches("full", filter));
+
+  // An empty entry still matches the empty filter via Matches().
+  EXPECT_TRUE(store_.Matches("empty", empty_filter));
 }
 
 TEST_F(MetadataStoreTest, Size) {

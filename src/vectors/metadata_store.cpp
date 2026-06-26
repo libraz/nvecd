@@ -9,18 +9,17 @@ namespace nvecd::vectors {
 
 void MetadataStore::Set(const std::string& id, Metadata meta) {
   std::unique_lock lock(mutex_);
-  if (meta.empty()) {
-    // An empty metadata set is equivalent to having no metadata.
-    metadata_.erase(id);
-    return;
-  }
+  // Presence is determined solely by map membership. An explicitly set but
+  // empty metadata map is retained so that it reports as present (with an
+  // empty value), distinct from an item that was never set. Callers wanting
+  // to remove an entry must use Delete().
   metadata_[id] = std::move(meta);
 }
 
 const Metadata* MetadataStore::Get(const std::string& id) const {
   std::shared_lock lock(mutex_);
   auto it = metadata_.find(id);
-  if (it == metadata_.end() || it->second.empty()) {
+  if (it == metadata_.end()) {
     return nullptr;
   }
   return &it->second;
@@ -42,10 +41,8 @@ std::vector<std::string> MetadataStore::Filter(const MetadataFilter& filter,
       return candidates;
     }
     result.reserve(metadata_.size());
-    for (const auto& [id, meta] : metadata_) {
-      if (!meta.empty()) {
-        result.push_back(id);
-      }
+    for (const auto& entry : metadata_) {
+      result.push_back(entry.first);
     }
     return result;
   }
@@ -63,7 +60,7 @@ std::vector<std::string> MetadataStore::Filter(const MetadataFilter& filter,
     // Linear scan all items.
     result.reserve(metadata_.size() / 4);  // Heuristic
     for (const auto& [id, meta] : metadata_) {
-      if (!meta.empty() && filter.Match(meta)) {
+      if (filter.Match(meta)) {
         result.push_back(id);
       }
     }
@@ -86,13 +83,7 @@ bool MetadataStore::Matches(const std::string& id, const MetadataFilter& filter)
 
 uint32_t MetadataStore::Size() const {
   std::shared_lock lock(mutex_);
-  uint32_t count = 0;
-  for (const auto& [id, meta] : metadata_) {
-    if (!meta.empty()) {
-      count++;
-    }
-  }
-  return count;
+  return static_cast<uint32_t>(metadata_.size());
 }
 
 void MetadataStore::Clear() {

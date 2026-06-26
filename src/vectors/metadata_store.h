@@ -38,15 +38,21 @@ class MetadataStore {
 
   /**
    * @brief Set metadata for an item
+   *
+   * Presence is tracked by ID. Setting an empty metadata map records the item
+   * as present with an empty value; this is distinct from an item that was
+   * never set. To remove an item's metadata, use Delete().
+   *
    * @param id Item's stable external ID
-   * @param meta Metadata key-value pairs
+   * @param meta Metadata key-value pairs (may be empty)
    */
   void Set(const std::string& id, Metadata meta);
 
   /**
    * @brief Get metadata for an item
    * @param id Item's stable external ID
-   * @return Pointer to metadata (null if not found), valid while holding read lock
+   * @return Pointer to metadata (null only if the item was never set, non-null
+   *         for an item set with an empty map), valid while holding read lock
    */
   const Metadata* Get(const std::string& id) const;
 
