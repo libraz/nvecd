@@ -291,14 +291,17 @@ Expected<uint64_t, Error> WriteAheadLog::Replay(uint64_t from_sequence,
       // Verify CRC
       uint32_t actual_crc = CalcCRC32(body.data(), body.size());
       if (actual_crc != expected_crc) {
-        // CRC mismatch — skip this record, continue to next
+        // CRC mismatch marks the start of a corrupt/torn tail (e.g. a partial
+        // write at crash time). The length prefix of this record is itself
+        // untrustworthy, so stop replaying this file rather than reinterpreting
+        // the remaining bytes as further records.
         utils::StructuredLog()
             .Event("wal_crc_mismatch")
             .Field("file", path)
             .Field("expected_crc", static_cast<int64_t>(expected_crc))
             .Field("actual_crc", static_cast<int64_t>(actual_crc))
             .Warn();
-        continue;
+        break;
       }
 
       // Parse record
