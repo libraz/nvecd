@@ -651,11 +651,6 @@ Expected<void, Error> SerializeVectorStore(std::ostream& output_stream, const ve
 
     const auto& vec = vec_opt.value();
 
-    // Write normalized flag
-    if (!WriteBinary(output_stream, vec.normalized)) {
-      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write normalized flag"));
-    }
-
     // Write vector data
     for (float component : vec.data) {
       if (!WriteBinary(output_stream, component)) {
@@ -691,12 +686,6 @@ Expected<void, Error> DeserializeVectorStore(std::istream& input_stream, vectors
       return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read vector ID"));
     }
 
-    // Read normalized flag
-    bool normalized = false;
-    if (!ReadBinary(input_stream, normalized)) {
-      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read normalized flag"));
-    }
-
     // Read vector data
     std::vector<float> data(dimension);
     for (uint64_t i = 0; i < dimension; ++i) {
@@ -705,8 +694,8 @@ Expected<void, Error> DeserializeVectorStore(std::istream& input_stream, vectors
       }
     }
 
-    // Add vector to store
-    // Note: We pass normalize=false and manually restore the normalized flag
+    // Add vector to store. Vectors are persisted verbatim (already in their
+    // stored form), so no re-normalization is applied on load.
     auto result = vector_store.SetVector(vector_id, data, false);
     if (!result) {
       return MakeUnexpected(
@@ -872,7 +861,7 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
                                       const events::EventStore& event_store, const events::CoOccurrenceIndex& co_index,
                                       const vectors::VectorStore& vector_store, const SnapshotStatistics* stats,
                                       const std::unordered_map<std::string, StoreStatistics>* store_stats,
-                                      const vectors::MetadataStore* metadata_store) {
+                                      const vectors::MetadataStore* metadata_store, bool suppress_logging) {
   // Create temporary file path
   std::string temp_filepath = filepath + ".tmp";
 
@@ -1159,7 +1148,11 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
                                       "Failed to rename temp file to " + filepath + ": " + rename_ec.message()));
     }
 
-    LogStorageInfo("snapshot_write", "Snapshot written successfully to " + filepath);
+    // Skip spdlog when running on a post-fork child path, where the logger is
+    // not safe to touch (see suppress_logging in WriteSnapshotV1's docs).
+    if (!suppress_logging) {
+      LogStorageInfo("snapshot_write", "Snapshot written successfully to " + filepath);
+    }
     return {};
   }
 }

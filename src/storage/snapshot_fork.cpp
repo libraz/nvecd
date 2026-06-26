@@ -5,14 +5,17 @@
 
 #include "storage/snapshot_fork.h"
 
+#include <pthread.h>
 #include <signal.h>
 #include <spdlog/spdlog.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <chrono>
+#include <cstring>
 #include <ctime>
 #include <filesystem>
+#include <mutex>
 #include <thread>
 
 #include "storage/snapshot_format_v1.h"
@@ -29,6 +32,49 @@ namespace {
 constexpr int kMinInheritedFD = 3;  // Close FDs >= 3 (preserve stdin/stdout/stderr)
 constexpr int kChildExitSuccess = 0;
 constexpr int kChildExitFailure = 1;
+
+/**
+ * @brief Async-signal-safe error report to stderr.
+ *
+ * Used exclusively on the post-fork child path. After fork() in a
+ * multithreaded process, the only operations the child may safely perform are
+ * async-signal-safe ones, because any non-async-signal-safe lock (the libc
+ * allocator arena, the spdlog registry/sink mutex, ...) may have been held by a
+ * sibling thread at fork time and is now permanently locked in the child.
+ * write(2) is async-signal-safe and does not depend on any such lock, so it is
+ * the only logging primitive the child uses.
+ *
+ * @param msg NUL-terminated message (must be a compile-time/heap-free literal).
+ */
+void ChildWriteStderr(const char* msg) {
+  // Ignore the result: there is nothing actionable the child can do on a failed
+  // write, and it must not allocate or branch into non-async-signal-safe code.
+  const ssize_t written = write(STDERR_FILENO, msg, std::strlen(msg));
+  static_cast<void>(written);
+}
+
+/**
+ * @brief pthread_atfork "prepare" handler.
+ *
+ * Runs in the forking thread while the process is still multithreaded, before
+ * fork() snapshots the address space. Flushing the logger here drains any
+ * buffered records so they are not lost or duplicated across the fork, and
+ * leaves the spdlog sinks in a quiescent state. The child never touches spdlog
+ * again (see ChildProcess), so no spdlog lock can deadlock the child.
+ */
+void AtForkPrepare() { spdlog::details::registry::instance().flush_all(); }
+
+/**
+ * @brief Register the pthread_atfork handlers exactly once.
+ *
+ * The parent/child post-fork handlers are intentionally no-ops: the parent's
+ * logger is already consistent, and the child must not re-enter spdlog. The
+ * sole job of the registration is to install the "prepare" flush as a barrier.
+ */
+void EnsureAtForkRegistered() {
+  static std::once_flag once;
+  std::call_once(once, [] { pthread_atfork(&AtForkPrepare, nullptr, nullptr); });
+}
 }  // namespace
 
 ForkSnapshotWriter::~ForkSnapshotWriter() {
@@ -49,6 +95,10 @@ utils::Expected<void, utils::Error> ForkSnapshotWriter::StartBackgroundSave(
 
   utils::LogStorageInfo("snapshot_fork", "Acquiring write locks for pre-fork barrier");
 
+  // Install the fork barrier that flushes spdlog before fork (see
+  // EnsureAtForkRegistered). Idempotent across snapshots.
+  EnsureAtForkRegistered();
+
   // Pre-fork barrier: acquire all write locks to ensure consistent mutex state
   auto lock_es = event_store.AcquireWriteLock();
   auto lock_co = co_index.AcquireWriteLock();
@@ -59,6 +109,11 @@ utils::Expected<void, utils::Error> ForkSnapshotWriter::StartBackgroundSave(
   signal(SIGCHLD, SIG_DFL);  // NOLINT(cppcoreguidelines-pro-type-cstyle-cast)
 
   utils::LogStorageInfo("snapshot_fork", "Forking child process for snapshot: " + filepath);
+
+  // Flush the logger immediately before fork so the child inherits no buffered
+  // log records and never has to re-enter spdlog (which would risk deadlocking
+  // on a registry/sink mutex held by a sibling thread at fork time).
+  spdlog::details::registry::instance().flush_all();
 
   pid_t pid = fork();
 
@@ -115,22 +170,38 @@ void ForkSnapshotWriter::ChildProcess(const std::string& filepath, const config:
                                       const events::EventStore& event_store, const events::CoOccurrenceIndex& co_index,
                                       const vectors::VectorStore& vector_store,
                                       const vectors::MetadataStore* metadata_store) {
-  // 1. Close inherited file descriptors (server sockets, log files, etc.)
+  // After fork() in a multithreaded process the child must restrict itself to
+  // operations that do not depend on a lock a sibling thread may have held at
+  // fork time. In particular it must NOT call into spdlog: the parent flushed
+  // and quiesced the logger before fork (see StartBackgroundSave and
+  // AtForkPrepare), and any spdlog call here could block forever on a
+  // registry/sink mutex inherited in a locked state. All child diagnostics use
+  // the async-signal-safe ChildWriteStderr() instead.
+
+  // 1. Close inherited file descriptors (server sockets, log files, etc.).
+  //    This also drops the child's copies of the parent's log sink FDs, so the
+  //    child cannot corrupt the parent's log output.
   CloseInheritedFDs(kMinInheritedFD);
 
-  // 2. Shutdown spdlog to avoid writing to parent's log file descriptors
-  spdlog::shutdown();
-
-  // 3. Reset signal handlers
+  // 2. Reset signal handlers
   signal(SIGCHLD, SIG_DFL);  // NOLINT(cppcoreguidelines-pro-type-cstyle-cast)
   signal(SIGPIPE, SIG_DFL);  // NOLINT(cppcoreguidelines-pro-type-cstyle-cast)
   signal(SIGTERM, SIG_DFL);  // NOLINT(cppcoreguidelines-pro-type-cstyle-cast)
 
-  // 4. Write snapshot — data is a frozen COW copy from parent
+  // 3. Write snapshot — data is a frozen COW copy from parent.
+  //    WriteSnapshotV1 may allocate via the libc allocator; that is safe across
+  //    fork because libc registers its own pthread_atfork handlers for the
+  //    allocator arenas. It must not, however, log via spdlog on its error
+  //    path; failures are surfaced through the exit code below and reported by
+  //    the parent in CheckChild().
   auto result = snapshot_v1::WriteSnapshotV1(filepath, config, event_store, co_index, vector_store, nullptr, nullptr,
-                                             metadata_store);
+                                             metadata_store, /*suppress_logging=*/true);
 
-  // 5. Exit (never call exit() — use _exit() to avoid atexit handlers)
+  if (!result) {
+    ChildWriteStderr("nvecd: fork snapshot child failed to write snapshot\n");
+  }
+
+  // 4. Exit (never call exit() — use _exit() to avoid atexit handlers)
   _exit(result ? kChildExitSuccess : kChildExitFailure);
 }
 

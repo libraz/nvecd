@@ -268,6 +268,11 @@ Expected<void, Error> ReadHeaderV1(std::istream& input_stream, HeaderV1& header)
  * @param vector_store VectorStore to serialize
  * @param stats Optional snapshot-level statistics
  * @param store_stats Optional per-store statistics map
+ * @param suppress_logging When true, the function performs no spdlog logging.
+ *        Required when called from a post-fork child (e.g. ForkSnapshotWriter),
+ *        where spdlog is not safe because a sibling thread may have held the
+ *        logger's registry/sink mutex at fork time. Defaults to false for the
+ *        normal synchronous in-parent save path.
  * @return Expected<void, Error> Success or error with details (context: filepath)
  *
  * @note Writes to temporary file first (.tmp suffix), then atomic rename
@@ -279,7 +284,8 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
                                       const vectors::VectorStore& vector_store,
                                       const SnapshotStatistics* stats = nullptr,
                                       const std::unordered_map<std::string, StoreStatistics>* store_stats = nullptr,
-                                      const vectors::MetadataStore* metadata_store = nullptr);
+                                      const vectors::MetadataStore* metadata_store = nullptr,
+                                      bool suppress_logging = false);
 
 /**
  * @brief Read complete snapshot from file (Version 1 format)

@@ -78,12 +78,13 @@ class ForkSnapshotWriter {
    * ensure no mutex is held at fork time. After fork, parent releases
    * locks immediately.
    *
-   * Child process:
-   * 1. Closes inherited file descriptors (server sockets, etc.)
-   * 2. Shuts down spdlog (avoid writing to parent's log files)
-   * 3. Resets signal handlers
-   * 4. Calls WriteSnapshotV1 to serialize all stores
-   * 5. Calls _exit() (never exit())
+   * Child process (post-fork path is async-signal-safe with respect to
+   * application locks; it never re-enters spdlog, whose registry/sink mutex a
+   * sibling thread could have held at fork time):
+   * 1. Closes inherited file descriptors (server sockets, parent log sinks)
+   * 2. Resets signal handlers
+   * 3. Calls WriteSnapshotV1 (with logging suppressed) to serialize all stores
+   * 4. Reports failure via an async-signal-safe write(2), then _exit()
    *
    * @param filepath Output file path
    * @param config Configuration to serialize
@@ -135,7 +136,10 @@ class ForkSnapshotWriter {
   /**
    * @brief Child process entry point (runs after fork)
    *
-   * This function never returns — it calls _exit().
+   * Restricted to operations that do not depend on a lock a sibling thread may
+   * have held at fork time. In particular it must not call into spdlog; all
+   * diagnostics use async-signal-safe write(2). This function never returns —
+   * it calls _exit().
    */
   [[noreturn]] static void ChildProcess(const std::string& filepath, const config::Config& config,
                                         const events::EventStore& event_store,
