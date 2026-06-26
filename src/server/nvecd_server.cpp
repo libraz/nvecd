@@ -160,6 +160,11 @@ void NvecdServer::Stop() {
     snapshot_scheduler_->Stop();
   }
 
+  // Stop co-occurrence decay scheduler
+  if (decay_scheduler_) {
+    decay_scheduler_->Stop();
+  }
+
   // Wait for any in-progress fork snapshot
   if (fork_writer_) {
     fork_writer_->WaitForChild();
@@ -307,6 +312,11 @@ utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
                                             co_index_.get(), vector_store_.get(), metadata_store_.get(), read_only_);
     snapshot_scheduler_->Start();
   }
+
+  // Create and start DecayScheduler (if co-occurrence decay is enabled)
+  decay_scheduler_ = std::make_unique<DecayScheduler>(
+      co_index_.get(), static_cast<int>(config_.events.decay_interval_sec), config_.events.decay_alpha);
+  decay_scheduler_->Start();
 
   // Create RateLimiter if enabled
   if (config_.api.rate_limiting.enable) {

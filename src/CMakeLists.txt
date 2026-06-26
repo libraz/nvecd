@@ -33,6 +33,7 @@ add_library(nvecd_server STATIC
   server/rate_limiter.cpp
   server/request_dispatcher.cpp
   server/snapshot_scheduler.cpp
+  server/decay_scheduler.cpp
   server/http_server.cpp
   server/nvecd_server.cpp
 )
