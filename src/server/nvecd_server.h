@@ -153,6 +153,8 @@ class NvecdServer {
   std::atomic<bool> shutdown_{false};  // Set to true when shutting down
   std::atomic<bool> loading_{false};
   std::atomic<bool> read_only_{false};  // Set to true during snapshot save
+  std::shared_mutex snapshot_write_gate_;
+  std::mutex write_serialization_gate_;
 
   // Statistics
   ServerStats stats_;

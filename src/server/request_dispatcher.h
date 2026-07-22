@@ -55,7 +55,7 @@ class RequestDispatcher {
 
   /**
    * @brief Dispatch a request to appropriate handler
-   * @param request Request string (may be multi-line for VECSET/SIMV)
+   * @param request Single-line request string
    * @param conn_ctx Connection context
    * @return Response string
    */
@@ -79,6 +79,7 @@ class RequestDispatcher {
   // Handler methods
   utils::Expected<std::string, utils::Error> HandleEvent(const Command& cmd) const;
   utils::Expected<std::string, utils::Error> HandleVecset(const Command& cmd) const;
+  utils::Expected<std::string, utils::Error> HandleVecdel(const Command& cmd) const;
   utils::Expected<std::string, utils::Error> HandleMetaset(const Command& cmd) const;
   utils::Expected<std::string, utils::Error> HandleSim(const Command& cmd, ConnectionContext& conn_ctx) const;
   utils::Expected<std::string, utils::Error> HandleSimv(const Command& cmd, ConnectionContext& conn_ctx) const;
@@ -103,16 +104,15 @@ class RequestDispatcher {
   utils::Expected<std::string, utils::Error> HandleShowVariables(const Command& cmd);
 
   /**
-   * @brief Best-effort append of a write command to the WAL
+   * @brief Append a write command to the WAL
    *
    * Encodes @p cmd and appends it to ctx_.wal when the log is wired. A failed
-   * append is logged as a warning but never propagated to the caller: durability
-   * is best-effort and a log-write failure must not fail an already-applied
-   * client write.
+   * append is propagated so the caller never receives a successful durable
+   * write acknowledgement when the WAL cannot accept the record.
    *
    * @param cmd Effective write command to persist (timestamps already resolved)
    */
-  void AppendToWal(const Command& cmd) const;
+  utils::Expected<void, utils::Error> AppendToWal(const Command& cmd) const;
 
   // Format response helpers
   static std::string FormatOK(const std::string& msg = "");

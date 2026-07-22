@@ -279,6 +279,25 @@ TEST_F(HttpServerTest, VecsetMissingFields) {
   EXPECT_TRUE(body.contains("error"));
 }
 
+TEST_F(HttpServerTest, VecdelRemovesVectorAndMetadata) {
+  auto vecset = client_->Post("/vecset", R"({"id":"delete_me","vector":[1,0,0,0]})", "application/json");
+  ASSERT_TRUE(vecset);
+  ASSERT_EQ(vecset->status, 200);
+  auto metaset = client_->Post("/metaset", R"({"id":"delete_me","metadata":{"state":"active"}})", "application/json");
+  ASSERT_TRUE(metaset);
+  ASSERT_EQ(metaset->status, 200);
+
+  auto deleted = client_->Delete("/vecset", R"({"id":"delete_me"})", "application/json");
+  ASSERT_TRUE(deleted);
+  EXPECT_EQ(deleted->status, 200);
+  EXPECT_FALSE(vector_store_->HasVector("delete_me"));
+  EXPECT_EQ(metadata_store_->Get("delete_me"), nullptr);
+
+  auto missing = client_->Delete("/vecset", R"({"id":"delete_me"})", "application/json");
+  ASSERT_TRUE(missing);
+  EXPECT_EQ(missing->status, 404);
+}
+
 // Event operations tests
 TEST_F(HttpServerTest, Event) {
   json req_body;
@@ -429,6 +448,18 @@ TEST_F(HttpServerTest, SimNotFound) {
   EXPECT_EQ(res->status, 404);
 }
 
+TEST_F(HttpServerTest, SimAndSimvRejectWrongOptionalFieldTypesWithBadRequest) {
+  json sim_body = {{"id", "item"}, {"top_k", "five"}, {"mode", true}};
+  auto sim_response = client_->Post("/sim", sim_body.dump(), "application/json");
+  ASSERT_TRUE(sim_response);
+  EXPECT_EQ(sim_response->status, 400);
+
+  json simv_body = {{"vector", json::array({1.0, 0.0, 0.0, 0.0})}, {"top_k", "five"}};
+  auto simv_response = client_->Post("/simv", simv_body.dump(), "application/json");
+  ASSERT_TRUE(simv_response);
+  EXPECT_EQ(simv_response->status, 400);
+}
+
 // Cache management tests
 TEST_F(HttpServerTest, CacheStats) {
   auto res = client_->Get("/cache/stats");
@@ -570,6 +601,48 @@ TEST_F(HttpServerTest, SimPopulatesCache) {
 
   uint64_t hits_after = cache_->GetStatistics().cache_hits;
   EXPECT_GT(hits_after, hits_before);
+}
+
+// A warmed HTTP SIMV result must be invalidated when HTTP itself adds a new
+// vector. The generation bump is essential here because a brand-new ID is not
+// present in the cached result and therefore cannot be evicted selectively.
+TEST_F(HttpServerTest, VecsetInvalidatesWarmSimvCacheViaVectorGeneration) {
+  cache_->SetMinQueryCost(0.0);
+  cache::CachePolicy vector_policy;
+  vector_policy.enabled = true;
+  vector_policy.ttl_seconds = 0;
+  cache_->SetSearchTypePolicy(cache::SearchType::kVectorSearch, vector_policy);
+
+  json first_vector;
+  first_vector["id"] = "existing";
+  first_vector["vector"] = {0.0F, 1.0F, 0.0F, 0.0F};
+  ASSERT_EQ(client_->Post("/vecset", first_vector.dump(), "application/json")->status, 200);
+
+  json query;
+  query["vector"] = {1.0F, 0.0F, 0.0F, 0.0F};
+  query["top_k"] = 10;
+  auto warm = client_->Post("/simv", query.dump(), "application/json");
+  ASSERT_TRUE(warm);
+  ASSERT_EQ(warm->status, 200);
+
+  // Confirm the second request is served from the warmed cache before the
+  // mutation, so this test specifically covers cache invalidation.
+  const uint64_t hits_before = cache_->GetStatistics().cache_hits;
+  ASSERT_EQ(client_->Post("/simv", query.dump(), "application/json")->status, 200);
+  EXPECT_GT(cache_->GetStatistics().cache_hits, hits_before);
+
+  json added_vector;
+  added_vector["id"] = "new_match";
+  added_vector["vector"] = {1.0F, 0.0F, 0.0F, 0.0F};
+  ASSERT_EQ(client_->Post("/vecset", added_vector.dump(), "application/json")->status, 200);
+
+  auto refreshed = client_->Post("/simv", query.dump(), "application/json");
+  ASSERT_TRUE(refreshed);
+  ASSERT_EQ(refreshed->status, 200);
+  const auto response = json::parse(refreshed->body);
+  ASSERT_TRUE(response.contains("results"));
+  EXPECT_TRUE(std::any_of(response["results"].begin(), response["results"].end(),
+                          [](const json& item) { return item["id"] == "new_match"; }));
 }
 
 // DUMP SAVE failure returns a non-2xx with a real error (not 200 ok)
@@ -731,13 +804,26 @@ TEST_F(HttpServerTest, VecsetDimensionMismatchRejectedEarly) {
   EXPECT_EQ(res->status, 400);
 }
 
+TEST_F(HttpServerTest, WriteEndpointsRejectDuringLockSnapshot) {
+  read_only_.store(true);
+  json vec;
+  vec["id"] = "blocked";
+  vec["vector"] = {1.0F, 0.0F, 0.0F, 0.0F};
+  auto res = client_->Post("/vecset", vec.dump(), "application/json");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(res->status, 503);
+}
+
 // Authentication tests: requirepass gates write/admin endpoints over HTTP
 class HttpServerAuthTest : public ::testing::Test {
  protected:
+  virtual void ConfigureServerConfig() {}
+
   void SetUp() override {
     config_ = std::make_unique<config::Config>();
     config_->vectors.default_dimension = 4;
     config_->similarity.default_top_k = 10;
+    ConfigureServerConfig();
 
     event_store_ = std::make_unique<events::EventStore>(config_->events);
     co_index_ = std::make_unique<events::CoOccurrenceIndex>();
@@ -864,6 +950,32 @@ TEST_F(HttpServerAuthTest, UnauthenticatedDumpSaveRejected) {
   auto res = client_->Post("/dump/save", req.dump(), "application/json");
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 401);
+}
+
+TEST_F(HttpServerAuthTest, UnauthenticatedDumpStatusRejected) {
+  auto res = client_->Get("/dump/status");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(res->status, 401);
+}
+
+class HttpServerRateLimitTest : public HttpServerAuthTest {
+ protected:
+  void ConfigureServerConfig() override {
+    config_->api.rate_limiting.enable = true;
+    config_->api.rate_limiting.capacity = 1;
+    config_->api.rate_limiting.refill_rate = 1;
+    config_->api.rate_limiting.max_clients = 10;
+  }
+};
+
+TEST_F(HttpServerRateLimitTest, AppliesConfiguredLimitToHttpRequests) {
+  auto first = client_->Get("/health/live");
+  ASSERT_TRUE(first);
+  EXPECT_EQ(first->status, 200);
+
+  auto limited = client_->Get("/health/live");
+  ASSERT_TRUE(limited);
+  EXPECT_EQ(limited->status, 429);
 }
 
 // CORS behavior: when enabled but no origin is configured, the

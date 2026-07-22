@@ -11,6 +11,7 @@
 #include <arpa/inet.h>
 #include <spdlog/spdlog.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 
 #include <chrono>
 #include <filesystem>
@@ -34,7 +35,7 @@ constexpr int kShutdownCheckIntervalMs = 100;
 constexpr size_t kBytesPerMegabyte = 1024 * 1024;  // Bytes in a megabyte
 
 /**
- * @brief Find the newest snapshot in @p dir that has a WAL checkpoint sidecar.
+ * @brief Find the newest snapshot in @p dir.
  *
  * Startup recovery must replay the WAL relative to the exact snapshot the WAL
  * was last truncated against. Every snapshot that triggered a truncation wrote a
@@ -46,9 +47,10 @@ constexpr size_t kBytesPerMegabyte = 1024 * 1024;  // Bytes in a megabyte
  * reconstructs their contents.
  *
  * @param dir Snapshot directory to scan
- * @return Path of the newest checkpointed snapshot, or std::nullopt if none
+ * @param require_checkpoint Whether a WAL checkpoint sidecar is mandatory
+ * @return Path of the newest eligible snapshot, or std::nullopt if none
  */
-std::optional<std::string> FindLatestSnapshot(const std::string& dir) {
+std::optional<std::string> FindLatestSnapshot(const std::string& dir, bool require_checkpoint) {
   std::error_code ec;
   std::filesystem::path snapshot_dir(dir);
   if (!std::filesystem::is_directory(snapshot_dir, ec)) {
@@ -68,9 +70,12 @@ std::optional<std::string> FindLatestSnapshot(const std::string& dir) {
     if (entry.path().extension() == storage::kWalCheckpointSuffix) {
       continue;
     }
-    // Only snapshots with a checkpoint sidecar are valid recovery bases.
+    // With WAL enabled, only snapshots with a checkpoint sidecar are valid
+    // bases: the sidecar tells us exactly where replay must begin. Without WAL
+    // there is no sidecar by design, so the newest valid snapshot is the sole
+    // durable recovery source and must not be ignored.
     const std::string sidecar = entry.path().string() + storage::kWalCheckpointSuffix;
-    if (!std::filesystem::exists(sidecar, ec)) {
+    if (require_checkpoint && !std::filesystem::exists(sidecar, ec)) {
       continue;
     }
     auto mtime = std::filesystem::last_write_time(entry, ec);
@@ -184,13 +189,13 @@ utils::Expected<void, utils::Error> NvecdServer::Start() {
     http_config.cors_allow_origin = config_.api.http.cors_allow_origin;
     http_config.allow_cidrs = config_.network.allow_cidrs;
     http_config.requirepass = config_.security.requirepass;
-    // Bound the HTTP request body using the same query-length budget as the TCP
-    // path (which accumulates up to 2x max_query_length per request).
+    // Apply the same per-request query-length budget to HTTP and TCP.
     if (config_.perf.max_query_length > 0) {
-      http_config.max_payload_bytes = static_cast<size_t>(config_.perf.max_query_length) * 2;
+      http_config.max_payload_bytes = static_cast<size_t>(config_.perf.max_query_length);
     }
 
-    http_server_ = std::make_unique<HttpServer>(http_config, &handler_ctx_, &config_, &loading_, &stats_);
+    http_server_ =
+        std::make_unique<HttpServer>(http_config, &handler_ctx_, &config_, &loading_, &stats_, rate_limiter_.get());
 
     auto http_start_result = http_server_->Start();
     if (!http_start_result) {
@@ -239,7 +244,6 @@ void NvecdServer::Stop() {
   // Stop Unix domain socket acceptor
   if (unix_acceptor_) {
     unix_acceptor_->Stop();
-    unix_acceptor_.reset();
   }
 
   // Stop accepting new connections
@@ -260,8 +264,17 @@ void NvecdServer::Stop() {
 
   // Stop thread pool
   if (thread_pool_) {
+    // ConnectionAcceptor::Stop has already shut down every active client fd,
+    // so connection handlers can observe shutdown and exit.  Bound this final
+    // wait by the configured server shutdown deadline instead of letting a
+    // misbehaving task make Stop() hang forever.
+    thread_pool_->Shutdown(false, static_cast<uint32_t>(config_.perf.shutdown_timeout_ms));
     thread_pool_.reset();
   }
+
+  // Connection tasks capture their acceptor while removing/closing fds, so
+  // keep the UDS acceptor alive until all worker tasks have stopped.
+  unix_acceptor_.reset();
 
   // Close the WAL last: all surfaces (TCP worker threads, HTTP server) are now
   // stopped and the fork child has been reaped, so no write can race the close.
@@ -276,14 +289,21 @@ void NvecdServer::Stop() {
 }
 
 utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
+  handler_ctx_.snapshot_write_gate = &snapshot_write_gate_;
+  handler_ctx_.write_serialization_gate = &write_serialization_gate_;
   spdlog::info("Initializing server components...");
 
   // Create EventStore
   event_store_ = std::make_unique<events::EventStore>(config_.events);
   spdlog::info("EventStore initialized (buffer_size={})", config_.events.ctx_buffer_size);
 
-  // Create CoOccurrenceIndex
-  co_index_ = std::make_unique<events::CoOccurrenceIndex>();
+  // Create CoOccurrenceIndex with the pruning policy configured alongside
+  // the event store. Keeping this wiring here makes the YAML settings apply
+  // to both TCP and HTTP ingestion paths through the shared index.
+  events::CoOccurrenceIndex::Config co_index_config;
+  co_index_config.max_neighbors_per_item = config_.events.max_neighbors_per_item;
+  co_index_config.min_support = static_cast<float>(config_.events.min_support);
+  co_index_ = std::make_unique<events::CoOccurrenceIndex>(co_index_config);
   spdlog::info("CoOccurrenceIndex initialized");
 
   // Create VectorStore
@@ -390,28 +410,34 @@ utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
   //
   // The fork-snapshot writer is also given the WAL pointer so it can write the
   // checkpoint sidecar and truncate the WAL once a background snapshot lands.
+  auto load_snapshot = [this](const std::string& snapshot_path) -> utils::Expected<void, utils::Error> {
+    config::Config loaded_config;
+    storage::snapshot_format::IntegrityError integrity_error;
+    auto load =
+        storage::snapshot_v1::ReadSnapshotV1(snapshot_path, loaded_config, *event_store_, *co_index_, *vector_store_,
+                                             nullptr, nullptr, &integrity_error, metadata_store_.get());
+    if (!load) {
+      std::string msg = load.error().message();
+      if (!integrity_error.message.empty()) {
+        msg += " (" + integrity_error.message + ")";
+      }
+      spdlog::error("Failed to load snapshot {} during recovery: {}", snapshot_path, msg);
+      return utils::MakeUnexpected(load.error());
+    }
+    spdlog::info("Recovery loaded snapshot: {}", snapshot_path);
+    return {};
+  };
+
   if (config_.wal.enabled) {
     // 1. Load the latest checkpointed snapshot, if one exists.
     std::string loaded_snapshot_path;
-    auto latest = FindLatestSnapshot(config_.snapshot.dir);
+    auto latest = FindLatestSnapshot(config_.snapshot.dir, /*require_checkpoint=*/true);
     if (latest.has_value()) {
-      config::Config loaded_config;
-      storage::snapshot_format::IntegrityError integrity_error;
-      auto load =
-          storage::snapshot_v1::ReadSnapshotV1(*latest, loaded_config, *event_store_, *co_index_, *vector_store_,
-                                               nullptr, nullptr, &integrity_error, metadata_store_.get());
+      auto load = load_snapshot(*latest);
       if (!load) {
-        // Recovery was requested but the chosen snapshot is unreadable: fail
-        // startup rather than silently losing the pre-snapshot state.
-        std::string msg = load.error().message();
-        if (!integrity_error.message.empty()) {
-          msg += " (" + integrity_error.message + ")";
-        }
-        spdlog::error("Failed to load snapshot {} during WAL recovery: {}", *latest, msg);
         return utils::MakeUnexpected(load.error());
       }
       loaded_snapshot_path = *latest;
-      spdlog::info("Recovery loaded snapshot: {}", loaded_snapshot_path);
     }
 
     // 2. Open the WAL (recovers CurrentSequence from existing files).
@@ -448,6 +474,26 @@ utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
     handler_ctx_.wal = &wal_;
     fork_writer_->SetWal(&wal_);
     spdlog::info("WAL enabled (dir={}, current_sequence={})", config_.wal.dir, wal_.CurrentSequence());
+  } else {
+    // WAL-off is the default configuration. Its snapshots have no .walseq
+    // sidecar, so recover the latest snapshot directly instead of starting
+    // every restart from an empty in-memory store.
+    auto latest = FindLatestSnapshot(config_.snapshot.dir, /*require_checkpoint=*/false);
+    if (latest.has_value()) {
+      auto load = load_snapshot(*latest);
+      if (!load) {
+        return utils::MakeUnexpected(load.error());
+      }
+    }
+  }
+
+  // Snapshot load and WAL replay repopulate the VectorStore directly, bypassing
+  // the incremental NotifyVectorAdded path, so the ANN index would otherwise be
+  // empty (or hold only replayed tail vectors) after recovery. Rebuild it from
+  // the fully restored store so ANN searches cover the entire corpus. No-op for
+  // the flat index or an empty store.
+  if (similarity_engine_) {
+    similarity_engine_->RebuildAnnFromStore();
   }
 
   // Create and start SnapshotScheduler (if auto-snapshot is enabled)
@@ -484,43 +530,52 @@ void NvecdServer::HandleConnection(int client_fd) {
 
   spdlog::debug("New connection: fd={}", client_fd);
 
-  // Submit connection handling to thread pool
-  thread_pool_->Submit([this, client_fd]() {
-    ConnectionContext conn_ctx;
-    conn_ctx.client_fd = client_fd;
+  // This runs synchronously on the thread-pool worker that ConnectionAcceptor
+  // already submitted us on. Do NOT submit a second task here: a nested Submit
+  // would return immediately, causing the acceptor's outer task to call
+  // RemoveConnection() before any I/O ran (undercounting active_fds_ and
+  // defeating the connection limits) and would leave the fd unclosed forever
+  // (fd leak -> EMFILE -> full-service DoS). Blocking here keeps connection
+  // accounting and fd close ownership on the acceptor's task.
+  ConnectionContext conn_ctx;
+  conn_ctx.client_fd = client_fd;
 
-    // Extract client IP for rate limiting
-    struct sockaddr_in peer_addr {};
-    socklen_t peer_len = sizeof(peer_addr);
-    if (getpeername(
-            client_fd,
-            reinterpret_cast<struct sockaddr*>(&peer_addr),  // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
-            &peer_len) == 0) {
-      char ip_buf[INET_ADDRSTRLEN];
-      if (inet_ntop(AF_INET, &peer_addr.sin_addr, ip_buf, sizeof(ip_buf)) != nullptr) {
-        conn_ctx.client_ip = ip_buf;
-      }
+  // Extract a stable peer identity for rate limiting.  A UNIX-domain peer is
+  // not an IPv4 address; interpreting it as one produces a bogus shared key.
+  sockaddr_storage peer_addr{};
+  socklen_t peer_len = sizeof(peer_addr);
+  if (getpeername(client_fd, reinterpret_cast<sockaddr*>(&peer_addr), &peer_len) == 0 &&
+      peer_addr.ss_family == AF_INET) {
+    const auto* ipv4_peer = reinterpret_cast<const sockaddr_in*>(&peer_addr);
+    char ip_buf[INET_ADDRSTRLEN];
+    if (inet_ntop(AF_INET, &ipv4_peer->sin_addr, ip_buf, sizeof(ip_buf)) != nullptr) {
+      conn_ctx.client_ip = ip_buf;
     }
+  } else if (peer_addr.ss_family == AF_UNIX) {
+    // Local socket access is authorized by the socket filesystem permissions.
+    // Keep it distinct so ProcessRequest can deliberately exempt it from the
+    // per-IP limiter instead of accidentally treating it as an arbitrary IP.
+    conn_ctx.client_ip = "unix";
+  }
 
-    // Create I/O configuration
-    IOConfig io_config;
-    io_config.recv_buffer_size = static_cast<size_t>(config_.perf.recv_buffer_size);
-    io_config.max_query_length = static_cast<size_t>(config_.perf.max_query_length);
-    io_config.max_accumulated_bytes = static_cast<size_t>(config_.perf.max_query_length) * 2;
-    io_config.recv_timeout_sec = config_.perf.connection_timeout_sec;
+  // Create I/O configuration
+  IOConfig io_config;
+  io_config.recv_buffer_size = static_cast<size_t>(config_.perf.recv_buffer_size);
+  io_config.max_query_length = static_cast<size_t>(config_.perf.max_query_length);
+  io_config.max_accumulated_bytes = static_cast<size_t>(config_.perf.max_query_length) * 2;
+  io_config.recv_timeout_sec = config_.perf.connection_timeout_sec;
 
-    // Create request processor
-    RequestProcessor processor = [this](const std::string& request, ConnectionContext& ctx) {
-      return this->ProcessRequest(request, ctx);
-    };
+  // Create request processor
+  RequestProcessor processor = [this](const std::string& request, ConnectionContext& ctx) {
+    return this->ProcessRequest(request, ctx);
+  };
 
-    // Create I/O handler and handle connection
-    ConnectionIOHandler io_handler(io_config, processor, shutdown_);
-    io_handler.HandleConnection(client_fd, conn_ctx);
+  // Create I/O handler and handle connection
+  ConnectionIOHandler io_handler(io_config, processor, shutdown_);
+  io_handler.HandleConnection(client_fd, conn_ctx);
 
-    stats_.active_connections--;
-    spdlog::debug("Connection closed: fd={}", client_fd);
-  });
+  stats_.active_connections--;
+  spdlog::debug("Connection closed: fd={}", client_fd);
 }
 
 std::string NvecdServer::ProcessRequest(const std::string& request, ConnectionContext& conn_ctx) {
@@ -529,7 +584,7 @@ std::string NvecdServer::ProcessRequest(const std::string& request, ConnectionCo
   }
 
   // Rate limit check
-  if (rate_limiter_ && !conn_ctx.client_ip.empty()) {
+  if (rate_limiter_ && !conn_ctx.client_ip.empty() && conn_ctx.client_ip != "unix") {
     if (!rate_limiter_->Allow(conn_ctx.client_ip)) {
       return "ERROR Rate limit exceeded\r\n";
     }

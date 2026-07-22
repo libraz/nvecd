@@ -87,6 +87,15 @@ target_link_libraries(command_parser_test
 )
 gtest_discover_tests(command_parser_test)
 
+add_executable(connection_io_handler_test
+  server/connection_io_handler_test.cpp
+)
+target_link_libraries(connection_io_handler_test
+  nvecd_server
+  gtest_main
+)
+gtest_discover_tests(connection_io_handler_test)
+
 add_executable(http_server_test
   server/http_server_test.cpp
 )

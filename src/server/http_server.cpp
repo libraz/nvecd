@@ -15,7 +15,9 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <sstream>
 #include <string_view>
 
@@ -28,6 +30,7 @@
 #include "server/filter_parser.h"
 #include "server/handlers/dump_handler.h"
 #include "server/score_format.h"
+#include "server/similarity_result_utils.h"
 #include "server/wal_codec.h"
 #include "similarity/similarity_engine.h"
 #include "storage/snapshot_fork.h"
@@ -51,6 +54,7 @@ constexpr int kHttpNoContent = 204;
 constexpr int kHttpBadRequest = 400;
 constexpr int kHttpUnauthorized = 401;
 constexpr int kHttpForbidden = 403;
+constexpr int kHttpTooManyRequests = 429;
 constexpr int kHttpNotFound = 404;
 constexpr int kHttpInternalServerError = 500;
 constexpr int kHttpServiceUnavailable = 503;
@@ -137,67 +141,29 @@ std::vector<utils::CIDR> ParseAllowCidrs(const std::vector<std::string>& allow_c
   return parsed;
 }
 
-std::vector<std::pair<std::string, float>> ApplyMinScore(const std::vector<similarity::SimilarityResult>& results,
-                                                         float min_score) {
-  std::vector<std::pair<std::string, float>> filtered;
-  filtered.reserve(results.size());
-  for (const auto& item : results) {
-    if (item.score >= min_score) {
-      filtered.emplace_back(item.item_id, item.score);
-    }
-  }
-  return filtered;
-}
-
-std::vector<similarity::SimilarityResult> ApplyMetadataFilter(const std::vector<similarity::SimilarityResult>& results,
-                                                              vectors::MetadataStore* metadata_store,
-                                                              const vectors::MetadataFilter& filter) {
-  if (filter.Empty() || metadata_store == nullptr) {
-    return results;
-  }
-
-  std::vector<similarity::SimilarityResult> filtered;
-  filtered.reserve(results.size());
-  for (const auto& item : results) {
-    if (metadata_store->Matches(item.item_id, filter)) {
-      filtered.push_back(item);
-    }
-  }
-  return filtered;
-}
-
-/// Oversampling factor for events-mode filtered search (mirrors the TCP path).
-constexpr int kEventsFilterOversampling = 3;
-
-/**
- * @brief Apply a metadata filter to events-mode results and truncate to top_k.
- *
- * Events mode resolves candidates from the metadata-unaware co-occurrence
- * index, so filtering happens here. Because matching keys off the item ID, a
- * vectorless item with matching metadata stays eligible (cold-start use case).
- * The caller over-fetches so up to @p top_k matching items can be returned.
- */
-std::vector<similarity::SimilarityResult> ApplyEventsFilterTopK(
-    const std::vector<similarity::SimilarityResult>& results, vectors::MetadataStore* metadata_store,
-    const vectors::MetadataFilter& filter, int top_k) {
-  std::vector<similarity::SimilarityResult> filtered;
-  filtered.reserve(results.size());
-  for (const auto& item : results) {
-    if (filter.Empty() || metadata_store == nullptr || metadata_store->Matches(item.item_id, filter)) {
-      filtered.push_back(item);
-      if (top_k > 0 && static_cast<int>(filtered.size()) >= top_k) {
-        break;
-      }
-    }
-  }
-  return filtered;
-}
-
 bool JsonNumberIsFinite(const json& value) {
   if (!value.is_number()) {
     return false;
   }
   return std::isfinite(value.get<double>());
+}
+
+bool WritesBlocked(const HandlerContext* handler_context) {
+  return handler_context != nullptr && handler_context->read_only.load(std::memory_order_acquire);
+}
+
+std::shared_lock<std::shared_mutex> AcquireSnapshotWriteGuard(const HandlerContext* handler_context) {
+  if (handler_context == nullptr || handler_context->snapshot_write_gate == nullptr) {
+    return {};
+  }
+  return std::shared_lock(*handler_context->snapshot_write_gate);
+}
+
+std::unique_lock<std::mutex> AcquireWriteSerializationGuard(const HandlerContext* handler_context) {
+  if (handler_context == nullptr || handler_context->write_serialization_gate == nullptr) {
+    return {};
+  }
+  return std::unique_lock(*handler_context->write_serialization_gate);
 }
 
 utils::Expected<vectors::Metadata, utils::Error> ParseMetadataJson(const json& value) {
@@ -257,50 +223,25 @@ void AppendCommandToWal(const HandlerContext* ctx, const Command& cmd) {
   }
 }
 
-/**
- * @brief Render a typed metadata map into the simple "key:value,..." filter form.
- *
- * The WAL METASET codec stores the command's filter_expr verbatim and replay
- * re-runs the metadata handler, which re-parses it via ParseSimpleFilter. The
- * HTTP surface receives typed JSON metadata, so it is serialized back into the
- * canonical filter grammar (numeric/bool values render without quotes so
- * ParseSimpleFilter auto-types them identically on replay).
- */
-std::string MetadataToFilterExpr(const vectors::Metadata& metadata) {
-  std::string expr;
-  bool first = true;
-  for (const auto& [key, value] : metadata) {
-    if (!first) {
-      expr += ",";
-    }
-    first = false;
-    expr += key;
-    expr += ":";
-    std::visit(
-        [&expr](const auto& held) {
-          using T = std::decay_t<decltype(held)>;
-          if constexpr (std::is_same_v<T, std::string>) {
-            expr += held;
-          } else if constexpr (std::is_same_v<T, bool>) {
-            expr += held ? "true" : "false";
-          } else {
-            expr += std::to_string(held);
-          }
-        },
-        value);
-  }
-  return expr;
-}
 }  // namespace
 
 HttpServer::HttpServer(HttpServerConfig config, HandlerContext* handler_context, const config::Config* full_config,
-                       std::atomic<bool>* loading, ServerStats* tcp_stats)
+                       std::atomic<bool>* loading, ServerStats* tcp_stats, RateLimiter* rate_limiter)
     : config_(std::move(config)),
       handler_context_(handler_context),
       full_config_(full_config),
       loading_(loading),
-      tcp_stats_(tcp_stats) {
+      tcp_stats_(tcp_stats),
+      rate_limiter_(rate_limiter) {
   parsed_allow_cidrs_ = ParseAllowCidrs(config_.allow_cidrs);
+
+  // Standalone HTTP users do not have NvecdServer's shared limiter. Build a
+  // local one from the same config instead of silently bypassing rate limits.
+  if (rate_limiter_ == nullptr && full_config_ != nullptr && full_config_->api.rate_limiting.enable) {
+    const auto& rate = full_config_->api.rate_limiting;
+    owned_rate_limiter_ = std::make_unique<RateLimiter>(rate.capacity, rate.refill_rate, rate.max_clients);
+    rate_limiter_ = owned_rate_limiter_.get();
+  }
 
   server_ = std::make_unique<httplib::Server>();
 
@@ -334,6 +275,7 @@ void HttpServer::SetupRoutes() {
   // nvecd-specific operations
   server_->Post("/event", [this](const httplib::Request& req, httplib::Response& res) { HandleEvent(req, res); });
   server_->Post("/vecset", [this](const httplib::Request& req, httplib::Response& res) { HandleVecset(req, res); });
+  server_->Delete("/vecset", [this](const httplib::Request& req, httplib::Response& res) { HandleVecdel(req, res); });
   server_->Post("/metaset", [this](const httplib::Request& req, httplib::Response& res) { HandleMetaset(req, res); });
   server_->Post("/sim", [this](const httplib::Request& req, httplib::Response& res) { HandleSim(req, res); });
   server_->Post("/simv", [this](const httplib::Request& req, httplib::Response& res) { HandleSimv(req, res); });
@@ -386,18 +328,27 @@ void HttpServer::SetupRoutes() {
 
 void HttpServer::SetupAccessControl() {
   server_->set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
-    if (utils::IsIPAllowed(req.remote_addr, parsed_allow_cidrs_)) {
-      return httplib::Server::HandlerResponse::Unhandled;
+    const std::string remote = req.remote_addr.empty() ? std::string("<unknown>") : req.remote_addr;
+    if (!utils::IsIPAllowed(req.remote_addr, parsed_allow_cidrs_)) {
+      nvecd::utils::StructuredLog()
+          .Event("server_warning")
+          .Field("type", "http_request_rejected_acl")
+          .Field("remote_addr", remote)
+          .Warn();
+      SendError(res, kHttpForbidden, "Access denied by network.allow_cidrs");
+      return httplib::Server::HandlerResponse::Handled;
     }
 
-    const auto& remote = req.remote_addr.empty() ? std::string("<unknown>") : req.remote_addr;
-    nvecd::utils::StructuredLog()
-        .Event("server_warning")
-        .Field("type", "http_request_rejected_acl")
-        .Field("remote_addr", remote)
-        .Warn();
-    SendError(res, kHttpForbidden, "Access denied by network.allow_cidrs");
-    return httplib::Server::HandlerResponse::Handled;
+    if (rate_limiter_ != nullptr && !rate_limiter_->Allow(remote)) {
+      nvecd::utils::StructuredLog()
+          .Event("server_warning")
+          .Field("type", "http_request_rate_limited")
+          .Field("remote_addr", remote)
+          .Warn();
+      SendError(res, kHttpTooManyRequests, "Rate limit exceeded");
+      return httplib::Server::HandlerResponse::Handled;
+    }
+    return httplib::Server::HandlerResponse::Unhandled;
   });
 }
 
@@ -827,6 +778,9 @@ void HttpServer::HandleConfig(const httplib::Request& /*req*/, httplib::Response
     // Event store config
     json events_obj;
     events_obj["ctx_buffer_size"] = full_config_->events.ctx_buffer_size;
+    events_obj["max_contexts"] = full_config_->events.max_contexts;
+    events_obj["max_neighbors_per_item"] = full_config_->events.max_neighbors_per_item;
+    events_obj["min_support"] = full_config_->events.min_support;
     events_obj["decay_interval_sec"] = full_config_->events.decay_interval_sec;
     response["events"] = events_obj;
 
@@ -862,6 +816,13 @@ void HttpServer::HandleEvent(const httplib::Request& req, httplib::Response& res
     SendError(res, kHttpUnauthorized, "Authentication required");
     return;
   }
+
+  auto snapshot_write_guard = AcquireSnapshotWriteGuard(handler_context_);
+  if (WritesBlocked(handler_context_)) {
+    SendError(res, kHttpServiceUnavailable, "Server is read-only while a snapshot is in progress");
+    return;
+  }
+  auto write_serialization_guard = AcquireWriteSerializationGuard(handler_context_);
 
   // Check if server is loading
   if (loading_ != nullptr && loading_->load()) {
@@ -1003,6 +964,13 @@ void HttpServer::HandleVecset(const httplib::Request& req, httplib::Response& re
     return;
   }
 
+  auto snapshot_write_guard = AcquireSnapshotWriteGuard(handler_context_);
+  if (WritesBlocked(handler_context_)) {
+    SendError(res, kHttpServiceUnavailable, "Server is read-only while a snapshot is in progress");
+    return;
+  }
+  auto write_serialization_guard = AcquireWriteSerializationGuard(handler_context_);
+
   // Check if server is loading
   if (loading_ != nullptr && loading_->load()) {
     SendError(res, kHttpServiceUnavailable, "Server is loading, please try again later");
@@ -1100,6 +1068,12 @@ void HttpServer::HandleVecset(const httplib::Request& req, httplib::Response& re
       }
     }
 
+    // Keep HTTP mutations in the same cache-generation domain as TCP VECSET.
+    // Selective invalidation cannot evict entries that never contained this new
+    // id, so bumping the generation is required for a warmed SIM/SIMV response
+    // to observe an HTTP-created vector.
+    handler_context_->vector_generation.fetch_add(1, std::memory_order_acq_rel);
+
     // Persist the vector registration, then (if present) the metadata. The WAL
     // records are independent ops so replay reconstructs both; the VECSET must
     // precede the METASET because METASET requires the vector to exist.
@@ -1115,7 +1089,7 @@ void HttpServer::HandleVecset(const httplib::Request& req, httplib::Response& re
         Command wal_metaset;
         wal_metaset.type = CommandType::kMetaset;
         wal_metaset.id = id;
-        wal_metaset.filter_expr = MetadataToFilterExpr(metadata);
+        wal_metaset.metadata = metadata;
         AppendCommandToWal(handler_context_, wal_metaset);
       }
     }
@@ -1142,11 +1116,83 @@ void HttpServer::HandleVecset(const httplib::Request& req, httplib::Response& re
   }
 }
 
+void HttpServer::HandleVecdel(const httplib::Request& req, httplib::Response& res) {
+  if (!IsAuthorized(req)) {
+    SendError(res, kHttpUnauthorized, "Authentication required");
+    return;
+  }
+
+  auto snapshot_write_guard = AcquireSnapshotWriteGuard(handler_context_);
+  if (WritesBlocked(handler_context_)) {
+    SendError(res, kHttpServiceUnavailable, "Server is read-only while a snapshot is in progress");
+    return;
+  }
+  auto write_serialization_guard = AcquireWriteSerializationGuard(handler_context_);
+
+  try {
+    const auto body = json::parse(req.body, nullptr, false);
+    if (body.is_discarded() || !body.contains("id") || !body["id"].is_string()) {
+      SendError(res, kHttpBadRequest, "Missing or invalid required field: id");
+      return;
+    }
+    const std::string id = body["id"];
+    if (id.empty()) {
+      SendError(res, kHttpBadRequest, "Field 'id' must not be empty");
+      return;
+    }
+    if (handler_context_ == nullptr || handler_context_->vector_store == nullptr) {
+      SendError(res, kHttpInternalServerError, "Vector store not initialized");
+      return;
+    }
+
+    const auto compact_index = handler_context_->vector_store->GetCompactIndex(id);
+    if (!compact_index.has_value() || !handler_context_->vector_store->DeleteVector(id)) {
+      SendError(res, kHttpNotFound, "Vector not found: " + id);
+      return;
+    }
+    handler_context_->vector_store->Defragment();
+
+    if (handler_context_->metadata_store != nullptr) {
+      handler_context_->metadata_store->Delete(id);
+    }
+    if (handler_context_->similarity_engine != nullptr) {
+      handler_context_->similarity_engine->NotifyVectorRemoved(*compact_index);
+      handler_context_->similarity_engine->RebuildAnnFromStore();
+    }
+    handler_context_->vector_generation.fetch_add(1, std::memory_order_acq_rel);
+
+    Command wal_vecdel;
+    wal_vecdel.type = CommandType::kVecdel;
+    wal_vecdel.id = id;
+    AppendCommandToWal(handler_context_, wal_vecdel);
+
+    auto* cache_ptr = handler_context_->cache.load(std::memory_order_acquire);
+    if (cache_ptr != nullptr) {
+      cache_ptr->InvalidateByItemId(id);
+    }
+
+    handler_context_->stats.total_commands.fetch_add(1);
+    json response;
+    response["status"] = "ok";
+    SendJson(res, kHttpOk, response);
+  } catch (const std::exception& e) {
+    spdlog::error("Unexpected exception in HandleVecdel: {}", e.what());
+    SendError(res, kHttpInternalServerError, R"({"error":"Internal server error"})");
+  }
+}
+
 void HttpServer::HandleMetaset(const httplib::Request& req, httplib::Response& res) {
   if (!IsAuthorized(req)) {
     SendError(res, kHttpUnauthorized, "Authentication required");
     return;
   }
+
+  auto snapshot_write_guard = AcquireSnapshotWriteGuard(handler_context_);
+  if (WritesBlocked(handler_context_)) {
+    SendError(res, kHttpServiceUnavailable, "Server is read-only while a snapshot is in progress");
+    return;
+  }
+  auto write_serialization_guard = AcquireWriteSerializationGuard(handler_context_);
 
   // Check if server is loading
   if (loading_ != nullptr && loading_->load()) {
@@ -1197,9 +1243,7 @@ void HttpServer::HandleMetaset(const httplib::Request& req, httplib::Response& r
       return;
     }
 
-    // Serialize the metadata into the canonical filter form before moving it
-    // into the store so the same value can be persisted to the WAL.
-    std::string wal_filter_expr = MetadataToFilterExpr(*metadata_result);
+    vectors::Metadata wal_metadata = *metadata_result;
     handler_context_->metadata_store->Set(id, std::move(*metadata_result));
 
     // Persist the metadata assignment for crash recovery.
@@ -1207,7 +1251,7 @@ void HttpServer::HandleMetaset(const httplib::Request& req, httplib::Response& r
       Command wal_metaset;
       wal_metaset.type = CommandType::kMetaset;
       wal_metaset.id = id;
-      wal_metaset.filter_expr = wal_filter_expr;
+      wal_metaset.metadata = std::move(wal_metadata);
       AppendCommandToWal(handler_context_, wal_metaset);
     }
 
@@ -1256,14 +1300,22 @@ void HttpServer::HandleSim(const httplib::Request& req, httplib::Response& res) 
       return;
     }
 
+    if (body.contains("top_k") && !body["top_k"].is_number_integer()) {
+      SendError(res, kHttpBadRequest, "Field 'top_k' must be an integer");
+      return;
+    }
+    if (body.contains("mode") && !body["mode"].is_string()) {
+      SendError(res, kHttpBadRequest, "Field 'mode' must be a string");
+      return;
+    }
+    if (body.contains("min_score") && !JsonNumberIsFinite(body["min_score"])) {
+      SendError(res, kHttpBadRequest, "Field 'min_score' must be a finite number");
+      return;
+    }
     std::string id = body["id"];
     int top_k = body.value("top_k", handler_context_->config->similarity.default_top_k);
     std::string mode = body.value("mode", "fusion");
     float min_score = body.value("min_score", 0.0F);
-    if (!std::isfinite(min_score)) {
-      SendError(res, kHttpBadRequest, "Field 'min_score' must be finite");
-      return;
-    }
 
     std::string filter_expr;
     vectors::MetadataFilter filter;
@@ -1308,14 +1360,10 @@ void HttpServer::HandleSim(const httplib::Request& req, httplib::Response& res) 
     cache::CacheKey cache_key;
 
     if (cache_enabled) {
-      const std::string adaptive_part = adaptive.has_value() ? (*adaptive ? "on" : "off") : "default";
-      auto generation = handler_context_->co_index != nullptr ? handler_context_->co_index->GetGeneration() : 0;
-      std::string key_str = "SIM:" + id + ":" + std::to_string(top_k) + ":" + mode + ":a" + adaptive_part + ":g" +
-                            std::to_string(generation);
-      if (!filter_expr.empty()) {
-        key_str += ":f" + filter_expr;
-      }
-      cache_key = cache::CacheKeyGenerator::Generate(key_str);
+      cache_key = cache::GenerateSimCacheKey(
+          {id, top_k, mode, adaptive,
+           handler_context_->co_index != nullptr ? handler_context_->co_index->GetGeneration() : 0,
+           handler_context_->vector_generation.load(std::memory_order_acquire), filter_expr});
 
       auto cached = cache_ptr->Lookup(cache_key, search_type);
       if (cached.has_value()) {
@@ -1465,13 +1513,17 @@ void HttpServer::HandleSimv(const httplib::Request& req, httplib::Response& res)
       }
     }
 
+    if (body.contains("top_k") && !body["top_k"].is_number_integer()) {
+      SendError(res, kHttpBadRequest, "Field 'top_k' must be an integer");
+      return;
+    }
+    if (body.contains("min_score") && !JsonNumberIsFinite(body["min_score"])) {
+      SendError(res, kHttpBadRequest, "Field 'min_score' must be a finite number");
+      return;
+    }
     std::vector<float> vector = body["vector"].get<std::vector<float>>();
     int top_k = body.value("top_k", handler_context_->config->similarity.default_top_k);
     float min_score = body.value("min_score", 0.0F);
-    if (!std::isfinite(min_score)) {
-      SendError(res, kHttpBadRequest, "Field 'min_score' must be finite");
-      return;
-    }
 
     std::string filter_expr;
     vectors::MetadataFilter filter;
@@ -1502,11 +1554,8 @@ void HttpServer::HandleSimv(const httplib::Request& req, httplib::Response& res)
     cache::CacheKey cache_key;
 
     if (cache_enabled) {
-      std::string key_str = "SIMV:" + cache::HashVector(vector) + ":" + std::to_string(top_k);
-      if (!filter_expr.empty()) {
-        key_str += ":f" + filter_expr;
-      }
-      cache_key = cache::CacheKeyGenerator::Generate(key_str);
+      cache_key = cache::GenerateSimvCacheKey(
+          {vector, top_k, handler_context_->vector_generation.load(std::memory_order_acquire), filter_expr});
 
       auto cached = cache_ptr->Lookup(cache_key, search_type);
       if (cached.has_value()) {
@@ -2076,7 +2125,12 @@ void HttpServer::HandleCacheDisable(const httplib::Request& req, httplib::Respon
   }
 }
 
-void HttpServer::HandleDumpStatus(const httplib::Request& /*req*/, httplib::Response& res) {
+void HttpServer::HandleDumpStatus(const httplib::Request& req, httplib::Response& res) {
+  if (!IsAuthorized(req)) {
+    SendError(res, kHttpUnauthorized, "Authentication required");
+    return;
+  }
+
   // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
     if (handler_context_ == nullptr || handler_context_->fork_snapshot_writer == nullptr) {

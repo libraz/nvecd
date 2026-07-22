@@ -423,6 +423,11 @@ void ConnectionAcceptor::AcceptLoop() {
       bool submitted = thread_pool_->Submit([this, client_fd]() {
         connection_handler_(client_fd);
         RemoveConnection(client_fd);
+        // The acceptor owns the accepted fd's lifecycle; the connection handler
+        // and I/O handler never close it. Close here so a completed connection
+        // releases its fd (otherwise every served connection leaks one fd,
+        // eventually exhausting RLIMIT_NOFILE and denying all service).
+        close(client_fd);
       });
 
       if (!submitted) {

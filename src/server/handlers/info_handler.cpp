@@ -78,6 +78,7 @@ utils::Expected<std::string, utils::Error> HandleInfo(const HandlerContext& ctx)
   oss << "ctx_count: " << ctx_count << "\n";
   oss << "vector_count: " << vector_count << "\n";
   oss << "event_count: " << event_count << "\n";
+  oss << "END\r\n";
 
   return oss.str();
 }

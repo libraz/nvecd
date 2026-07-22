@@ -8,8 +8,11 @@
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <chrono>
+#include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <sstream>
 
 // Include concrete types before request_dispatcher.h to resolve forward declarations
@@ -27,6 +30,7 @@
 #include "server/handlers/variable_handler.h"
 #include "server/request_dispatcher.h"
 #include "server/score_format.h"
+#include "server/similarity_result_utils.h"
 #include "server/wal_codec.h"
 #include "similarity/similarity_engine.h"
 #include "storage/wal.h"
@@ -39,78 +43,20 @@ namespace nvecd::server {
 
 namespace {
 
-std::vector<std::pair<std::string, float>> ApplyMinScore(const std::vector<similarity::SimilarityResult>& results,
-                                                         float min_score) {
-  std::vector<std::pair<std::string, float>> pairs;
-  pairs.reserve(results.size());
-  for (const auto& item : results) {
-    if (item.score >= min_score) {
-      pairs.emplace_back(item.item_id, item.score);
-    }
-  }
-  return pairs;
+bool IsSnapshotProtectedWrite(CommandType type) {
+  return type == CommandType::kEvent || type == CommandType::kVecset || type == CommandType::kVecdel ||
+         type == CommandType::kMetaset;
 }
 
-std::string AdaptiveCachePart(std::optional<bool> adaptive) {
-  if (!adaptive.has_value()) {
-    return "default";
+bool ConstantTimeEquals(const std::string& left, const std::string& right) {
+  const size_t max_size = std::max(left.size(), right.size());
+  size_t difference = left.size() ^ right.size();
+  for (size_t i = 0; i < max_size; ++i) {
+    const unsigned char left_byte = i < left.size() ? static_cast<unsigned char>(left[i]) : 0;
+    const unsigned char right_byte = i < right.size() ? static_cast<unsigned char>(right[i]) : 0;
+    difference |= static_cast<size_t>(left_byte ^ right_byte);
   }
-  return *adaptive ? "on" : "off";
-}
-
-std::vector<similarity::SimilarityResult> ApplyMetadataFilter(const std::vector<similarity::SimilarityResult>& results,
-                                                              vectors::MetadataStore* metadata_store,
-                                                              const vectors::MetadataFilter& filter) {
-  if (filter.Empty() || metadata_store == nullptr) {
-    return results;
-  }
-
-  std::vector<similarity::SimilarityResult> filtered;
-  filtered.reserve(results.size());
-  for (const auto& result : results) {
-    if (metadata_store->Matches(result.item_id, filter)) {
-      filtered.push_back(result);
-    }
-  }
-  return filtered;
-}
-
-/// Oversampling factor used when a metadata filter is combined with an
-/// events-mode search. The co-occurrence search has no filter awareness, so we
-/// fetch more candidates than requested and filter afterwards; this keeps the
-/// filtered result able to reach top_k when enough matching neighbors exist.
-constexpr int kEventsFilterOversampling = 3;
-
-/**
- * @brief Apply a metadata filter to events-mode results and truncate to top_k.
- *
- * Events mode resolves candidates purely from the co-occurrence index, which is
- * metadata-unaware. Filtering is therefore applied here against the metadata
- * store. Because MetadataStore::Matches keys off the item ID alone, a vectorless
- * item with matching metadata stays eligible, preserving the cold-start
- * recommendation use case. The caller over-fetches so that, after filtering,
- * up to @p top_k matching items can still be returned.
- *
- * @param results Over-fetched events-mode results (already score-sorted)
- * @param metadata_store Metadata store (may be null)
- * @param filter Filter conditions (empty = no filtering)
- * @param top_k Maximum number of results to keep
- * @return Filtered results truncated to top_k
- */
-std::vector<similarity::SimilarityResult> ApplyEventsFilterTopK(
-    const std::vector<similarity::SimilarityResult>& results, vectors::MetadataStore* metadata_store,
-    const vectors::MetadataFilter& filter, int top_k) {
-  std::vector<similarity::SimilarityResult> filtered;
-  filtered.reserve(results.size());
-  for (const auto& result : results) {
-    if (filter.Empty() || metadata_store == nullptr || metadata_store->Matches(result.item_id, filter)) {
-      filtered.push_back(result);
-      if (top_k > 0 && static_cast<int>(filtered.size()) >= top_k) {
-        break;
-      }
-    }
-  }
-  return filtered;
+  return difference == 0;
 }
 
 }  // namespace
@@ -141,6 +87,35 @@ std::string RequestDispatcher::Dispatch(const std::string& request, ConnectionCo
     }
   }
 
+  // Lock-mode snapshots set read_only before taking their store-lock barrier.
+  // Reject a write before it can enter a store mutation path so the snapshot is
+  // a true point-in-time image rather than a mix of pre/post-barrier updates.
+  if (GetCommandPrivilege(cmd->type) != CommandPrivilege::kRead && ctx_.read_only.load(std::memory_order_acquire)) {
+    ctx_.stats.failed_commands++;
+    return FormatError("READONLY Snapshot in progress");
+  }
+
+  // Keep the shared gate for the full store-mutation and WAL append sequence.
+  // A lock-mode snapshot sets read_only first, then takes this gate exclusively
+  // to drain any writer that already passed the initial flag check. Rechecking
+  // after acquisition closes the check-then-mutate race at the boundary.
+  std::shared_lock<std::shared_mutex> snapshot_write_guard;
+  if (IsSnapshotProtectedWrite(cmd->type) && ctx_.snapshot_write_gate != nullptr) {
+    snapshot_write_guard = std::shared_lock(*ctx_.snapshot_write_gate);
+    if (ctx_.read_only.load(std::memory_order_acquire)) {
+      ctx_.stats.failed_commands++;
+      return FormatError("READONLY Snapshot in progress");
+    }
+  }
+
+  // Keep the same command-level critical section through the WAL append. The
+  // WAL is replayed in sequence order, so allowing another writer to append a
+  // dependent METASET before this VECSET is durable corrupts recovery.
+  std::unique_lock<std::mutex> write_serialization_guard;
+  if (IsSnapshotProtectedWrite(cmd->type) && ctx_.write_serialization_gate != nullptr) {
+    write_serialization_guard = std::unique_lock(*ctx_.write_serialization_gate);
+  }
+
   // Route to appropriate handler
   utils::Expected<std::string, utils::Error> result =
       utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandUnknown, "Unknown command type"));
@@ -154,6 +129,10 @@ std::string RequestDispatcher::Dispatch(const std::string& request, ConnectionCo
     case CommandType::kVecset:
       ctx_.stats.vecset_commands++;
       result = HandleVecset(*cmd);
+      break;
+
+    case CommandType::kVecdel:
+      result = HandleVecdel(*cmd);
       break;
 
     case CommandType::kMetaset:
@@ -319,7 +298,10 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleEvent(const 
   wal_cmd.score = result->stored_event.score;
   wal_cmd.event_type = result->stored_event.type;
   wal_cmd.timestamp = result->stored_event.timestamp;
-  AppendToWal(wal_cmd);
+  auto wal_result = AppendToWal(wal_cmd);
+  if (!wal_result) {
+    return utils::MakeUnexpected(wal_result.error());
+  }
 
   // Selective cache invalidation for mutated item
   auto* cache_ptr = ctx_.cache.load(std::memory_order_acquire);
@@ -373,7 +355,10 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleVecset(const
   ctx_.vector_generation.fetch_add(1, std::memory_order_acq_rel);
 
   // Persist the vector registration for crash recovery.
-  AppendToWal(cmd);
+  auto wal_result = AppendToWal(cmd);
+  if (!wal_result) {
+    return utils::MakeUnexpected(wal_result.error());
+  }
 
   // Selective cache invalidation for mutated item
   auto* cache_ptr = ctx_.cache.load(std::memory_order_acquire);
@@ -382,6 +367,51 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleVecset(const
   }
 
   return FormatOK("VECSET");
+}
+
+utils::Expected<std::string, utils::Error> RequestDispatcher::HandleVecdel(const Command& cmd) const {
+  if (ctx_.vector_store == nullptr) {
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kInternalError, "VectorStore not initialized"));
+  }
+
+  // Capture the compact index before deletion. The store may defragment during
+  // DeleteVector(), invalidating every later compact index, so ANN cleanup must
+  // happen before the mutation and a full rebuild follows it.
+  const auto compact_index = ctx_.vector_store->GetCompactIndex(cmd.id);
+  if (!compact_index.has_value()) {
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kVectorNotFound, "Vector not found: " + cmd.id));
+  }
+  if (!ctx_.vector_store->DeleteVector(cmd.id)) {
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kVectorNotFound, "Vector not found: " + cmd.id));
+  }
+  // RebuildAnnFromStore labels entries by compact index. Compact the store
+  // unconditionally after a public delete so the rebuilt index never sees a
+  // tombstoned row or a shifted label.
+  ctx_.vector_store->Defragment();
+
+  if (ctx_.metadata_store != nullptr) {
+    ctx_.metadata_store->Delete(cmd.id);
+  }
+  if (ctx_.similarity_engine != nullptr) {
+    ctx_.similarity_engine->NotifyVectorRemoved(*compact_index);
+    // Deletion can trigger VectorStore defragmentation and re-key every live
+    // compact index. Rebuilding is required for HNSW/IVF labels to remain
+    // associated with the correct external IDs.
+    ctx_.similarity_engine->RebuildAnnFromStore();
+  }
+
+  ctx_.vector_generation.fetch_add(1, std::memory_order_acq_rel);
+  auto wal_result = AppendToWal(cmd);
+  if (!wal_result) {
+    return utils::MakeUnexpected(wal_result.error());
+  }
+
+  auto* cache_ptr = ctx_.cache.load(std::memory_order_acquire);
+  if (cache_ptr != nullptr) {
+    cache_ptr->InvalidateByItemId(cmd.id);
+  }
+
+  return FormatOK("VECDEL");
 }
 
 utils::Expected<std::string, utils::Error> RequestDispatcher::HandleMetaset(const Command& cmd) const {
@@ -398,23 +428,29 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleMetaset(cons
         utils::MakeError(utils::ErrorCode::kVectorNotFound, "Vector not found for metadata: " + cmd.id));
   }
 
-  auto parsed = ParseSimpleFilter(cmd.filter_expr);
-  if (!parsed) {
-    return utils::MakeUnexpected(parsed.error());
-  }
-
   vectors::Metadata metadata;
-  for (const auto& condition : parsed->conditions) {
-    if (condition.field.empty()) {
-      return utils::MakeUnexpected(
-          utils::MakeError(utils::ErrorCode::kCommandInvalidArgument, "Metadata key must not be empty"));
+  if (cmd.metadata.has_value()) {
+    metadata = *cmd.metadata;
+  } else {
+    auto parsed = ParseSimpleFilter(cmd.filter_expr);
+    if (!parsed) {
+      return utils::MakeUnexpected(parsed.error());
     }
-    metadata[condition.field] = condition.value;
+    for (const auto& condition : parsed->conditions) {
+      if (condition.field.empty()) {
+        return utils::MakeUnexpected(
+            utils::MakeError(utils::ErrorCode::kCommandInvalidArgument, "Metadata key must not be empty"));
+      }
+      metadata[condition.field] = condition.value;
+    }
   }
   ctx_.metadata_store->Set(cmd.id, std::move(metadata));
 
   // Persist the metadata assignment for crash recovery (filter_expr verbatim).
-  AppendToWal(cmd);
+  auto wal_result = AppendToWal(cmd);
+  if (!wal_result) {
+    return utils::MakeUnexpected(wal_result.error());
+  }
 
   auto* cache_ptr = ctx_.cache.load(std::memory_order_acquire);
   if (cache_ptr != nullptr) {
@@ -449,14 +485,9 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSim(const Co
   }
 
   if (cache_enabled) {
-    auto gen = ctx_.co_index != nullptr ? ctx_.co_index->GetGeneration() : 0;
-    auto vgen = ctx_.vector_generation.load(std::memory_order_acquire);
-    std::string key_str = "SIM:" + cmd.id + ":" + std::to_string(cmd.top_k) + ":" + cmd.mode + ":a" +
-                          AdaptiveCachePart(cmd.adaptive) + ":g" + std::to_string(gen) + ":v" + std::to_string(vgen);
-    if (!cmd.filter_expr.empty()) {
-      key_str += ":f" + cmd.filter_expr;
-    }
-    cache_key = cache::CacheKeyGenerator::Generate(key_str);
+    cache_key = cache::GenerateSimCacheKey({cmd.id, cmd.top_k, cmd.mode, cmd.adaptive,
+                                            ctx_.co_index != nullptr ? ctx_.co_index->GetGeneration() : 0,
+                                            ctx_.vector_generation.load(std::memory_order_acquire), cmd.filter_expr});
     auto cached = cache_ptr->Lookup(cache_key, search_type);
     if (cached.has_value()) {
       auto pairs = ApplyMinScore(*cached, cmd.min_score);
@@ -564,13 +595,8 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSimv(const C
   }
 
   if (cache_enabled) {
-    std::string vec_hash = cache::HashVector(cmd.vector);
-    auto vgen = ctx_.vector_generation.load(std::memory_order_acquire);
-    std::string key_str = "SIMV:" + vec_hash + ":" + std::to_string(cmd.top_k) + ":v" + std::to_string(vgen);
-    if (!cmd.filter_expr.empty()) {
-      key_str += ":f" + cmd.filter_expr;
-    }
-    cache_key = cache::CacheKeyGenerator::Generate(key_str);
+    cache_key = cache::GenerateSimvCacheKey(
+        {cmd.vector, cmd.top_k, ctx_.vector_generation.load(std::memory_order_acquire), cmd.filter_expr});
     auto cached = cache_ptr->Lookup(cache_key, search_type);
     if (cached.has_value()) {
       auto pairs = ApplyMinScore(*cached, cmd.min_score);
@@ -735,7 +761,7 @@ std::string RequestDispatcher::HandleAuth(const Command& cmd, ConnectionContext&
     return "+OK (no password required)\r\n";
   }
 
-  if (cmd.variable_value == ctx_.requirepass) {
+  if (ConstantTimeEquals(cmd.variable_value, ctx_.requirepass)) {
     conn_ctx.authenticated = true;
     return "+OK\r\n";
   }
@@ -748,22 +774,29 @@ std::string RequestDispatcher::HandleAuth(const Command& cmd, ConnectionContext&
 // Write-Ahead Log integration
 //
 
-void RequestDispatcher::AppendToWal(const Command& cmd) const {
+utils::Expected<void, utils::Error> RequestDispatcher::AppendToWal(const Command& cmd) const {
   if (ctx_.wal == nullptr) {
-    return;
+    return {};
+  }
+
+  // Operators can opt out of retaining vector payloads in the WAL when
+  // snapshots are their chosen vector durability boundary. Keep all other
+  // mutations in the log so event and metadata recovery semantics are intact.
+  if (cmd.type == CommandType::kVecset && ctx_.config != nullptr && !ctx_.config->wal.include_vectors) {
+    return {};
   }
 
   std::vector<uint8_t> payload = EncodeCommand(cmd);
   auto appended = ctx_.wal->Append(WalOpForCommand(cmd), payload.data(), payload.size());
   if (!appended) {
-    // Durability is best-effort: a failed log write is reported but the client
-    // write still succeeds, since the in-memory mutation already happened.
     utils::StructuredLog()
         .Event("wal_append_failed")
         .Field("command", CommandTypeToString(cmd.type))
         .Field("error", appended.error().message())
         .Warn();
+    return utils::MakeUnexpected(appended.error());
   }
+  return {};
 }
 
 void RequestDispatcher::ReplayRecord(const storage::WalRecord& record) {
@@ -787,6 +820,9 @@ void RequestDispatcher::ReplayRecord(const storage::WalRecord& record) {
       break;
     case CommandType::kVecset:
       applied = HandleVecset(*decoded);
+      break;
+    case CommandType::kVecdel:
+      applied = HandleVecdel(*decoded);
       break;
     case CommandType::kMetaset:
       applied = HandleMetaset(*decoded);

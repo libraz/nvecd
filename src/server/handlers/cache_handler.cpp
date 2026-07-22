@@ -20,6 +20,7 @@ utils::Expected<std::string, utils::Error> HandleCacheStats(const HandlerContext
   if (cache_ptr == nullptr) {
     oss << "cache_enabled: false\n";
     oss << "cache_entries: 0\n";
+    oss << "END\r\n";
     return oss.str();
   }
 
@@ -40,6 +41,7 @@ utils::Expected<std::string, utils::Error> HandleCacheStats(const HandlerContext
   oss << "avg_hit_latency_ms: " << std::fixed << std::setprecision(3) << stats.AverageCacheHitLatency() << "\n";
   oss << "avg_miss_latency_ms: " << std::fixed << std::setprecision(3) << stats.AverageCacheMissLatency() << "\n";
   oss << "total_time_saved_ms: " << std::fixed << std::setprecision(2) << stats.TotalTimeSaved() << "\n";
+  oss << "END\r\n";
 
   return oss.str();
 }

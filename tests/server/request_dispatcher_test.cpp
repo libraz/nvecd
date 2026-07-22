@@ -7,8 +7,13 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <atomic>
+#include <chrono>
+#include <future>
 #include <memory>
+#include <mutex>
+#include <shared_mutex>
 #include <string>
 
 #include "cache/similarity_cache.h"
@@ -18,6 +23,7 @@
 #include "events/event_store.h"
 #include "server/server_types.h"
 #include "similarity/similarity_engine.h"
+#include "storage/wal.h"
 #include "vectors/metadata_store.h"
 #include "vectors/vector_store.h"
 
@@ -121,6 +127,28 @@ TEST_F(RequestDispatcherTest, EmptyRequestReturnsError) {
   EXPECT_NE(response.find("ERROR"), std::string::npos);
 }
 
+TEST_F(RequestDispatcherTest, WalAppendFailureIsReturnedToClient) {
+  // A non-open WAL deterministically rejects Append. The dispatcher must not
+  // acknowledge the write as durable when that happens.
+  nvecd::storage::WriteAheadLog closed_wal;
+  ctx_->wal = &closed_wal;
+
+  auto response = Dispatch("VECSET durable_item 1 0 0\r\n");
+  EXPECT_NE(response.find("ERROR"), std::string::npos);
+  EXPECT_NE(response.find("WAL is not open"), std::string::npos);
+}
+
+TEST_F(RequestDispatcherTest, WalCanExcludeVectorPayloads) {
+  // include_vectors=false deliberately makes snapshots the vector durability
+  // boundary. A non-open WAL must therefore not prevent a VECSET response.
+  nvecd::storage::WriteAheadLog closed_wal;
+  ctx_->wal = &closed_wal;
+  config_->wal.include_vectors = false;
+
+  const auto response = Dispatch("VECSET snapshot_backed_item 1 0 0\r\n");
+  EXPECT_NE(response.find("OK VECSET"), std::string::npos);
+}
+
 // ============================================================================
 // Authentication tests
 // ============================================================================
@@ -133,6 +161,31 @@ TEST_F(RequestDispatcherTest, AuthRequired_BlocksWriteWithoutAuth) {
 
   auto response = Dispatch("EVENT ctx1 ADD item1 95\r\n", conn_ctx);
   EXPECT_NE(response.find("NOAUTH"), std::string::npos);
+}
+
+TEST(RequestDispatcherAuthTest, PrivilegeClassificationCoversEveryProtectedCommand) {
+  // Dispatch gates every non-read command through GetCommandPrivilege(). Keep
+  // this exhaustive list beside the dispatcher tests so a newly added mutable
+  // endpoint cannot silently default to unauthenticated read access.
+  constexpr std::array writes = {CommandType::kEvent,       CommandType::kVecset,      CommandType::kVecdel,
+                                 CommandType::kMetaset,     CommandType::kSet,         CommandType::kCacheClear,
+                                 CommandType::kCacheEnable, CommandType::kCacheDisable};
+  constexpr std::array admins = {CommandType::kDumpSave, CommandType::kDumpLoad,   CommandType::kDumpVerify,
+                                 CommandType::kDumpInfo, CommandType::kDumpStatus, CommandType::kConfigVerify};
+  constexpr std::array reads = {CommandType::kSim,          CommandType::kSimv,       CommandType::kInfo,
+                                CommandType::kConfigHelp,   CommandType::kConfigShow, CommandType::kDebugOn,
+                                CommandType::kDebugOff,     CommandType::kCacheStats, CommandType::kGet,
+                                CommandType::kShowVariables};
+
+  for (const auto command : writes) {
+    EXPECT_EQ(GetCommandPrivilege(command), CommandPrivilege::kWrite) << CommandTypeToString(command);
+  }
+  for (const auto command : admins) {
+    EXPECT_EQ(GetCommandPrivilege(command), CommandPrivilege::kAdmin) << CommandTypeToString(command);
+  }
+  for (const auto command : reads) {
+    EXPECT_EQ(GetCommandPrivilege(command), CommandPrivilege::kRead) << CommandTypeToString(command);
+  }
 }
 
 TEST_F(RequestDispatcherTest, AuthRequired_AllowsReadWithoutAuth) {
@@ -157,6 +210,67 @@ TEST_F(RequestDispatcherTest, AuthSuccess) {
   auto response = Dispatch("AUTH correct_password\r\n", conn_ctx);
   EXPECT_NE(response.find("OK"), std::string::npos);
   EXPECT_TRUE(conn_ctx.authenticated);
+}
+
+TEST_F(RequestDispatcherTest, AuthPreservesLeadingTrailingAndRepeatedSpaces) {
+  ctx_->requirepass = " leading  and trailing ";
+
+  ConnectionContext conn_ctx;
+  conn_ctx.authenticated = false;
+
+  // One delimiter separates AUTH from the opaque password; the remaining
+  // whitespace belongs to the configured secret and must survive parsing.
+  auto response = Dispatch("AUTH  leading  and trailing \r\n", conn_ctx);
+  EXPECT_NE(response.find("OK"), std::string::npos);
+  EXPECT_TRUE(conn_ctx.authenticated);
+}
+
+TEST_F(RequestDispatcherTest, WriteIsRejectedWhileLockSnapshotIsInProgress) {
+  read_only_.store(true);
+  auto response = Dispatch("VECSET item 1 0\r\n");
+  EXPECT_NE(response.find("READONLY"), std::string::npos);
+}
+
+TEST_F(RequestDispatcherTest, SnapshotWriteGateClosesCheckThenMutateRace) {
+  std::shared_mutex gate;
+  ctx_->snapshot_write_gate = &gate;
+
+  std::unique_lock<std::shared_mutex> snapshot_guard(gate);
+  auto pending_write = std::async(std::launch::async, [this] { return Dispatch("VECSET item 1 0\r\n"); });
+
+  // The write acquired neither the gate nor the store mutation path while the
+  // snapshot owns the exclusive barrier.
+  EXPECT_EQ(pending_write.wait_for(std::chrono::milliseconds(20)), std::future_status::timeout);
+  read_only_.store(true, std::memory_order_release);
+  snapshot_guard.unlock();
+
+  const std::string response = pending_write.get();
+  EXPECT_NE(response.find("READONLY"), std::string::npos);
+  EXPECT_FALSE(vector_store_->HasVector("item"));
+}
+
+TEST_F(RequestDispatcherTest, WriteSerializationGateCoversMutationUntilWalAppend) {
+  std::mutex gate;
+  ctx_->write_serialization_gate = &gate;
+
+  std::unique_lock<std::mutex> wal_order_guard(gate);
+  auto pending_write = std::async(std::launch::async, [this] { return Dispatch("VECSET item 1 0\r\n"); });
+  EXPECT_EQ(pending_write.wait_for(std::chrono::milliseconds(20)), std::future_status::timeout);
+
+  wal_order_guard.unlock();
+  EXPECT_NE(pending_write.get().find("OK VECSET"), std::string::npos);
+  EXPECT_TRUE(vector_store_->HasVector("item"));
+}
+
+TEST_F(RequestDispatcherTest, VecdelRemovesVectorAndMetadata) {
+  ASSERT_NE(Dispatch("VECSET item 1 0\r\n").find("OK VECSET"), std::string::npos);
+  ASSERT_NE(Dispatch("METASET item state:active\r\n").find("OK METASET"), std::string::npos);
+
+  const auto response = Dispatch("VECDEL item\r\n");
+  EXPECT_NE(response.find("OK VECDEL"), std::string::npos);
+  EXPECT_FALSE(vector_store_->HasVector("item"));
+  EXPECT_EQ(metadata_store_->Get("item"), nullptr);
+  EXPECT_NE(Dispatch("VECDEL item\r\n").find("Vector not found"), std::string::npos);
 }
 
 TEST_F(RequestDispatcherTest, AuthFailure) {

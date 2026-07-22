@@ -29,7 +29,7 @@ utils::Expected<std::string, utils::Error> HandleConfigHelp(const std::string& p
     // Show top-level sections
     auto paths = explorer.ListPaths("");
     std::string result = config::ConfigSchemaExplorer::FormatPathList(paths, "");
-    return std::string("+OK\n") + result;
+    return std::string("+OK\n") + result + "END\r\n";
   }
 
   // Show help for specific path
@@ -40,7 +40,7 @@ utils::Expected<std::string, utils::Error> HandleConfigHelp(const std::string& p
   }
 
   std::string result = config::ConfigSchemaExplorer::FormatHelp(help_info.value());
-  return std::string("+OK\n") + result;
+  return std::string("+OK\n") + result + "END\r\n";
 }
 
 utils::Expected<std::string, utils::Error> HandleConfigShow(const ServerContext& ctx, const std::string& path) {
@@ -63,7 +63,7 @@ utils::Expected<std::string, utils::Error> HandleConfigShow(const ServerContext&
         .Error();
     return utils::MakeUnexpected(result.error());
   }
-  return std::string("+OK\n") + *result;
+  return std::string("+OK\n") + *result + "END\r\n";
 }
 
 utils::Expected<std::string, utils::Error> HandleConfigVerify(const std::string& filepath) {
@@ -103,7 +103,7 @@ utils::Expected<std::string, utils::Error> HandleConfigVerify(const std::string&
     summary << "    http: " << test_config.api.http.bind << ":" << test_config.api.http.port << "\n";
   }
 
-  return std::string("+OK\n") + summary.str();
+  return std::string("+OK\n") + summary.str() + "END\r\n";
 }
 
 }  // namespace nvecd::server::handlers

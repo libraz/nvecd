@@ -147,6 +147,11 @@ int main(int argc, char* argv[]) {
   }
   // NOLINTEND(cppcoreguidelines-pro-bounds-pointer-arithmetic)
 
+  if (config_test_mode && config_path == nullptr) {
+    std::cerr << "Error: --config-test requires a configuration file (-c <file> or positional path)\n";
+    return 1;
+  }
+
   spdlog::info("nvecd server starting...");
   spdlog::info("Version: {}", nvecd::Version::String());
   spdlog::info("Vector SIMD: {}", nvecd::vectors::simd::GetImplementationName());

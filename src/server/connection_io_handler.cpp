@@ -60,8 +60,6 @@ void ConnectionIOHandler::HandleConnection(int client_fd, ConnectionContext& ctx
       break;
     }
 
-    buffer[bytes] = '\0';
-
     // Check buffer size limit
     if (accumulated.size() + bytes > max_accumulated) {
       nvecd::utils::StructuredLog()
@@ -75,7 +73,9 @@ void ConnectionIOHandler::HandleConnection(int client_fd, ConnectionContext& ctx
       break;
     }
 
-    accumulated += buffer.data();
+    // Preserve every received byte. Using the C-string overload would silently
+    // truncate at an embedded NUL before the command parser can reject it.
+    accumulated.append(buffer.data(), static_cast<size_t>(bytes));
 
     // Process complete requests
     if (!ProcessBuffer(accumulated, client_fd, ctx)) {
@@ -97,6 +97,18 @@ bool ConnectionIOHandler::ProcessBuffer(std::string& accumulated, int client_fd,
 
     if (pos == std::string::npos) {
       break;  // No complete line found
+    }
+
+    if (pos > config_.max_query_length) {
+      nvecd::utils::StructuredLog()
+          .Event("server_warning")
+          .Field("type", "request_too_large")
+          .Field("fd", static_cast<uint64_t>(client_fd))
+          .Field("size", static_cast<uint64_t>(pos))
+          .Field("limit", static_cast<uint64_t>(config_.max_query_length))
+          .Warn();
+      SendResponse(client_fd, "ERROR Request too large");
+      return false;
     }
 
     std::string request = accumulated.substr(0, pos);

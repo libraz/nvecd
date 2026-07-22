@@ -29,6 +29,8 @@
 #include "server/handlers/variable_handler.h"
 #include "server/server_types.h"
 #include "similarity/similarity_engine.h"
+#include "storage/wal.h"
+#include "storage/wal_checkpoint.h"
 #include "utils/error.h"
 #include "vectors/vector_store.h"
 #include "version.h"
@@ -425,6 +427,38 @@ TEST_F(HandlerTest, DumpLoad_RoundTrip_RestoresData) {
 
   // Clean up
   std::filesystem::remove(dump_path);
+}
+
+TEST_F(HandlerTest, DumpLoadWithWalMakesLoadedSnapshotTheRecoveryBase) {
+  const std::string root = ::testing::TempDir() + "/nvecd_dump_load_wal";
+  const std::string dump_path = root + "/rollback.dmp";
+  std::filesystem::remove_all(root);
+  std::filesystem::create_directories(root);
+
+  nvecd::storage::WriteAheadLog wal;
+  nvecd::storage::WriteAheadLog::Config wal_config;
+  wal_config.directory = root + "/wal";
+  ASSERT_TRUE(wal.Open(wal_config).has_value());
+  ctx_->wal = &wal;
+  config_->snapshot.mode = "lock";
+  config_->snapshot.dir = root;
+  ctx_->dump_dir = root;
+  vector_store_->SetVector("before", {0.1F, 0.2F, 0.3F});
+  ASSERT_TRUE(HandleDumpSave(*ctx_, dump_path).has_value());
+
+  // Simulate a durable mutation after the snapshot. A rollback load must move
+  // the checkpoint past this record so a later restart does not replay it.
+  const uint8_t payload = 0;
+  ASSERT_TRUE(wal.Append(nvecd::storage::WalOpType::kEventAdd, &payload, 1).has_value());
+  const uint64_t sequence_before_load = wal.CurrentSequence();
+
+  vector_store_->Clear();
+  ASSERT_TRUE(HandleDumpLoad(*ctx_, dump_path).has_value());
+  EXPECT_EQ(nvecd::storage::ReadWalCheckpoint(dump_path), sequence_before_load);
+  EXPECT_TRUE(vector_store_->HasVector("before"));
+
+  wal.Close();
+  std::filesystem::remove_all(root);
 }
 
 TEST_F(HandlerTest, DumpVerify_ValidFile_Succeeds) {

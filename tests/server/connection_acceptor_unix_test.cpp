@@ -263,6 +263,33 @@ TEST_F(ConnectionAcceptorUnixTest, AcceptsUnixConnection) {
   server->Stop();
 }
 
+TEST_F(ConnectionAcceptorUnixTest, UnixConnectionsDoNotUseBogusIpRateLimitKey) {
+  nvecd::config::Config config;
+  config.api.tcp.port = 0;
+  config.api.unix_socket.path = socket_path_;
+  config.perf.max_connections = 10;  // NOLINT(cppcoreguidelines-avoid-magic-numbers)
+  config.perf.thread_pool_size = 2;
+  config.vectors.default_dimension = 3;
+  config.events.ctx_buffer_size = 100;   // NOLINT(cppcoreguidelines-avoid-magic-numbers)
+  config.similarity.default_top_k = 10;  // NOLINT(cppcoreguidelines-avoid-magic-numbers)
+  config.similarity.max_top_k = 100;     // NOLINT(cppcoreguidelines-avoid-magic-numbers)
+  config.api.rate_limiting.enable = true;
+  config.api.rate_limiting.capacity = 1;
+  config.api.rate_limiting.refill_rate = 1;
+  config.api.rate_limiting.max_clients = 1;
+
+  auto server = std::make_unique<nvecd::server::NvecdServer>(config);
+  ASSERT_TRUE(server->Start().has_value());
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+  // UDS authorization is governed by the socket file permissions. It must not
+  // be reinterpreted as a made-up IPv4 identity that exhausts a shared bucket.
+  EXPECT_NE(SendUdsCommand(socket_path_, "INFO").find("OK INFO"), std::string::npos);
+  EXPECT_NE(SendUdsCommand(socket_path_, "INFO").find("OK INFO"), std::string::npos);
+
+  server->Stop();
+}
+
 // ============================================================================
 // Test 8: SocketPermissions
 // ============================================================================

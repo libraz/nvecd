@@ -11,6 +11,8 @@
 #include <atomic>
 #include <ctime>
 #include <memory>
+#include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <vector>
 
@@ -198,6 +200,17 @@ struct HandlerContext {
   /// cache entry). Shared by the TCP dispatcher and the HTTP server so both
   /// surfaces observe the same key space.
   std::atomic<uint64_t> vector_generation{0};
+
+  /// Optional server-wide barrier for lock-mode snapshots. Core write handlers
+  /// hold this shared for their full mutation/WAL sequence; a snapshot holds it
+  /// exclusively after publishing read_only, so no write can cross the
+  /// snapshot's point-in-time boundary.
+  std::shared_mutex* snapshot_write_gate = nullptr;
+
+  /// Serializes a core mutation with its WAL append. This preserves WAL order
+  /// across VECSET/METASET from concurrent TCP and HTTP clients: a METASET
+  /// that observed a vector cannot be replayed before that vector's record.
+  std::mutex* write_serialization_gate = nullptr;
 
   // NOLINTEND(cppcoreguidelines-avoid-const-or-ref-data-members)
 };

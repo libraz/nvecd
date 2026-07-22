@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "config/config.h"
+#include "server/rate_limiter.h"
 #include "server/server_types.h"
 #include "utils/error.h"
 #include "utils/expected.h"
@@ -55,6 +56,7 @@ struct HttpServerConfig {
  * Provides RESTful JSON API:
  * - POST /event - Register co-occurrence event
  * - POST /vecset - Register vector
+ * - DELETE /vecset - Delete vector by JSON {"id":"..."}
  * - POST /sim - Similarity search by ID
  * - POST /simv - Similarity search by vector
  * - GET /info - Server information
@@ -74,7 +76,8 @@ class HttpServer {
    * @param tcp_stats Optional pointer to TCP server's ServerStats (for /info)
    */
   HttpServer(HttpServerConfig config, HandlerContext* handler_context, const config::Config* full_config = nullptr,
-             std::atomic<bool>* loading = nullptr, ServerStats* tcp_stats = nullptr);
+             std::atomic<bool>* loading = nullptr, ServerStats* tcp_stats = nullptr,
+             RateLimiter* rate_limiter = nullptr);
 
   ~HttpServer();
 
@@ -132,6 +135,10 @@ class HttpServer {
   std::vector<utils::CIDR> parsed_allow_cidrs_;
   std::atomic<bool>* loading_;  // Shared loading flag (owned by TcpServer)
   ServerStats* tcp_stats_;      // Pointer to TCP server's statistics (for /info)
+  /// Shared with TCP when constructed by NvecdServer; owned fallback supports
+  /// standalone HTTP use while preserving the configured limiter semantics.
+  std::unique_ptr<RateLimiter> owned_rate_limiter_;
+  RateLimiter* rate_limiter_ = nullptr;
 
   /**
    * @brief Setup routes
@@ -161,6 +168,11 @@ class HttpServer {
    * @brief Handle POST /vecset
    */
   void HandleVecset(const httplib::Request& req, httplib::Response& res);
+
+  /**
+   * @brief Handle DELETE /vecset
+   */
+  void HandleVecdel(const httplib::Request& req, httplib::Response& res);
 
   /**
    * @brief Handle POST /metaset

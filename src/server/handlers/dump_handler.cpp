@@ -10,11 +10,14 @@
 
 #include <array>
 #include <ctime>
+#include <filesystem>
+#include <shared_mutex>
 #include <sstream>
 
 #include "config/config.h"
 #include "events/co_occurrence_index.h"
 #include "events/event_store.h"
+#include "similarity/similarity_engine.h"
 #include "storage/snapshot_fork.h"
 #include "storage/snapshot_format_v1.h"
 #include "storage/snapshot_lock.h"
@@ -91,6 +94,13 @@ utils::Expected<std::string, utils::Error> HandleDumpSave(HandlerContext& ctx, c
   } else {
     // Lock mode: synchronous blocking save
     utils::FlagGuard read_only_guard(ctx.read_only);
+    // Publish read_only before taking the exclusive gate. Existing writers
+    // drain under their shared guards; writers arriving afterwards block, then
+    // observe read_only and fail without crossing the snapshot boundary.
+    std::unique_lock<std::shared_mutex> snapshot_write_guard;
+    if (ctx.snapshot_write_gate != nullptr) {
+      snapshot_write_guard = std::unique_lock(*ctx.snapshot_write_gate);
+    }
 
     uint64_t captured_wal_sequence = 0;
     auto result =
@@ -157,6 +167,34 @@ utils::Expected<std::string, utils::Error> HandleDumpLoad(HandlerContext& ctx, c
                                            *ctx.vector_store, nullptr, nullptr, &integrity_error, ctx.metadata_store);
 
   if (result) {
+    // ReadSnapshotV1 repopulates the VectorStore directly, so the ANN index
+    // still reflects the pre-load corpus (its compact indices now point at
+    // different items). Rebuild it from the freshly loaded store so ANN
+    // searches return the loaded vectors with correct IDs.
+    if (ctx.similarity_engine != nullptr) {
+      ctx.similarity_engine->RebuildAnnFromStore();
+    }
+    if (ctx.wal != nullptr) {
+      // DUMP LOAD is an explicit rollback to this snapshot. Make that snapshot
+      // the durable recovery base and discard the pre-load WAL tail; otherwise
+      // a later restart would replay mutations that the operator deliberately
+      // rolled back.
+      const uint64_t checkpoint_sequence = ctx.wal->CurrentSequence();
+      auto checkpoint = storage::WriteWalCheckpoint(resolved_path, checkpoint_sequence);
+      if (!checkpoint) {
+        return utils::MakeUnexpected(checkpoint.error());
+      }
+      auto truncated = ctx.wal->Truncate(checkpoint_sequence);
+      if (!truncated) {
+        return utils::MakeUnexpected(truncated.error());
+      }
+      std::error_code ec;
+      std::filesystem::last_write_time(resolved_path, std::filesystem::file_time_type::clock::now(), ec);
+      if (ec) {
+        return utils::MakeUnexpected(utils::MakeError(
+            utils::ErrorCode::kStorageWriteError, "Failed to mark loaded snapshot as recovery base: " + ec.message()));
+      }
+    }
     utils::LogStorageInfo("dump_load", "Successfully loaded snapshot from: " + resolved_path);
     return std::string("OK DUMP_LOADED " + resolved_path + "\r\n");
   }
