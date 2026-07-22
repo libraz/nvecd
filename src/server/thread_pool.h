@@ -67,30 +67,37 @@ class ThreadPool {
   /**
    * @brief Check if pool is shutting down
    */
-  bool IsShutdown() const { return shutdown_; }
+  bool IsShutdown() const;
 
   /**
-   * @brief Shutdown pool and wait for all tasks
-   * @param graceful If true, wait for pending tasks to complete. If false, abandon pending tasks.
-   * @param timeout_ms Maximum time to wait for pending tasks (0 = no timeout)
+   * @brief Shutdown pool and wait for running tasks up to the requested limit
+   * @param graceful If true, run pending tasks before stopping. If false, abandon pending tasks.
+   * @param timeout_ms Maximum time to wait for pending and running tasks (0 = no timeout).
+   *        On timeout, pending tasks are discarded and workers are detached.
+   *        Running tasks are not force-cancelled; they retain only shared worker
+   *        state and can finish safely after this object is destroyed.
    */
   void Shutdown(bool graceful = true, uint32_t timeout_ms = 0);
 
  private:
+  struct State {
+    std::queue<Task> tasks;
+    mutable std::mutex queue_mutex;
+    std::condition_variable condition;
+    std::condition_variable idle_condition;
+    std::atomic<bool> shutdown{false};
+    std::atomic<size_t> active_workers{0};
+    size_t max_queue_size = 0;
+  };
+
   std::vector<std::thread> workers_;
-  std::queue<Task> tasks_;
-
-  mutable std::mutex queue_mutex_;
-  std::condition_variable condition_;
-  std::atomic<bool> shutdown_{false};
-  std::atomic<size_t> active_workers_{0};  // Number of workers currently executing tasks
-
-  size_t max_queue_size_;
+  std::shared_ptr<State> state_;
+  std::mutex shutdown_mutex_;
 
   /**
    * @brief Worker thread function
    */
-  void WorkerThread();
+  static void WorkerThread(std::shared_ptr<State> state);
 };
 
 }  // namespace nvecd::server

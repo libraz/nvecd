@@ -210,6 +210,30 @@ TEST_F(ThreadPoolTest, ShutdownRejectsTasks) {
   EXPECT_EQ(counter, 1);
 }
 
+TEST_F(ThreadPoolTest, ShutdownTimeoutReturnsForUncooperativeRunningTask) {
+  ThreadPool pool(1);
+  std::atomic<bool> started{false};
+  std::atomic<bool> allow_exit{false};
+
+  ASSERT_TRUE(pool.Submit([&started, &allow_exit]() {
+    started = true;
+    while (!allow_exit.load()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }));
+  while (!started.load()) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+
+  const auto start = std::chrono::steady_clock::now();
+  pool.Shutdown(false, 25);
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+
+  EXPECT_LT(elapsed, std::chrono::milliseconds(250));
+  allow_exit = true;
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+}
+
 TEST_F(ThreadPoolTest, DestructorWaitsForTasks) {
   std::atomic<int> counter{0};
 
