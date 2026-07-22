@@ -14,18 +14,33 @@
 
 namespace nvecd::cache {
 
-CacheKey GenerateSimCacheKey(const std::string& id, int top_k, const std::string& mode) {
-  // Format: "SIM:<id>:<top_k>:<mode>"
+namespace {
+
+std::string AdaptiveCachePart(std::optional<bool> adaptive) {
+  if (!adaptive.has_value()) {
+    return "default";
+  }
+  return *adaptive ? "on" : "off";
+}
+
+}  // namespace
+
+CacheKey GenerateSimCacheKey(const SimCacheKeyParams& params) {
   std::ostringstream oss;
-  oss << "SIM:" << id << ":" << top_k << ":" << mode;
+  oss << "SIM:" << params.id << ":" << params.top_k << ":" << params.mode << ":a" << AdaptiveCachePart(params.adaptive)
+      << ":g" << params.cooccurrence_generation << ":v" << params.vector_generation;
+  if (!params.filter_expr.empty()) {
+    oss << ":f" << params.filter_expr;
+  }
   return CacheKeyGenerator::Generate(oss.str());
 }
 
-CacheKey GenerateSimvCacheKey(const std::vector<float>& vector, int top_k, const std::string& mode) {
-  // Format: "SIMV:<vector_hash>:<top_k>:<mode>"
-  std::string vector_hash = HashVector(vector);
+CacheKey GenerateSimvCacheKey(const SimvCacheKeyParams& params) {
   std::ostringstream oss;
-  oss << "SIMV:" << vector_hash << ":" << top_k << ":" << mode;
+  oss << "SIMV:" << HashVector(params.vector) << ":" << params.top_k << ":v" << params.vector_generation;
+  if (!params.filter_expr.empty()) {
+    oss << ":f" << params.filter_expr;
+  }
   return CacheKeyGenerator::Generate(oss.str());
 }
 

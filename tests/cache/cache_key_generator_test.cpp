@@ -15,67 +15,102 @@ using namespace nvecd::cache;
 // ========== GenerateSimCacheKey tests ==========
 
 TEST(GenerateSimCacheKeyTest, Deterministic) {
-  CacheKey a = GenerateSimCacheKey("item1", 10, "vectors");
-  CacheKey b = GenerateSimCacheKey("item1", 10, "vectors");
+  CacheKey a = GenerateSimCacheKey({"item1", 10, "vectors"});
+  CacheKey b = GenerateSimCacheKey({"item1", 10, "vectors"});
   EXPECT_EQ(a, b);
 }
 
 TEST(GenerateSimCacheKeyTest, DifferentId) {
-  CacheKey a = GenerateSimCacheKey("item1", 10, "vectors");
-  CacheKey b = GenerateSimCacheKey("item2", 10, "vectors");
+  CacheKey a = GenerateSimCacheKey({"item1", 10, "vectors"});
+  CacheKey b = GenerateSimCacheKey({"item2", 10, "vectors"});
   EXPECT_NE(a, b);
 }
 
 TEST(GenerateSimCacheKeyTest, DifferentTopK) {
-  CacheKey a = GenerateSimCacheKey("item1", 10, "vectors");
-  CacheKey b = GenerateSimCacheKey("item1", 20, "vectors");
+  CacheKey a = GenerateSimCacheKey({"item1", 10, "vectors"});
+  CacheKey b = GenerateSimCacheKey({"item1", 20, "vectors"});
   EXPECT_NE(a, b);
 }
 
 TEST(GenerateSimCacheKeyTest, DifferentMode) {
-  CacheKey a = GenerateSimCacheKey("item1", 10, "vectors");
-  CacheKey b = GenerateSimCacheKey("item1", 10, "events");
+  CacheKey a = GenerateSimCacheKey({"item1", 10, "vectors"});
+  CacheKey b = GenerateSimCacheKey({"item1", 10, "events"});
   EXPECT_NE(a, b);
 }
 
 TEST(GenerateSimCacheKeyTest, AllModes) {
-  CacheKey vectors = GenerateSimCacheKey("id", 5, "vectors");
-  CacheKey events = GenerateSimCacheKey("id", 5, "events");
-  CacheKey fusion = GenerateSimCacheKey("id", 5, "fusion");
+  CacheKey vectors = GenerateSimCacheKey({"id", 5, "vectors"});
+  CacheKey events = GenerateSimCacheKey({"id", 5, "events"});
+  CacheKey fusion = GenerateSimCacheKey({"id", 5, "fusion"});
   EXPECT_NE(vectors, events);
   EXPECT_NE(vectors, fusion);
   EXPECT_NE(events, fusion);
+}
+
+TEST(GenerateSimCacheKeyTest, CanonicalKeyIncludesAllCrossSurfaceInvalidationFields) {
+  SimCacheKeyParams base{"item", 10, "fusion", true, 7, 11, "status:active"};
+
+  // TCP and HTTP provide the same values to the shared builder, so they must
+  // resolve to the identical entry.
+  EXPECT_EQ(GenerateSimCacheKey(base), GenerateSimCacheKey(base));
+
+  auto changed_vector_generation = base;
+  ++changed_vector_generation.vector_generation;
+  EXPECT_NE(GenerateSimCacheKey(base), GenerateSimCacheKey(changed_vector_generation));
+
+  auto changed_cooccurrence_generation = base;
+  ++changed_cooccurrence_generation.cooccurrence_generation;
+  EXPECT_NE(GenerateSimCacheKey(base), GenerateSimCacheKey(changed_cooccurrence_generation));
+
+  auto changed_adaptive = base;
+  changed_adaptive.adaptive = false;
+  EXPECT_NE(GenerateSimCacheKey(base), GenerateSimCacheKey(changed_adaptive));
+
+  auto changed_filter = base;
+  changed_filter.filter_expr = "status:draft";
+  EXPECT_NE(GenerateSimCacheKey(base), GenerateSimCacheKey(changed_filter));
 }
 
 // ========== GenerateSimvCacheKey tests ==========
 
 TEST(GenerateSimvCacheKeyTest, Deterministic) {
   std::vector<float> vec = {1.0f, 2.0f, 3.0f};
-  CacheKey a = GenerateSimvCacheKey(vec, 10, "vectors");
-  CacheKey b = GenerateSimvCacheKey(vec, 10, "vectors");
+  CacheKey a = GenerateSimvCacheKey({vec, 10});
+  CacheKey b = GenerateSimvCacheKey({vec, 10});
   EXPECT_EQ(a, b);
 }
 
 TEST(GenerateSimvCacheKeyTest, DifferentVector) {
   std::vector<float> vec1 = {1.0f, 2.0f, 3.0f};
   std::vector<float> vec2 = {4.0f, 5.0f, 6.0f};
-  CacheKey a = GenerateSimvCacheKey(vec1, 10, "vectors");
-  CacheKey b = GenerateSimvCacheKey(vec2, 10, "vectors");
+  CacheKey a = GenerateSimvCacheKey({vec1, 10});
+  CacheKey b = GenerateSimvCacheKey({vec2, 10});
   EXPECT_NE(a, b);
 }
 
 TEST(GenerateSimvCacheKeyTest, DifferentTopK) {
   std::vector<float> vec = {1.0f, 2.0f, 3.0f};
-  CacheKey a = GenerateSimvCacheKey(vec, 10, "vectors");
-  CacheKey b = GenerateSimvCacheKey(vec, 20, "vectors");
+  CacheKey a = GenerateSimvCacheKey({vec, 10});
+  CacheKey b = GenerateSimvCacheKey({vec, 20});
   EXPECT_NE(a, b);
 }
 
 TEST(GenerateSimvCacheKeyTest, EmptyVector) {
   std::vector<float> empty_vec;
-  CacheKey a = GenerateSimvCacheKey(empty_vec, 10, "vectors");
-  CacheKey b = GenerateSimvCacheKey(empty_vec, 10, "vectors");
+  CacheKey a = GenerateSimvCacheKey({empty_vec, 10});
+  CacheKey b = GenerateSimvCacheKey({empty_vec, 10});
   EXPECT_EQ(a, b);
+}
+
+TEST(GenerateSimvCacheKeyTest, CanonicalKeyIncludesVectorGenerationAndFilter) {
+  SimvCacheKeyParams base{{1.0F, 2.0F, 3.0F}, 10, 1, "tenant:alpha"};
+  auto next_generation = base;
+  ++next_generation.vector_generation;
+  EXPECT_NE(GenerateSimvCacheKey(base), GenerateSimvCacheKey(next_generation));
+
+  auto different_filter = base;
+  different_filter.filter_expr = "tenant:beta";
+  EXPECT_NE(GenerateSimvCacheKey(base), GenerateSimvCacheKey(different_filter));
 }
 
 // ========== HashVector tests ==========

@@ -10,11 +10,9 @@
  * - TTL expiration
  * - Cache behavior after data mutation
  *
- * NOTE: The SimilarityCache component is not yet wired into the SIM query
- * path (neither TCP nor HTTP). Cache Lookup/Insert are implemented but not
- * called from RequestDispatcher::HandleSim. As a result, SIM queries do not
- * produce cache hits or misses. Tests are written to verify cache management
- * commands and document expected behavior once cache integration is complete.
+ * The tests deliberately assert cache counters through the TCP surface, so a
+ * regression that bypasses cache lookup/insert cannot pass on command success
+ * alone.
  */
 
 #include <gtest/gtest.h>
@@ -37,7 +35,7 @@ class CacheE2ETest : public NvecdTestFixture {
   void SetUp() override {
     SetUpServer(3);
     // Set min query cost to 0 so all queries are eligible for caching
-    // once cache integration is wired into the query path.
+    // on every query in this fixture.
     TcpClient setup_client("127.0.0.1", port_);
     setup_client.SendCommand("SET cache.min_query_cost_ms 0");
   }
@@ -52,11 +50,11 @@ TEST_F(CacheE2ETest, CacheMissHitCycle) {
   TcpClient client("127.0.0.1", port_);
   PopulateBasicData(client);
 
-  // First query: should be a cache miss (once cache integration is wired in)
+  // First query is a miss and stores the result.
   auto resp1 = client.SendCommand("SIM item1 10 using=vectors");
   EXPECT_TRUE(ContainsOK(resp1));
 
-  // Second identical query: should be a cache hit (once wired in)
+  // The identical second query must be served from cache.
   auto resp2 = client.SendCommand("SIM item1 10 using=vectors");
   EXPECT_TRUE(ContainsOK(resp2));
 
@@ -67,10 +65,8 @@ TEST_F(CacheE2ETest, CacheMissHitCycle) {
   int cache_hits = std::stoi(ParseResponseField(stats, "cache_hits"));
   int cache_misses = std::stoi(ParseResponseField(stats, "cache_misses"));
 
-  // Currently cache is not integrated into SIM query path, so both are 0.
-  // When cache is wired in: EXPECT_GE(cache_hits, 1) and
-  // EXPECT_GE(cache_misses, 1).
-  EXPECT_GE(cache_hits + cache_misses, 0);
+  EXPECT_GE(cache_misses, 1);
+  EXPECT_GE(cache_hits, 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -96,9 +92,8 @@ TEST_F(CacheE2ETest, CacheStatsAccumulation) {
   EXPECT_TRUE(ContainsOK(stats));
 
   int total_queries = std::stoi(ParseResponseField(stats, "total_queries"));
-  // Currently total_queries tracks cache lookups, not SIM invocations.
-  // When cache is wired into SIM: EXPECT_GE(total_queries, 3).
-  EXPECT_GE(total_queries, 0);
+  EXPECT_GE(total_queries, 3);
+  EXPECT_GE(std::stoi(ParseResponseField(stats, "cache_misses")), 3);
 }
 
 // ---------------------------------------------------------------------------
@@ -117,6 +112,7 @@ TEST_F(CacheE2ETest, CacheClearResetsEntries) {
   auto stats_before = client.SendCommand("CACHE STATS");
   EXPECT_TRUE(ContainsOK(stats_before));
   int entries_before = std::stoi(ParseResponseField(stats_before, "cache_entries"));
+  EXPECT_GE(entries_before, 1);
 
   // Clear cache
   auto clear_resp = client.SendCommand("CACHE CLEAR");
@@ -185,7 +181,7 @@ TEST_F(CacheE2ETest, CacheEnableDisableToggle) {
   stats = client.SendCommand("CACHE STATS");
   EXPECT_EQ(ParseResponseField(stats, "cache_enabled"), "false");
 
-  // Query while disabled (not cached)
+  // Query while disabled must not populate the cache.
   resp = client.SendCommand("SIM item1 10 using=vectors");
   EXPECT_TRUE(ContainsOK(resp));
 
@@ -197,18 +193,16 @@ TEST_F(CacheE2ETest, CacheEnableDisableToggle) {
   stats = client.SendCommand("CACHE STATS");
   EXPECT_EQ(ParseResponseField(stats, "cache_enabled"), "true");
 
-  // Query after re-enable (miss, cache was empty)
+  // Query after re-enable is a miss, then the second is a hit.
   resp = client.SendCommand("SIM item1 10 using=vectors");
   EXPECT_TRUE(ContainsOK(resp));
 
-  // Query once more (would be a hit once cache integration is wired in)
   resp = client.SendCommand("SIM item1 10 using=vectors");
   EXPECT_TRUE(ContainsOK(resp));
 
-  // When cache is wired into SIM: EXPECT_GE(cache_hits, 1).
   stats = client.SendCommand("CACHE STATS");
   int cache_hits = std::stoi(ParseResponseField(stats, "cache_hits"));
-  EXPECT_GE(cache_hits, 0);
+  EXPECT_GE(cache_hits, 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -219,7 +213,7 @@ TEST_F(CacheE2ETest, CacheAfterDumpLoad) {
   TcpClient client("127.0.0.1", port_);
   PopulateBasicData(client);
 
-  // Issue a SIM query (populates cache once wired in)
+  // Issue a SIM query to populate the cache before restarting.
   auto resp = client.SendCommand("SIM item1 10 using=vectors");
   EXPECT_TRUE(ContainsOK(resp));
 
@@ -266,14 +260,14 @@ TEST_F(CacheE2ETest, CacheTTLExpiration) {
   auto set_resp = client.SendCommand("SET cache.ttl_seconds 1");
   EXPECT_TRUE(set_resp.find("OK") != std::string::npos);
 
-  // Query to populate cache (once cache integration is wired in)
+  // Query to populate cache.
   auto resp = client.SendCommand("SIM item1 10 using=vectors");
   EXPECT_TRUE(ContainsOK(resp));
 
   // Wait for TTL to expire
   std::this_thread::sleep_for(std::chrono::seconds(2));
 
-  // Query again (should be a TTL-expired miss once wired in)
+  // Query again: the prior entry must expire and cause a miss.
   resp = client.SendCommand("SIM item1 10 using=vectors");
   EXPECT_TRUE(ContainsOK(resp));
 
@@ -281,8 +275,7 @@ TEST_F(CacheE2ETest, CacheTTLExpiration) {
   auto stats = client.SendCommand("CACHE STATS");
   EXPECT_TRUE(ContainsOK(stats));
   int ttl_expirations = std::stoi(ParseResponseField(stats, "ttl_expirations"));
-  // When cache is wired into SIM: EXPECT_GE(ttl_expirations, 1).
-  EXPECT_GE(ttl_expirations, 0);
+  EXPECT_GE(ttl_expirations, 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -293,7 +286,7 @@ TEST_F(CacheE2ETest, CacheAfterEventMutation) {
   TcpClient client("127.0.0.1", port_);
   PopulateBasicData(client);
 
-  // Query with using=vectors to populate cache
+  // Query with using=vectors to populate cache.
   auto resp = client.SendCommand("SIM item1 10 using=vectors");
   EXPECT_TRUE(ContainsOK(resp));
 
@@ -305,20 +298,13 @@ TEST_F(CacheE2ETest, CacheAfterEventMutation) {
   resp = client.SendCommand("SIM item1 10 using=vectors");
   EXPECT_TRUE(ContainsOK(resp));
 
-  // Check stats to document behavior.
-  // Since the mutation only affects events and the query uses vectors mode
-  // (using=vectors), the cache may serve the previously cached result as a
-  // hit. The vector data has not changed, so the cached result is still
-  // correct for this specific query mode.
-  //
-  // NOTE: Currently cache is not integrated into SIM query path, so this
-  // test verifies that SIM queries succeed after mutations and that cache
-  // stats are accessible. Once cache is wired in, this test documents that
-  // event mutations do NOT invalidate vector-mode cache entries (expected
-  // behavior since vector data is unchanged).
+  // Co-occurrence generation is part of every SIM key, including vectors
+  // mode. The mutation must therefore produce a new cache lookup rather than
+  // accidentally serving an entry created before the mutation.
   auto stats = client.SendCommand("CACHE STATS");
   EXPECT_TRUE(ContainsOK(stats));
 
   int total_queries = std::stoi(ParseResponseField(stats, "total_queries"));
-  EXPECT_GE(total_queries, 0);
+  EXPECT_GE(total_queries, 2);
+  EXPECT_GE(std::stoi(ParseResponseField(stats, "cache_misses")), 2);
 }

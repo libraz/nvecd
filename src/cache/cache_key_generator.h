@@ -9,6 +9,8 @@
 
 #pragma once
 
+#include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -17,31 +19,41 @@
 namespace nvecd::cache {
 
 /**
- * @brief Generate cache key for SIM command (ID-based similarity search)
+ * @brief Complete cache identity for an ID-based similarity query.
  *
- * @param id Target ID
- * @param top_k Number of results
- * @param mode Search mode ("vectors", "events", "fusion")
- * @return MD5-based cache key
- *
- * Key format: "SIM:<id>:<top_k>:<mode>"
+ * Both the TCP and HTTP surfaces must use this exact set of fields. In
+ * particular, vector_generation invalidates cached vector/fusion results when
+ * either surface accepts a VECSET.
  */
-CacheKey GenerateSimCacheKey(const std::string& id, int top_k, const std::string& mode);
+struct SimCacheKeyParams {
+  std::string id;
+  int top_k = 0;
+  std::string mode;
+  std::optional<bool> adaptive;
+  uint64_t cooccurrence_generation = 0;
+  uint64_t vector_generation = 0;
+  std::string filter_expr;
+};
 
 /**
- * @brief Generate cache key for SIMV command (vector-based similarity search)
- *
- * @param vector Query vector
- * @param top_k Number of results
- * @param mode Search mode ("vectors", "events", "fusion")
- * @return MD5-based cache key
- *
- * Key format: "SIMV:<vector_hash>:<top_k>:<mode>"
- *
- * Note: Vector is hashed using MD5 of raw bytes for deterministic key generation.
- * This ensures identical vectors produce identical cache keys.
+ * @brief Complete cache identity for a vector-based similarity query.
  */
-CacheKey GenerateSimvCacheKey(const std::vector<float>& vector, int top_k, const std::string& mode);
+struct SimvCacheKeyParams {
+  std::vector<float> vector;
+  int top_k = 0;
+  uint64_t vector_generation = 0;
+  std::string filter_expr;
+};
+
+/**
+ * @brief Generate the canonical cache key shared by TCP and HTTP SIM.
+ */
+CacheKey GenerateSimCacheKey(const SimCacheKeyParams& params);
+
+/**
+ * @brief Generate the canonical cache key shared by TCP and HTTP SIMV.
+ */
+CacheKey GenerateSimvCacheKey(const SimvCacheKeyParams& params);
 
 /**
  * @brief Hash vector to string (for cache key generation)
