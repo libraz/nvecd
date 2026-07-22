@@ -80,6 +80,55 @@ SimilarityEngine::SimilarityEngine(events::EventStore* event_store, events::CoOc
         .Info();
   }
   // else: flat (no index), brute-force search
+
+  // The ANN index above is provisionally sized to the configured
+  // default_dimension. Record it so EnsureAnnDimension() can detect and correct
+  // a mismatch against the dimension the VectorStore actually learns.
+  if (ann_index_) {
+    ann_dimension_ = static_cast<uint32_t>(vectors_config.default_dimension);
+  }
+}
+
+void SimilarityEngine::EnsureAnnDimension() {
+  if (ann_dimension_bound_ || !ann_index_) {
+    return;
+  }
+  auto real_dim = static_cast<uint32_t>(vector_store_->GetDimension());
+  if (real_dim == 0) {
+    return;  // No vector stored yet; nothing to bind to.
+  }
+  if (real_dim != ann_dimension_) {
+    // Rebind the still-empty index to the real dimension. Rebuild(nullptr, 0,
+    // dim) resets the index and adopts the new dimension without inserting.
+    ann_index_->Rebuild(nullptr, 0, real_dim);
+    ann_dimension_ = real_dim;
+  }
+  ann_dimension_bound_ = true;
+}
+
+void SimilarityEngine::RebuildAnnFromStore() {
+  if (!ann_index_) {
+    return;  // flat: nothing to rebuild
+  }
+  // Hold the store read lock for the whole rebuild so the matrix cannot
+  // reallocate while the ANN reads it.
+  auto lock = vector_store_->AcquireReadLock();
+  auto dim = static_cast<uint32_t>(vector_store_->GetDimension());
+  if (dim == 0) {
+    return;  // Empty store; leave the index unbound until the first vector.
+  }
+  auto count = static_cast<uint32_t>(vector_store_->GetMatrixCount());
+  const float* data = vector_store_->GetMatrixData();
+  ann_index_->Rebuild(data, count, dim);
+  ann_dimension_ = dim;
+  ann_dimension_bound_ = true;
+
+  utils::StructuredLog()
+      .Event("ann_index_rebuilt_from_store")
+      .Field("index_type", config_.index_type)
+      .Field("count", static_cast<uint64_t>(count))
+      .Field("dimension", static_cast<uint64_t>(dim))
+      .Info();
 }
 
 SimilarityEngine::~SimilarityEngine() {
@@ -204,13 +253,16 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
         results.clear();
         results.reserve(ann_results.size());
         for (const auto& [compact_idx, score] : ann_results) {
-          if (static_cast<size_t>(compact_idx) == query_idx) {
-            continue;  // Exclude self
-          }
           if (compact_idx >= map_snap.count || map_snap.IsDeleted(compact_idx)) {
             continue;
           }
           const std::string& cand_id = (*map_snap.idx_to_id)[compact_idx];
+          // The compact index captured for the query can become stale after a
+          // concurrent compaction. Identity is stable, so exclude self by ID
+          // rather than comparing indices from two different snapshots.
+          if (cand_id == item_id) {
+            continue;
+          }
           if (has_filter && !metadata_store_->Matches(cand_id, filter)) {
             continue;
           }
@@ -346,7 +398,18 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
   utils::Expected<std::vector<SimilarityResult>, utils::Error> vector_results =
       SearchByIdVectors(item_id, fetch_k, filter);
 
-  // If both failed, return error
+  const bool has_event_candidates = event_results && !event_results->empty();
+  const bool has_vector_candidates = vector_results && !vector_results->empty();
+
+  // A typo / missing query ID has no candidates in the co-occurrence index and
+  // fails the vector lookup. Report that typed not-found error rather than
+  // silently returning an empty fusion response unlike vectors mode.
+  if (!has_event_candidates && !has_vector_candidates && !vector_results) {
+    return utils::MakeUnexpected(vector_results.error());
+  }
+
+  // If both sources actually failed for another reason, preserve the aggregate
+  // failure. Empty-but-valid sources remain a valid empty fusion response.
   if (!event_results && !vector_results) {
     auto error = utils::MakeError(utils::ErrorCode::kSimilaritySearchFailed,
                                   "Both event and vector searches failed for ID: " + item_id);
@@ -365,7 +428,10 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
         .Field("error", event_results.error().message())
         .Warn();
   }
-  if (!vector_results) {
+  // A vectorless item is an expected cold-start case: event-only fusion is a
+  // supported query mode, so logging it once per query would create a WARN
+  // storm under normal traffic. Preserve warnings for genuine vector failures.
+  if (!vector_results && vector_results.error().code() != utils::ErrorCode::kVectorNotFound) {
     utils::StructuredLog()
         .Event("fusion_source_failed")
         .Field("item_id", item_id)
@@ -375,25 +441,36 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
   }
 
   // Normalize scores for each source
-  if (event_results) {
+  if (has_event_candidates) {
     NormalizeScores(*event_results);
   }
-  if (vector_results) {
+  if (has_vector_candidates) {
     NormalizeScores(*vector_results);
+  }
+
+  // If one source has no candidates, its configured weight must not shrink the
+  // surviving score. Re-normalize the contributing weights to one so min_score
+  // has identical semantics in fusion and its single-source fallback.
+  float event_weight = has_event_candidates ? beta : 0.0F;
+  float vector_weight = has_vector_candidates ? alpha : 0.0F;
+  const float contributing_weight = event_weight + vector_weight;
+  if (contributing_weight > 0.0F) {
+    event_weight /= contributing_weight;
+    vector_weight /= contributing_weight;
   }
 
   // Merge scores with computed weights
   std::map<std::string, float> fusion_scores;
 
-  if (event_results) {
+  if (has_event_candidates) {
     for (const auto& result : *event_results) {
-      fusion_scores[result.item_id] += beta * result.score;
+      fusion_scores[result.item_id] += event_weight * result.score;
     }
   }
 
-  if (vector_results) {
+  if (has_vector_candidates) {
     for (const auto& result : *vector_results) {
-      fusion_scores[result.item_id] += alpha * result.score;
+      fusion_scores[result.item_id] += vector_weight * result.score;
     }
   }
 
@@ -703,6 +780,10 @@ void SimilarityEngine::NotifyVectorAdded(size_t compact_index, const float* vect
   if (!ann_index_) {
     return;
   }
+
+  // Bind the index to the real data dimension before the first insert so Add()
+  // never reads past the vector buffer.
+  EnsureAnnDimension();
 
   if (config_.index_type == "hnsw") {
     // HNSW: direct incremental insertion

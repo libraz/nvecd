@@ -176,8 +176,8 @@ TEST_F(SimilarityEngineTest, SearchByIdVectors_SortedByScore) {
 
 TEST_F(SimilarityEngineTest, SearchByIdFusion_BothEmpty) {
   auto results = engine_->SearchByIdFusion("item1", 10);
-  ASSERT_TRUE(results.has_value());
-  EXPECT_TRUE(results->empty());  // No results from either source
+  ASSERT_FALSE(results.has_value());
+  EXPECT_EQ(results.error().code(), utils::ErrorCode::kVectorNotFound);
 }
 
 TEST_F(SimilarityEngineTest, SearchByIdFusion_OnlyEvents) {
@@ -272,6 +272,47 @@ TEST_F(SimilarityEngineTest, SearchByVector_TopK) {
   auto results = engine_->SearchByVector(query, 5);
   ASSERT_TRUE(results.has_value());
   EXPECT_LE(results->size(), 5);
+}
+
+// A public VECDEL compacts VectorStore then rebuilds ANN indexes because their
+// labels are compact row indices.  This regression test proves a HNSW rebuild
+// maps the remaining rows back to their current IDs after the deleted middle
+// row shifts the final item's compact index.
+TEST(SimilarityEngineAnnDeleteTest, HnswRebuildAfterDefragmentDoesNotReturnDeletedId) {
+  auto events_config = MakeEventsConfig();
+  auto vectors_config = MakeVectorsConfig();
+  auto similarity_config = MakeSimilarityConfig();
+  similarity_config.index_type = "hnsw";
+  similarity_config.hnsw_m = 8;
+  similarity_config.hnsw_ef_construction = 32;
+  similarity_config.hnsw_ef_search = 16;
+
+  events::EventStore event_store(events_config);
+  events::CoOccurrenceIndex co_index;
+  vectors::VectorStore vector_store(vectors_config);
+  SimilarityEngine engine(&event_store, &co_index, &vector_store, similarity_config, vectors_config);
+
+  ASSERT_TRUE(vector_store.SetVector("first", {1.0F, 0.0F, 0.0F}).has_value());
+  ASSERT_TRUE(vector_store.SetVector("deleted", {0.9F, 0.1F, 0.0F}).has_value());
+  ASSERT_TRUE(vector_store.SetVector("shifted", {0.0F, 1.0F, 0.0F}).has_value());
+  engine.RebuildAnnFromStore();
+
+  const auto deleted_index = vector_store.GetCompactIndex("deleted");
+  ASSERT_TRUE(deleted_index.has_value());
+  engine.NotifyVectorRemoved(*deleted_index);
+  ASSERT_TRUE(vector_store.DeleteVector("deleted"));
+  vector_store.Defragment();
+  engine.RebuildAnnFromStore();
+
+  auto results = engine.SearchByVector({1.0F, 0.0F, 0.0F}, 10);
+  ASSERT_TRUE(results.has_value());
+  std::unordered_set<std::string> ids;
+  for (const auto& result : *results) {
+    ids.insert(result.item_id);
+  }
+  EXPECT_NE(ids.find("first"), ids.end());
+  EXPECT_NE(ids.find("shifted"), ids.end());
+  EXPECT_EQ(ids.find("deleted"), ids.end());
 }
 
 // ============================================================================

@@ -179,12 +179,36 @@ class SimilarityEngine {
   bool IsAnnIndexReady() const;
 
   /**
+   * @brief Rebuild the ANN index from the current VectorStore contents
+   *
+   * Resets the ANN index and re-inserts every vector currently held by the
+   * VectorStore, adopting the store's actual dimension. Must be called after a
+   * snapshot load or DUMP LOAD: those paths repopulate the VectorStore directly
+   * without going through NotifyVectorAdded, so without this the ANN index would
+   * silently omit the restored corpus (and, after the first post-load VECSET,
+   * misattribute stale compact indices). No-op for the flat index.
+   */
+  void RebuildAnnFromStore();
+
+  /**
    * @brief Get the configured index type
    * @return "hnsw", "ivf", or "flat"
    */
   const std::string& GetIndexType() const { return config_.index_type; }
 
  private:
+  /**
+   * @brief Bind the ANN index to the VectorStore's actual data dimension
+   *
+   * The ANN index is provisionally constructed for the configured
+   * default_dimension, which need not match the dimension the VectorStore
+   * learns from the first stored vector. Because AnnIndex::Add() receives only
+   * a bare pointer and trusts the index dimension, a mismatch would read past
+   * the end of every inserted vector (heap-buffer-overflow). On the first real
+   * vector this rebinds the still-empty index to the store's dimension.
+   */
+  void EnsureAnnDimension();
+
   /**
    * @brief Validate top_k parameter
    * @param top_k Requested number of results
@@ -243,6 +267,13 @@ class SimilarityEngine {
 
   /// Legacy direct IVF pointer (non-owning, null if index_type != "ivf")
   vectors::IvfIndex* ivf_index_raw_ = nullptr;
+
+  /// Dimension the ANN index is currently bound to (0 = flat/no index).
+  uint32_t ann_dimension_ = 0;
+
+  /// True once the ANN index has been bound to the real data dimension
+  /// (via the first vector add or a rebuild-from-store).
+  bool ann_dimension_bound_ = false;
 
   /// Background thread for asynchronous IVF training
   std::unique_ptr<std::thread> ivf_train_thread_;

@@ -5,6 +5,8 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cmath>
 #include <memory>
 
 #include "config/config.h"
@@ -81,6 +83,32 @@ TEST_F(AdaptiveFusionTest, AdaptiveDisabledByDefault) {
   EXPECT_FALSE(result->empty());
 }
 
+TEST_F(AdaptiveFusionTest, StaticFusionUsesConfiguredWeightedNormalizedScores) {
+  sim_config_.fusion_alpha = 0.25;
+  sim_config_.fusion_beta = 0.75;
+  vector_store_->SetVector("query", {1.0F, 0.0F, 0.0F});
+  // Candidate wins events but loses vector similarity after per-source
+  // normalization; competitor has the inverse signal.
+  vector_store_->SetVector("event_winner", {0.8F, 0.6F, 0.0F});
+  vector_store_->SetVector("vector_winner", {1.0F, 0.0F, 0.0F});
+  co_index_->SetScore("query", "event_winner", 10.0F);
+  co_index_->SetScore("query", "vector_winner", 0.0F);
+  CreateEngine();
+
+  auto results = engine_->SearchByIdFusion("query", 2, false);
+  ASSERT_TRUE(results.has_value());
+  ASSERT_EQ(results->size(), 2U);
+
+  const auto event_winner = std::find_if(results->begin(), results->end(),
+                                         [](const auto& result) { return result.item_id == "event_winner"; });
+  const auto vector_winner = std::find_if(results->begin(), results->end(),
+                                          [](const auto& result) { return result.item_id == "vector_winner"; });
+  ASSERT_NE(event_winner, results->end());
+  ASSERT_NE(vector_winner, results->end());
+  EXPECT_NEAR(event_winner->score, 0.75F, 1e-5F);
+  EXPECT_NEAR(vector_winner->score, 0.25F, 1e-5F);
+}
+
 TEST_F(AdaptiveFusionTest, GetNeighborCount) {
   co_index_->SetScore("a", "b", 1.0F);
   co_index_->SetScore("a", "c", 2.0F);
@@ -104,9 +132,26 @@ TEST_F(AdaptiveFusionTest, PerQueryOverride) {
   auto result_static = engine_->SearchByIdFusion("item1", 10, false);
   ASSERT_TRUE(result_static.has_value());
 
-  // Both should succeed
+  // Both should succeed, and the mature item must use different weights when
+  // adaptive fusion is explicitly enabled. This checks the observable score
+  // rather than merely exercising the optional parameter.
   EXPECT_FALSE(result_adaptive->empty());
   EXPECT_FALSE(result_static->empty());
+
+  bool saw_changed_score = false;
+  for (const auto& static_result : *result_static) {
+    for (const auto& adaptive_result : *result_adaptive) {
+      if (static_result.item_id == adaptive_result.item_id &&
+          std::abs(static_result.score - adaptive_result.score) > 0.0001F) {
+        saw_changed_score = true;
+        break;
+      }
+    }
+    if (saw_changed_score) {
+      break;
+    }
+  }
+  EXPECT_TRUE(saw_changed_score);
 }
 
 TEST_F(AdaptiveFusionTest, GenerationCounter) {
