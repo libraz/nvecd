@@ -38,6 +38,7 @@ Content-Type: application/json
 {
   "ctx": "user_alice",
   "id": "product123",
+  "type": "ADD",
   "score": 100
 }
 ```
@@ -48,6 +49,7 @@ Content-Type: application/json
 |-----------|---|------|------|
 | `ctx` | string | Yes | コンテキスト ID（例: ユーザー ID、セッション ID） |
 | `id` | string | Yes | アイテム ID（例: 商品 ID、記事 ID） |
+| `type` | string | Yes | イベント種別（`ADD`、`REMOVE`、`CLICK`、`PURCHASE` など） |
 | `score` | integer | Yes | イベントスコア（0-100、例: 100=購入、80=閲覧） |
 
 **レスポンス（200 OK）:**
@@ -382,7 +384,8 @@ GET /health/detail HTTP/1.1
 
 ### GET /metrics
 
-サーバーメトリクスを JSON 形式で取得します。
+Prometheus テキスト形式でサーバーメトリクスを取得します
+（`Content-Type: text/plain; version=0.0.4`）。
 
 **リクエスト:**
 
@@ -392,13 +395,25 @@ GET /metrics HTTP/1.1
 
 **レスポンス（200 OK）:**
 
-```json
-{
-  "uptime_seconds": 3600,
-  "total_commands": 15000,
-  "connections": {"active": 5, "total": 1200},
-  "memory": {...}
-}
+```text
+# HELP nvecd_uptime_seconds Server uptime in seconds
+# TYPE nvecd_uptime_seconds counter
+nvecd_uptime_seconds 3600
+
+# HELP nvecd_commands_total Total commands processed
+# TYPE nvecd_commands_total counter
+nvecd_commands_total{command="event"} 4200
+nvecd_commands_total{command="vecset"} 1800
+nvecd_commands_total{command="sim"} 9000
+nvecd_commands_total 15000
+
+# HELP nvecd_memory_bytes Current memory usage in bytes
+# TYPE nvecd_memory_bytes gauge
+nvecd_memory_bytes 949452800
+```
+
+キャッシュ・ベクトル・イベント・コンテキストのゲージも出力されます
+（例: `nvecd_cache_hit_rate`、`nvecd_vectors_total`、`nvecd_events_total`）。
 ```
 
 ### GET /config
@@ -707,6 +722,7 @@ curl -X POST http://localhost:8080/event \
   -d '{
     "ctx": "user_alice",
     "id": "product123",
+    "type": "PURCHASE",
     "score": 100
   }'
 ```
@@ -772,6 +788,7 @@ await fetch('http://localhost:8080/event', {
   body: JSON.stringify({
     ctx: 'user_alice',
     id: 'product123',
+    type: 'PURCHASE',
     score: 100
   })
 });
@@ -805,6 +822,7 @@ import requests
 requests.post('http://localhost:8080/event', json={
     'ctx': 'user_alice',
     'id': 'product123',
+    'type': 'PURCHASE',
     'score': 100
 })
 
@@ -859,6 +877,7 @@ for ctx, product_id, score in events:
     requests.post(f'{BASE_URL}/event', json={
         'ctx': ctx,
         'id': product_id,
+        'type': 'PURCHASE',
         'score': score
     })
 
@@ -950,6 +969,7 @@ spec:
       periodSeconds: 10
 ```
 
-### Prometheus メトリクス（将来対応予定）
+### Prometheus メトリクス
 
-現在は JSON メトリクス用に `/info` エンドポイントを使用してください。Prometheus 形式は将来のリリースで対応予定です。
+`GET /metrics` は現在 Prometheus テキスト形式を公開しています。JSON が必要な場合は
+`/info` または `/health/detail` を使用してください。

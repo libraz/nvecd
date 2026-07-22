@@ -24,19 +24,33 @@ nvecd -c /path/to/config.yaml
 ```yaml
 events:
   ctx_buffer_size: 50          # コンテキストごとのリングバッファサイズ
+  max_contexts: 0              # 保持するアクティブコンテキスト数（0 = 無制限）
+  max_neighbors_per_item: 0    # アイテムごとの共起エッジ数（0 = 無制限）
+  min_support: 0.0             # このスコア未満のエッジを削除（0 = 無効）
   decay_interval_sec: 3600     # 減衰間隔（秒）
   decay_alpha: 0.99            # 減衰係数（0.0 - 1.0）
   dedup_window_sec: 60         # 重複排除の時間窓（秒）
   dedup_cache_size: 10000      # 重複排除キャッシュサイズ（LRU）
+  temporal_cooccurrence: false # 共起更新に時間減衰を適用
+  temporal_half_life_sec: 86400
+  negative_signals: false      # DEL イベントを負のフィードバックとして扱う
+  negative_weight: 0.5
 ```
 
 | オプション | 型 | デフォルト | 説明 |
 |--------|------|---------|-------------|
 | `ctx_buffer_size` | int | 50 | コンテキストごとに保持するイベント数。古いイベントは上書きされます。 |
+| `max_contexts` | int | 0 | 保持するアクティブコンテキストの最大数。`0` は無制限で、上限時は最も古いコンテキストから削除されます。 |
+| `max_neighbors_per_item` | int | 0 | アイテムごとに保持する共起エッジの最大数。`0` は無制限です。 |
+| `min_support` | float | 0.0 | このスコア未満の共起エッジを削除します。`0` は無効です。 |
 | `decay_interval_sec` | int | 3600 | 共起スコアの減衰間隔（0 = 無効）。 |
 | `decay_alpha` | float | 0.99 | 各減衰時のスコア乗数（0.0-1.0、高いほど減衰が遅い）。 |
 | `dedup_window_sec` | int | 60 | 重複検出の時間窓（秒）。この時間窓内に同じ `(ctx, id, score)` の組み合わせを受信した場合、重複として無視されます。0 に設定すると重複排除が無効になります。 |
 | `dedup_cache_size` | int | 10000 | 重複排除で追跡する最近のイベントの最大数（LRUキャッシュ）。満杯になると最も古いエントリが削除されます。 |
+| `temporal_cooccurrence` | bool | false | 時間減衰した共起寄与を有効にします。 |
+| `temporal_half_life_sec` | float | 86400 | temporal co-occurrence 有効時の減衰半減期（秒）。 |
+| `negative_signals` | bool | false | DEL イベントを負のフィードバックとして扱います。 |
+| `negative_weight` | float | 0.5 | 負のフィードバックの強さ（0.0-1.0）。 |
 
 **重複排除の動作:**
 
@@ -79,6 +93,10 @@ similarity:
   max_top_k: 1000              # 最大許容 top_k
   fusion_alpha: 0.6            # ベクトル類似度の重み（フュージョンモード）
   fusion_beta: 0.4             # 共起の重み（フュージョンモード）
+  adaptive_fusion: false       # アイテム成熟度に応じてベクトル重みを調整
+  adaptive_min_alpha: 0.2
+  adaptive_max_alpha: 0.9
+  adaptive_maturity_threshold: 50
 ```
 
 | オプション | 型 | デフォルト | 説明 |
@@ -87,8 +105,41 @@ similarity:
 | `max_top_k` | int | 1000 | 最大許容 top_k（メモリ問題を防ぐ）。 |
 | `fusion_alpha` | float | 0.6 | フュージョンモードでのベクトル類似度の重み（alpha + beta = 1.0）。 |
 | `fusion_beta` | float | 0.4 | フュージョンモードでの共起の重み。 |
+| `adaptive_fusion` | bool | false | 共起の成熟度に基づいて vector/fusion の重みを調整します。 |
+| `adaptive_min_alpha` | float | 0.2 | 成熟したアイテムでのベクトル重み。 |
+| `adaptive_max_alpha` | float | 0.9 | 新しいアイテムでのベクトル重み。 |
+| `adaptive_maturity_threshold` | int | 50 | アイテムを成熟とみなす近傍数。 |
 
 **注意**: `fusion_beta` を高くすると、イベントベースのシグナルがより重視されます。
+
+#### ANN インデックスの選択とチューニング
+
+`similarity.index_type` でアクティブなベクトルインデックスを選択します。値は既定の
+`flat`、`hnsw`、`ivf` です。サーバーが利用するのはこのいずれか 1 つだけであり、
+TieredVectorStore、MergeScheduler、ScalarQuantizer はランタイム機能としては提供していません。
+
+```yaml
+similarity:
+  index_type: hnsw
+  hnsw_m: 16
+  hnsw_ef_construction: 200
+  hnsw_ef_search: 50
+  hnsw_max_elements: 0       # 0 = 動的に拡張
+```
+
+| オプション | 既定値 | 説明 |
+|--------|---------|-------------|
+| `index_type` | `flat` | `flat`、`hnsw`、`ivf` のいずれか。 |
+| `hnsw_m` | 16 | HNSW ノードごとの接続数。大きいほどメモリを使い、再現率が向上する場合があります。 |
+| `hnsw_ef_construction` | 200 | 構築時の探索幅。大きいほど投入時間との引き換えに再現率が向上します。 |
+| `hnsw_ef_search` | 50 | 検索時の探索幅。大きいほどレイテンシとの引き換えに再現率が向上します。 |
+| `hnsw_max_elements` | 0 | HNSW の事前確保容量。`0` は動的拡張です。 |
+| `ivf_nlist` | 256 | IVF クラスタ数。 |
+| `ivf_nprobe` | 8 | クエリごとに探索するクラスタ数。大きいほどレイテンシとの引き換えに再現率が向上します。 |
+| `ivf_train_threshold` | 10000 | IVF 自動学習に必要なベクトル数。 |
+| `ivf_seal_threshold` | 100000 | IVF セグメントを確定するまでにバッファするベクトル数。 |
+
+`ivf_enabled` は互換性のため残されています。新しい設定では `index_type: ivf` を使用してください。
 
 ---
 
@@ -114,6 +165,32 @@ snapshot:
 | `mode` | string | "fork" | スナップショット戦略。`fork`: fork() によるコピーオンライト -- 親プロセスはサービスを継続。`lock`: 保存中にグローバル書き込みロックを取得。 |
 
 **自動スナップショットのファイル名**: `auto_YYYYMMDD_HHMMSS.snapshot`
+
+---
+
+### Write-Ahead Log（WAL）設定
+
+WAL は直近のスナップショット以降の書き込みを再起動時に再生します。
+`include_vectors: false` はログを小さくしますが、VECSET の内容は次のスナップショットまでクラッシュ復旧できません。
+
+```yaml
+wal:
+  enabled: false
+  dir: "/var/lib/nvecd/wal"
+  max_file_size: 67108864
+  sync_on_write: false
+  sync_interval_ms: 100
+  include_vectors: true
+```
+
+| オプション | 既定値 | 説明 |
+|--------|---------|-------------|
+| `enabled` | false | WAL によるクラッシュ復旧を有効化します。 |
+| `dir` | `/var/lib/nvecd/wal` | WAL セグメントのディレクトリ。有効時は必須です。 |
+| `max_file_size` | 67108864 | セグメントをローテーションするサイズ（バイト）。 |
+| `sync_on_write` | false | 最大の耐久性のため各 append ごとに fsync します。 |
+| `sync_interval_ms` | 100 | `sync_on_write` が false のときのバッチ fsync 間隔。 |
+| `include_vectors` | true | VECSET のペイロードを永続化します。無効化するのは、ベクトル永続性をスナップショットで満たせる場合だけです。 |
 
 ---
 
@@ -252,7 +329,7 @@ security:
 |--------|------|---------|-------------|
 | `requirepass` | string | "" | 書き込み/管理コマンド用のパスワード。空 = 認証なし。 |
 
-**注意**: `requirepass` が設定されている場合、クライアントは書き込みまたは管理コマンドを実行する前に `AUTH <password>` で認証する必要があります。読み取りコマンド（EVENT、SIM、SIMV、INFO）は認証を必要としません。
+**注意**: `requirepass` が設定されている場合、クライアントは書き込みまたは管理コマンドを実行する前に `AUTH <password>` で認証する必要があります。`EVENT`、`VECSET`、`METASET`、DUMP/SET は書き込みです。SIM、SIMV、INFO、CONFIG SHOW は読み取りコマンドです。
 
 ---
 

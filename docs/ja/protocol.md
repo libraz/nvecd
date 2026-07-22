@@ -222,7 +222,7 @@ SIM <id> <top_k> [using=events|vectors|fusion] [filter=<expr>] [min_score=<float
   - `events`: 共起ベース（イベントデータのみ）
   - `vectors`: ベクトル距離ベース（ベクトルデータのみ）
   - `fusion`（デフォルト）: 共起 x ベクトルのハイブリッド
-- `filter=`（省略可能）: メタデータフィルタ式。形式: `key:value`（単一条件）、`key1:value1,key2:value2`（AND条件）。値は自動型判定（文字列、整数、浮動小数点、真偽値）。メタデータが全条件に一致するアイテムのみ返されます。
+- `filter=`（省略可能）: メタデータフィルタ式。等価は `key:value`（または `key=value`）、比較は `!=`、`>`、`>=`、`<`、`<=`、集合所属は `key=in(value1|value2)` を使います。カンマ区切りの条件は AND 結合です。値は文字列、整数、浮動小数点、真偽値へ自動型判定されます。
 - `min_score=`（省略可能、デフォルト: 0.0）: 最小スコア閾値。score < min_score の結果はレスポンスから除外されます。
 - `adaptive=`（省略可能）: 適応型 fusion モード。`on` にすると、アイテムのデータ密度に基づいてベクトル/共起の重みバランスを自動調整します。fusion モードでのみ有効。`similarity.adaptive_*` 設定で調整可能。
 
@@ -247,8 +247,8 @@ item202 0.8567
 ```
 SIM item456 10 using=events
 → OK RESULTS 2
-item101 0.95
-item789 0.87
+item101 0.9500
+item789 0.8700
 ```
 
 **例（vectors のみ）**:
@@ -324,15 +324,15 @@ OK RESULTS <count>
 ```
 SIMV 5 0.1 0.9 -0.2 0.5
 → OK RESULTS 2
-item789 0.98
-item101 0.82
+item789 0.9800
+item101 0.8200
 ```
 
 **例（フィルタと min_score 付き）**:
 ```
 SIMV 5 filter=type:article min_score=0.7 0.1 0.9 -0.2 0.5
 → OK RESULTS 1
-item789 0.98
+item789 0.9800
 ```
 
 **エラーレスポンス**:
@@ -668,6 +668,7 @@ ttl_expirations: 8
 avg_hit_latency_ms: 0.125
 avg_miss_latency_ms: 2.450
 total_time_saved_ms: 2418.75
+END
 ```
 
 キャッシュインスタンスが構成されていない場合は、有効フラグとエントリ数のみが返されます:
@@ -675,6 +676,7 @@ total_time_saved_ms: 2418.75
 OK CACHE_STATS
 cache_enabled: false
 cache_entries: 0
+END
 ```
 
 **統計フィールド**:

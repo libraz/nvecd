@@ -839,9 +839,9 @@ Text-based protocol with `\r\n` delimiters.
 | Command | Syntax | Description |
 |---------|--------|-------------|
 | EVENT | `EVENT <ctx> <type> <id> <score>` | Register co-occurrence event |
-| VECSET | `VECSET <id> <dim>\r\n<v1> <v2> ...` | Register vector (multi-line) |
+| VECSET | `VECSET <id> <v1> <v2> ... <vN>` | Register vector |
 | SIM | `SIM <id> <top_k> [mode]` | Similarity search by ID |
-| SIMV | `SIMV <dim> <top_k> [mode]\r\n<v1> <v2> ...` | Similarity search by vector |
+| SIMV | `SIMV <top_k> [filter=<expr>] [min_score=<float>] <v1> <v2> ... <vN>` | Similarity search by vector |
 
 **MygramDB-compatible commands:**
 

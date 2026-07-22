@@ -120,7 +120,7 @@ Cache hit: **0.21us** (4.8M ops/sec). See [Benchmarks](docs/en/benchmarks.md) fo
 - **Metadata Filtering** - Attribute-based post-filtering for SIM/SIMV queries (`filter=key:value`)
 - **Score Thresholding** - Minimum score cutoff (`min_score=0.5`) to filter low-confidence results
 - **Write-Ahead Log** - Optional CRC32-verified operation log (`wal.enabled`); on restart, writes since the last snapshot are recovered by replaying the WAL
-- **Tiered Vector Store** - Two-tier architecture with delta buffer and background merge
+- **ANN Indexing** - Select HNSW or IVF through `similarity.index_type`
 - **Co-occurrence Pruning** - Configurable max neighbors and minimum support thresholds
 
 ## What Makes Nvecd Different
@@ -178,7 +178,7 @@ Configurable via `events.negative_signals` and `events.negative_weight`.
 | Cold-start handling | Automatic | Manual | Manual | N/A |
 | Distributed search | No | Yes | Yes | No |
 | Managed cloud service | No | Yes | Yes | No |
-| ANN indexing (HNSW, IVF, PQ) | HNSW + IVF | Yes | Yes | Yes |
+| ANN indexing (HNSW, IVF) | HNSW + IVF | Yes | Yes | Yes |
 | Metadata filtering | Yes (post-filter) | Yes | Yes | No |
 
 ## Architecture
@@ -191,7 +191,7 @@ graph LR
 
     subgraph Nvecd Engine
         Events[Event Store] --> CoOcc[Co-occurrence Index]
-        Vectors[Tiered Vector Store] --> ANN[HNSW / IVF Index]
+        Vectors[Vector Store] --> ANN[HNSW / IVF Index]
         ANN --> Sim[Similarity Engine]
         CoOcc --> Sim
         Sim --> Cache[Query Cache]

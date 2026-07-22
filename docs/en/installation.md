@@ -259,7 +259,7 @@ cd build
 ### Test Coverage
 
 - **Event Processing**: EventStore, CoOccurrenceIndex, StateCache, DedupCache (90+ tests)
-- **Vector Search**: VectorStore, TieredVectorStore, HNSW, IVF, distance functions (180+ tests)
+- **Vector Search**: VectorStore, HNSW, IVF, distance functions (180+ tests)
 - **Similarity Engine**: Fusion search, adaptive fusion, metadata filtering (45+ tests)
 - **Cache System**: SimilarityCache, cache policies, key generation, compression (100+ tests)
 - **Server & Protocol**: Command parser, handlers, HTTP server, networking (130+ tests)

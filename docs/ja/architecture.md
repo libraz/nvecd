@@ -838,9 +838,9 @@ class VectorStore {
 | コマンド | 構文 | 説明 |
 |---------|------|------|
 | EVENT | `EVENT <ctx> <type> <id> <score>` | 共起イベントの登録 |
-| VECSET | `VECSET <id> <dim>\r\n<v1> <v2> ...` | ベクトルの登録（複数行） |
+| VECSET | `VECSET <id> <v1> <v2> ... <vN>` | ベクトルの登録 |
 | SIM | `SIM <id> <top_k> [mode]` | IDによる類似度検索 |
-| SIMV | `SIMV <dim> <top_k> [mode]\r\n<v1> <v2> ...` | ベクトルによる類似度検索 |
+| SIMV | `SIMV <top_k> [filter=<expr>] [min_score=<float>] <v1> <v2> ... <vN>` | ベクトルによる類似度検索 |
 
 **MygramDB互換コマンド:**
 

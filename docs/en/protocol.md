@@ -222,7 +222,7 @@ SIM <id> <top_k> [using=events|vectors|fusion] [filter=<expr>] [min_score=<float
   - `events`: Co-occurrence-based (event data only)
   - `vectors`: Vector distance-based (vector data only)
   - `fusion` (default): Hybrid co-occurrence × vector
-- `filter=` (optional): Metadata filter expression. Format: `key:value` for single condition, `key1:value1,key2:value2` for AND conditions. Values are auto-typed (string, int, float, bool). Only items whose metadata matches all conditions are returned.
+- `filter=` (optional): Metadata filter expression. Use `key:value` (or `key=value`) for equality; `!=`, `>`, `>=`, `<`, `<=` for comparisons; and `key=in(value1|value2)` for membership. Comma-separated conditions are ANDed. Values are auto-typed (string, int, float, bool).
 - `min_score=` (optional, default: 0.0): Minimum score threshold. Results with score < min_score are excluded from the response.
 - `adaptive=` (optional): Adaptive fusion mode. When `on`, automatically adjusts the vector/co-occurrence weight balance based on item data density. Only applicable in fusion mode. Configurable via `similarity.adaptive_*` settings.
 
@@ -247,8 +247,8 @@ item202 0.8567
 ```
 SIM item456 10 using=events
 → OK RESULTS 2
-item101 0.95
-item789 0.87
+item101 0.9500
+item789 0.8700
 ```
 
 **Example (vectors only)**:
@@ -324,15 +324,15 @@ OK RESULTS <count>
 ```
 SIMV 5 0.1 0.9 -0.2 0.5
 → OK RESULTS 2
-item789 0.98
-item101 0.82
+item789 0.9800
+item101 0.8200
 ```
 
 **Example (with filter and min_score)**:
 ```
 SIMV 5 filter=type:article min_score=0.7 0.1 0.9 -0.2 0.5
 → OK RESULTS 1
-item789 0.98
+item789 0.9800
 ```
 
 **Error Responses**:
@@ -671,6 +671,7 @@ ttl_expirations: 8
 avg_hit_latency_ms: 0.125
 avg_miss_latency_ms: 2.450
 total_time_saved_ms: 2418.75
+END
 ```
 
 When no cache instance is configured, only the enabled flag and entry count are returned:
@@ -678,6 +679,7 @@ When no cache instance is configured, only the enabled flag and entry count are 
 OK CACHE_STATS
 cache_enabled: false
 cache_entries: 0
+END
 ```
 
 **Statistics fields**:

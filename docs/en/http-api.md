@@ -345,7 +345,7 @@ GET /info HTTP/1.1
     "peak_memory_human": "963.20 MB",
     "process_rss": 990000000,
     "process_rss_human": "944.13 MB",
-    "memory_health": "ok"
+    "memory_health": "HEALTHY"
   },
   "stores": {
     "event_store": {
@@ -865,6 +865,7 @@ curl -X POST http://localhost:8080/event \
   -d '{
     "ctx": "user_alice",
     "id": "product123",
+    "type": "ADD",
     "score": 100
   }'
 ```
@@ -930,6 +931,7 @@ await fetch('http://localhost:8080/event', {
   body: JSON.stringify({
     ctx: 'user_alice',
     id: 'product123',
+    type: 'ADD',
     score: 100
   })
 });
@@ -963,6 +965,7 @@ import requests
 requests.post('http://localhost:8080/event', json={
     'ctx': 'user_alice',
     'id': 'product123',
+    'type': 'ADD',
     'score': 100
 })
 
@@ -1017,6 +1020,7 @@ for ctx, product_id, score in events:
     requests.post(f'{BASE_URL}/event', json={
         'ctx': ctx,
         'id': product_id,
+        'type': 'ADD',
         'score': score
     })
 
@@ -1110,6 +1114,7 @@ spec:
       periodSeconds: 10
 ```
 
-### Prometheus Metrics (Future)
+### Prometheus Metrics
 
-Currently, use `/info` endpoint for JSON metrics. Prometheus format is planned for future releases.
+`GET /metrics` exposes Prometheus text format today. Use `/info` or
+`/health/detail` when a JSON response is more convenient.

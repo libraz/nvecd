@@ -259,7 +259,7 @@ cd build
 ### テストカバレッジ
 
 - **イベント処理**: EventStore、CoOccurrenceIndex、StateCache、DedupCache (90 以上)
-- **ベクトル検索**: VectorStore、TieredVectorStore、HNSW、IVF、距離関数 (180 以上)
+- **ベクトル検索**: VectorStore、HNSW、IVF、距離関数 (180 以上)
 - **類似度エンジン**: Fusion 検索、適応型 Fusion、メタデータフィルタ (45 以上)
 - **キャッシュシステム**: SimilarityCache、キャッシュポリシー、キー生成、圧縮 (100 以上)
 - **サーバー & プロトコル**: コマンドパーサー、ハンドラ、HTTP サーバー、ネットワーク (130 以上)
