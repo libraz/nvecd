@@ -64,7 +64,10 @@ constexpr int kHttpTimeoutSec = 5;
  * @brief Event store configuration
  */
 struct EventsConfig {
-  uint32_t ctx_buffer_size = defaults::kCtxBufferSize;        ///< Events per context (ring buffer size)
+  uint32_t ctx_buffer_size = defaults::kCtxBufferSize;  ///< Events per context (ring buffer size)
+  uint32_t max_contexts = 0;                            ///< Active contexts retained (0 = unlimited)
+  uint32_t max_neighbors_per_item = 0;                  ///< Co-occurrence neighbors per item (0 = unlimited)
+  double min_support = 0.0;                             ///< Prune co-occurrence edges below this score (0 = disabled)
   uint32_t decay_interval_sec = defaults::kDecayIntervalSec;  ///< Decay interval in seconds
   double decay_alpha = defaults::kDecayAlpha;                 ///< Decay factor (0.0-1.0)
   uint32_t dedup_window_sec = defaults::kDedupWindowSec;      ///< Deduplication time window in seconds

@@ -74,6 +74,9 @@ nlohmann::json ConfigToJson(const Config& config) {
   // Events configuration
   json["events"] = {
       {"ctx_buffer_size", config.events.ctx_buffer_size},
+      {"max_contexts", config.events.max_contexts},
+      {"max_neighbors_per_item", config.events.max_neighbors_per_item},
+      {"min_support", config.events.min_support},
       {"decay_interval_sec", config.events.decay_interval_sec},
       {"decay_alpha", config.events.decay_alpha},
       {"dedup_window_sec", config.events.dedup_window_sec},
@@ -157,19 +160,16 @@ nlohmann::json ConfigToJson(const Config& config) {
        }},
   };
 
-  // Network configuration
-  if (!config.network.allow_cidrs.empty()) {
-    json["network"]["allow_cidrs"] = config.network.allow_cidrs;
-  }
+  // Keep optional and empty values visible so CONFIG SHOW has the same
+  // introspection surface as SHOW VARIABLES.
+  json["network"]["allow_cidrs"] = config.network.allow_cidrs;
 
   // Logging configuration
   json["logging"] = {
       {"level", config.logging.level},
       {"json", config.logging.json},
   };
-  if (!config.logging.file.empty()) {
-    json["logging"]["file"] = config.logging.file;
-  }
+  json["logging"]["file"] = config.logging.file;
 
   // Cache configuration
   constexpr size_t kBytesPerMB = 1024 * 1024;  // Bytes in one megabyte
@@ -184,12 +184,10 @@ nlohmann::json ConfigToJson(const Config& config) {
 
   // Security configuration
   // auth_enabled lets operators confirm whether authentication is active
-  // without exposing the secret. The requirepass value itself is masked by
-  // IsSensitiveField before display and is only emitted when a password is set.
+  // without exposing the secret. requirepass is included for parity with
+  // runtime introspection and is masked before display.
   json["security"]["auth_enabled"] = !config.security.requirepass.empty();
-  if (!config.security.requirepass.empty()) {
-    json["security"]["requirepass"] = config.security.requirepass;
-  }
+  json["security"]["requirepass"] = config.security.requirepass;
 
   // WAL configuration
   json["wal"] = {
@@ -638,6 +636,13 @@ utils::Expected<std::string, utils::Error> FormatConfigForDisplay(const Config& 
       return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kNotFound, "Path not found: " + path));
     }
     config_json = node.value();
+
+    // When the path resolves to a scalar leaf (e.g. "security.requirepass"),
+    // MaskSensitiveFieldsRecursive is a no-op because it only descends objects
+    // and arrays. Mask the leaf here so a scalar secret is never disclosed.
+    if (!config_json.is_object() && !config_json.is_array() && IsSensitiveField(path) && !config_json.is_null()) {
+      return JsonToYaml(nlohmann::json("***"));
+    }
   }
 
   // Mask sensitive fields

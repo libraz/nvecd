@@ -11,7 +11,9 @@
 #include <spdlog/spdlog.h>
 
 #include <charconv>
+#include <cmath>
 #include <shared_mutex>
+#include <string_view>
 
 #include "cache/similarity_cache.h"
 #include "utils/structured_log.h"
@@ -24,6 +26,32 @@ using utils::Expected;
 using utils::MakeError;
 using utils::MakeUnexpected;
 
+namespace {
+
+// Configuration files and the JSON schema use `performance.*`.  Accept the
+// historical `perf.*` spelling on the command surface, but expose only the
+// schema spelling from SHOW VARIABLES and related introspection.
+std::string CanonicalVariableName(const std::string& variable_name) {
+  constexpr std::string_view kLegacyPrefix = "perf.";
+  if (variable_name.compare(0, kLegacyPrefix.size(), kLegacyPrefix) == 0) {
+    return "performance." + variable_name.substr(kLegacyPrefix.size());
+  }
+  return variable_name;
+}
+
+std::string CanonicalDouble(double value) {
+  char buffer[64];
+  const auto [end, ec] = std::to_chars(buffer, buffer + sizeof(buffer), value, std::chars_format::general);
+  if (ec == std::errc{}) {
+    return {buffer, end};
+  }
+  // ParseDouble already guarantees a finite value. This fallback is only for
+  // platforms whose floating-point to_chars implementation reports an error.
+  return std::to_string(value);
+}
+
+}  // namespace
+
 // Mutable variables (can be changed at runtime)
 static const std::map<std::string, bool> kVariableMutability = {
     // Logging
@@ -35,7 +63,7 @@ static const std::map<std::string, bool> kVariableMutability = {
     {"cache.enabled", true},
     {"cache.min_query_cost_ms", true},
     {"cache.ttl_seconds", true},
-    {"cache.max_memory_bytes", false},     // Immutable (memory allocation)
+    {"cache.max_memory_mb", false},        // Immutable (memory allocation)
     {"cache.compression_enabled", false},  // Immutable
     {"cache.eviction_batch_size", false},  // Immutable
 
@@ -58,6 +86,9 @@ static const std::map<std::string, bool> kVariableMutability = {
 
     // Event store (all immutable - data structures)
     {"events.ctx_buffer_size", false},
+    {"events.max_contexts", false},
+    {"events.max_neighbors_per_item", false},
+    {"events.min_support", false},
     {"events.decay_alpha", false},
     {"events.decay_interval_sec", false},
     {"events.dedup_window_sec", false},
@@ -86,17 +117,40 @@ static const std::map<std::string, bool> kVariableMutability = {
     {"snapshot.mode", false},
 
     // Performance (all immutable)
-    {"perf.thread_pool_size", false},
-    {"perf.max_connections", false},
-    {"perf.max_connections_per_ip", false},
-    {"perf.connection_timeout_sec", false},
-    {"perf.recv_buffer_size", false},
-    {"perf.send_buffer_size", false},
-    {"perf.max_query_length", false},
-    {"perf.shutdown_timeout_ms", false},
+    {"performance.thread_pool_size", false},
+    {"performance.max_connections", false},
+    {"performance.max_connections_per_ip", false},
+    {"performance.connection_timeout_sec", false},
+    {"performance.recv_buffer_size", false},
+    {"performance.send_buffer_size", false},
+    {"performance.max_query_length", false},
+    {"performance.shutdown_timeout_ms", false},
 
     // API HTTP timeout (immutable)
     {"api.http.timeout_sec", false},
+    {"api.unix_socket.path", false},
+    {"events.temporal_half_life_sec", false},
+    {"events.negative_weight", false},
+    {"similarity.sample_size", false},
+    {"similarity.adaptive_min_alpha", false},
+    {"similarity.adaptive_max_alpha", false},
+    {"similarity.adaptive_maturity_threshold", false},
+    {"similarity.ivf_nlist", false},
+    {"similarity.ivf_nprobe", false},
+    {"similarity.ivf_train_threshold", false},
+    {"similarity.ivf_seal_threshold", false},
+    {"similarity.hnsw_m", false},
+    {"similarity.hnsw_ef_construction", false},
+    {"similarity.hnsw_ef_search", false},
+    {"similarity.hnsw_max_elements", false},
+    {"network.allow_cidrs", false},
+    {"security.requirepass", false},
+    {"wal.enabled", false},
+    {"wal.dir", false},
+    {"wal.max_file_size", false},
+    {"wal.sync_on_write", false},
+    {"wal.sync_interval_ms", false},
+    {"wal.include_vectors", false},
 };
 
 RuntimeVariableManager::RuntimeVariableManager(ConstructorTag) {}
@@ -118,8 +172,9 @@ void RuntimeVariableManager::InitializeRuntimeValues() {
 }
 
 Expected<void, Error> RuntimeVariableManager::SetVariable(const std::string& variable_name, const std::string& value) {
+  const auto canonical_name = CanonicalVariableName(variable_name);
   // Check if variable exists
-  auto var_iter = kVariableMutability.find(variable_name);
+  auto var_iter = kVariableMutability.find(canonical_name);
   if (var_iter == kVariableMutability.end()) {
     return MakeUnexpected(MakeError(ErrorCode::kInvalidArgument, "Unknown variable: " + variable_name));
   }
@@ -130,34 +185,46 @@ Expected<void, Error> RuntimeVariableManager::SetVariable(const std::string& var
         MakeError(ErrorCode::kInvalidArgument, "Variable '" + variable_name + "' is immutable (requires restart)"));
   }
 
-  // Apply variable-specific logic
+  // Parse before changing process-wide component state, then store a canonical
+  // representation. CONFIG SHOW and a subsequent CONFIG SET therefore round
+  // trip regardless of whether callers used aliases such as "on" or "1".
   Expected<void, Error> result;
+  std::string canonical_value;
+  // Serializing the apply + map-update sequence prevents a slower component
+  // callback from making runtime_values_ disagree with the actual last-applied
+  // setting when multiple CONFIG SET requests arrive concurrently.
+  std::scoped_lock set_lock(set_mutex_);
 
-  if (variable_name == "logging.level") {
+  if (canonical_name == "logging.level") {
+    canonical_value = value;
     result = ApplyLoggingLevel(value);
-  } else if (variable_name == "logging.json") {
+  } else if (canonical_name == "logging.json") {
     auto json_enabled = ParseBool(value);
     if (!json_enabled) {
       return MakeUnexpected(json_enabled.error());
     }
+    canonical_value = *json_enabled ? "true" : "false";
     result = ApplyLoggingFormat(*json_enabled ? "json" : "text");
-  } else if (variable_name == "cache.enabled") {
+  } else if (canonical_name == "cache.enabled") {
     auto enabled = ParseBool(value);
     if (!enabled) {
       return MakeUnexpected(enabled.error());
     }
+    canonical_value = *enabled ? "true" : "false";
     result = ApplyCacheEnabled(*enabled);
-  } else if (variable_name == "cache.min_query_cost_ms") {
+  } else if (canonical_name == "cache.min_query_cost_ms") {
     auto cost = ParseDouble(value);
     if (!cost) {
       return MakeUnexpected(cost.error());
     }
+    canonical_value = CanonicalDouble(*cost);
     result = ApplyCacheMinQueryCost(*cost);
-  } else if (variable_name == "cache.ttl_seconds") {
+  } else if (canonical_name == "cache.ttl_seconds") {
     auto ttl = ParseInt(value);
     if (!ttl) {
       return MakeUnexpected(ttl.error());
     }
+    canonical_value = std::to_string(*ttl);
     result = ApplyCacheTtl(*ttl);
   } else {
     return MakeUnexpected(MakeError(ErrorCode::kInvalidArgument, "Variable not implemented: " + variable_name));
@@ -167,25 +234,28 @@ Expected<void, Error> RuntimeVariableManager::SetVariable(const std::string& var
     return result;
   }
 
-  // Update runtime value (with lock)
   {
     std::unique_lock lock(mutex_);
-    runtime_values_[variable_name] = value;
+    runtime_values_[canonical_name] = canonical_value;
   }
 
   // Log the change
-  utils::StructuredLog().Event("variable_changed").Field("variable", variable_name).Field("value", value).Info();
+  utils::StructuredLog()
+      .Event("variable_changed")
+      .Field("variable", canonical_name)
+      .Field("value", canonical_value)
+      .Info();
 
   return {};
 }
 
 Expected<std::string, Error> RuntimeVariableManager::GetVariable(const std::string& variable_name) const {
   std::shared_lock lock(mutex_);
-  std::string value = GetVariableInternal(variable_name);
-  if (value.empty()) {
+  const auto canonical_name = CanonicalVariableName(variable_name);
+  if (kVariableMutability.find(canonical_name) == kVariableMutability.end()) {
     return MakeUnexpected(MakeError(ErrorCode::kInvalidArgument, "Unknown variable: " + variable_name));
   }
-  return value;
+  return GetVariableInternal(canonical_name);
 }
 
 std::map<std::string, VariableInfo> RuntimeVariableManager::GetAllVariables(const std::string& prefix) const {
@@ -199,16 +269,14 @@ std::map<std::string, VariableInfo> RuntimeVariableManager::GetAllVariables(cons
     }
 
     std::string value = GetVariableInternal(name);
-    if (!value.empty()) {
-      result[name] = {value, is_mutable};
-    }
+    result[name] = {value, is_mutable};
   }
 
   return result;
 }
 
 bool RuntimeVariableManager::IsMutable(const std::string& variable_name) {
-  auto var_iter = kVariableMutability.find(variable_name);
+  auto var_iter = kVariableMutability.find(CanonicalVariableName(variable_name));
   return (var_iter != kVariableMutability.end()) && var_iter->second;
 }
 
@@ -305,8 +373,9 @@ std::string RuntimeVariableManager::GetVariableInternal(const std::string& varia
   }
 
   // Cache
-  if (variable_name == "cache.max_memory_bytes") {
-    return std::to_string(base_config_.cache.max_memory_bytes);
+  if (variable_name == "cache.max_memory_mb") {
+    constexpr size_t kBytesPerMB = 1024 * 1024;
+    return std::to_string(base_config_.cache.max_memory_bytes / kBytesPerMB);
   }
   if (variable_name == "cache.compression_enabled") {
     return base_config_.cache.compression_enabled ? "true" : "false";
@@ -357,6 +426,15 @@ std::string RuntimeVariableManager::GetVariableInternal(const std::string& varia
   // Events
   if (variable_name == "events.ctx_buffer_size") {
     return std::to_string(base_config_.events.ctx_buffer_size);
+  }
+  if (variable_name == "events.max_contexts") {
+    return std::to_string(base_config_.events.max_contexts);
+  }
+  if (variable_name == "events.max_neighbors_per_item") {
+    return std::to_string(base_config_.events.max_neighbors_per_item);
+  }
+  if (variable_name == "events.min_support") {
+    return std::to_string(base_config_.events.min_support);
   }
   if (variable_name == "events.decay_alpha") {
     return std::to_string(base_config_.events.decay_alpha);
@@ -426,28 +504,28 @@ std::string RuntimeVariableManager::GetVariableInternal(const std::string& varia
   }
 
   // Performance
-  if (variable_name == "perf.thread_pool_size") {
+  if (variable_name == "performance.thread_pool_size") {
     return std::to_string(base_config_.perf.thread_pool_size);
   }
-  if (variable_name == "perf.max_connections") {
+  if (variable_name == "performance.max_connections") {
     return std::to_string(base_config_.perf.max_connections);
   }
-  if (variable_name == "perf.max_connections_per_ip") {
+  if (variable_name == "performance.max_connections_per_ip") {
     return std::to_string(base_config_.perf.max_connections_per_ip);
   }
-  if (variable_name == "perf.connection_timeout_sec") {
+  if (variable_name == "performance.connection_timeout_sec") {
     return std::to_string(base_config_.perf.connection_timeout_sec);
   }
-  if (variable_name == "perf.recv_buffer_size") {
+  if (variable_name == "performance.recv_buffer_size") {
     return std::to_string(base_config_.perf.recv_buffer_size);
   }
-  if (variable_name == "perf.send_buffer_size") {
+  if (variable_name == "performance.send_buffer_size") {
     return std::to_string(base_config_.perf.send_buffer_size);
   }
-  if (variable_name == "perf.max_query_length") {
+  if (variable_name == "performance.max_query_length") {
     return std::to_string(base_config_.perf.max_query_length);
   }
-  if (variable_name == "perf.shutdown_timeout_ms") {
+  if (variable_name == "performance.shutdown_timeout_ms") {
     return std::to_string(base_config_.perf.shutdown_timeout_ms);
   }
 
@@ -455,6 +533,59 @@ std::string RuntimeVariableManager::GetVariableInternal(const std::string& varia
   if (variable_name == "api.http.timeout_sec") {
     return std::to_string(base_config_.api.http.timeout_sec);
   }
+  if (variable_name == "api.unix_socket.path")
+    return base_config_.api.unix_socket.path;
+  if (variable_name == "events.temporal_half_life_sec")
+    return std::to_string(base_config_.events.temporal_half_life_sec);
+  if (variable_name == "events.negative_weight")
+    return std::to_string(base_config_.events.negative_weight);
+  if (variable_name == "similarity.sample_size")
+    return std::to_string(base_config_.similarity.sample_size);
+  if (variable_name == "similarity.adaptive_min_alpha")
+    return std::to_string(base_config_.similarity.adaptive_min_alpha);
+  if (variable_name == "similarity.adaptive_max_alpha")
+    return std::to_string(base_config_.similarity.adaptive_max_alpha);
+  if (variable_name == "similarity.adaptive_maturity_threshold")
+    return std::to_string(base_config_.similarity.adaptive_maturity_threshold);
+  if (variable_name == "similarity.ivf_nlist")
+    return std::to_string(base_config_.similarity.ivf_nlist);
+  if (variable_name == "similarity.ivf_nprobe")
+    return std::to_string(base_config_.similarity.ivf_nprobe);
+  if (variable_name == "similarity.ivf_train_threshold")
+    return std::to_string(base_config_.similarity.ivf_train_threshold);
+  if (variable_name == "similarity.ivf_seal_threshold")
+    return std::to_string(base_config_.similarity.ivf_seal_threshold);
+  if (variable_name == "similarity.hnsw_m")
+    return std::to_string(base_config_.similarity.hnsw_m);
+  if (variable_name == "similarity.hnsw_ef_construction")
+    return std::to_string(base_config_.similarity.hnsw_ef_construction);
+  if (variable_name == "similarity.hnsw_ef_search")
+    return std::to_string(base_config_.similarity.hnsw_ef_search);
+  if (variable_name == "similarity.hnsw_max_elements")
+    return std::to_string(base_config_.similarity.hnsw_max_elements);
+  if (variable_name == "network.allow_cidrs") {
+    std::string value;
+    for (size_t i = 0; i < base_config_.network.allow_cidrs.size(); ++i) {
+      if (i != 0)
+        value += ',';
+      value += base_config_.network.allow_cidrs[i];
+    }
+    return value;
+  }
+  if (variable_name == "security.requirepass")
+    return base_config_.security.requirepass.empty() ? "" : "***";
+  if (variable_name == "wal.enabled")
+    return base_config_.wal.enabled ? "true" : "false";
+  if (variable_name == "wal.dir")
+    return base_config_.wal.dir;
+  if (variable_name == "wal.max_file_size")
+    return std::to_string(base_config_.wal.max_file_size);
+  if (variable_name == "wal.sync_on_write")
+    return base_config_.wal.sync_on_write ? "true" : "false";
+  if (variable_name == "wal.sync_interval_ms")
+    return std::to_string(base_config_.wal.sync_interval_ms);
+  if (variable_name == "wal.include_vectors")
+    return base_config_.wal.include_vectors ? "true" : "false";
 
   return "";  // Unknown variable
 }
@@ -485,7 +616,7 @@ Expected<double, Error> RuntimeVariableManager::ParseDouble(const std::string& v
   try {
     size_t pos = 0;
     double result = std::stod(value, &pos);
-    if (pos != value.size()) {
+    if (pos != value.size() || !std::isfinite(result)) {
       return MakeUnexpected(MakeError(ErrorCode::kInvalidArgument, "Invalid double value: " + value));
     }
     return result;

@@ -18,6 +18,26 @@
           "minimum": 10,
           "maximum": 10000
         },
+        "max_contexts": {
+          "type": "integer",
+          "description": "Maximum active contexts retained by the LRU (0 = unlimited)",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "max_neighbors_per_item": {
+          "type": "integer",
+          "description": "Maximum retained co-occurrence neighbors per item (0 = unlimited)",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "min_support": {
+          "type": "number",
+          "description": "Prune co-occurrence edges with absolute score below this threshold (0 = disabled)",
+          "default": 0.0,
+          "minimum": 0.0
+        },
         "decay_interval_sec": {
           "type": "integer",
           "description": "Decay interval in seconds (0 = disabled)",
@@ -196,7 +216,7 @@
           "type": "integer",
           "description": "HNSW number of connections per node",
           "default": 16,
-          "minimum": 1
+          "minimum": 2
         },
         "hnsw_ef_construction": {
           "type": "integer",
@@ -244,7 +264,7 @@
           "type": "integer",
           "description": "Number of snapshots to retain",
           "default": 3,
-          "minimum": 1,
+          "minimum": 0,
           "maximum": 100
         },
         "mode": {
@@ -264,7 +284,7 @@
           "type": "integer",
           "description": "Worker thread pool size",
           "default": 8,
-          "minimum": 1,
+          "minimum": 0,
           "maximum": 128
         },
         "max_connections": {

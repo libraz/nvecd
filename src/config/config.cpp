@@ -11,6 +11,7 @@
 #include <yaml-cpp/yaml.h>
 
 #include <cerrno>
+#include <cmath>
 #include <cstdlib>
 #include <fstream>
 #include <nlohmann/json-schema.hpp>
@@ -114,6 +115,15 @@ EventsConfig ParseEventsConfig(const YAML::Node& node) {
 
   if (node["ctx_buffer_size"]) {
     config.ctx_buffer_size = node["ctx_buffer_size"].as<uint32_t>();
+  }
+  if (node["max_contexts"]) {
+    config.max_contexts = node["max_contexts"].as<uint32_t>();
+  }
+  if (node["max_neighbors_per_item"]) {
+    config.max_neighbors_per_item = node["max_neighbors_per_item"].as<uint32_t>();
+  }
+  if (node["min_support"]) {
+    config.min_support = node["min_support"].as<double>();
   }
   if (node["decay_interval_sec"]) {
     config.decay_interval_sec = node["decay_interval_sec"].as<uint32_t>();
@@ -566,10 +576,36 @@ utils::Expected<Config, utils::Error> LoadConfig(const std::string& path) {
 }
 
 utils::Expected<void, utils::Error> ValidateConfig(const Config& config) {
+  const auto require_finite = [](double value, const char* name) -> utils::Expected<void, utils::Error> {
+    if (std::isfinite(value)) {
+      return {};
+    }
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kConfigInvalidValue, std::string(name) + " must be finite"));
+  };
+  for (const auto& [value, name] : {std::pair{config.events.min_support, "events.min_support"},
+                                    std::pair{config.events.decay_alpha, "events.decay_alpha"},
+                                    std::pair{config.events.temporal_half_life_sec, "events.temporal_half_life_sec"},
+                                    std::pair{config.events.negative_weight, "events.negative_weight"},
+                                    std::pair{config.similarity.fusion_alpha, "similarity.fusion_alpha"},
+                                    std::pair{config.similarity.fusion_beta, "similarity.fusion_beta"},
+                                    std::pair{config.similarity.adaptive_min_alpha, "similarity.adaptive_min_alpha"},
+                                    std::pair{config.similarity.adaptive_max_alpha, "similarity.adaptive_max_alpha"},
+                                    std::pair{config.cache.min_query_cost_ms, "cache.min_query_cost_ms"}}) {
+    auto finite = require_finite(value, name);
+    if (!finite) {
+      return finite;
+    }
+  }
+
   // Validate events configuration
   if (config.events.ctx_buffer_size == 0) {
     return utils::MakeUnexpected(
         utils::MakeError(utils::ErrorCode::kConfigInvalidValue, "events.ctx_buffer_size must be greater than 0"));
+  }
+  if (config.events.min_support < 0.0) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kConfigInvalidValue, "events.min_support must not be negative"));
   }
   if (config.events.decay_alpha < 0.0 || config.events.decay_alpha > 1.0) {
     return utils::MakeUnexpected(

@@ -11,6 +11,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <shared_mutex>
 #include <string>
 #include <utility>
@@ -55,9 +56,9 @@ struct VariableInfo {
  * - api.tcp.*, api.http.* (socket binding)
  * - events.*, vectors.* (data structures)
  * - similarity.* (engine configuration)
- * - cache.max_memory_bytes (memory allocation)
+ * - cache.max_memory_mb (memory allocation)
  * - snapshot.* (snapshot configuration)
- * - perf.* (performance tuning)
+ * - performance.* (performance tuning; the legacy perf.* alias is accepted)
  *
  * Feature flags are surfaced as immutable variables so operators can inspect
  * them via SHOW VARIABLES while SET attempts are rejected:
@@ -141,6 +142,10 @@ class RuntimeVariableManager {
 
   // Thread-safe storage (readers-writer lock)
   mutable std::shared_mutex mutex_;
+
+  // Serializes the externally visible apply + value-update transaction without
+  // holding mutex_ while a cache callback or logger may call back into us.
+  std::mutex set_mutex_;
 
   // Current runtime values (only mutable variables)
   std::map<std::string, std::string> runtime_values_;

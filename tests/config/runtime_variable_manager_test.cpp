@@ -122,6 +122,36 @@ TEST(RuntimeVariableManagerTest, GetVariable_ImmutableVectorsDimension) {
   EXPECT_EQ(*val, "768");
 }
 
+TEST(RuntimeVariableManagerTest, GetVariable_UsesSchemaPerformancePrefixAndAcceptsLegacyAlias) {
+  Config config = MakeDefaultConfig();
+  auto manager = *RuntimeVariableManager::Create(config);
+
+  auto canonical = manager->GetVariable("performance.thread_pool_size");
+  ASSERT_TRUE(canonical) << canonical.error().message();
+  EXPECT_EQ(*canonical, "8");
+
+  auto legacy = manager->GetVariable("perf.thread_pool_size");
+  ASSERT_TRUE(legacy) << legacy.error().message();
+  EXPECT_EQ(*legacy, "8");
+}
+
+TEST(RuntimeVariableManagerTest, GetVariable_KnownEmptyAndSensitiveValuesAreHandledSafely) {
+  Config config = MakeDefaultConfig();
+  config.api.unix_socket.path.clear();
+  config.network.allow_cidrs = {"127.0.0.0/8", "10.0.0.0/8"};
+  config.security.requirepass = "not-exposed";
+  config.wal.enabled = true;
+  auto manager = *RuntimeVariableManager::Create(config);
+
+  auto socket_path = manager->GetVariable("api.unix_socket.path");
+  ASSERT_TRUE(socket_path) << socket_path.error().message();
+  EXPECT_TRUE(socket_path->empty());
+
+  EXPECT_EQ(*manager->GetVariable("network.allow_cidrs"), "127.0.0.0/8,10.0.0.0/8");
+  EXPECT_EQ(*manager->GetVariable("security.requirepass"), "***");
+  EXPECT_EQ(*manager->GetVariable("wal.enabled"), "true");
+}
+
 // ============================================================================
 // GetVariable: unknown variable fails
 // ============================================================================
@@ -249,6 +279,14 @@ TEST(RuntimeVariableManagerTest, SetVariable_CacheMinQueryCostMs_Negative_Fails)
   EXPECT_FALSE(result);
 }
 
+TEST(RuntimeVariableManagerTest, SetVariable_CacheMinQueryCostMs_NonFinite_Fails) {
+  Config config = MakeDefaultConfig();
+  auto manager = *RuntimeVariableManager::Create(config);
+
+  EXPECT_FALSE(manager->SetVariable("cache.min_query_cost_ms", "nan"));
+  EXPECT_FALSE(manager->SetVariable("cache.min_query_cost_ms", "inf"));
+}
+
 TEST(RuntimeVariableManagerTest, SetVariable_LoggingJson_Toggle) {
   Config config = MakeDefaultConfig();
   auto manager = *RuntimeVariableManager::Create(config);
@@ -259,6 +297,20 @@ TEST(RuntimeVariableManagerTest, SetVariable_LoggingJson_Toggle) {
   auto val = manager->GetVariable("logging.json");
   ASSERT_TRUE(val);
   EXPECT_EQ(*val, "false");
+}
+
+TEST(RuntimeVariableManagerTest, SetVariable_CanonicalizesAcceptedValueAliases) {
+  Config config = MakeDefaultConfig();
+  auto manager = *RuntimeVariableManager::Create(config);
+
+  ASSERT_TRUE(manager->SetVariable("cache.enabled", "on"));
+  EXPECT_EQ(*manager->GetVariable("cache.enabled"), "true");
+
+  ASSERT_TRUE(manager->SetVariable("logging.json", "0"));
+  EXPECT_EQ(*manager->GetVariable("logging.json"), "false");
+
+  ASSERT_TRUE(manager->SetVariable("cache.min_query_cost_ms", "5.5000"));
+  EXPECT_EQ(*manager->GetVariable("cache.min_query_cost_ms"), "5.5");
 }
 
 // ============================================================================
@@ -285,7 +337,7 @@ TEST(RuntimeVariableManagerTest, SetVariable_ImmutableCacheMaxMemory_Fails) {
   Config config = MakeDefaultConfig();
   auto manager = *RuntimeVariableManager::Create(config);
 
-  auto result = manager->SetVariable("cache.max_memory_bytes", "1024");
+  auto result = manager->SetVariable("cache.max_memory_mb", "1024");
   EXPECT_FALSE(result);
 }
 
@@ -325,10 +377,11 @@ TEST(RuntimeVariableManagerTest, IsMutable_ImmutableVariables) {
   EXPECT_FALSE(RuntimeVariableManager::IsMutable("api.tcp.port"));
   EXPECT_FALSE(RuntimeVariableManager::IsMutable("api.tcp.bind"));
   EXPECT_FALSE(RuntimeVariableManager::IsMutable("vectors.default_dimension"));
-  EXPECT_FALSE(RuntimeVariableManager::IsMutable("cache.max_memory_bytes"));
+  EXPECT_FALSE(RuntimeVariableManager::IsMutable("cache.max_memory_mb"));
   EXPECT_FALSE(RuntimeVariableManager::IsMutable("snapshot.dir"));
   EXPECT_FALSE(RuntimeVariableManager::IsMutable("snapshot.mode"));
   EXPECT_FALSE(RuntimeVariableManager::IsMutable("perf.thread_pool_size"));
+  EXPECT_FALSE(RuntimeVariableManager::IsMutable("performance.thread_pool_size"));
 }
 
 TEST(RuntimeVariableManagerTest, IsMutable_UnknownVariable) {
@@ -352,6 +405,9 @@ TEST(RuntimeVariableManagerTest, GetAllVariables_ReturnsAllKnownVariables) {
   EXPECT_NE(all_vars.find("cache.enabled"), all_vars.end());
   EXPECT_NE(all_vars.find("api.tcp.port"), all_vars.end());
   EXPECT_NE(all_vars.find("vectors.default_dimension"), all_vars.end());
+  EXPECT_NE(all_vars.find("performance.thread_pool_size"), all_vars.end());
+  EXPECT_EQ(all_vars.find("perf.thread_pool_size"), all_vars.end());
+  EXPECT_NE(all_vars.find("wal.include_vectors"), all_vars.end());
 }
 
 TEST(RuntimeVariableManagerTest, GetAllVariables_MutabilityFlagCorrect) {
@@ -436,4 +492,21 @@ TEST(RuntimeVariableManagerTest, SetCacheToggleCallback_CalledOnToggle) {
   ASSERT_TRUE(result) << result.error().message();
   EXPECT_TRUE(callback_called);
   EXPECT_FALSE(callback_value);
+}
+
+TEST(RuntimeVariableManagerTest, SetVariable_CallbackCanReadManagerWithoutDeadlock) {
+  Config config = MakeDefaultConfig();
+  auto manager = *RuntimeVariableManager::Create(config);
+  auto* raw_manager = manager.get();
+  bool callback_read_succeeded = false;
+  manager->SetCacheToggleCallback(
+      [raw_manager, &callback_read_succeeded](bool) -> nvecd::utils::Expected<void, nvecd::utils::Error> {
+        auto value = raw_manager->GetVariable("cache.enabled");
+        callback_read_succeeded = value.has_value();
+        return {};
+      });
+
+  ASSERT_TRUE(manager->SetVariable("cache.enabled", "false"));
+  EXPECT_TRUE(callback_read_succeeded);
+  EXPECT_EQ(*manager->GetVariable("cache.enabled"), "false");
 }

@@ -8,6 +8,9 @@
 #include <gtest/gtest.h>
 
 #include <fstream>
+#include <limits>
+
+#include "config/config_help.h"
 
 using namespace nvecd::config;
 
@@ -134,6 +137,16 @@ TEST(ConfigTest, ValidateValidConfig) {
   EXPECT_TRUE(result) << "Validation failed: " << result.error().message();
 }
 
+TEST(ConfigTest, ValidateConfigRejectsNonFiniteNumericValues) {
+  Config config;
+  config.events.decay_alpha = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_FALSE(ValidateConfig(config));
+
+  config = Config{};
+  config.cache.min_query_cost_ms = std::numeric_limits<double>::infinity();
+  EXPECT_FALSE(ValidateConfig(config));
+}
+
 /**
  * @brief Test loading configuration with minimal settings
  */
@@ -180,6 +193,9 @@ vectors:
 TEST(ConfigTest, LoadFlagshipFeatureConfig) {
   const char* flagship_config = R"(
 events:
+  max_contexts: 1000
+  max_neighbors_per_item: 25
+  min_support: 3.5
   temporal_cooccurrence: true
   temporal_half_life_sec: 43200.0
   negative_signals: true
@@ -207,6 +223,9 @@ similarity:
 
   Config config = *config_result;
   EXPECT_TRUE(config.events.temporal_cooccurrence);
+  EXPECT_EQ(config.events.max_contexts, 1000U);
+  EXPECT_EQ(config.events.max_neighbors_per_item, 25U);
+  EXPECT_DOUBLE_EQ(config.events.min_support, 3.5);
   EXPECT_DOUBLE_EQ(config.events.temporal_half_life_sec, 43200.0);
   EXPECT_TRUE(config.events.negative_signals);
   EXPECT_DOUBLE_EQ(config.events.negative_weight, 0.3);
@@ -222,6 +241,24 @@ similarity:
   EXPECT_EQ(config.similarity.ivf_seal_threshold, 50000U);
 
   std::remove("flagship_test_config.yaml");
+}
+
+TEST(ConfigTest, DisplayConfigIncludesEmptyAndSensitiveRuntimeVariables) {
+  Config config;
+  config.cache.max_memory_bytes = 32 * 1024 * 1024;
+  config.api.unix_socket.path.clear();
+  config.logging.file.clear();
+  config.security.requirepass = "never-display-this";
+
+  auto display = FormatConfigForDisplay(config);
+  ASSERT_TRUE(display) << display.error().message();
+
+  EXPECT_NE(display->find("max_memory_mb: 32"), std::string::npos);
+  EXPECT_NE(display->find("unix_socket:"), std::string::npos);
+  EXPECT_NE(display->find("path: \"\""), std::string::npos);
+  EXPECT_NE(display->find("allow_cidrs:"), std::string::npos);
+  EXPECT_NE(display->find("requirepass: \"***\""), std::string::npos);
+  EXPECT_EQ(display->find("never-display-this"), std::string::npos);
 }
 
 /**
