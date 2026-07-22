@@ -15,6 +15,10 @@
 
 namespace nvecd::vectors {
 
+namespace {
+constexpr size_t kMaxVectorDimension = 4096;
+}
+
 VectorStore::VectorStore(config::VectorsConfig config) : config_(std::move(config)) {}
 
 utils::Expected<void, utils::Error> VectorStore::SetVector(const std::string& vector_id, const std::vector<float>& vec,
@@ -28,6 +32,12 @@ utils::Expected<void, utils::Error> VectorStore::SetVector(const std::string& ve
 
   if (vec.empty()) {
     auto error = utils::MakeError(utils::ErrorCode::kInvalidArgument, "Vector cannot be empty");
+    utils::LogVectorStoreError("set_vector", vector_id, static_cast<int>(vec.size()), error.message());
+    return utils::MakeUnexpected(error);
+  }
+  if (vec.size() > kMaxVectorDimension) {
+    auto error = utils::MakeError(utils::ErrorCode::kVectorDimensionMismatch,
+                                  "Vector dimension exceeds maximum of " + std::to_string(kMaxVectorDimension));
     utils::LogVectorStoreError("set_vector", vector_id, static_cast<int>(vec.size()), error.message());
     return utils::MakeUnexpected(error);
   }
@@ -69,36 +79,33 @@ utils::Expected<void, utils::Error> VectorStore::SetVector(const std::string& ve
       size_t idx = it->second;
       std::copy(data.begin(), data.end(), matrix_.begin() + static_cast<ptrdiff_t>(idx * current_dim));
       norms_[idx] = simd::GetOptimalImpl().l2_norm(data.data(), data.size());
+      normalized_[idx] = normalize;
     } else {
       // New vector: check for tombstone slot to reuse
       size_t idx = idx_to_id_.size();  // Default: append
 
-      if (tombstone_count_ > 0) {
-        // Find a tombstone slot to reuse
-        for (size_t i = 0; i < deleted_.size(); ++i) {
-          if (deleted_[i]) {
-            idx = i;
-            deleted_[i] = false;
-            --tombstone_count_;
-            break;
-          }
-        }
+      if (!free_slots_.empty()) {
+        // Deletion records reusable positions, avoiding an O(number of slots)
+        // scan on every new vector after a fragmented workload.
+        idx = free_slots_.back();
+        free_slots_.pop_back();
+        deleted_[idx] = false;
+        --tombstone_count_;
 
-        if (idx < idx_to_id_.size()) {
-          // Reusing a tombstone slot
-          std::copy(data.begin(), data.end(), matrix_.begin() + static_cast<ptrdiff_t>(idx * current_dim));
-          norms_[idx] = simd::GetOptimalImpl().l2_norm(data.data(), data.size());
-          idx_to_id_[idx] = vector_id;
-          id_to_idx_[vector_id] = idx;
-          ++active_count_;
-          return {};
-        }
+        std::copy(data.begin(), data.end(), matrix_.begin() + static_cast<ptrdiff_t>(idx * current_dim));
+        norms_[idx] = simd::GetOptimalImpl().l2_norm(data.data(), data.size());
+        normalized_[idx] = normalize;
+        idx_to_id_[idx] = vector_id;
+        id_to_idx_[vector_id] = idx;
+        ++active_count_;
+        return {};
       }
 
       // Append new slot
       matrix_.resize(matrix_.size() + current_dim);
       std::copy(data.begin(), data.end(), matrix_.begin() + static_cast<ptrdiff_t>(idx * current_dim));
       norms_.push_back(simd::GetOptimalImpl().l2_norm(data.data(), data.size()));
+      normalized_.push_back(normalize);
       idx_to_id_.push_back(vector_id);
       deleted_.push_back(false);
       id_to_idx_[vector_id] = idx;
@@ -128,7 +135,7 @@ std::optional<Vector> VectorStore::GetVector(const std::string& vector_id) const
   const float* begin = matrix_.data() + idx * dim;
   std::vector<float> data(begin, begin + dim);
 
-  return Vector(std::move(data), false);
+  return Vector(std::move(data), normalized_[idx]);
 }
 
 bool VectorStore::DeleteVector(const std::string& vector_id) {
@@ -141,6 +148,7 @@ bool VectorStore::DeleteVector(const std::string& vector_id) {
 
   size_t idx = it->second;
   deleted_[idx] = true;
+  free_slots_.push_back(idx);
   id_to_idx_.erase(it);
   --active_count_;
   ++tombstone_count_;
@@ -181,9 +189,11 @@ void VectorStore::Clear() {
   std::unique_lock lock(mutex_);
   matrix_.clear();
   norms_.clear();
+  normalized_.clear();
   id_to_idx_.clear();
   idx_to_id_.clear();
   deleted_.clear();
+  free_slots_.clear();
   active_count_ = 0;
   tombstone_count_ = 0;
   dimension_.store(0, std::memory_order_release);
@@ -216,9 +226,11 @@ size_t VectorStore::MemoryUsageLocked() const {
 
   // Norms array
   total += norms_.capacity() * sizeof(float);
+  total += normalized_.capacity() / 8;
 
   // Deleted flags (std::vector<bool> uses ~1 bit per entry)
   total += deleted_.capacity() / 8;
+  total += free_slots_.capacity() * sizeof(size_t);
 
   // ID strings in idx_to_id_
   for (const auto& id : idx_to_id_) {
@@ -314,9 +326,11 @@ void VectorStore::DefragmentLocked() {
   if (dim == 0 || active_count_ == 0) {
     matrix_.clear();
     norms_.clear();
+    normalized_.clear();
     id_to_idx_.clear();
     idx_to_id_.clear();
     deleted_.clear();
+    free_slots_.clear();
     active_count_ = 0;
     tombstone_count_ = 0;
     return;
@@ -325,6 +339,7 @@ void VectorStore::DefragmentLocked() {
   size_t new_n = active_count_;
   std::vector<float> new_matrix(new_n * dim);
   std::vector<float> new_norms(new_n);
+  std::vector<bool> new_normalized(new_n, false);
   std::unordered_map<std::string, size_t> new_id_to_idx;
   new_id_to_idx.reserve(new_n);
   std::vector<std::string> new_idx_to_id;
@@ -343,6 +358,7 @@ void VectorStore::DefragmentLocked() {
     std::copy(src, src + dim, dst);
 
     new_norms[new_idx] = norms_[old_idx];
+    new_normalized[new_idx] = normalized_[old_idx];
     new_idx_to_id.push_back(idx_to_id_[old_idx]);
     new_id_to_idx[idx_to_id_[old_idx]] = new_idx;
     ++new_idx;
@@ -350,9 +366,11 @@ void VectorStore::DefragmentLocked() {
 
   matrix_ = std::move(new_matrix);
   norms_ = std::move(new_norms);
+  normalized_ = std::move(new_normalized);
   id_to_idx_ = std::move(new_id_to_idx);
   idx_to_id_ = std::move(new_idx_to_id);
   deleted_ = std::move(new_deleted);
+  free_slots_.clear();
   tombstone_count_ = 0;
 }
 

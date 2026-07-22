@@ -85,6 +85,24 @@ TEST_F(HnswIndexTest, AddMultipleVectors) {
   EXPECT_EQ(index_->Size(), kCount);
 }
 
+// Re-VECSET reuses a compact index. The old HNSW node must become deleted so
+// queries see one result with the replacement embedding instead of two nodes.
+TEST_F(HnswIndexTest, AddSameCompactIndexReplacesOldEmbeddingWithoutDuplicates) {
+  std::vector<float> original(kDim, 0.0F);
+  original[0] = 1.0F;
+  std::vector<float> replacement(kDim, 0.0F);
+  replacement[1] = 1.0F;
+
+  index_->Add(0, original.data());
+  index_->Add(0, replacement.data());
+
+  EXPECT_EQ(index_->Size(), 1U);
+  auto results = index_->Search(replacement.data(), 10);
+  ASSERT_EQ(results.size(), 1U);
+  EXPECT_EQ(results[0].first, 0U);
+  EXPECT_NEAR(results[0].second, 1.0F, 0.01F);
+}
+
 TEST_F(HnswIndexTest, SearchReturnsTopK) {
   std::mt19937 rng(42);
   constexpr uint32_t kCount = 50;
@@ -144,6 +162,28 @@ TEST_F(HnswIndexTest, MarkDeletedNonExistent) {
   // Should not crash
   index_->MarkDeleted(999);
   EXPECT_EQ(index_->Size(), 0U);
+}
+
+TEST_F(HnswIndexTest, DeserializeRejectsOversizedDimensionBeforeAllocation) {
+  std::stringstream serialized;
+  const uint32_t magic = 0x48534E57;
+  const uint32_t version = 1;
+  const uint32_t m = 8;
+  const uint32_t ef_construction = 50;
+  const uint32_t ef_search = 20;
+  const uint32_t dimension = 4097;
+  const uint32_t node_count = 1;
+  const uint32_t entry_point = 0;
+  const uint32_t max_level = 0;
+  const uint32_t active_count = 1;
+  for (const uint32_t value :
+       {magic, version, m, ef_construction, ef_search, dimension, node_count, entry_point, max_level, active_count}) {
+    serialized.write(reinterpret_cast<const char*>(&value), sizeof(value));
+  }
+
+  auto result = index_->Deserialize(serialized);
+  EXPECT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), utils::ErrorCode::kSnapshotLoadFailed);
 }
 
 // ============================================================================

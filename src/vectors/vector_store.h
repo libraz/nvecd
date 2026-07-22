@@ -315,13 +315,15 @@ class VectorStore {
   // Compact storage (single source of truth)
   std::vector<float> matrix_;                          ///< [n x dim] contiguous float array
   std::vector<float> norms_;                           ///< [n] pre-computed L2 norms
+  std::vector<bool> normalized_;                       ///< [n] whether input was normalized on write
   std::unordered_map<std::string, size_t> id_to_idx_;  ///< ID -> row index
   std::vector<std::string> idx_to_id_;                 ///< row index -> ID
 
   // Tombstone tracking
-  std::vector<bool> deleted_;   ///< Tombstone flags per slot
-  size_t active_count_ = 0;     ///< Number of non-deleted vectors
-  size_t tombstone_count_ = 0;  ///< Number of deleted slots
+  std::vector<bool> deleted_;       ///< Tombstone flags per slot
+  std::vector<size_t> free_slots_;  ///< Reusable tombstone slots (LIFO)
+  size_t active_count_ = 0;         ///< Number of non-deleted vectors
+  size_t tombstone_count_ = 0;      ///< Number of deleted slots
 };
 
 }  // namespace nvecd::vectors

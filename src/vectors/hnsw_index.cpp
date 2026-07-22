@@ -14,6 +14,7 @@
 
 #include "utils/error.h"
 #include "utils/structured_log.h"
+#include "vectors/distance.h"
 
 namespace nvecd::vectors {
 
@@ -28,6 +29,26 @@ namespace {
 /// of 64 comfortably exceeds the height any realistic index reaches, since the
 /// number of nodes required to populate level L grows as M^L.
 constexpr uint32_t kMaxNodeLevel = 64;
+constexpr uint32_t kMaxVectorDimension = 4096;
+constexpr uint32_t kMaxDeserializedNodes = 10'000'000;
+
+/// Return whether a seekable stream contains at least @p required bytes from
+/// its current position. Non-seekable streams retain the structural limits
+/// below; snapshot files and string streams used by the server are seekable.
+bool HasRemainingBytes(std::istream& in, size_t required) {
+  const auto current = in.tellg();
+  if (current == std::istream::pos_type(-1)) {
+    in.clear(in.rdstate() & ~std::ios::failbit);
+    return true;
+  }
+  in.seekg(0, std::ios::end);
+  const auto end = in.tellg();
+  in.seekg(current);
+  if (end == std::istream::pos_type(-1) || end < current) {
+    return false;
+  }
+  return static_cast<uint64_t>(end - current) >= required;
+}
 
 }  // namespace
 
@@ -36,12 +57,17 @@ constexpr uint32_t kMaxNodeLevel = 64;
 // ============================================================================
 
 HnswIndex::HnswIndex(uint32_t dimension, DistanceFunc distance_func, const Config& config)
-    : config_(config), dimension_(dimension), distance_func_(distance_func), rng_(std::random_device{}()) {
+    : config_(config),
+      dimension_(dimension),
+      distance_func_(distance_func),
+      use_cosine_prenorm_(distance_func == CosineDistanceRaw),
+      rng_(std::random_device{}()) {
   level_mult_ = 1.0 / std::log(static_cast<double>(std::max(config_.m, 2U)));
 
   if (config_.max_elements > 0) {
     nodes_.reserve(config_.max_elements);
     vectors_.reserve(static_cast<size_t>(config_.max_elements) * dimension_);
+    vector_norms_.reserve(config_.max_elements);
     compact_to_internal_.reserve(config_.max_elements);
   }
 }
@@ -52,6 +78,8 @@ HnswIndex::HnswIndex(HnswIndex&& other) noexcept
       distance_func_(other.distance_func_),
       nodes_(std::move(other.nodes_)),
       vectors_(std::move(other.vectors_)),
+      vector_norms_(std::move(other.vector_norms_)),
+      use_cosine_prenorm_(other.use_cosine_prenorm_),
       compact_to_internal_(std::move(other.compact_to_internal_)),
       entry_point_(other.entry_point_),
       max_level_(other.max_level_),
@@ -70,11 +98,13 @@ HnswIndex& HnswIndex::operator=(HnswIndex&& other) noexcept {
     distance_func_ = other.distance_func_;
     nodes_ = std::move(other.nodes_);
     vectors_ = std::move(other.vectors_);
+    vector_norms_ = std::move(other.vector_norms_);
     compact_to_internal_ = std::move(other.compact_to_internal_);
     entry_point_ = other.entry_point_;
     max_level_ = other.max_level_;
     active_count_ = other.active_count_;
     level_mult_ = other.level_mult_;
+    use_cosine_prenorm_ = other.use_cosine_prenorm_;
     rng_ = std::move(other.rng_);
     other.entry_point_ = UINT32_MAX;
     other.max_level_ = 0;
@@ -115,15 +145,19 @@ const float* HnswIndex::GetNodeVector(uint32_t internal_id) const {
   return vectors_.data() + static_cast<size_t>(internal_id) * dimension_;
 }
 
-float HnswIndex::ComputeDistance(const float* query, uint32_t internal_id) const {
+float HnswIndex::ComputeDistance(const float* query, float query_norm, uint32_t internal_id) const {
+  if (use_cosine_prenorm_) {
+    return CosineSimilarityPreNorm(query, GetNodeVector(internal_id), dimension_, query_norm,
+                                   vector_norms_[internal_id]);
+  }
   return distance_func_(query, GetNodeVector(internal_id), dimension_);
 }
 
-std::vector<std::pair<float, uint32_t>> HnswIndex::SearchLayer(const float* query, uint32_t entry_node, uint32_t layer,
-                                                               uint32_t ef) const {
+std::vector<std::pair<float, uint32_t>> HnswIndex::SearchLayer(const float* query, float query_norm,
+                                                               uint32_t entry_node, uint32_t layer, uint32_t ef) const {
   // Max-heap for candidates (worst candidate on top for easy eviction)
   // Min-heap for visited-but-not-yet-expanded (best candidate on top)
-  float entry_dist = ComputeDistance(query, entry_node);
+  float entry_dist = ComputeDistance(query, query_norm, entry_node);
 
   // candidates: max-heap (worst first) — the result set W
   auto cmp_max = [](const std::pair<float, uint32_t>& a, const std::pair<float, uint32_t>& b) {
@@ -168,7 +202,7 @@ std::vector<std::pair<float, uint32_t>> HnswIndex::SearchLayer(const float* quer
       }
       visited.insert(neighbor_id);
 
-      float dist = ComputeDistance(query, neighbor_id);
+      float dist = ComputeDistance(query, query_norm, neighbor_id);
 
       if (candidates.size() < ef || dist > candidates.top().first) {
         candidates.push({dist, neighbor_id});
@@ -213,19 +247,38 @@ std::vector<uint32_t> HnswIndex::SelectNeighbors(const std::vector<std::pair<flo
 
 void HnswIndex::Add(uint32_t compact_index, const float* vector) {
   std::unique_lock lock(mutex_);
+  AddLocked(compact_index, vector);
+}
 
+void HnswIndex::AddLocked(uint32_t compact_index, const float* vector) {
   uint32_t internal_id = static_cast<uint32_t>(nodes_.size());
+  const float vector_norm = use_cosine_prenorm_ ? simd::GetOptimalImpl().l2_norm(vector, dimension_) : 0.0F;
 
   // Grow compact_to_internal_ if needed
   if (compact_index >= compact_to_internal_.size()) {
     compact_to_internal_.resize(compact_index + 1, UINT32_MAX);
   }
+
+  // Overwrite (re-VECSET of the same id / reused tombstone slot): retire the
+  // previous node for this compact_index instead of orphaning it. Leaving it
+  // live would double-count active_count_, return the item twice from Search,
+  // and keep ranking it by the stale embedding. A fresh node is inserted below
+  // so the new embedding participates in the graph.
+  uint32_t previous_internal = compact_to_internal_[compact_index];
+  if (previous_internal != UINT32_MAX && previous_internal < nodes_.size() && !nodes_[previous_internal].deleted) {
+    nodes_[previous_internal].deleted = true;
+    if (active_count_ > 0) {
+      --active_count_;
+    }
+  }
+
   compact_to_internal_[compact_index] = internal_id;
 
   // Store vector data
   size_t offset = vectors_.size();
   vectors_.resize(offset + dimension_);
   std::memcpy(vectors_.data() + offset, vector, static_cast<size_t>(dimension_) * sizeof(float));
+  vector_norms_.push_back(vector_norm);
 
   // Create node with random level
   uint32_t level = RandomLevel();
@@ -252,10 +305,10 @@ void HnswIndex::Add(uint32_t compact_index, const float* vector) {
     bool changed = true;
     while (changed) {
       changed = false;
-      float cur_dist = ComputeDistance(vector, cur_node);
+      float cur_dist = ComputeDistance(vector, vector_norm, cur_node);
       if (static_cast<uint32_t>(l) < nodes_[cur_node].neighbors.size()) {
         for (uint32_t neighbor : nodes_[cur_node].neighbors[l]) {
-          float d = ComputeDistance(vector, neighbor);
+          float d = ComputeDistance(vector, vector_norm, neighbor);
           if (d > cur_dist) {
             cur_node = neighbor;
             cur_dist = d;
@@ -271,7 +324,7 @@ void HnswIndex::Add(uint32_t compact_index, const float* vector) {
     uint32_t layer = static_cast<uint32_t>(l);
     uint32_t ef = config_.ef_construction;
 
-    auto candidates = SearchLayer(vector, cur_node, layer, ef);
+    auto candidates = SearchLayer(vector, vector_norm, cur_node, layer, ef);
 
     // Select neighbors for this layer
     uint32_t max_conn = MaxNeighbors(layer);
@@ -295,7 +348,9 @@ void HnswIndex::Add(uint32_t compact_index, const float* vector) {
         std::vector<std::pair<float, uint32_t>> neighbor_candidates;
         neighbor_candidates.reserve(neighbor_links[layer].size());
         for (uint32_t nid : neighbor_links[layer]) {
-          float d = distance_func_(neighbor_vec, GetNodeVector(nid), dimension_);
+          float d = use_cosine_prenorm_ ? CosineSimilarityPreNorm(neighbor_vec, GetNodeVector(nid), dimension_,
+                                                                  vector_norms_[neighbor_id], vector_norms_[nid])
+                                        : distance_func_(neighbor_vec, GetNodeVector(nid), dimension_);
           neighbor_candidates.push_back({d, nid});
         }
         std::sort(neighbor_candidates.begin(), neighbor_candidates.end(),
@@ -343,6 +398,7 @@ std::vector<std::pair<uint32_t, float>> HnswIndex::Search(const float* query, ui
 
   // Use ef_search as the search width (at least top_k)
   uint32_t ef = std::max(config_.ef_search, top_k);
+  const float query_norm = use_cosine_prenorm_ ? simd::GetOptimalImpl().l2_norm(query, dimension_) : 0.0F;
 
   // Navigate from top layers to layer 1, finding closest entry
   uint32_t cur_node = entry_point_;
@@ -350,10 +406,10 @@ std::vector<std::pair<uint32_t, float>> HnswIndex::Search(const float* query, ui
     bool changed = true;
     while (changed) {
       changed = false;
-      float cur_dist = ComputeDistance(query, cur_node);
+      float cur_dist = ComputeDistance(query, query_norm, cur_node);
       if (static_cast<uint32_t>(l) < nodes_[cur_node].neighbors.size()) {
         for (uint32_t neighbor : nodes_[cur_node].neighbors[l]) {
-          float d = ComputeDistance(query, neighbor);
+          float d = ComputeDistance(query, query_norm, neighbor);
           if (d > cur_dist) {
             cur_node = neighbor;
             cur_dist = d;
@@ -365,7 +421,7 @@ std::vector<std::pair<uint32_t, float>> HnswIndex::Search(const float* query, ui
   }
 
   // Search layer 0 with ef candidates
-  auto candidates = SearchLayer(query, cur_node, 0, ef);
+  auto candidates = SearchLayer(query, query_norm, cur_node, 0, ef);
 
   // Filter deleted nodes and convert to (compact_index, score) pairs
   std::vector<std::pair<uint32_t, float>> results;
@@ -390,6 +446,7 @@ void HnswIndex::Rebuild(const float* all_vectors, uint32_t count, uint32_t dimen
   // Clear existing state
   nodes_.clear();
   vectors_.clear();
+  vector_norms_.clear();
   compact_to_internal_.clear();
   entry_point_ = UINT32_MAX;
   max_level_ = 0;
@@ -400,16 +457,20 @@ void HnswIndex::Rebuild(const float* all_vectors, uint32_t count, uint32_t dimen
     return;
   }
 
-  // Reserve space
+  // Reserve space. compact_to_internal_ must be seeded with the empty sentinel
+  // (UINT32_MAX), not zero-filled: Add() reads compact_to_internal_[compact_index]
+  // to detect an overwrite, and a stray 0 would be misread as "live node 0" and
+  // wrongly retire it.
   nodes_.reserve(count);
   vectors_.reserve(static_cast<size_t>(count) * dimension);
-  compact_to_internal_.resize(count);
+  vector_norms_.reserve(count);
+  compact_to_internal_.assign(count, UINT32_MAX);
 
-  lock.unlock();
-
-  // Re-insert all vectors
+  // Re-insert all vectors while retaining the exclusive lock. Readers either
+  // observe the old graph before Rebuild starts or the complete replacement;
+  // they never search an empty/partially rebuilt graph.
   for (uint32_t i = 0; i < count; ++i) {
-    Add(i, all_vectors + static_cast<size_t>(i) * dimension);
+    AddLocked(i, all_vectors + static_cast<size_t>(i) * dimension);
   }
 }
 
@@ -507,12 +568,38 @@ utils::Expected<void, utils::Error> HnswIndex::Deserialize(std::istream& in) {
   in.read(reinterpret_cast<char*>(&max_level_), sizeof(max_level_));
   in.read(reinterpret_cast<char*>(&active_count_), sizeof(active_count_));
 
+  const auto invalid_format = [](const std::string& message) {
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kSnapshotLoadFailed, message));
+  };
+  if (!in.good()) {
+    return invalid_format("Truncated HNSW index header");
+  }
+  if (config_.m < 2 || dimension_ == 0 || dimension_ > kMaxVectorDimension || node_count > kMaxDeserializedNodes ||
+      active_count_ > node_count || max_level_ > kMaxNodeLevel ||
+      (entry_point_ != UINT32_MAX && entry_point_ >= node_count)) {
+    return invalid_format("Invalid HNSW index header values");
+  }
+  if (node_count > 0 && static_cast<size_t>(node_count) > std::numeric_limits<size_t>::max() / dimension_) {
+    return invalid_format("HNSW vector payload size overflows size_t");
+  }
+  const size_t vector_count = static_cast<size_t>(node_count) * dimension_;
+  if (vector_count > std::numeric_limits<size_t>::max() / sizeof(float) ||
+      !HasRemainingBytes(in, vector_count * sizeof(float))) {
+    return invalid_format("Truncated or oversized HNSW vector payload");
+  }
+
   // Recalculate level multiplier
   level_mult_ = 1.0 / std::log(static_cast<double>(std::max(config_.m, 2U)));
 
   // Vector data
-  vectors_.resize(static_cast<size_t>(node_count) * dimension_);
+  vectors_.resize(vector_count);
   in.read(reinterpret_cast<char*>(vectors_.data()), static_cast<std::streamsize>(vectors_.size() * sizeof(float)));
+  vector_norms_.resize(node_count);
+  if (use_cosine_prenorm_) {
+    for (uint32_t i = 0; i < node_count; ++i) {
+      vector_norms_[i] = simd::GetOptimalImpl().l2_norm(GetNodeVector(i), dimension_);
+    }
+  }
 
   // Nodes
   nodes_.resize(node_count);
@@ -522,16 +609,27 @@ utils::Expected<void, utils::Error> HnswIndex::Deserialize(std::istream& in) {
     in.read(reinterpret_cast<char*>(&node.level), sizeof(node.level));
     uint8_t deleted_byte = 0;
     in.read(reinterpret_cast<char*>(&deleted_byte), sizeof(deleted_byte));
+    if (!in.good() || node.level > kMaxNodeLevel || deleted_byte > 1) {
+      return invalid_format("Invalid HNSW node header");
+    }
     node.deleted = (deleted_byte != 0);
 
     node.neighbors.resize(node.level + 1);
     for (uint32_t l = 0; l <= node.level; ++l) {
       uint32_t neighbor_count = 0;
       in.read(reinterpret_cast<char*>(&neighbor_count), sizeof(neighbor_count));
+      if (!in.good() || neighbor_count > node_count ||
+          !HasRemainingBytes(in, static_cast<size_t>(neighbor_count) * sizeof(uint32_t))) {
+        return invalid_format("Invalid HNSW neighbor list");
+      }
       node.neighbors[l].resize(neighbor_count);
       if (neighbor_count > 0) {
         in.read(reinterpret_cast<char*>(node.neighbors[l].data()),
                 static_cast<std::streamsize>(neighbor_count * sizeof(uint32_t)));
+        if (!in.good() || std::any_of(node.neighbors[l].begin(), node.neighbors[l].end(),
+                                      [node_count](uint32_t neighbor) { return neighbor >= node_count; })) {
+          return invalid_format("Invalid HNSW neighbor reference");
+        }
       }
     }
   }
@@ -539,10 +637,19 @@ utils::Expected<void, utils::Error> HnswIndex::Deserialize(std::istream& in) {
   // compact_to_internal mapping
   uint32_t map_size = 0;
   in.read(reinterpret_cast<char*>(&map_size), sizeof(map_size));
+  if (!in.good() || map_size > kMaxDeserializedNodes ||
+      !HasRemainingBytes(in, static_cast<size_t>(map_size) * sizeof(uint32_t))) {
+    return invalid_format("Invalid HNSW compact index map");
+  }
   compact_to_internal_.resize(map_size);
   if (map_size > 0) {
     in.read(reinterpret_cast<char*>(compact_to_internal_.data()),
             static_cast<std::streamsize>(map_size * sizeof(uint32_t)));
+    if (!in.good() ||
+        std::any_of(compact_to_internal_.begin(), compact_to_internal_.end(),
+                    [node_count](uint32_t internal) { return internal != UINT32_MAX && internal >= node_count; })) {
+      return invalid_format("Invalid HNSW compact index reference");
+    }
   }
 
   if (!in.good()) {

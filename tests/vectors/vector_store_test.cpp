@@ -143,8 +143,8 @@ TEST(VectorStoreTest, SetVectorWithNormalization) {
   auto retrieved = store.GetVector("item1");
   ASSERT_TRUE(retrieved.has_value());
 
-  // Note: normalized flag is not tracked in compact storage
-  // The data should still be normalized though
+  EXPECT_TRUE(retrieved->normalized);
+  // The data should still be normalized too.
 
   // Check normalization: should be {0.6, 0.8}
   EXPECT_NEAR(retrieved->data[0], 0.6f, 1e-5);
@@ -193,6 +193,16 @@ TEST(VectorStoreTest, EmptyVector) {
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code(), utils::ErrorCode::kInvalidArgument);
   EXPECT_NE(result.error().message().find("empty"), std::string::npos);
+}
+
+TEST(VectorStoreTest, RejectsDimensionAboveConfiguredSafetyLimit) {
+  VectorStore store(MakeConfig());
+  std::vector<float> oversized(4097, 1.0F);
+
+  auto result = store.SetVector("oversized", oversized);
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), utils::ErrorCode::kVectorDimensionMismatch);
+  EXPECT_EQ(store.GetVectorCount(), 0U);
 }
 
 // ============================================================================
@@ -406,19 +416,16 @@ TEST(VectorStoreTest, ConcurrentReadsAndWrites) {
 // Edge Cases
 // ============================================================================
 
-TEST(VectorStoreTest, LargeVectorDimension) {
+TEST(VectorStoreTest, RejectsDimensionBeyondSafetyLimit) {
   auto config = MakeConfig();
   VectorStore store(config);
 
   std::vector<float> large_vec(10000, 0.5f);
   auto result = store.SetVector("item1", large_vec);
-  ASSERT_TRUE(result.has_value());
-
-  EXPECT_EQ(store.GetDimension(), 10000);
-
-  auto retrieved = store.GetVector("item1");
-  ASSERT_TRUE(retrieved.has_value());
-  EXPECT_EQ(retrieved->data.size(), 10000);
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), utils::ErrorCode::kVectorDimensionMismatch);
+  EXPECT_EQ(store.GetVectorCount(), 0U);
+  EXPECT_EQ(store.GetDimension(), 0U);
 }
 
 TEST(VectorStoreTest, VeryLongId) {
@@ -602,12 +609,14 @@ TEST(VectorStoreTest, HighDimension_Normalization) {
   auto retrieved = store.GetVector("unnormalized");
   ASSERT_TRUE(retrieved.has_value());
   EXPECT_FLOAT_EQ(retrieved->data[0], 1.0f);
+  EXPECT_FALSE(retrieved->normalized);
 
   // With normalization
   auto result_norm = store.SetVector("normalized", vec, true);
   ASSERT_TRUE(result_norm.has_value());
   auto retrieved_norm = store.GetVector("normalized");
   ASSERT_TRUE(retrieved_norm.has_value());
+  EXPECT_TRUE(retrieved_norm->normalized);
 
   // Calculate L2 norm
   float norm = 0.0f;

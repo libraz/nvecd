@@ -123,6 +123,9 @@ class HnswIndex : public AnnIndex {
    */
   uint32_t RandomLevel();
 
+  /// Insert one vector while mutex_ is already held exclusively.
+  void AddLocked(uint32_t compact_index, const float* vector);
+
   /**
    * @brief Greedy search from entry point at a single layer
    *
@@ -134,8 +137,8 @@ class HnswIndex : public AnnIndex {
    * @param ef Number of candidates to track
    * @return Vector of (distance, internal_node_id) pairs, sorted ascending by distance
    */
-  std::vector<std::pair<float, uint32_t>> SearchLayer(const float* query, uint32_t entry_node, uint32_t layer,
-                                                      uint32_t ef) const;
+  std::vector<std::pair<float, uint32_t>> SearchLayer(const float* query, float query_norm, uint32_t entry_node,
+                                                      uint32_t layer, uint32_t ef) const;
 
   /**
    * @brief Select neighbors using simple heuristic
@@ -158,7 +161,7 @@ class HnswIndex : public AnnIndex {
   /**
    * @brief Compute distance between query and an internal node
    */
-  float ComputeDistance(const float* query, uint32_t internal_id) const;
+  float ComputeDistance(const float* query, float query_norm, uint32_t internal_id) const;
 
   /**
    * @brief Maximum number of neighbors at a given level
@@ -174,6 +177,12 @@ class HnswIndex : public AnnIndex {
 
   /// Vector data storage: [node_count x dimension] contiguous
   std::vector<float> vectors_;
+
+  /// L2 norms aligned with vectors_; used to avoid repeated cosine norms.
+  std::vector<float> vector_norms_;
+
+  /// True only for the cosine raw-pointer metric.
+  bool use_cosine_prenorm_ = false;
 
   /// Map from compact_index to internal node ID
   std::vector<uint32_t> compact_to_internal_;

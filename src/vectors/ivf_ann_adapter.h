@@ -70,13 +70,20 @@ class IvfAnnAdapter : public AnnIndex {
   }
 
   void Rebuild(const float* all_vectors, uint32_t count, uint32_t dimension) override {
+    // Adopt the caller's dimension so Search (query_norm / stride) matches the
+    // real data dimension even when the index was provisionally constructed for
+    // a different configured default_dimension.
+    dimension_ = dimension;
+    ivf_->ResetTrained();
+    if (count == 0 || all_vectors == nullptr) {
+      return;  // Dimension-only rebind: nothing to train yet.
+    }
     // Build valid indices
     std::vector<size_t> valid_indices;
     valid_indices.reserve(count);
     for (uint32_t i = 0; i < count; ++i) {
       valid_indices.push_back(i);
     }
-    ivf_->ResetTrained();
     ivf_->Train(all_vectors, valid_indices.data(), count, dimension);
   }
 

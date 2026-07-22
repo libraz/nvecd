@@ -167,6 +167,7 @@ void IvfIndex::Train(const float* matrix, const size_t* valid_indices, size_t nu
   }
 
   trained_ = true;
+  ++layout_generation_;
 
   // Log training completion
   size_t total_indexed = 0;
@@ -337,7 +338,20 @@ std::vector<std::pair<float, size_t>> IvfIndex::Search(const float* query_vec, f
   if (buffer_results.empty()) {
     std::sort(ivf_results.begin(), ivf_results.end(),
               [](const std::pair<float, size_t>& a, const std::pair<float, size_t>& b) { return a.first > b.first; });
-    return ivf_results;
+    // Deduplicate by compact_index (keep the highest score). A vector whose
+    // embedding was overwritten after a seal can appear in two inverted lists
+    // (old cluster + new cluster) with no buffer entry to trigger the merge
+    // dedup below, so without this the same id would be returned twice.
+    std::unordered_set<size_t> seen_single;
+    seen_single.reserve(ivf_results.size());
+    std::vector<std::pair<float, size_t>> deduped;
+    deduped.reserve(ivf_results.size());
+    for (const auto& entry : ivf_results) {
+      if (seen_single.insert(entry.second).second) {
+        deduped.push_back(entry);
+      }
+    }
+    return deduped;
   }
   if (ivf_results.empty()) {
     // buffer_results is already sorted descending from SearchBuffer
@@ -393,9 +407,11 @@ bool IvfIndex::IsTrained() const {
 }
 
 void IvfIndex::ResetTrained() {
+  std::unique_lock lock(mutex_);
   // Reset nlist to 0 so auto-scaling recalculates for the new data size
   config_.nlist = 0;
   trained_ = false;
+  ++layout_generation_;
 }
 
 size_t IvfIndex::GetIndexedCount() const {
@@ -423,7 +439,9 @@ uint32_t IvfIndex::GetNprobe() const {
 }
 
 void IvfIndex::SetNlist(uint32_t nlist) {
+  std::unique_lock lock(mutex_);
   config_.nlist = nlist;
+  ++layout_generation_;
 }
 
 // ============================================================================
@@ -437,6 +455,18 @@ void IvfIndex::AppendToBuffer(size_t compact_index, const float* vector) {
 
   const uint32_t dim = dimension_.load(std::memory_order_relaxed);
   std::unique_lock lock(buffer_mutex_);
+
+  // Upsert: if this compact_index is already pending in the buffer (a re-VECSET
+  // of the same id before the buffer was sealed), overwrite its vector in place
+  // instead of appending a duplicate. Two live entries for one id would return
+  // the item twice from Search and keep ranking it by the stale embedding.
+  for (size_t i = 0; i < buffer_indices_.size(); ++i) {
+    if (buffer_indices_[i] == compact_index) {
+      std::copy(vector, vector + dim, buffer_vectors_.begin() + static_cast<ptrdiff_t>(i * dim));
+      return;
+    }
+  }
+
   buffer_indices_.push_back(compact_index);
   buffer_vectors_.insert(buffer_vectors_.end(), vector, vector + dim);
 }
@@ -465,23 +495,49 @@ void IvfIndex::SealBuffer() {
   }
   // Buffer lock released: AppendToBuffer can proceed immediately
 
-  // Phase 2: Assign extracted entries to IVF clusters (expensive, lock-free on buffer)
-  std::unique_lock ivf_lock(mutex_);
-
-  if (!trained_) {
-    // IVF not trained: put entries back in buffer
-    std::unique_lock buf_lock(buffer_mutex_);
-    buffer_indices_.insert(buffer_indices_.end(), seal_indices.begin(), seal_indices.end());
-    buffer_vectors_.insert(buffer_vectors_.end(), seal_vectors.begin(), seal_vectors.end());
-    return;
+  // Phase 2: Snapshot the immutable IVF layout, then do the O(n * k * d)
+  // assignments without holding mutex_. Searchers retain their shared lock
+  // throughout this work instead of being blocked by a seal.
+  const uint32_t dim = dimension_.load(std::memory_order_relaxed);
+  uint32_t nlist = 0;
+  IvfMetric metric = IvfMetric::kCosine;
+  uint64_t layout_generation = 0;
+  std::vector<float> centroids;
+  std::vector<float> centroid_norms;
+  {
+    std::shared_lock ivf_lock(mutex_);
+    if (!trained_) {
+      std::unique_lock buf_lock(buffer_mutex_);
+      buffer_indices_.insert(buffer_indices_.end(), seal_indices.begin(), seal_indices.end());
+      buffer_vectors_.insert(buffer_vectors_.end(), seal_vectors.begin(), seal_vectors.end());
+      return;
+    }
+    nlist = config_.nlist;
+    metric = config_.metric;
+    layout_generation = layout_generation_;
+    centroids = centroids_;
+    centroid_norms = centroid_norms_;
   }
 
+  std::vector<size_t> cluster_assignments(seal_indices.size());
   const auto& simd_impl = simd::GetOptimalImpl();
-  const uint32_t nlist = config_.nlist;
-  const uint32_t dim = dimension_.load(std::memory_order_relaxed);
-  size_t sealed_count = seal_indices.size();
+  const auto similarity = [metric, &simd_impl](const float* a, float norm_a, const float* b, float norm_b,
+                                               uint32_t vector_dim) {
+    switch (metric) {
+      case IvfMetric::kDot:
+        return simd_impl.dot_product(a, b, vector_dim);
+      case IvfMetric::kL2:
+        return 1.0F / (1.0F + simd_impl.l2_distance(a, b, vector_dim));
+      case IvfMetric::kCosine:
+      default:
+        if (norm_a < kNormEpsilon || norm_b < kNormEpsilon) {
+          return kWorstScore;
+        }
+        return simd_impl.dot_product(a, b, vector_dim) / (norm_a * norm_b);
+    }
+  };
 
-  for (size_t i = 0; i < sealed_count; ++i) {
+  for (size_t i = 0; i < seal_indices.size(); ++i) {
     const float* vec = seal_vectors.data() + i * dim;
     float vec_norm = simd_impl.l2_norm(vec, dim);
 
@@ -489,7 +545,7 @@ void IvfIndex::SealBuffer() {
     float best_sim = kWorstScore;
 
     for (uint32_t c = 0; c < nlist; ++c) {
-      float sim = Similarity(vec, vec_norm, centroids_.data() + static_cast<size_t>(c) * dim, centroid_norms_[c], dim);
+      float sim = similarity(vec, vec_norm, centroids.data() + static_cast<size_t>(c) * dim, centroid_norms[c], dim);
       if (sim > best_sim) {
         best_sim = sim;
         best = c;
@@ -501,10 +557,29 @@ void IvfIndex::SealBuffer() {
       best = seal_indices[i] % nlist;
     }
 
-    inverted_lists_[best].push_back(seal_indices[i]);
+    cluster_assignments[i] = best;
   }
 
-  utils::StructuredLog().Event("ivf_buffer_sealed").Field("sealed_count", static_cast<int64_t>(sealed_count)).Info();
+  // Phase 3: Commit only if the layout we assigned against is still current.
+  // If a concurrent Train/Reset changed it, preserve the entries in the write
+  // buffer so the next seal assigns them against the new centroids.
+  {
+    std::unique_lock ivf_lock(mutex_);
+    if (!trained_ || layout_generation_ != layout_generation) {
+      std::unique_lock buf_lock(buffer_mutex_);
+      buffer_indices_.insert(buffer_indices_.end(), seal_indices.begin(), seal_indices.end());
+      buffer_vectors_.insert(buffer_vectors_.end(), seal_vectors.begin(), seal_vectors.end());
+      return;
+    }
+    for (size_t i = 0; i < seal_indices.size(); ++i) {
+      inverted_lists_[cluster_assignments[i]].push_back(seal_indices[i]);
+    }
+  }
+
+  utils::StructuredLog()
+      .Event("ivf_buffer_sealed")
+      .Field("sealed_count", static_cast<int64_t>(seal_indices.size()))
+      .Info();
 }
 
 std::vector<std::pair<float, size_t>> IvfIndex::SearchBuffer(const float* query_vec, float query_norm,

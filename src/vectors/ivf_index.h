@@ -13,7 +13,9 @@
  *
  * Thread-safety:
  * - AppendToBuffer: exclusive lock on buffer_mutex_ only (fast path)
- * - SealBuffer: exclusive lock on both buffer_mutex_ and mutex_
+ * - SealBuffer: briefly locks buffer_mutex_ to swap entries out, then takes a
+ *   shared snapshot of IVF state while assigning clusters off-lock; it takes
+ *   mutex_ exclusively only to commit the precomputed assignments.
  * - Train/AddVector/RemoveVector/BulkAddVectors: exclusive lock on mutex_
  * - Search/IsTrained/GetNprobe: shared lock on mutex_ + shared lock on buffer_mutex_
  */
@@ -254,7 +256,9 @@ class IvfIndex {
    * centroid and appends to the corresponding inverted list. If not trained,
    * the buffer is left as-is (entries will be included in the next Train call).
    *
-   * Takes exclusive locks on both buffer_mutex_ and mutex_.
+   * Briefly takes buffer_mutex_ to detach pending entries. Cluster assignment
+   * runs without mutex_ held, so concurrent IVF searches continue; mutex_ is
+   * acquired exclusively only to append the precomputed assignments.
    */
   void SealBuffer();
 
@@ -326,6 +330,11 @@ class IvfIndex {
 
   /// Inverted lists: cluster_id -> list of compact indices
   std::vector<std::vector<size_t>> inverted_lists_;
+
+  /// Bumped whenever the trained IVF layout changes. SealBuffer uses this to
+  /// discard an off-lock assignment if training/reset changed the centroids
+  /// before it could be committed.
+  uint64_t layout_generation_ = 0;
 
   /// Reader-writer lock for IVF structures (centroids, inverted lists)
   mutable std::shared_mutex mutex_;
