@@ -37,6 +37,11 @@ static constexpr uint32_t kWalRecordHeaderSize = 17;
 /// WAL file header: magic "NWAL" (4) + version (4) = 8 bytes
 static constexpr uint32_t kWalFileHeaderSize = 8;
 
+/// Hard cap for a single record body while reading untrusted WAL files.
+/// This matches the default segment size and prevents a corrupt length field
+/// from allocating arbitrary memory during recovery.
+static constexpr uint32_t kMaxWalRecordBodySize = 64U * 1024U * 1024U;
+
 /// WAL magic number
 static constexpr uint32_t kWalMagic = 0x4C41574E;  // "NWAL" in little-endian
 

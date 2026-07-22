@@ -236,12 +236,12 @@ TEST_F(SnapshotIntegrationTest, BasicSaveLoadRoundTrip) {
   // Reconnect client
   TcpClient client2("127.0.0.1", port_);
 
-  // Verify data is cleared (new server instance)
-  std::string info_response = client2.SendCommand("INFO");
-  EXPECT_TRUE(info_response.find("vector_count:0") != std::string::npos ||
-              info_response.find("vector_count: 0") != std::string::npos);
+  // WAL-off is the default configuration. A durable DUMP SAVE must therefore
+  // be recovered automatically on restart even though it has no .walseq
+  // sidecar; otherwise the default deployment always comes back empty.
+  VerifyTestData(client2);
 
-  // Load snapshot
+  // An explicit load remains safe and idempotent after automatic recovery.
   std::string load_response = client2.SendCommand("DUMP LOAD test_snapshot.dmp");
   EXPECT_TRUE(load_response.find("OK") == 0);
 

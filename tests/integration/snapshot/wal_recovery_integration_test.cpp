@@ -205,6 +205,31 @@ TEST(WalRecoveryIntegration, RecoversStateFromWalReplay) {
   fs::remove_all(root);
 }
 
+TEST(WalRecoveryIntegration, VecdelPersistsAcrossWalReplay) {
+  const std::string root = MakeTempDir("vecdel");
+  const std::string wal_dir = root + "/wal";
+  fs::create_directories(wal_dir);
+
+  {
+    Instance a(root);
+    a.OpenWal(wal_dir);
+    a.EnableWalForLiveWrites();
+
+    ASSERT_NE(a.Dispatch("VECSET removed 1 0").find("OK VECSET"), std::string::npos);
+    ASSERT_NE(a.Dispatch("METASET removed status:active").find("OK METASET"), std::string::npos);
+    ASSERT_NE(a.Dispatch("VECDEL removed").find("OK VECDEL"), std::string::npos);
+    a.wal.Close();
+
+    Instance b(root);
+    b.OpenWal(wal_dir);
+    EXPECT_GE(b.Replay(/*from=*/0), 3U);
+    EXPECT_FALSE(b.vector_store->HasVector("removed"));
+    EXPECT_EQ(b.metadata_store->Get("removed"), nullptr);
+  }
+
+  fs::remove_all(root);
+}
+
 // ============================================================================
 // Snapshot + WAL boundary: pre- and post-snapshot ops present, no double-count.
 // ============================================================================

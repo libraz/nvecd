@@ -6,6 +6,7 @@
 #include "server/wal_codec.h"
 
 #include <cstring>
+#include <limits>
 #include <string>
 #include <type_traits>
 
@@ -16,6 +17,10 @@ namespace {
 using nvecd::events::EventType;
 using storage::WalOpType;
 using storage::WalRecord;
+
+constexpr uint32_t kTypedMetadataMagic = 0x314D564EU;  // Bytes: "NVM1"
+
+enum class MetadataValueTag : uint8_t { kString, kInt64, kDouble, kBool };
 
 /// Append a little-endian integer of type T to the buffer.
 template <typename T>
@@ -39,6 +44,12 @@ void AppendFloat(std::vector<uint8_t>& buf, float value) {
   AppendLE<uint32_t>(buf, bits);
 }
 
+void AppendDouble(std::vector<uint8_t>& buf, double value) {
+  uint64_t bits = 0;
+  std::memcpy(&bits, &value, sizeof(bits));
+  AppendLE<uint64_t>(buf, bits);
+}
+
 /// Cursor for safely reading from a payload buffer with bounds checking.
 class Reader {
  public:
@@ -46,7 +57,7 @@ class Reader {
 
   /// Read a little-endian integer of type T.
   bool ReadLE(uint64_t& out, size_t bytes) {
-    if (pos_ + bytes > size_) {
+    if (bytes > remaining()) {
       return false;
     }
     uint64_t value = 0;
@@ -64,7 +75,7 @@ class Reader {
     if (!ReadLE(len, sizeof(uint32_t))) {
       return false;
     }
-    if (pos_ + len > size_) {
+    if (len > remaining()) {
       return false;
     }
     out.assign(reinterpret_cast<const char*>(data_ + pos_),
@@ -84,6 +95,19 @@ class Reader {
     return true;
   }
 
+  bool ReadDouble(double& out) {
+    uint64_t bits = 0;
+    if (!ReadLE(bits, sizeof(uint64_t))) {
+      return false;
+    }
+    std::memcpy(&out, &bits, sizeof(out));
+    return true;
+  }
+
+  size_t position() const { return pos_; }
+  void set_position(size_t position) { pos_ = position; }
+  size_t remaining() const { return size_ - pos_; }
+
  private:
   const uint8_t* data_;
   size_t size_;
@@ -95,6 +119,90 @@ utils::Error TruncatedError(const char* what) {
                           std::string("WAL payload truncated while decoding ") + what);
 }
 
+void EncodeTypedMetadata(std::vector<uint8_t>& buf, const vectors::Metadata& metadata) {
+  AppendLE<uint32_t>(buf, kTypedMetadataMagic);
+  AppendLE<uint32_t>(buf, static_cast<uint32_t>(metadata.size()));
+  for (const auto& [key, value] : metadata) {
+    AppendString(buf, key);
+    std::visit(
+        [&buf](const auto& held) {
+          using T = std::decay_t<decltype(held)>;
+          if constexpr (std::is_same_v<T, std::string>) {
+            buf.push_back(static_cast<uint8_t>(MetadataValueTag::kString));
+            AppendString(buf, held);
+          } else if constexpr (std::is_same_v<T, int64_t>) {
+            buf.push_back(static_cast<uint8_t>(MetadataValueTag::kInt64));
+            AppendLE<int64_t>(buf, held);
+          } else if constexpr (std::is_same_v<T, double>) {
+            buf.push_back(static_cast<uint8_t>(MetadataValueTag::kDouble));
+            AppendDouble(buf, held);
+          } else {
+            buf.push_back(static_cast<uint8_t>(MetadataValueTag::kBool));
+            buf.push_back(static_cast<uint8_t>(held));
+          }
+        },
+        value);
+  }
+}
+
+utils::Expected<vectors::Metadata, utils::Error> DecodeTypedMetadata(Reader& reader) {
+  uint64_t count = 0;
+  if (!reader.ReadLE(count, sizeof(uint32_t))) {
+    return utils::MakeUnexpected(TruncatedError("METASET metadata count"));
+  }
+  if (count > reader.remaining()) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kStorageCorrupted, "METASET metadata entry count exceeds payload"));
+  }
+
+  vectors::Metadata metadata;
+  for (uint64_t i = 0; i < count; ++i) {
+    std::string key;
+    uint64_t tag = 0;
+    if (!reader.ReadString(key) || !reader.ReadLE(tag, sizeof(uint8_t))) {
+      return utils::MakeUnexpected(TruncatedError("METASET metadata entry"));
+    }
+    switch (static_cast<MetadataValueTag>(tag)) {
+      case MetadataValueTag::kString: {
+        std::string value;
+        if (!reader.ReadString(value)) {
+          return utils::MakeUnexpected(TruncatedError("METASET string value"));
+        }
+        metadata.emplace(std::move(key), std::move(value));
+        break;
+      }
+      case MetadataValueTag::kInt64: {
+        uint64_t raw = 0;
+        if (!reader.ReadLE(raw, sizeof(int64_t))) {
+          return utils::MakeUnexpected(TruncatedError("METASET integer value"));
+        }
+        metadata.emplace(std::move(key), static_cast<int64_t>(raw));
+        break;
+      }
+      case MetadataValueTag::kDouble: {
+        double value = 0.0;
+        if (!reader.ReadDouble(value)) {
+          return utils::MakeUnexpected(TruncatedError("METASET double value"));
+        }
+        metadata.emplace(std::move(key), value);
+        break;
+      }
+      case MetadataValueTag::kBool: {
+        uint64_t raw = 0;
+        if (!reader.ReadLE(raw, sizeof(uint8_t)) || raw > 1) {
+          return utils::MakeUnexpected(TruncatedError("METASET boolean value"));
+        }
+        metadata.emplace(std::move(key), raw == 1);
+        break;
+      }
+      default:
+        return utils::MakeUnexpected(
+            utils::MakeError(utils::ErrorCode::kStorageCorrupted, "METASET metadata value tag is invalid"));
+    }
+  }
+  return metadata;
+}
+
 }  // namespace
 
 storage::WalOpType WalOpForCommand(const Command& cmd) {
@@ -103,6 +211,8 @@ storage::WalOpType WalOpForCommand(const Command& cmd) {
       return cmd.event_type == EventType::DEL ? WalOpType::kEventDel : WalOpType::kEventAdd;
     case CommandType::kVecset:
       return WalOpType::kVecSet;
+    case CommandType::kVecdel:
+      return WalOpType::kVecDel;
     case CommandType::kMetaset:
       return WalOpType::kMetaSet;
     default:
@@ -133,10 +243,19 @@ std::vector<uint8_t> EncodeCommand(const Command& cmd) {
       }
       break;
     }
-    case CommandType::kMetaset: {
-      // METASET: str id, str filter_expr
+    case CommandType::kVecdel: {
+      // VECDEL: str id
       AppendString(buf, cmd.id);
-      AppendString(buf, cmd.filter_expr);
+      break;
+    }
+    case CommandType::kMetaset: {
+      // METASET: str id, then either a legacy text filter or typed metadata.
+      AppendString(buf, cmd.id);
+      if (cmd.metadata.has_value()) {
+        EncodeTypedMetadata(buf, *cmd.metadata);
+      } else {
+        AppendString(buf, cmd.filter_expr);
+      }
       break;
     }
     default:
@@ -188,6 +307,10 @@ utils::Expected<Command, utils::Error> DecodeWalRecord(const storage::WalRecord&
       if (!reader.ReadLE(dim, sizeof(uint32_t))) {
         return utils::MakeUnexpected(TruncatedError("VECSET dim"));
       }
+      if (dim > static_cast<uint64_t>(std::numeric_limits<int>::max()) || dim > reader.remaining() / sizeof(float)) {
+        return utils::MakeUnexpected(
+            utils::MakeError(utils::ErrorCode::kStorageCorrupted, "VECSET dimension exceeds payload bounds"));
+      }
       cmd.dimension = static_cast<int>(dim);
       cmd.vector.reserve(dim);
       for (uint64_t i = 0; i < dim; ++i) {
@@ -199,13 +322,32 @@ utils::Expected<Command, utils::Error> DecodeWalRecord(const storage::WalRecord&
       }
       break;
     }
+    case WalOpType::kVecDel: {
+      cmd.type = CommandType::kVecdel;
+      if (!reader.ReadString(cmd.id)) {
+        return utils::MakeUnexpected(TruncatedError("VECDEL id"));
+      }
+      break;
+    }
     case WalOpType::kMetaSet: {
       cmd.type = CommandType::kMetaset;
       if (!reader.ReadString(cmd.id)) {
         return utils::MakeUnexpected(TruncatedError("METASET id"));
       }
-      if (!reader.ReadString(cmd.filter_expr)) {
-        return utils::MakeUnexpected(TruncatedError("METASET filter_expr"));
+      const size_t metadata_start = reader.position();
+      uint64_t magic = 0;
+      if (reader.remaining() >= sizeof(uint32_t) && reader.ReadLE(magic, sizeof(uint32_t)) &&
+          magic == kTypedMetadataMagic) {
+        auto metadata = DecodeTypedMetadata(reader);
+        if (!metadata) {
+          return utils::MakeUnexpected(metadata.error());
+        }
+        cmd.metadata = std::move(*metadata);
+      } else {
+        reader.set_position(metadata_start);
+        if (!reader.ReadString(cmd.filter_expr)) {
+          return utils::MakeUnexpected(TruncatedError("METASET filter_expr"));
+        }
       }
       break;
     }

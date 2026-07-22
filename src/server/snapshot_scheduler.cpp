@@ -97,12 +97,29 @@ void SnapshotScheduler::SchedulerLoop() {
   auto next_save_time = std::chrono::steady_clock::now() + std::chrono::seconds(interval_sec);
 
   while (running_) {
+    // Reap any finished fork child every tick. This is the only place the
+    // auto-snapshot path drives ForkSnapshotWriter::CheckChild(), which reaps
+    // the child (preventing zombies), flips status out of kInProgress (so the
+    // next snapshot can start), and — critically — writes the WAL checkpoint
+    // sidecar and truncates the WAL. Without it a single fork would stay
+    // kInProgress forever: only one snapshot per process, WAL growing unbounded.
+    if (fork_writer_ != nullptr) {
+      const bool was_in_progress = fork_writer_->IsInProgress();
+      fork_writer_->CheckChild();
+      // A forked child creates its output asynchronously. Retention cleanup
+      // must run only after that child is reaped; otherwise the newly started
+      // snapshot can appear after CleanupOldSnapshots() has counted files and
+      // leave retain + 1 files behind.
+      if (was_in_progress && !fork_writer_->IsInProgress()) {
+        CleanupOldSnapshots();
+      }
+    }
+
     auto now = std::chrono::steady_clock::now();
 
     // Check if it's time to save
     if (now >= next_save_time) {
       TakeSnapshot();
-      CleanupOldSnapshots();
 
       // Schedule next save
       next_save_time = std::chrono::steady_clock::now() + std::chrono::seconds(interval_sec);
@@ -110,6 +127,16 @@ void SnapshotScheduler::SchedulerLoop() {
 
     // Sleep for check interval
     std::this_thread::sleep_for(std::chrono::milliseconds(kCheckIntervalMs));
+  }
+
+  // Drain a final CheckChild on shutdown so a snapshot that completed just
+  // before Stop() still records its checkpoint and truncates the WAL.
+  if (fork_writer_ != nullptr) {
+    const bool was_in_progress = fork_writer_->IsInProgress();
+    fork_writer_->CheckChild();
+    if (was_in_progress && !fork_writer_->IsInProgress()) {
+      CleanupOldSnapshots();
+    }
   }
 
   utils::StructuredLog().Event("snapshot_scheduler_thread_exiting").Info();

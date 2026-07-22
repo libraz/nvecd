@@ -11,6 +11,7 @@
 #include <array>
 #include <cerrno>
 #include <cstring>
+#include <filesystem>
 
 namespace nvecd::storage {
 
@@ -67,6 +68,21 @@ bool ReadAll(int fd, void* buf, size_t n) {
   return true;
 }
 
+/// Persist the directory entry created by rename(2). fsync'ing only the file
+/// is not sufficient: after a power loss the directory can lose the rename and
+/// leave a completed snapshot without its checkpoint sidecar.
+bool FsyncParentDirectory(const std::string& path) {
+  const auto parent = std::filesystem::path(path).parent_path();
+  const std::string directory = parent.empty() ? "." : parent.string();
+  const int dir_fd = ::open(directory.c_str(), O_RDONLY | O_DIRECTORY);
+  if (dir_fd < 0) {
+    return false;
+  }
+  const bool ok = ::fsync(dir_fd) == 0;
+  ::close(dir_fd);
+  return ok;
+}
+
 }  // namespace
 
 utils::Expected<void, utils::Error> WriteWalCheckpoint(const std::string& snapshot_path, uint64_t sequence) {
@@ -111,6 +127,12 @@ utils::Expected<void, utils::Error> WriteWalCheckpoint(const std::string& snapsh
     return utils::MakeUnexpected(utils::MakeError(
         utils::ErrorCode::kStorageWriteError,
         "Failed to rename WAL checkpoint into place '" + final_path + "': " + std::string(std::strerror(saved_errno))));
+  }
+
+  if (!FsyncParentDirectory(final_path)) {
+    return utils::MakeUnexpected(utils::MakeError(
+        utils::ErrorCode::kStorageWriteError,
+        "Failed to fsync WAL checkpoint directory for '" + final_path + "': " + std::string(std::strerror(errno))));
   }
 
   return {};

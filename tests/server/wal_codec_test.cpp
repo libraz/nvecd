@@ -51,6 +51,27 @@ TEST(WalCodecTest, EventAddRoundTrip) {
   EXPECT_EQ(decoded->timestamp.value(), 1719400000ULL);
 }
 
+TEST(WalCodecTest, EventPayloadUsesStableLittleEndianWireFixture) {
+  Command cmd;
+  cmd.type = CommandType::kEvent;
+  cmd.event_type = EventType::ADD;
+  cmd.ctx = "c";
+  cmd.id = "i";
+  cmd.score = -1;
+  cmd.timestamp = 1ULL;
+
+  // event_type:u8, ctx:string, id:string, score:i32, timestamp:u64. This
+  // fixed fixture protects the durable payload format from accidental native-
+  // endian or field-order changes that a round-trip test alone cannot catch.
+  const std::vector<uint8_t> expected = {0x00,                                             // ADD
+                                         0x01, 0x00, 0x00, 0x00,                           // ctx length
+                                         'c',  0x01, 0x00, 0x00, 0x00,                     // id length
+                                         'i',  0xFF, 0xFF, 0xFF, 0xFF,                     // score -1
+                                         0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};  // timestamp
+
+  EXPECT_EQ(EncodeCommand(cmd), expected);
+}
+
 TEST(WalCodecTest, EventDelMapsToDeleteOpAndNegativeScore) {
   Command cmd;
   cmd.type = CommandType::kEvent;
@@ -127,6 +148,23 @@ TEST(WalCodecTest, MetasetEmptyFilterRoundTrip) {
   EXPECT_TRUE(decoded->filter_expr.empty());
 }
 
+TEST(WalCodecTest, TypedHttpMetadataRoundTripsWithoutFilterGrammarLoss) {
+  Command cmd;
+  cmd.type = CommandType::kMetaset;
+  cmd.id = "doc:with,delimiters";
+  cmd.metadata = vectors::Metadata{{"text", std::string("comma,value:with:colons")},
+                                   {"empty", std::string("")},
+                                   {"count", int64_t{9007199254740991LL}},
+                                   {"ratio", 0.12345678901234566},
+                                   {"published", true}};
+
+  auto decoded = DecodeWalRecord(MakeRecord(cmd));
+  ASSERT_TRUE(decoded.has_value()) << decoded.error().to_string();
+  ASSERT_TRUE(decoded->metadata.has_value());
+  EXPECT_TRUE(decoded->filter_expr.empty());
+  EXPECT_EQ(*decoded->metadata, *cmd.metadata);
+}
+
 TEST(WalCodecTest, EncodeUnsupportedCommandReturnsEmpty) {
   Command cmd;
   cmd.type = CommandType::kSim;
@@ -164,6 +202,18 @@ TEST(WalCodecTest, TruncatedVecsetPayloadReturnsError) {
 
   auto decoded = DecodeWalRecord(record);
   EXPECT_FALSE(decoded.has_value());
+}
+
+TEST(WalCodecTest, VecsetImpossibleDimensionIsRejectedBeforeAllocation) {
+  WalRecord record;
+  record.op = WalOpType::kVecSet;
+  // id="x", then dimension=UINT32_MAX with no vector body. The dimension is
+  // CRC-valid at the file layer but must never reach vector::reserve().
+  record.payload = {1, 0, 0, 0, 'x', 0xFF, 0xFF, 0xFF, 0xFF};
+
+  auto decoded = DecodeWalRecord(record);
+  ASSERT_FALSE(decoded.has_value());
+  EXPECT_EQ(decoded.error().code(), utils::ErrorCode::kStorageCorrupted);
 }
 
 TEST(WalCodecTest, EmptyPayloadStringLengthReturnsError) {

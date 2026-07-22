@@ -107,10 +107,12 @@ WriteAheadLog::~WriteAheadLog() {
 }
 
 Expected<void, Error> WriteAheadLog::Open(const Config& config) {
+  // Close owns mutex_ while releasing the active fd. Calling it after taking
+  // mutex_ here deadlocks when Open is used to rotate to a new configuration.
+  // Lifecycle calls are serialized by the server; close first, then acquire
+  // the data-path lock for initialization.
+  Close();
   std::lock_guard<std::mutex> lock(mutex_);
-  if (open_) {
-    Close();
-  }
 
   config_ = config;
 
@@ -126,6 +128,14 @@ Expected<void, Error> WriteAheadLog::Open(const Config& config) {
   if (!scan_result) {
     return utils::MakeUnexpected(scan_result.error());
   }
+
+  // A previous clean Open/Close without appends leaves a header-only segment.
+  // Keeping it forever makes repeated restarts leak one WAL file each time;
+  // it has no recovery value, so discard it before creating the next segment.
+  files_.erase(
+      std::remove_if(files_.begin(), files_.end(),
+                     [](const WalFile& file) { return file.max_sequence == 0 && ::unlink(file.path.c_str()) == 0; }),
+      files_.end());
 
   // Open or create the current file
   auto rotate_result = RotateFile();
@@ -214,13 +224,24 @@ Expected<uint64_t, Error> WriteAheadLog::Append(WalOpType op, const void* payloa
   WriteU32(header, record_body_size);
   WriteU32(header + 4, crc);
 
+  auto poison_current_segment = [this](const std::string& message) -> Expected<uint64_t, Error> {
+    // A short/failed write leaves an untrusted tail. Never append another ACKed
+    // record to that segment: recovery stops at its corrupt tail and would
+    // otherwise lose every later record in the same file.
+    if (current_fd_ >= 0) {
+      ::close(current_fd_);
+      current_fd_ = -1;
+    }
+    open_ = false;
+    utils::StructuredLog().Event("wal_segment_poisoned").Field("error", message).Error();
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kWalWriteError, message));
+  };
+
   if (!WriteAll(current_fd_, header, sizeof(header))) {
-    return utils::MakeUnexpected(utils::MakeError(
-        utils::ErrorCode::kWalWriteError, "Failed to write record header: " + std::string(std::strerror(errno))));
+    return poison_current_segment("Failed to write record header: " + std::string(std::strerror(errno)));
   }
   if (!WriteAll(current_fd_, body.data(), body.size())) {
-    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kWalWriteError,
-                                                  "Failed to write record body: " + std::string(std::strerror(errno))));
+    return poison_current_segment("Failed to write record body: " + std::string(std::strerror(errno)));
   }
 
   current_file_size_ += total_record_size;
@@ -232,7 +253,9 @@ Expected<uint64_t, Error> WriteAheadLog::Append(WalOpType op, const void* payloa
   }
 
   if (config_.sync_on_write) {
-    ::fsync(current_fd_);
+    if (::fsync(current_fd_) != 0) {
+      return poison_current_segment("Failed to fsync WAL record: " + std::string(std::strerror(errno)));
+    }
   } else {
     needs_sync_.store(true);
   }
@@ -278,7 +301,12 @@ Expected<uint64_t, Error> WriteAheadLog::Replay(uint64_t from_sequence,
       uint32_t body_length = ReadU32(rec_header);
       uint32_t expected_crc = ReadU32(rec_header + 4);
 
-      if (body_length < kWalRecordHeaderSize) {
+      if (body_length < kWalRecordHeaderSize || body_length > kMaxWalRecordBodySize) {
+        utils::StructuredLog()
+            .Event("wal_record_length_invalid")
+            .Field("file", path)
+            .Field("body_length", static_cast<int64_t>(body_length))
+            .Warn();
         break;  // Invalid record — stop
       }
 

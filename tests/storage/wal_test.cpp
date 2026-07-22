@@ -55,6 +55,36 @@ TEST_F(WalTest, OpenClose) {
   EXPECT_FALSE(wal.IsOpen());
 }
 
+TEST_F(WalTest, ReopenClosesPreviousSegmentWithoutDeadlock) {
+  WriteAheadLog wal;
+  auto config = MakeConfig();
+  ASSERT_TRUE(wal.Open(config));
+  ASSERT_TRUE(wal.Append(WalOpType::kEventAdd, nullptr, 0));
+
+  // Open must safely replace an existing lifecycle without recursively taking
+  // the non-recursive WAL mutex.
+  ASSERT_TRUE(wal.Open(config));
+  EXPECT_TRUE(wal.IsOpen());
+  EXPECT_TRUE(wal.Append(WalOpType::kEventAdd, nullptr, 0));
+}
+
+TEST_F(WalTest, ReopenRemovesHeaderOnlySegments) {
+  const auto config = MakeConfig();
+  for (int i = 0; i < 3; ++i) {
+    WriteAheadLog wal;
+    ASSERT_TRUE(wal.Open(config));
+    wal.Close();
+  }
+
+  size_t segment_count = 0;
+  for (const auto& entry : fs::directory_iterator(test_dir_)) {
+    if (entry.path().filename().string().rfind("wal-", 0) == 0) {
+      ++segment_count;
+    }
+  }
+  EXPECT_EQ(segment_count, 1U);
+}
+
 TEST_F(WalTest, AppendSingle) {
   WriteAheadLog wal;
   ASSERT_TRUE(wal.Open(MakeConfig()));
