@@ -5,6 +5,7 @@
 
 #include "events/event_store.h"
 
+#include <algorithm>
 #include <chrono>
 
 #include "utils/error.h"
@@ -93,12 +94,11 @@ utils::Expected<EventStore::IngestResult, utils::Error> EventStore::AddEventAndG
       // Time-window based deduplication
       if (dedup_cache_) {
         EventKey key(ctx, id, score);
-        if (dedup_cache_->IsDuplicate(key, ts)) {
+        if (dedup_cache_->CheckAndInsert(key, ts)) {
           deduped_events_.fetch_add(1, std::memory_order_relaxed);
           result.deduped = true;
           return result;  // Duplicate within time window
         }
-        dedup_cache_->Insert(key, ts);
       }
       break;
 
@@ -106,12 +106,11 @@ utils::Expected<EventStore::IngestResult, utils::Error> EventStore::AddEventAndG
       // Last-value based deduplication
       if (state_cache_) {
         StateKey key(ctx, id);
-        if (state_cache_->IsDuplicateSet(key, score)) {
+        if (state_cache_->CheckAndUpdateSet(key, score)) {
           deduped_events_.fetch_add(1, std::memory_order_relaxed);
           result.deduped = true;
           return result;  // Same value, idempotent skip
         }
-        state_cache_->UpdateScore(key, score);
       }
       break;
 
@@ -119,12 +118,11 @@ utils::Expected<EventStore::IngestResult, utils::Error> EventStore::AddEventAndG
       // Deletion flag based deduplication
       if (state_cache_) {
         StateKey key(ctx, id);
-        if (state_cache_->IsDuplicateDel(key)) {
+        if (state_cache_->CheckAndMarkDeleted(key)) {
           deduped_events_.fetch_add(1, std::memory_order_relaxed);
           result.deduped = true;
           return result;  // Already deleted
         }
-        state_cache_->MarkDeleted(key);
       }
       // For DEL, store with score=0
       score = 0;
@@ -145,9 +143,11 @@ utils::Expected<EventStore::IngestResult, utils::Error> EventStore::AddEventAndG
     // Create ring buffer for context if it doesn't exist
     auto it = ctx_events_.find(ctx);
     if (it == ctx_events_.end()) {
+      EvictLeastRecentlyUsedContextLocked();
       auto [new_it, inserted] = ctx_events_.emplace(ctx, RingBuffer<Event>(config_.ctx_buffer_size));
       it = new_it;
     }
+    TouchContextLocked(ctx);
 
     // Snapshot the buffer contents that existed before this event.
     result.prior_events = it->second.GetAll();
@@ -176,12 +176,27 @@ utils::Expected<void, utils::Error> EventStore::RestoreEvent(const std::string& 
   std::unique_lock lock(mutex_);
   auto it = ctx_events_.find(ctx);
   if (it == ctx_events_.end()) {
+    EvictLeastRecentlyUsedContextLocked();
     auto [new_it, inserted] = ctx_events_.emplace(ctx, RingBuffer<Event>(config_.ctx_buffer_size));
     it = new_it;
   }
+  TouchContextLocked(ctx);
   // Push verbatim: preserve the original score, type, and timestamp so
   // temporal-decay weights and DEL/SET semantics survive the reload exactly.
   it->second.Push(event);
+
+  // Restore the last-value state cache in the same insertion order as the
+  // ring buffer. Snapshot/WAL recovery bypasses AddEventAndGetPrior(), so
+  // without this reseed a replayed SET/DEL would look new and apply its
+  // co-occurrence delta a second time after restart.
+  if (state_cache_) {
+    StateKey key(ctx, event.item_id);
+    if (event.type == EventType::SET) {
+      state_cache_->UpdateScore(key, event.score);
+    } else if (event.type == EventType::DEL) {
+      state_cache_->MarkDeleted(key);
+    }
+  }
 
   return {};
 }
@@ -218,6 +233,8 @@ std::vector<std::string> EventStore::GetAllContexts() const {
 void EventStore::Clear() {
   std::unique_lock lock(mutex_);
   ctx_events_.clear();
+  ctx_last_access_.clear();
+  context_access_sequence_ = 0;
   total_events_.store(0, std::memory_order_relaxed);
   deduped_events_.store(0, std::memory_order_relaxed);
   if (dedup_cache_) {
@@ -244,14 +261,17 @@ EventStoreStatistics EventStore::GetStatistics() const {
   stats.stored_events = stored;
 
   // Estimate memory usage
-  stats.memory_bytes = MemoryUsage();
+  stats.memory_bytes = MemoryUsageLocked();
 
   return stats;
 }
 
 size_t EventStore::MemoryUsage() const {
   std::shared_lock lock(mutex_);
+  return MemoryUsageLocked();
+}
 
+size_t EventStore::MemoryUsageLocked() const {
   size_t total = 0;
 
   // Base container overhead
@@ -275,6 +295,24 @@ size_t EventStore::MemoryUsage() const {
   }
 
   return total;
+}
+
+void EventStore::EvictLeastRecentlyUsedContextLocked() {
+  if (config_.max_contexts == 0 || ctx_events_.size() < config_.max_contexts) {
+    return;
+  }
+
+  const auto victim = std::min_element(ctx_last_access_.begin(), ctx_last_access_.end(),
+                                       [](const auto& lhs, const auto& rhs) { return lhs.second < rhs.second; });
+  if (victim == ctx_last_access_.end()) {
+    return;
+  }
+  ctx_events_.erase(victim->first);
+  ctx_last_access_.erase(victim);
+}
+
+void EventStore::TouchContextLocked(const std::string& ctx) {
+  ctx_last_access_[ctx] = ++context_access_sequence_;
 }
 
 std::shared_lock<std::shared_mutex> EventStore::AcquireReadLock() const {

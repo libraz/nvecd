@@ -90,6 +90,9 @@ class StateCache {
    */
   bool IsDuplicateSet(const StateKey& key, int score);
 
+  /** @brief Atomically deduplicate and record a SET state. */
+  bool CheckAndUpdateSet(const StateKey& key, int score);
+
   /**
    * @brief Check if DEL operation is duplicate
    *
@@ -99,6 +102,9 @@ class StateCache {
    * @return true if already deleted, false otherwise
    */
   bool IsDuplicateDel(const StateKey& key);
+
+  /** @brief Atomically deduplicate and record a DEL state. */
+  bool CheckAndMarkDeleted(const StateKey& key);
 
   /**
    * @brief Update score for a key

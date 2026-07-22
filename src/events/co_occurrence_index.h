@@ -117,9 +117,10 @@ class CoOccurrenceIndex {
    * (and resulting over-count) of re-processing the entire buffer per event.
    *
    * Self-pairs (same item_id) are skipped. Temporal decay, when enabled, is
-   * computed relative to the most recent timestamp among the new event and the
-   * prior events. The pruning hook (max_neighbors / min_support) is applied to
-   * the affected item, matching UpdateFromEvents.
+   * computed relative to the newer event in each pair, matching
+   * UpdateFromEvents regardless of arrival order. The pruning hook
+   * (max_neighbors / min_support) is applied to the affected item, matching
+   * UpdateFromEvents.
    *
    * @param ctx Context identifier (used for logging, not stored)
    * @param prior_events Events already present in the context before new_event

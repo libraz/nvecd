@@ -93,6 +93,23 @@ TEST(EventStoreTest, AddEventsToMultipleContexts) {
   EXPECT_EQ(events2[0].item_id, "item2");
 }
 
+TEST(EventStoreTest, MaxContextsEvictsLeastRecentlyWrittenContext) {
+  auto config = MakeConfig();
+  config.max_contexts = 2;
+  EventStore store(config);
+
+  ASSERT_TRUE(store.AddEvent("oldest", "item1", 10).has_value());
+  ASSERT_TRUE(store.AddEvent("recent", "item2", 20).has_value());
+  // Touch oldest so recent becomes the LRU entry.
+  ASSERT_TRUE(store.AddEvent("oldest", "item3", 30).has_value());
+  ASSERT_TRUE(store.AddEvent("new", "item4", 40).has_value());
+
+  EXPECT_EQ(store.GetContextCount(), 2U);
+  EXPECT_FALSE(store.GetEvents("oldest").empty());
+  EXPECT_TRUE(store.GetEvents("recent").empty());
+  EXPECT_FALSE(store.GetEvents("new").empty());
+}
+
 // ============================================================================
 // Ring Buffer Behavior
 // ============================================================================

@@ -233,12 +233,34 @@ class EventStore {
   std::unique_lock<std::shared_mutex> AcquireWriteLock();
 
  private:
+  /**
+   * @brief Estimate memory usage assuming the caller already holds mutex_
+   *
+   * Split out from MemoryUsage() so callers that already hold the lock (e.g.
+   * GetStatistics()) do not re-acquire the non-recursive shared_mutex, which
+   * would be undefined behavior and can deadlock a writer-preferring lock.
+   *
+   * @return Estimated memory usage in bytes
+   */
+  size_t MemoryUsageLocked() const;
+
+  /**
+   * @brief Make room for a new context according to the configured LRU cap.
+   * @pre mutex_ is held exclusively and @p ctx is not already present.
+   */
+  void EvictLeastRecentlyUsedContextLocked();
+
+  /// Record context activity while holding mutex_ exclusively.
+  void TouchContextLocked(const std::string& ctx);
+
   config::EventsConfig config_;  ///< Configuration
 
   // Context -> RingBuffer<Event>
   // Uses shared_mutex for reader-writer lock pattern
   mutable std::shared_mutex mutex_;
   std::unordered_map<std::string, RingBuffer<Event>> ctx_events_;
+  std::unordered_map<std::string, uint64_t> ctx_last_access_;
+  uint64_t context_access_sequence_ = 0;
 
   std::atomic<uint64_t> total_events_{0};    ///< Total events processed
   std::atomic<uint64_t> deduped_events_{0};  ///< Total deduplicated events

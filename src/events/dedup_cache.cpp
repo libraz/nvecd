@@ -39,6 +39,36 @@ bool DedupCache::IsDuplicate(const EventKey& key, uint64_t current_timestamp) co
   return false;
 }
 
+bool DedupCache::CheckAndInsert(const EventKey& key, uint64_t timestamp) {
+  if (window_sec_ == 0) {
+    total_misses_.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+
+  std::unique_lock lock(mutex_);
+  auto it = cache_.find(key);
+  if (it != cache_.end()) {
+    const uint64_t previous = it->second.timestamp;
+    if (timestamp >= previous && timestamp - previous <= window_sec_) {
+      total_hits_.fetch_add(1, std::memory_order_relaxed);
+      return true;
+    }
+
+    total_misses_.fetch_add(1, std::memory_order_relaxed);
+    it->second.timestamp = std::max(previous, timestamp);
+    lru_list_.splice(lru_list_.begin(), lru_list_, it->second.lru_iter);
+    return false;
+  }
+
+  total_misses_.fetch_add(1, std::memory_order_relaxed);
+  if (cache_.size() >= max_size_) {
+    EvictLRU();
+  }
+  lru_list_.push_front(key);
+  cache_[key] = CacheEntry{timestamp, lru_list_.begin()};
+  return false;
+}
+
 void DedupCache::Insert(const EventKey& key, uint64_t timestamp) {
   std::unique_lock lock(mutex_);
 

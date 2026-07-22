@@ -354,6 +354,33 @@ TEST(CoOccurrenceIndexTest, ZeroScores) {
   // GetSimilar should filter out zero scores
   auto similar = index.GetSimilar("item1", 10);
   EXPECT_TRUE(similar.empty());
+
+  // A zero contribution must not leave invisible neighbor/map entries.
+  EXPECT_EQ(index.GetItemCount(), 0);
+  EXPECT_EQ(index.GetNeighborCount("item1"), 0);
+  EXPECT_EQ(index.GetStatistics().co_pairs, 0);
+}
+
+TEST(CoOccurrenceIndexTest, TemporalIncrementalMatchesBatchRebuild) {
+  const auto events = MakeEvents({
+      {"item1", 10, 100},
+      {"item2", 20, 200},
+      {"item3", 30, 1000},
+  });
+
+  CoOccurrenceIndex batch;
+  batch.UpdateFromEvents("ctx", events, true, 100.0);
+
+  CoOccurrenceIndex incremental;
+  std::vector<Event> prior;
+  for (const auto& event : events) {
+    incremental.AddEventIncremental("ctx", prior, event, true, 100.0);
+    prior.push_back(event);
+  }
+
+  EXPECT_FLOAT_EQ(incremental.GetScore("item1", "item2"), batch.GetScore("item1", "item2"));
+  EXPECT_FLOAT_EQ(incremental.GetScore("item1", "item3"), batch.GetScore("item1", "item3"));
+  EXPECT_FLOAT_EQ(incremental.GetScore("item2", "item3"), batch.GetScore("item2", "item3"));
 }
 
 TEST(CoOccurrenceIndexTest, LargeNumberOfEvents) {

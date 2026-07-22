@@ -5,7 +5,9 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <thread>
+#include <vector>
 
 #include "events/event_store.h"
 
@@ -166,6 +168,52 @@ TEST_F(EventStoreDeduplicationTest, MixedDuplicateAndUnique) {
 
   auto events = store.GetEvents("user1");
   EXPECT_EQ(events.size(), 3);
+}
+
+// Recovery bypasses normal ingestion, but must still reconstruct SET/DEL state
+// so replaying a record already represented by the snapshot is idempotent.
+TEST_F(EventStoreDeduplicationTest, RestoreSeedsStateCacheForSetAndDelete) {
+  EventStore store(config_);
+  ASSERT_TRUE(store.RestoreEvent("ctx", Event("item", 42, 100, EventType::SET)));
+
+  auto set_replay = store.AddEventAndGetPrior("ctx", "item", 42, EventType::SET, 101);
+  ASSERT_TRUE(set_replay);
+  EXPECT_TRUE(set_replay->deduped);
+
+  ASSERT_TRUE(store.RestoreEvent("ctx", Event("item", 0, 102, EventType::DEL)));
+  auto del_replay = store.AddEventAndGetPrior("ctx", "item", 0, EventType::DEL, 103);
+  ASSERT_TRUE(del_replay);
+  EXPECT_TRUE(del_replay->deduped);
+}
+
+// The duplicate check and cache update must be a single transaction. Under the
+// former check-then-insert flow multiple concurrent ADDs could all pass the
+// read-side check before any writer recorded the key.
+TEST_F(EventStoreDeduplicationTest, ConcurrentDuplicateAddsAreStoredExactlyOnce) {
+  EventStore store(config_);
+  constexpr int kThreads = 64;
+  std::atomic<int> accepted{0};
+  std::vector<std::thread> workers;
+  workers.reserve(kThreads);
+
+  for (int i = 0; i < kThreads; ++i) {
+    workers.emplace_back([&]() {
+      auto result = store.AddEventAndGetPrior("ctx", "item", 42, EventType::ADD, 1000);
+      ASSERT_TRUE(result);
+      if (!result->deduped) {
+        accepted.fetch_add(1, std::memory_order_relaxed);
+      }
+    });
+  }
+  for (auto& worker : workers) {
+    worker.join();
+  }
+
+  EXPECT_EQ(accepted.load(), 1);
+  const auto stats = store.GetStatistics();
+  EXPECT_EQ(stats.total_events, kThreads);
+  EXPECT_EQ(stats.deduped_events, kThreads - 1);
+  EXPECT_EQ(stats.stored_events, 1U);
 }
 
 }  // namespace nvecd::events

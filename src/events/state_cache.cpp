@@ -30,6 +30,27 @@ bool StateCache::IsDuplicateSet(const StateKey& key, int score) {
   return false;  // State transition
 }
 
+bool StateCache::CheckAndUpdateSet(const StateKey& key, int score) {
+  std::unique_lock lock(mutex_);
+  auto it = states_.find(key);
+  if (it != states_.end() && it->second.first == score) {
+    total_hits_.fetch_add(1, std::memory_order_relaxed);
+    TouchLocked(key);
+    return true;
+  }
+
+  total_misses_.fetch_add(1, std::memory_order_relaxed);
+  if (it != states_.end()) {
+    it->second.first = score;
+    TouchLocked(key);
+  } else {
+    EvictIfFull();
+    lru_list_.push_front(key);
+    states_.emplace(key, std::make_pair(score, lru_list_.begin()));
+  }
+  return false;
+}
+
 bool StateCache::IsDuplicateDel(const StateKey& key) {
   std::shared_lock lock(mutex_);
 
@@ -47,6 +68,27 @@ bool StateCache::IsDuplicateDel(const StateKey& key) {
 
   total_misses_.fetch_add(1, std::memory_order_relaxed);
   return false;  // Not deleted yet
+}
+
+bool StateCache::CheckAndMarkDeleted(const StateKey& key) {
+  std::unique_lock lock(mutex_);
+  auto it = states_.find(key);
+  if (it != states_.end() && it->second.first == kDeletedScore) {
+    total_hits_.fetch_add(1, std::memory_order_relaxed);
+    TouchLocked(key);
+    return true;
+  }
+
+  total_misses_.fetch_add(1, std::memory_order_relaxed);
+  if (it != states_.end()) {
+    it->second.first = kDeletedScore;
+    TouchLocked(key);
+  } else {
+    EvictIfFull();
+    lru_list_.push_front(key);
+    states_.emplace(key, std::make_pair(kDeletedScore, lru_list_.begin()));
+  }
+  return false;
 }
 
 void StateCache::UpdateScore(const StateKey& key, int score) {

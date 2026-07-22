@@ -74,35 +74,6 @@ void CoOccurrenceIndex::AddEventIncrementalInternal(const std::vector<Event>& pr
     return;
   }
 
-  // Pre-compute the decay weight for the new event and each prior event.
-  // Ages are measured relative to the most recent timestamp across all
-  // events involved (new + prior), mirroring the full-scan path so that the
-  // incremental result matches a from-scratch computation.
-  float new_decay = 1.0F;
-  std::vector<float> prior_decay;
-  if (temporal_enabled && half_life_sec > 0.0) {
-    uint64_t max_ts = new_event.timestamp;
-    for (const auto& e : prior_events) {
-      if (e.timestamp > max_ts) {
-        max_ts = e.timestamp;
-      }
-    }
-
-    const double inv_half_life = 1.0 / half_life_sec;
-    constexpr float kMinDecay = 1e-6F;
-    auto decay_for = [&](uint64_t ts) {
-      double age = static_cast<double>(max_ts - ts);
-      auto decay = static_cast<float>(std::exp2(-age * inv_half_life));
-      return std::max(decay, kMinDecay);
-    };
-
-    new_decay = decay_for(new_event.timestamp);
-    prior_decay.resize(prior_events.size());
-    for (size_t i = 0; i < prior_events.size(); ++i) {
-      prior_decay[i] = decay_for(prior_events[i].timestamp);
-    }
-  }
-
   // Add only the pairs (new_event, prior_events[i]) once each (symmetric).
   for (size_t i = 0; i < prior_events.size(); ++i) {
     const auto& prior = prior_events[i];
@@ -114,8 +85,25 @@ void CoOccurrenceIndex::AddEventIncrementalInternal(const std::vector<Event>& pr
     // restore can supply scores outside the validated [0,100] range, and a
     // 32-bit int*int product could otherwise overflow.
     auto score = static_cast<float>(static_cast<int64_t>(new_event.score) * prior.score);
-    if (!prior_decay.empty()) {
-      score *= new_decay * prior_decay[i];
+    if (temporal_enabled && half_life_sec > 0.0) {
+      // Decay is pair-local: this keeps a streaming update bit-for-bit
+      // equivalent to a batch rebuild regardless of the arrival order of
+      // other events in the context.
+      const uint64_t pair_max_ts = std::max(new_event.timestamp, prior.timestamp);
+      const double inv_half_life = 1.0 / half_life_sec;
+      constexpr float kMinDecay = 1e-6F;
+      const auto decay_for = [&](uint64_t ts) {
+        const double age = static_cast<double>(pair_max_ts - ts);
+        return std::max(static_cast<float>(std::exp2(-age * inv_half_life)), kMinDecay);
+      };
+      score *= decay_for(new_event.timestamp) * decay_for(prior.timestamp);
+    }
+
+    // A zero contribution must not materialize a pair.  Besides wasting
+    // memory, such entries inflate neighbor/item statistics even though they
+    // can never appear in a similarity result.
+    if (score == 0.0F) {
+      continue;
     }
 
     co_scores_[new_event.item_id][prior.item_id] += score;
@@ -125,7 +113,9 @@ void CoOccurrenceIndex::AddEventIncrementalInternal(const std::vector<Event>& pr
   generation_.fetch_add(1, std::memory_order_release);
 
   // Only the new event's neighbor list can grow here, so prune just that item.
-  if (config_.max_neighbors_per_item > 0) {
+  // min_support is a live retention policy too: delaying it until a periodic
+  // decay lets low-support edges accumulate unboundedly when decay is off.
+  if (config_.max_neighbors_per_item > 0 || config_.min_support > 0.0F) {
     auto it = co_scores_.find(new_event.item_id);
     if (it != co_scores_.end() && it->second.size() > config_.max_neighbors_per_item) {
       PruneItemLocked(new_event.item_id);
@@ -136,26 +126,6 @@ void CoOccurrenceIndex::AddEventIncrementalInternal(const std::vector<Event>& pr
 void CoOccurrenceIndex::UpdateFromEventsInternal(const std::string& ctx [[maybe_unused]],
                                                  const std::vector<Event>& events, bool temporal_enabled,
                                                  double half_life_sec) {
-  // Pre-compute per-event decay weights
-  std::vector<float> decay_weights;
-  if (temporal_enabled && half_life_sec > 0.0) {
-    uint64_t max_ts = 0;
-    for (const auto& e : events) {
-      if (e.timestamp > max_ts) {
-        max_ts = e.timestamp;
-      }
-    }
-
-    decay_weights.resize(events.size());
-    const double inv_half_life = 1.0 / half_life_sec;
-    constexpr float kMinDecay = 1e-6F;
-    for (size_t i = 0; i < events.size(); ++i) {
-      double age = static_cast<double>(max_ts - events[i].timestamp);
-      auto decay = static_cast<float>(std::exp2(-age * inv_half_life));
-      decay_weights[i] = std::max(decay, kMinDecay);
-    }
-  }
-
   // Compute pairwise co-occurrence scores
   for (size_t i = 0; i < events.size(); ++i) {
     for (size_t j = i + 1; j < events.size(); ++j) {
@@ -172,8 +142,21 @@ void CoOccurrenceIndex::UpdateFromEventsInternal(const std::string& ctx [[maybe_
       auto score = static_cast<float>(static_cast<int64_t>(event1.score) * event2.score);
 
       // Apply temporal decay if enabled
-      if (!decay_weights.empty()) {
-        score *= decay_weights[i] * decay_weights[j];
+      if (temporal_enabled && half_life_sec > 0.0) {
+        const uint64_t pair_max_ts = std::max(event1.timestamp, event2.timestamp);
+        const double inv_half_life = 1.0 / half_life_sec;
+        constexpr float kMinDecay = 1e-6F;
+        const auto decay_for = [&](uint64_t ts) {
+          const double age = static_cast<double>(pair_max_ts - ts);
+          return std::max(static_cast<float>(std::exp2(-age * inv_half_life)), kMinDecay);
+        };
+        score *= decay_for(event1.timestamp) * decay_for(event2.timestamp);
+      }
+
+      // Do not create map entries for a non-contribution (for example an
+      // event with score zero).
+      if (score == 0.0F) {
+        continue;
       }
 
       co_scores_[event1.item_id][event2.item_id] += score;
@@ -183,8 +166,9 @@ void CoOccurrenceIndex::UpdateFromEventsInternal(const std::string& ctx [[maybe_
 
   generation_.fetch_add(1, std::memory_order_release);
 
-  // Prune affected items if max_neighbors is configured
-  if (config_.max_neighbors_per_item > 0) {
+  // Prune affected items after a bulk update. Apply min_support immediately
+  // as well, otherwise a deployment with decay disabled never enforces it.
+  if (config_.max_neighbors_per_item > 0 || config_.min_support > 0.0F) {
     for (size_t i = 0; i < events.size(); ++i) {
       auto it = co_scores_.find(events[i].item_id);
       if (it != co_scores_.end() && it->second.size() > config_.max_neighbors_per_item) {

@@ -96,6 +96,17 @@ class DedupCache {
   bool IsDuplicate(const EventKey& key, uint64_t current_timestamp) const;
 
   /**
+   * @brief Atomically test for a duplicate and record a new event.
+   *
+   * This is the ingestion-safe counterpart to IsDuplicate()+Insert(). Keeping
+   * the check and update under one exclusive lock prevents two concurrent
+   * requests for the same event from both observing a miss and being counted.
+   *
+   * @return true when an in-window duplicate was already present.
+   */
+  bool CheckAndInsert(const EventKey& key, uint64_t timestamp);
+
+  /**
    * @brief Insert event into cache
    *
    * If cache is full, evicts least recently used entry.
