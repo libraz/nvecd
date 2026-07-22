@@ -110,5 +110,18 @@ TEST(FilterParserTest, TrailingComma) {
   EXPECT_EQ(result->conditions.size(), 1U);
 }
 
+TEST(FilterParserTest, ComparisonAndInOperators) {
+  auto result = ParseSimpleFilter("rating>=4.5,count<10,status!=archived,category=in(books|music)");
+  ASSERT_TRUE(result.has_value());
+  ASSERT_EQ(result->conditions.size(), 4U);
+  EXPECT_EQ(result->conditions[0].op, vectors::FilterOp::kGe);
+  EXPECT_DOUBLE_EQ(std::get<double>(result->conditions[0].value), 4.5);
+  EXPECT_EQ(result->conditions[1].op, vectors::FilterOp::kLt);
+  EXPECT_EQ(result->conditions[2].op, vectors::FilterOp::kNe);
+  EXPECT_EQ(result->conditions[3].op, vectors::FilterOp::kIn);
+  ASSERT_EQ(result->conditions[3].values.size(), 2U);
+  EXPECT_EQ(std::get<std::string>(result->conditions[3].values[1]), "music");
+}
+
 }  // namespace
 }  // namespace nvecd::server

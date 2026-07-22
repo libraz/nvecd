@@ -2,7 +2,8 @@
  * @file filter_parser.h
  * @brief Parse simple filter expressions into MetadataFilter
  *
- * Supports a simple key:value syntax for metadata filtering:
+ * Supports equality (`key:value` / `key=value`), comparison (`key>=value`),
+ * and membership (`key=in(value1|value2)`) metadata filtering:
  *   "status:active"                   → Eq("status", "active")
  *   "status:active,category:news"     → Eq("status","active") AND Eq("category","news")
  *

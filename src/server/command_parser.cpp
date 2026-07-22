@@ -208,15 +208,32 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request, 
   if (request.empty()) {
     return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "Empty command"));
   }
-
-  // Split by newlines for multi-line commands (VECSET, SIMV)
-  auto lines = Split(request, '\n');
-  if (lines.empty()) {
-    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "Empty command"));
+  if (request.find('\0') != std::string::npos) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "Command must not contain embedded NUL bytes"));
   }
 
-  // Parse first line (command and args)
-  std::string first_line = Trim(lines[0]);
+  // The transport is line-delimited, so a command itself cannot span lines.
+  // Rejecting an embedded newline prevents direct callers from silently having
+  // the parser ignore a trailing payload. Accept one terminal CR/LF pair for
+  // convenience in unit tests and non-network callers.
+  std::string raw_first_line = request;
+  while (!raw_first_line.empty() && (raw_first_line.back() == '\r' || raw_first_line.back() == '\n')) {
+    raw_first_line.pop_back();
+  }
+  if (raw_first_line.empty()) {
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "Empty command"));
+  }
+  if (raw_first_line.find_first_of("\r\n") != std::string::npos) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "Command must be a single line"));
+  }
+
+  // Parse the line. Keep an untrimmed copy for AUTH:
+  // passwords are opaque bytes after the first command separator, so collapsing
+  // or trimming whitespace would make valid configured secrets impossible to
+  // authenticate with over TCP.
+  std::string first_line = Trim(raw_first_line);
   auto tokens = Split(first_line, ' ');
   if (tokens.empty()) {
     return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "Empty command"));
@@ -224,6 +241,17 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request, 
 
   Command cmd;
   std::string cmd_name = ToUpper(tokens[0]);
+
+  if (cmd_name == "AUTH") {
+    const size_t separator = raw_first_line.find_first_of(" \t");
+    if (separator == std::string::npos || separator + 1 >= raw_first_line.size()) {
+      return utils::MakeUnexpected(
+          utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "AUTH requires 1 argument: <password>"));
+    }
+    cmd.type = CommandType::kAuth;
+    cmd.variable_value = raw_first_line.substr(separator + 1);
+    return cmd;
+  }
 
   // Parse command type and arguments
   if (cmd_name == "EVENT") {
@@ -326,6 +354,15 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request, 
 
     cmd.dimension = static_cast<int>(vec.size());
     cmd.vector = std::move(vec);
+
+  } else if (cmd_name == "VECDEL") {
+    // VECDEL <id>
+    if (tokens.size() != 2) {
+      return utils::MakeUnexpected(
+          utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "VECDEL requires 1 argument: <id>"));
+    }
+    cmd.type = CommandType::kVecdel;
+    cmd.id = tokens[1];
 
   } else if (cmd_name == "METASET") {
     // METASET <id> <key:value[,key:value...]>
@@ -580,23 +617,6 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request, 
       return utils::MakeUnexpected(
           utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "Unknown SHOW subcommand: " + subcmd));
     }
-
-  } else if (cmd_name == "AUTH") {
-    // AUTH <password>
-    if (tokens.size() < 2) {
-      return utils::MakeUnexpected(
-          utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "AUTH requires 1 argument: <password>"));
-    }
-    cmd.type = CommandType::kAuth;
-    // Join all remaining tokens as password (in case password contains spaces)
-    std::string password;
-    for (size_t i = 1; i < tokens.size(); ++i) {
-      if (i > 1) {
-        password += " ";
-      }
-      password += tokens[i];
-    }
-    cmd.variable_value = password;  // Reuse variable_value field for password
 
   } else {
     cmd.type = CommandType::kUnknown;

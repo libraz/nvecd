@@ -7,6 +7,7 @@
 
 #include <cerrno>
 #include <cstdlib>
+#include <string_view>
 
 namespace nvecd::server {
 
@@ -46,6 +47,62 @@ vectors::MetadataValue ParseValue(const std::string& val) {
   return val;
 }
 
+bool ParseCondition(const std::string& pair, vectors::FilterCondition* condition) {
+  struct Operator {
+    std::string_view text;
+    vectors::FilterOp op;
+  };
+  constexpr Operator kOperators[] = {{"!=", vectors::FilterOp::kNe}, {">=", vectors::FilterOp::kGe},
+                                     {"<=", vectors::FilterOp::kLe}, {"=", vectors::FilterOp::kEq},
+                                     {">", vectors::FilterOp::kGt},  {"<", vectors::FilterOp::kLt},
+                                     {":", vectors::FilterOp::kEq}};
+
+  size_t operator_pos = std::string::npos;
+  const Operator* selected = nullptr;
+  for (const auto& candidate : kOperators) {
+    const size_t pos = pair.find(candidate.text);
+    if (pos != std::string::npos && (operator_pos == std::string::npos || pos < operator_pos ||
+                                     (pos == operator_pos && candidate.text.size() > selected->text.size()))) {
+      operator_pos = pos;
+      selected = &candidate;
+    }
+  }
+  if (selected == nullptr || operator_pos == 0) {
+    return false;
+  }
+
+  condition->field = pair.substr(0, operator_pos);
+  const std::string value = pair.substr(operator_pos + selected->text.size());
+  if (value.empty()) {
+    return false;
+  }
+
+  condition->op = selected->op;
+  if (selected->op == vectors::FilterOp::kEq && value.size() >= 5 && value.rfind("in(", 0) == 0 &&
+      value.back() == ')') {
+    condition->op = vectors::FilterOp::kIn;
+    const std::string list = value.substr(3, value.size() - 4);
+    size_t start = 0;
+    while (start <= list.size()) {
+      const size_t separator = list.find('|', start);
+      const std::string item =
+          list.substr(start, separator == std::string::npos ? std::string::npos : separator - start);
+      if (item.empty()) {
+        return false;
+      }
+      condition->values.push_back(ParseValue(item));
+      if (separator == std::string::npos) {
+        break;
+      }
+      start = separator + 1;
+    }
+    return !condition->values.empty();
+  }
+
+  condition->value = ParseValue(value);
+  return true;
+}
+
 }  // namespace
 
 utils::Expected<vectors::MetadataFilter, utils::Error> ParseSimpleFilter(const std::string& expr) {
@@ -70,25 +127,11 @@ utils::Expected<vectors::MetadataFilter, utils::Error> ParseSimpleFilter(const s
       continue;
     }
 
-    // Split by first ':'
-    size_t colon = pair.find(':');
-    if (colon == std::string::npos || colon == 0) {
-      return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandParseError,
-                                                    "Invalid filter condition: missing ':' in '" + pair + "'"));
-    }
-
-    std::string key = pair.substr(0, colon);
-    std::string val = pair.substr(colon + 1);
-
-    if (val.empty()) {
-      return utils::MakeUnexpected(
-          utils::MakeError(utils::ErrorCode::kCommandParseError, "Empty value for filter key '" + key + "'"));
-    }
-
     vectors::FilterCondition cond;
-    cond.field = key;
-    cond.op = vectors::FilterOp::kEq;
-    cond.value = ParseValue(val);
+    if (!ParseCondition(pair, &cond)) {
+      return utils::MakeUnexpected(
+          utils::MakeError(utils::ErrorCode::kCommandParseError, "Invalid filter condition: '" + pair + "'"));
+    }
     filter.conditions.push_back(std::move(cond));
   }
 

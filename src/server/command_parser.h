@@ -22,6 +22,7 @@
 #include "server/command_types.h"
 #include "utils/error.h"
 #include "utils/expected.h"
+#include "vectors/metadata.h"
 
 namespace nvecd::server {
 
@@ -36,7 +37,7 @@ struct Command {
 
   // EVENT fields
   std::string ctx;                                        // Context ID
-  std::string id;                                         // Item ID (EVENT, SIM, VECSET)
+  std::string id;                                         // Item ID (EVENT, SIM, VECSET, VECDEL)
   int score = 0;                                          // Event score (EVENT)
   events::EventType event_type = events::EventType::ADD;  // Event type (ADD/SET/DEL)
 
@@ -46,7 +47,10 @@ struct Command {
   std::optional<uint64_t> timestamp;  // Optional timestamp for EVENT (epoch seconds)
   std::optional<bool> adaptive;       // Optional adaptive flag for SIM
   std::string filter_expr;            // Filter or metadata expression (e.g., "status:active,type:news")
-  float min_score = 0.0F;             // Minimum score threshold
+  // Typed metadata is used by HTTP WAL records. TCP METASET continues to use
+  // filter_expr so its text protocol remains unchanged.
+  std::optional<vectors::Metadata> metadata;
+  float min_score = 0.0F;  // Minimum score threshold
 
   // VECSET/SIMV fields
   int dimension = 0;          // Vector dimension
@@ -68,16 +72,17 @@ struct Command {
  * - EVENT <ctx> ADD <id> <score> [timestamp=<epoch_sec>]
  * - EVENT <ctx> SET <id> <score> [timestamp=<epoch_sec>]
  * - EVENT <ctx> DEL <id> [timestamp=<epoch_sec>]
- * - VECSET <id> <dim> text\n<floats>
+ * - VECSET <id> <f1> <f2> ... <fN>
+ * - VECDEL <id>
  * - METASET <id> <key:value[,key:value...]>
  * - SIM <id> <top_k> [using=mode] [adaptive=on|off]
- * - SIMV <dim> <top_k>\n<floats>
+ * - SIMV <top_k> [filter=<expr>] [min_score=<float>] <f1> <f2> ... <fN>
  * - INFO
  * - CONFIG HELP|SHOW|VERIFY [path]
  * - DUMP SAVE|LOAD|VERIFY|INFO [filepath]
  * - DEBUG ON|OFF
  *
- * @param request Raw request string (may contain multiple lines for VECSET/SIMV)
+ * @param request Raw single-line request string (an optional final CRLF is accepted)
  * @param max_top_k Maximum allowed top_k for SIM/SIMV (0 = no upper-bound check)
  * @return Expected<Command, Error> Parsed command or error
  */

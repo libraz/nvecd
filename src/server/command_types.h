@@ -32,6 +32,7 @@ enum class CommandType : std::uint8_t {
   // Core commands
   kEvent,
   kVecset,
+  kVecdel,
   kMetaset,
   kSim,
   kSimv,
@@ -74,6 +75,8 @@ inline const char* CommandTypeToString(CommandType type) {
       return "EVENT";
     case CommandType::kVecset:
       return "VECSET";
+    case CommandType::kVecdel:
+      return "VECDEL";
     case CommandType::kMetaset:
       return "METASET";
     case CommandType::kSim:
@@ -140,6 +143,7 @@ inline CommandPrivilege GetCommandPrivilege(CommandType type) {
   switch (type) {
     case CommandType::kEvent:
     case CommandType::kVecset:
+    case CommandType::kVecdel:
     case CommandType::kMetaset:
     case CommandType::kSet:
     case CommandType::kCacheClear:

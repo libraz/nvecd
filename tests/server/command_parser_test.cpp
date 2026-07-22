@@ -27,6 +27,21 @@ TEST(CommandParserTest, ParseEvent_MissingArgs) {
   EXPECT_EQ(result.error().code(), ErrorCode::kCommandSyntaxError);
 }
 
+TEST(CommandParserTest, RejectsEmbeddedNulInsteadOfSilentlyTruncating) {
+  std::string request = "EVENT ctx ADD item 1";
+  request.push_back('\0');
+  request += " VECSET hidden 1 0";
+  auto result = ParseCommand(request);
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), ErrorCode::kCommandSyntaxError);
+}
+
+TEST(CommandParserTest, RejectsMultilineCommandInsteadOfIgnoringTrailingPayload) {
+  auto result = ParseCommand("VECSET item 1 0\nVECSET hidden 1 1");
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), ErrorCode::kCommandSyntaxError);
+}
+
 TEST(CommandParserTest, ParseEvent_InvalidScore) {
   auto result = ParseCommand("EVENT user123 ADD item456 abc");
   ASSERT_FALSE(result.has_value());
@@ -91,6 +106,17 @@ TEST(CommandParserTest, ParseVecset_RejectsNonFiniteFloat) {
   result = ParseCommand("VECSET item123 1.0 inf");
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code(), ErrorCode::kCommandInvalidArgument);
+}
+
+TEST(CommandParserTest, ParseVecdel_ValidAndRejectsMissingId) {
+  auto result = ParseCommand("VECDEL item123");
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->type, CommandType::kVecdel);
+  EXPECT_EQ(result->id, "item123");
+
+  result = ParseCommand("VECDEL");
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), ErrorCode::kCommandSyntaxError);
 }
 
 // METASET command tests
