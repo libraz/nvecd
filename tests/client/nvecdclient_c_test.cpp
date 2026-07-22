@@ -128,6 +128,23 @@ TEST_F(NvecdClientCTest, VecsetCommand) {
   nvecdclient_destroy(client);
 }
 
+TEST_F(NvecdClientCTest, VecdelCommand) {
+  NvecdClientConfig_C config = {};
+  config.host = "127.0.0.1";
+  config.port = port_;
+
+  NvecdClient_C* client = nvecdclient_create(&config);
+  ASSERT_NE(client, nullptr);
+  ASSERT_EQ(nvecdclient_connect(client), 0);
+
+  float vector[] = {0.1F, 0.2F, 0.3F};  // NOLINT
+  ASSERT_EQ(nvecdclient_vecset(client, "delete_me", vector, 3), 0);
+  EXPECT_EQ(nvecdclient_vecdel(client, "delete_me"), 0) << nvecdclient_get_last_error(client);
+  EXPECT_EQ(nvecdclient_vecdel(client, "delete_me"), -1);
+
+  nvecdclient_destroy(client);
+}
+
 //
 // SIM command tests
 //

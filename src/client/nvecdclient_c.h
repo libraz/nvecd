@@ -160,6 +160,15 @@ int nvecdclient_event(NvecdClient_C* client, const char* ctx, const char* type, 
 int nvecdclient_vecset(NvecdClient_C* client, const char* id, const float* vector, size_t dimension);
 
 /**
+ * @brief Delete a vector (VECDEL command)
+ *
+ * @param client Client handle
+ * @param id Vector ID
+ * @return 0 on success, -1 on error
+ */
+int nvecdclient_vecdel(NvecdClient_C* client, const char* id);
+
+/**
  * @brief Attach metadata to an existing item (METASET command)
  *
  * @param client Client handle

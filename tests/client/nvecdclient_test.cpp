@@ -11,6 +11,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <filesystem>
 #include <memory>
 #include <thread>
 
@@ -43,6 +44,7 @@ class NvecdClientTest : public ::testing::Test {
     config_->vectors.default_dimension = 3;               // Small dimension for tests
     config_->network.allow_cidrs = {"127.0.0.1/32"};      // Allow localhost
     config_->snapshot.dir = "/tmp/nvecd_test_snapshots";  // Use temp dir for tests
+    config_->snapshot.mode = "lock";                      // Save/Load round-trip is synchronous
 
     // Create and start server (server owns stores)
     server_ = std::make_unique<server::NvecdServer>(*config_);
@@ -127,6 +129,24 @@ TEST(NvecdClientFramingTest, MalformedCountTreatedAsComplete) {
   EXPECT_TRUE(detail::IsResponseComplete("OK RESULTS abc\r\n"));
 }
 
+TEST(NvecdClientFramingTest, CompleteResponseLengthPreservesCoalescedNextResponse) {
+  const std::string first = "OK RESULTS 1\r\nitem789 0.9245\r\n";
+  const std::string second = "OK VECSET\r\n";
+  const auto length = detail::CompleteResponseLength(first + second);
+  ASSERT_TRUE(length.has_value());
+  EXPECT_EQ(*length, first.size());
+}
+
+TEST(NvecdClientValidationTest, RejectsWhitespaceInTokenArgumentsInsteadOfQuoting) {
+  NvecdClient client(ClientConfig{});
+  EXPECT_FALSE(client.Vecset("item with space", {1.0F, 0.0F, 0.0F}));
+  EXPECT_FALSE(client.Save("/tmp/snapshot with space.dmp"));
+
+  SearchOptions options;
+  options.filter = "category:two words";
+  EXPECT_FALSE(client.Simv({1.0F, 0.0F, 0.0F}, 1, "vectors", options));
+}
+
 //
 // Connection tests
 //
@@ -154,6 +174,29 @@ TEST_F(NvecdClientTest, ConnectInvalidPort) {
   auto result = client.Connect();
   EXPECT_FALSE(result);
   EXPECT_FALSE(client.IsConnected());
+}
+
+TEST(NvecdClientAuthTest, AuthPreservesWhitespacePassword) {
+  config::Config server_config;
+  server_config.api.tcp.port = 0;
+  server_config.api.http.enable = false;
+  server_config.network.allow_cidrs = {"127.0.0.1/32"};
+  server_config.security.requirepass = " leading  and trailing ";
+  server_config.snapshot.dir = "/tmp/nvecd_client_auth_snapshots";
+
+  server::NvecdServer server(server_config);
+  ASSERT_TRUE(server.Start());
+
+  ClientConfig client_config;
+  client_config.host = "127.0.0.1";
+  client_config.port = server.GetPort();
+  NvecdClient client(client_config);
+  ASSERT_TRUE(client.Connect());
+  ASSERT_TRUE(client.Auth(server_config.security.requirepass));
+  EXPECT_TRUE(client.Vecset("authorized", {1.0F, 0.0F, 0.0F}));
+
+  client.Disconnect();
+  server.Stop();
 }
 
 //
@@ -212,6 +255,17 @@ TEST_F(NvecdClientTest, VecsetEmptyVector) {
   std::vector<float> vec;
   auto result = client.Vecset("vec1", vec);
   EXPECT_FALSE(result);
+}
+
+TEST_F(NvecdClientTest, VecdelRemovesVector) {
+  ClientConfig config;
+  config.host = "127.0.0.1";
+  config.port = port_;
+  NvecdClient client(config);
+  ASSERT_TRUE(client.Connect());
+  ASSERT_TRUE(client.Vecset("delete_me", {1.0F, 0.0F, 0.0F}));
+  EXPECT_TRUE(client.Vecdel("delete_me"));
+  EXPECT_FALSE(client.Vecdel("delete_me"));
 }
 
 //
@@ -558,4 +612,12 @@ TEST_F(NvecdClientTest, DumpCommandsBasic) {
   auto save_result = client.Save("");
   ASSERT_TRUE(save_result) << "Save failed: " << save_result.error().message();
   EXPECT_FALSE(save_result->empty());
+  EXPECT_EQ(save_result->find("OK DUMP_SAVED"), std::string::npos);
+
+  // A returned save path is directly consumable by Load(); both APIs strip
+  // their protocol status prefixes rather than leaking them to callers.
+  auto load_result = client.Load(*save_result);
+  ASSERT_TRUE(load_result) << "Load failed: " << load_result.error().message();
+  EXPECT_EQ(load_result->find("OK DUMP_LOADED"), std::string::npos);
+  EXPECT_TRUE(std::filesystem::equivalent(*load_result, *save_result));
 }

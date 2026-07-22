@@ -22,6 +22,7 @@
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 
 #include "utils/error.h"
@@ -106,50 +107,55 @@ std::optional<std::string> ValidateNoControlCharacters(const std::string& value,
 }
 
 /**
- * @brief Escape special characters in strings
+ * @brief Validate a whitespace-delimited protocol token.
+ *
+ * nvecd does not implement shell-style quoting. Reject whitespace rather than
+ * serializing a command that would be parsed as different arguments. AUTH is
+ * deliberately excluded because its password is an opaque suffix.
  */
-std::string EscapeString(const std::string& str) {
-  // Check if string needs quoting (contains spaces or special chars)
-  bool needs_quotes = false;
-  for (char character : str) {
-    if (character == ' ' || character == '\t' || character == '\n' || character == '\r' || character == '"' ||
-        character == '\'') {
-      needs_quotes = true;
-      break;
+std::optional<std::string> ValidateProtocolToken(const std::string& value, const char* field_name) {
+  if (auto error = ValidateNoControlCharacters(value, field_name)) {
+    return error;
+  }
+  for (unsigned char character : value) {
+    if (std::isspace(character) != 0) {
+      return std::string("Input for ") + field_name + " must not contain whitespace";
     }
   }
-
-  if (!needs_quotes) {
-    return str;
-  }
-
-  // Use double quotes and escape internal quotes
-  std::string result = "\"";
-  for (char character : str) {
-    if (character == '"' || character == '\\') {
-      result += '\\';
-    }
-    result += character;
-  }
-  result += '"';
-  return result;
+  return std::nullopt;
 }
 
 }  // namespace
 
 namespace detail {
 
-bool IsResponseComplete(const std::string& buffer) {
+std::optional<size_t> CompleteResponseLength(const std::string& buffer, bool requires_end_terminator) {
   // Locate the end of the first line (the header).
   size_t first_newline = buffer.find('\n');
   if (first_newline == std::string::npos) {
-    return false;  // Header line not yet fully received.
+    return std::nullopt;  // Header line not yet fully received.
   }
 
   // Extract the header without its trailing CR/LF.
   std::string header = buffer.substr(0, first_newline);
   if (!header.empty() && header.back() == '\r') {
     header.pop_back();
+  }
+
+  // Multi-line administrative responses use an END line. Errors remain
+  // single-line even for such commands, so do not wait for END after ERROR.
+  if (requires_end_terminator && header.rfind("ERROR", 0) != 0 && header.rfind("-ERR", 0) != 0) {
+    constexpr std::string_view kEndCrLf = "\nEND\r\n";
+    constexpr std::string_view kEndLf = "\nEND\n";
+    const size_t crlf_pos = buffer.find(kEndCrLf);
+    const size_t lf_pos = buffer.find(kEndLf);
+    if (crlf_pos != std::string::npos && (lf_pos == std::string::npos || crlf_pos <= lf_pos)) {
+      return crlf_pos + kEndCrLf.size();
+    }
+    if (lf_pos != std::string::npos) {
+      return lf_pos + kEndLf.size();
+    }
+    return std::nullopt;
   }
 
   // Multi-line SIM/SIMV responses are framed by an explicit result count.
@@ -164,29 +170,52 @@ bool IsResponseComplete(const std::string& buffer) {
     } catch (const std::exception&) {
       // Malformed count: fall back to single-line framing so the caller can
       // surface a protocol error instead of blocking forever.
-      return true;
+      return first_newline + 1;
     }
     if (count < 0) {
-      return true;
+      return first_newline + 1;
     }
 
     // The complete response is the header line plus <count> result lines, each
     // terminated by a newline. Count the newlines received so far.
     size_t expected_lines = static_cast<size_t>(count) + 1;
     size_t newline_count = 0;
-    for (char character : buffer) {
-      if (character == '\n') {
+    for (size_t i = 0; i < buffer.size(); ++i) {
+      if (buffer[i] == '\n') {
         ++newline_count;
         if (newline_count >= expected_lines) {
-          return true;
+          return i + 1;
         }
       }
     }
-    return false;
+    return std::nullopt;
   }
 
   // Single-line response: complete as soon as the first line terminates.
-  return true;
+  return first_newline + 1;
+}
+
+bool IsResponseComplete(const std::string& buffer) {
+  return CompleteResponseLength(buffer).has_value();
+}
+
+bool CommandRequiresEndTerminator(std::string_view command) {
+  while (!command.empty() && std::isspace(static_cast<unsigned char>(command.front())) != 0) {
+    command.remove_prefix(1);
+  }
+  const auto starts_with = [&command](std::string_view prefix) {
+    if (command.size() < prefix.size()) {
+      return false;
+    }
+    for (size_t i = 0; i < prefix.size(); ++i) {
+      if (std::toupper(static_cast<unsigned char>(command[i])) != prefix[i]) {
+        return false;
+      }
+    }
+    return true;
+  };
+  return (command.size() == 4 && starts_with("INFO")) || starts_with("CONFIG") || starts_with("CACHE STATS") ||
+         starts_with("DUMP INFO") || starts_with("DUMP STATUS");
 }
 
 }  // namespace detail
@@ -283,6 +312,7 @@ class NvecdClient::Impl {
       close(sock_);
       sock_ = -1;
     }
+    response_buffer_.clear();
   }
 
   [[nodiscard]] bool IsConnected() const { return sock_ >= 0; }
@@ -306,7 +336,13 @@ class NvecdClient::Impl {
     std::string response;
     std::vector<char> buffer(config_.recv_buffer_size);
 
-    while (!detail::IsResponseComplete(response)) {
+    const bool requires_end_terminator = detail::CommandRequiresEndTerminator(command);
+    while (true) {
+      if (const auto response_length = detail::CompleteResponseLength(response_buffer_, requires_end_terminator)) {
+        response.assign(response_buffer_.data(), *response_length);
+        response_buffer_.erase(0, *response_length);
+        break;
+      }
       ssize_t received = recv(sock_, buffer.data(), buffer.size(), 0);
       if (received <= 0) {
         if (received == 0) {
@@ -316,7 +352,7 @@ class NvecdClient::Impl {
             MakeError(ErrorCode::kClientCommandFailed, std::string("Failed to receive response: ") + strerror(errno)));
       }
 
-      response.append(buffer.data(), static_cast<size_t>(received));
+      response_buffer_.append(buffer.data(), static_cast<size_t>(received));
     }
 
     // Remove trailing \r\n
@@ -332,13 +368,13 @@ class NvecdClient::Impl {
   //
 
   Expected<void, Error> Event(const std::string& ctx, const std::string& type, const std::string& id, int score) const {
-    if (auto err = ValidateNoControlCharacters(ctx, "context ID")) {
+    if (auto err = ValidateProtocolToken(ctx, "context ID")) {
       return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, *err));
     }
     if (auto err = ValidateNoControlCharacters(type, "event type")) {
       return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, *err));
     }
-    if (auto err = ValidateNoControlCharacters(id, "document ID")) {
+    if (auto err = ValidateProtocolToken(id, "document ID")) {
       return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, *err));
     }
 
@@ -353,7 +389,7 @@ class NvecdClient::Impl {
     }
 
     std::ostringstream cmd;
-    cmd << "EVENT " << EscapeString(ctx) << " " << type << " " << EscapeString(id);
+    cmd << "EVENT " << ctx << " " << type << " " << id;
     if (type != "DEL") {
       cmd << " " << score;
     }
@@ -375,7 +411,7 @@ class NvecdClient::Impl {
   }
 
   Expected<void, Error> Vecset(const std::string& id, const std::vector<float>& vector) const {
-    if (auto err = ValidateNoControlCharacters(id, "vector ID")) {
+    if (auto err = ValidateProtocolToken(id, "vector ID")) {
       return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, *err));
     }
     if (vector.empty()) {
@@ -383,7 +419,7 @@ class NvecdClient::Impl {
     }
 
     std::ostringstream cmd;
-    cmd << "VECSET " << EscapeString(id);
+    cmd << "VECSET " << id;
     for (float val : vector) {
       cmd << " " << FormatFloat(val);
     }
@@ -404,11 +440,32 @@ class NvecdClient::Impl {
     return {};
   }
 
-  Expected<void, Error> Metaset(const std::string& id, const std::string& metadata) const {
-    if (auto err = ValidateNoControlCharacters(id, "item ID")) {
+  Expected<void, Error> Vecdel(const std::string& id) const {
+    if (auto err = ValidateProtocolToken(id, "vector ID")) {
       return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, *err));
     }
-    if (auto err = ValidateNoControlCharacters(metadata, "metadata")) {
+    if (id.empty()) {
+      return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, "Vector ID cannot be empty"));
+    }
+
+    auto result = SendCommand("VECDEL " + id);
+    if (!result) {
+      return MakeUnexpected(result.error());
+    }
+    if (result->find("ERROR") == 0) {
+      return MakeUnexpected(MakeError(ErrorCode::kClientServerError, result->substr(kErrorPrefixLen)));
+    }
+    if (result->find("OK") != 0) {
+      return MakeUnexpected(MakeError(ErrorCode::kClientProtocolError, "Unexpected response: " + *result));
+    }
+    return {};
+  }
+
+  Expected<void, Error> Metaset(const std::string& id, const std::string& metadata) const {
+    if (auto err = ValidateProtocolToken(id, "item ID")) {
+      return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, *err));
+    }
+    if (auto err = ValidateProtocolToken(metadata, "metadata")) {
       return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, *err));
     }
     if (metadata.empty()) {
@@ -416,7 +473,7 @@ class NvecdClient::Impl {
     }
 
     std::ostringstream cmd;
-    cmd << "METASET " << EscapeString(id) << " " << metadata;
+    cmd << "METASET " << id << " " << metadata;
 
     auto result = SendCommand(cmd.str());
     if (!result) {
@@ -436,15 +493,18 @@ class NvecdClient::Impl {
 
   Expected<SimResponse, Error> Sim(const std::string& id, uint32_t top_k, const std::string& mode,
                                    const SearchOptions& options) const {
-    if (auto err = ValidateNoControlCharacters(id, "document ID")) {
+    if (auto err = ValidateProtocolToken(id, "document ID")) {
       return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, *err));
     }
-    if (auto err = ValidateNoControlCharacters(mode, "search mode")) {
+    if (auto err = ValidateProtocolToken(mode, "search mode")) {
+      return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, *err));
+    }
+    if (auto err = ValidateProtocolToken(options.filter, "metadata filter")) {
       return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, *err));
     }
 
     std::ostringstream cmd;
-    cmd << "SIM " << EscapeString(id) << " " << top_k;
+    cmd << "SIM " << id << " " << top_k;
     if (!mode.empty()) {
       cmd << " using=" << mode;
     }
@@ -491,7 +551,10 @@ class NvecdClient::Impl {
     if (vector.empty()) {
       return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, "Vector cannot be empty"));
     }
-    if (auto err = ValidateNoControlCharacters(mode, "search mode")) {
+    if (auto err = ValidateProtocolToken(mode, "search mode")) {
+      return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, *err));
+    }
+    if (auto err = ValidateProtocolToken(options.filter, "metadata filter")) {
       return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, *err));
     }
 
@@ -618,7 +681,10 @@ class NvecdClient::Impl {
     if (filepath.empty()) {
       cmd << "DUMP SAVE";
     } else {
-      cmd << "DUMP SAVE " << EscapeString(filepath);
+      if (auto err = ValidateProtocolToken(filepath, "snapshot filepath")) {
+        return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, *err));
+      }
+      cmd << "DUMP SAVE " << filepath;
     }
 
     auto result = SendCommand(cmd.str());
@@ -630,12 +696,16 @@ class NvecdClient::Impl {
       return MakeUnexpected(MakeError(ErrorCode::kClientServerError, result->substr(kErrorPrefixLen)));
     }
 
-    // Response format: "SNAPSHOT <filepath>"
-    if (result->find("SNAPSHOT ") == 0) {
-      return result->substr(9);  // NOLINT(readability-magic-numbers) - Length of "SNAPSHOT "
+    constexpr std::string_view kSavedPrefix = "OK DUMP_SAVED ";
+    constexpr std::string_view kSaveStartedPrefix = "OK DUMP_SAVE_STARTED ";
+    const std::string_view prefix = result->rfind(kSavedPrefix, 0) == 0 ? kSavedPrefix : kSaveStartedPrefix;
+    if (result->rfind(prefix, 0) == 0) {
+      std::string path = result->substr(prefix.size());
+      path.erase(path.find_last_not_of("\r\n") + 1);
+      return path;
     }
 
-    return *result;
+    return MakeUnexpected(MakeError(ErrorCode::kClientProtocolError, "Unexpected DUMP SAVE response: " + *result));
   }
 
   Expected<std::string, Error> Load(const std::string& filepath) const {
@@ -643,8 +713,11 @@ class NvecdClient::Impl {
       return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, "Filepath cannot be empty for LOAD"));
     }
 
+    if (auto err = ValidateProtocolToken(filepath, "snapshot filepath")) {
+      return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, *err));
+    }
     std::ostringstream cmd;
-    cmd << "DUMP LOAD " << EscapeString(filepath);
+    cmd << "DUMP LOAD " << filepath;
 
     auto result = SendCommand(cmd.str());
     if (!result) {
@@ -655,12 +728,14 @@ class NvecdClient::Impl {
       return MakeUnexpected(MakeError(ErrorCode::kClientServerError, result->substr(kErrorPrefixLen)));
     }
 
-    // Response format: "SNAPSHOT: <filepath>"
-    if (result->find("SNAPSHOT: ") == 0) {
-      return result->substr(10);  // NOLINT(readability-magic-numbers) - Length of "SNAPSHOT: "
+    constexpr std::string_view kLoadedPrefix = "OK DUMP_LOADED ";
+    if (result->rfind(kLoadedPrefix, 0) == 0) {
+      std::string path = result->substr(kLoadedPrefix.size());
+      path.erase(path.find_last_not_of("\r\n") + 1);
+      return path;
     }
 
-    return *result;
+    return MakeUnexpected(MakeError(ErrorCode::kClientProtocolError, "Unexpected DUMP LOAD response: " + *result));
   }
 
   Expected<std::string, Error> Verify(const std::string& filepath) const {
@@ -668,8 +743,11 @@ class NvecdClient::Impl {
       return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, "Filepath cannot be empty for VERIFY"));
     }
 
+    if (auto err = ValidateProtocolToken(filepath, "snapshot filepath")) {
+      return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, *err));
+    }
     std::ostringstream cmd;
-    cmd << "DUMP VERIFY " << EscapeString(filepath);
+    cmd << "DUMP VERIFY " << filepath;
 
     auto result = SendCommand(cmd.str());
     if (!result) {
@@ -688,8 +766,11 @@ class NvecdClient::Impl {
       return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, "Filepath cannot be empty for DUMP INFO"));
     }
 
+    if (auto err = ValidateProtocolToken(filepath, "snapshot filepath")) {
+      return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, *err));
+    }
     std::ostringstream cmd;
-    cmd << "DUMP INFO " << EscapeString(filepath);
+    cmd << "DUMP INFO " << filepath;
 
     auto result = SendCommand(cmd.str());
     if (!result) {
@@ -743,7 +824,11 @@ class NvecdClient::Impl {
     }
 
     std::ostringstream cmd;
-    cmd << "AUTH " << EscapeString(password);
+    // AUTH is the sole command whose argument is an opaque suffix rather than
+    // a token. The server preserves all bytes after this delimiter, including
+    // leading, trailing, and repeated spaces; quoting here would turn those
+    // bytes into part of the password.
+    cmd << "AUTH " << password;
 
     auto result = SendCommand(cmd.str());
     if (!result) {
@@ -823,6 +908,7 @@ class NvecdClient::Impl {
 
   ClientConfig config_;
   mutable int sock_ = -1;
+  mutable std::string response_buffer_;
 };
 
 //
@@ -856,6 +942,10 @@ Expected<void, Error> NvecdClient::Event(const std::string& ctx, const std::stri
 
 Expected<void, Error> NvecdClient::Vecset(const std::string& id, const std::vector<float>& vector) const {
   return impl_->Vecset(id, vector);
+}
+
+Expected<void, Error> NvecdClient::Vecdel(const std::string& id) const {
+  return impl_->Vecdel(id);
 }
 
 Expected<void, Error> NvecdClient::Metaset(const std::string& id, const std::string& metadata) const {

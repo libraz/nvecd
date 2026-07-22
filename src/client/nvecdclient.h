@@ -53,6 +53,15 @@ namespace detail {
  */
 bool IsResponseComplete(const std::string& buffer);
 
+/**
+ * @brief Return the byte length of the first complete response in @p buffer.
+ *
+ * A receive can contain a complete response followed by bytes from the next
+ * response. Callers use this length to preserve trailing bytes for the next
+ * command instead of letting them contaminate the current response.
+ */
+std::optional<size_t> CompleteResponseLength(const std::string& buffer, bool requires_end_terminator = false);
+
 }  // namespace detail
 
 /**
@@ -227,6 +236,14 @@ class NvecdClient {
    */
   nvecd::utils::Expected<void, nvecd::utils::Error> Vecset(const std::string& id,
                                                            const std::vector<float>& vector) const;
+
+  /**
+   * @brief Delete a vector (VECDEL command)
+   *
+   * @param id Vector ID
+   * @return Expected<void, Error>
+   */
+  nvecd::utils::Expected<void, nvecd::utils::Error> Vecdel(const std::string& id) const;
 
   /**
    * @brief Attach metadata to an existing item (METASET command)

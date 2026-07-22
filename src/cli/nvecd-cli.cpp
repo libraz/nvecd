@@ -17,9 +17,11 @@
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -51,15 +53,29 @@ constexpr int kMaxWaitReadyRetries = 100;     // Maximum retries for --wait-read
  * @param buffer Accumulated bytes received so far.
  * @return true if @p buffer contains at least one complete response.
  */
-bool IsResponseComplete(const std::string& buffer) {
+std::optional<size_t> CompleteResponseLength(const std::string& buffer, bool requires_end_terminator) {
   size_t first_newline = buffer.find('\n');
   if (first_newline == std::string::npos) {
-    return false;  // Header line not yet fully received.
+    return std::nullopt;  // Header line not yet fully received.
   }
 
   std::string header = buffer.substr(0, first_newline);
   if (!header.empty() && header.back() == '\r') {
     header.pop_back();
+  }
+
+  if (requires_end_terminator && header.rfind("ERROR", 0) != 0 && header.rfind("-ERR", 0) != 0) {
+    constexpr std::string_view kEndCrLf = "\nEND\r\n";
+    constexpr std::string_view kEndLf = "\nEND\n";
+    const size_t crlf_pos = buffer.find(kEndCrLf);
+    const size_t lf_pos = buffer.find(kEndLf);
+    if (crlf_pos != std::string::npos && (lf_pos == std::string::npos || crlf_pos <= lf_pos)) {
+      return crlf_pos + kEndCrLf.size();
+    }
+    if (lf_pos != std::string::npos) {
+      return lf_pos + kEndLf.size();
+    }
+    return std::nullopt;
   }
 
   constexpr char kResultsPrefix[] = "OK RESULTS ";
@@ -70,33 +86,49 @@ bool IsResponseComplete(const std::string& buffer) {
       size_t pos = 0;
       count = std::stol(header.substr(kResultsPrefixLen), &pos);
     } catch (const std::exception&) {
-      return true;  // Malformed count: let the caller surface a protocol error.
+      return first_newline + 1;  // Malformed count: let the caller surface a protocol error.
     }
     if (count < 0) {
-      return true;
+      return first_newline + 1;
     }
 
     size_t expected_lines = static_cast<size_t>(count) + 1;
     size_t newline_count = 0;
-    for (char character : buffer) {
-      if (character == '\n') {
+    for (size_t i = 0; i < buffer.size(); ++i) {
+      if (buffer[i] == '\n') {
         ++newline_count;
         if (newline_count >= expected_lines) {
-          return true;
+          return i + 1;
         }
       }
     }
-    return false;
+    return std::nullopt;
   }
 
-  return true;
+  return first_newline + 1;
+}
+
+bool CommandRequiresEndTerminator(const std::string& command) {
+  const auto starts_with = [&command](std::string_view prefix) {
+    if (command.size() < prefix.size()) {
+      return false;
+    }
+    for (size_t i = 0; i < prefix.size(); ++i) {
+      if (std::toupper(static_cast<unsigned char>(command[i])) != prefix[i]) {
+        return false;
+      }
+    }
+    return true;
+  };
+  return (command.size() == 4 && starts_with("INFO")) || starts_with("CONFIG") || starts_with("CACHE STATS") ||
+         starts_with("DUMP INFO") || starts_with("DUMP STATUS");
 }
 
 #ifdef USE_READLINE
 // Command list for tab completion
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays,cppcoreguidelines-avoid-non-const-global-variables)
-const char* command_list[] = {"EVENT", "VECSET", "METASET", "SIM",  "SIMV", "INFO", "CONFIG",
-                              "CACHE", "DUMP",   "DEBUG",   "quit", "exit", "help", nullptr};
+const char* command_list[] = {"EVENT", "VECSET", "VECDEL", "METASET", "SIM",  "SIMV", "INFO", "CONFIG",
+                              "CACHE", "DUMP",   "DEBUG",  "quit",    "exit", "help", nullptr};
 
 /**
  * @brief Command name generator for readline completion
@@ -228,6 +260,15 @@ char** CommandCompletion(const char* text, int start, int /* end */) {
     return rl_completion_matches(text, KeywordGeneratorWrapper);
   }
 
+  // VECDEL <id>
+  if (command == "VECDEL") {
+    if (token_count == 1) {
+      current_keywords = {"<item_id>"};
+      return rl_completion_matches(text, KeywordGeneratorWrapper);
+    }
+    return nullptr;
+  }
+
   // METASET <id> <key:value[,key:value...]>
   if (command == "METASET") {
     if (token_count == 1) {
@@ -294,8 +335,30 @@ char** CommandCompletion(const char* text, int start, int /* end */) {
     return nullptr;
   }
 
-  // INFO, CONFIG: no arguments
-  if (command == "INFO" || command == "CONFIG") {
+  // INFO has no arguments.
+  if (command == "INFO") {
+    return nullptr;
+  }
+
+  // CONFIG SHOW [path] | HELP [path] | VERIFY <config_file>
+  if (command == "CONFIG") {
+    if (token_count == 1) {
+      current_keywords = {"SHOW", "HELP", "VERIFY"};
+      return rl_completion_matches(text, KeywordGeneratorWrapper);
+    }
+    if (token_count == 2) {
+      std::string subcommand = tokens[1];
+      for (char& character : subcommand) {
+        character = static_cast<char>(toupper(character));
+      }
+      if (subcommand == "SHOW" || subcommand == "HELP") {
+        current_keywords = {"<path>"};
+        return rl_completion_matches(text, KeywordGeneratorWrapper);
+      }
+      if (subcommand == "VERIFY") {
+        rl_attempted_completion_over = 0;
+      }
+    }
     return nullptr;
   }
 
@@ -404,6 +467,7 @@ class NvecdClient {
       close(sock_);
       sock_ = -1;
     }
+    response_buffer_.clear();
   }
 
   [[nodiscard]] bool IsConnected() const { return sock_ >= 0; }
@@ -431,7 +495,13 @@ class NvecdClient {
     // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
     char buffer[kReceiveBufferSize];
 
-    while (!IsResponseComplete(response)) {
+    const bool requires_end_terminator = CommandRequiresEndTerminator(command);
+    while (true) {
+      if (const auto response_length = CompleteResponseLength(response_buffer_, requires_end_terminator)) {
+        response.assign(response_buffer_.data(), *response_length);
+        response_buffer_.erase(0, *response_length);
+        break;
+      }
       // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
       ssize_t received = recv(sock_, buffer, sizeof(buffer), 0);
       if (received <= 0) {
@@ -453,7 +523,7 @@ class NvecdClient {
       }
 
       // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
-      response.append(buffer, static_cast<size_t>(received));
+      response_buffer_.append(buffer, static_cast<size_t>(received));
     }
 
     // Remove trailing newline
@@ -596,11 +666,14 @@ class NvecdClient {
     std::cout << "Available commands:" << '\n';
     std::cout << "  EVENT <ctx> ADD <id> <score>      - Track user behavior event" << '\n';
     std::cout << "  VECSET <id> <f1> <f2> ... <fN>    - Register or update vector" << '\n';
+    std::cout << "  VECDEL <id>                       - Delete vector and its metadata" << '\n';
     std::cout << "  METASET <id> <key:value[,..]>      - Register or update item metadata" << '\n';
     std::cout << "  SIM <id> <top_k> [using=<mode>]   - Search similar items by ID" << '\n';
     std::cout << "  SIMV <top_k> <f1> <f2> ... <fN>   - Search similar items by vector" << '\n';
     std::cout << "  INFO                               - Show server statistics" << '\n';
-    std::cout << "  CONFIG                             - Show current configuration" << '\n';
+    std::cout << "  CONFIG SHOW [path]                 - Show current configuration" << '\n';
+    std::cout << "  CONFIG HELP [path]                 - Show configuration help" << '\n';
+    std::cout << "  CONFIG VERIFY <file>               - Validate a configuration file" << '\n';
     std::cout << "  CACHE STATS                        - Show cache statistics" << '\n';
     std::cout << "  CACHE CLEAR                        - Clear all cache entries" << '\n';
     std::cout << "  DUMP SAVE [filename]               - Save snapshot to disk" << '\n';
@@ -683,6 +756,7 @@ class NvecdClient {
 
   Config config_;
   int sock_{-1};
+  mutable std::string response_buffer_;
 };
 
 void PrintUsage(const char* program_name) {

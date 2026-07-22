@@ -40,6 +40,19 @@ static char* strdup_safe(const std::string& str) {
   return result;
 }
 
+// Transfer an owned string to a C out-parameter. Do not report success with a
+// null output when allocation fails: callers otherwise cannot distinguish OOM
+// from a valid empty response.
+static int copy_string_result(const std::string& value, char** out, std::string& last_error) {
+  char* copy = strdup_safe(value);
+  if (copy == nullptr) {
+    last_error = "Memory allocation failed";
+    return -1;
+  }
+  *out = copy;
+  return 0;
+}
+
 // Helper: Translate C search options to the C++ SearchOptions struct.
 static SearchOptions to_cpp_options(const NvecdSearchOptions_C* options) {
   SearchOptions cpp_options;
@@ -194,6 +207,19 @@ int nvecdclient_vecset(NvecdClient_C* client, const char* id, const float* vecto
   return 0;
 }
 
+int nvecdclient_vecdel(NvecdClient_C* client, const char* id) {
+  if (client == nullptr || client->client == nullptr || id == nullptr) {
+    return -1;
+  }
+
+  auto result = client->client->Vecdel(id);
+  if (!result) {
+    client->last_error = result.error().to_string();
+    return -1;
+  }
+  return 0;
+}
+
 int nvecdclient_metaset(NvecdClient_C* client, const char* id, const char* metadata) {
   if (client == nullptr || client->client == nullptr || id == nullptr || metadata == nullptr) {
     return -1;
@@ -318,8 +344,7 @@ int nvecdclient_get_config(NvecdClient_C* client, char** config_str) {
     return -1;
   }
 
-  *config_str = strdup_safe(*result);
-  return 0;
+  return copy_string_result(*result, config_str, client->last_error);
 }
 
 int nvecdclient_save(NvecdClient_C* client, const char* filepath, char** saved_path) {
@@ -334,8 +359,7 @@ int nvecdclient_save(NvecdClient_C* client, const char* filepath, char** saved_p
     return -1;
   }
 
-  *saved_path = strdup_safe(*result);
-  return 0;
+  return copy_string_result(*result, saved_path, client->last_error);
 }
 
 int nvecdclient_load(NvecdClient_C* client, const char* filepath, char** loaded_path) {
@@ -349,8 +373,7 @@ int nvecdclient_load(NvecdClient_C* client, const char* filepath, char** loaded_
     return -1;
   }
 
-  *loaded_path = strdup_safe(*result);
-  return 0;
+  return copy_string_result(*result, loaded_path, client->last_error);
 }
 
 int nvecdclient_verify(NvecdClient_C* client, const char* filepath, char** result_str) {
@@ -364,8 +387,7 @@ int nvecdclient_verify(NvecdClient_C* client, const char* filepath, char** resul
     return -1;
   }
 
-  *result_str = strdup_safe(*result);
-  return 0;
+  return copy_string_result(*result, result_str, client->last_error);
 }
 
 int nvecdclient_dump_info(NvecdClient_C* client, const char* filepath, char** info_str) {
@@ -379,8 +401,7 @@ int nvecdclient_dump_info(NvecdClient_C* client, const char* filepath, char** in
     return -1;
   }
 
-  *info_str = strdup_safe(*result);
-  return 0;
+  return copy_string_result(*result, info_str, client->last_error);
 }
 
 int nvecdclient_dump_status(NvecdClient_C* client, char** status_str) {
@@ -394,8 +415,7 @@ int nvecdclient_dump_status(NvecdClient_C* client, char** status_str) {
     return -1;
   }
 
-  *status_str = strdup_safe(*result);
-  return 0;
+  return copy_string_result(*result, status_str, client->last_error);
 }
 
 int nvecdclient_cache_stats(NvecdClient_C* client, char** stats_str) {
@@ -409,8 +429,7 @@ int nvecdclient_cache_stats(NvecdClient_C* client, char** stats_str) {
     return -1;
   }
 
-  *stats_str = strdup_safe(*result);
-  return 0;
+  return copy_string_result(*result, stats_str, client->last_error);
 }
 
 int nvecdclient_cache_clear(NvecdClient_C* client) {
