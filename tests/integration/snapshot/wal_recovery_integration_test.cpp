@@ -290,7 +290,9 @@ TEST(WalRecoveryIntegration, SnapshotBoundaryNoDoubleCount) {
 
     // Replay only records beyond the checkpoint.
     b.OpenWal(wal_dir);
-    const uint64_t checkpoint = storage::ReadWalCheckpoint(snapshot_path);
+    auto checkpoint_result = storage::ReadWalCheckpoint(snapshot_path);
+    ASSERT_TRUE(checkpoint_result.has_value()) << checkpoint_result.error().message();
+    const uint64_t checkpoint = *checkpoint_result;
     EXPECT_GT(checkpoint, 0U);
     b.Replay(/*from=*/checkpoint + 1);
     b.EnableWalForLiveWrites();

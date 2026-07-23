@@ -10,12 +10,15 @@
 
 #include <zlib.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <sstream>
+#include <unordered_set>
 #include <variant>
 #include <vector>
 
@@ -49,6 +52,9 @@ constexpr uint32_t kMaxConfigSize = 16 * 1024 * 1024;      // 16MB max for confi
 constexpr uint32_t kMaxStatsSize = 16 * 1024 * 1024;       // 16MB max for statistics section
 constexpr uint32_t kMaxStoreDataSize = 512 * 1024 * 1024;  // 512MB max for store data
 constexpr uint32_t kMaxStoreStatsSize = 16 * 1024 * 1024;  // 16MB max for store statistics
+constexpr uint32_t kMaxStringLength = 256 * 1024 * 1024;   // 256MB max for length-prefixed strings
+constexpr uint64_t kMaxSnapshotFileSize = 3ULL * 1024ULL * 1024ULL * 1024ULL;
+constexpr uint64_t kMaxVectorDimension = 4096;  // Matches the public configuration schema.
 
 enum class MetadataValueType : uint8_t {
   kString = 1,
@@ -60,6 +66,41 @@ enum class MetadataValueType : uint8_t {
 /// @brief Absolute file offset of the file_crc32 field in the V1 header.
 /// kFixedHeaderSize (8) + header_size(4) + flags(4) + snapshot_timestamp(8) + total_file_size(8) = 32
 constexpr size_t kFileCRC32Offset = snapshot_format::kFixedHeaderSize + 24;
+
+Expected<uint32_t, Error> CalculateFileCRC32Streaming(std::istream& input_stream, uint64_t file_size) {
+  if (file_size > kMaxSnapshotFileSize) {
+    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Snapshot exceeds maximum total file size"));
+  }
+  input_stream.clear();
+  input_stream.seekg(0, std::ios::beg);
+  if (!input_stream.good()) {
+    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to seek snapshot for CRC32"));
+  }
+
+  std::array<char, 64 * 1024> buffer{};
+  uint64_t offset = 0;
+  uLong crc = crc32(0L, Z_NULL, 0);
+  while (offset < file_size) {
+    const size_t chunk_size = static_cast<size_t>(std::min<uint64_t>(buffer.size(), file_size - offset));
+    input_stream.read(buffer.data(), static_cast<std::streamsize>(chunk_size));
+    if (input_stream.gcount() != static_cast<std::streamsize>(chunk_size)) {
+      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to stream snapshot CRC32"));
+    }
+    const uint64_t crc_begin = kFileCRC32Offset;
+    const uint64_t crc_end = crc_begin + sizeof(uint32_t);
+    const uint64_t chunk_end = offset + chunk_size;
+    if (offset < crc_end && chunk_end > crc_begin) {
+      const size_t zero_begin = static_cast<size_t>(std::max<uint64_t>(offset, crc_begin) - offset);
+      const size_t zero_end = static_cast<size_t>(std::min<uint64_t>(chunk_end, crc_end) - offset);
+      std::fill(buffer.begin() + static_cast<ptrdiff_t>(zero_begin), buffer.begin() + static_cast<ptrdiff_t>(zero_end),
+                '\0');
+    }
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    crc = crc32(crc, reinterpret_cast<const Bytef*>(buffer.data()), static_cast<uInt>(chunk_size));
+    offset = chunk_end;
+  }
+  return static_cast<uint32_t>(crc);
+}
 
 /**
  * @brief Write binary data to stream
@@ -81,10 +122,24 @@ bool ReadBinary(std::istream& input_stream, T& value) {
   return input_stream.good();
 }
 
+bool HasRemainingBytes(std::istream& input_stream, uint64_t required) {
+  const auto current = input_stream.tellg();
+  if (current == std::istream::pos_type(-1)) {
+    return false;
+  }
+  input_stream.seekg(0, std::ios::end);
+  const auto end = input_stream.tellg();
+  input_stream.seekg(current, std::ios::beg);
+  return end != std::istream::pos_type(-1) && end >= current && static_cast<uint64_t>(end - current) >= required;
+}
+
 /**
  * @brief Write string to stream (length-prefixed)
  */
 bool WriteString(std::ostream& output_stream, const std::string& str) {
+  if (str.size() > kMaxStringLength) {
+    return false;
+  }
   auto len = static_cast<uint32_t>(str.size());
   if (!WriteBinary(output_stream, len)) {
     return false;
@@ -99,7 +154,6 @@ bool WriteString(std::ostream& output_stream, const std::string& str) {
  * @brief Read string from stream (length-prefixed)
  */
 bool ReadString(std::istream& input_stream, std::string& str) {
-  constexpr uint32_t kMaxStringLength = 256 * 1024 * 1024;  // 256MB limit
   uint32_t len = 0;
   if (!ReadBinary(input_stream, len)) {
     return false;
@@ -107,6 +161,9 @@ bool ReadString(std::istream& input_stream, std::string& str) {
   if (len > kMaxStringLength) {
     LogStorageError("snapshot_read", "string_length_exceeded",
                     "String length " + std::to_string(len) + " exceeds limit");
+    return false;
+  }
+  if (!HasRemainingBytes(input_stream, len)) {
     return false;
   }
   if (len > 0) {
@@ -118,41 +175,33 @@ bool ReadString(std::istream& input_stream, std::string& str) {
   return input_stream.good();
 }
 
-Expected<std::string, Error> CreateSecureTemporaryFile(const std::string& filepath) {
-#ifdef _WIN32
-  return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError,
-                                  "Secure temporary snapshot files are not supported on this platform"));
-#else
-  const std::filesystem::path parent = std::filesystem::path(filepath).parent_path();
-  auto directory_valid = ValidatePrivateDirectory(parent.empty() ? std::filesystem::path(".") : parent);
-  if (!directory_valid) {
-    return MakeUnexpected(directory_valid.error());
-  }
-
-  std::string path_template = filepath + ".tmp.XXXXXX";
-  std::vector<char> mutable_template(path_template.begin(), path_template.end());
-  mutable_template.push_back('\0');
-  const int fd = ::mkstemp(mutable_template.data());
-  if (fd < 0) {
-    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError,
-                                    "Failed to create temporary snapshot file: " + std::string(std::strerror(errno))));
-  }
-  if (::fchmod(fd, S_IRUSR | S_IWUSR) != 0) {
-    const int saved_errno = errno;
-    ::close(fd);
-    ::unlink(mutable_template.data());
+Expected<uint32_t, Error> CheckedSizeToU32(size_t size, uint32_t limit, const std::string& label) {
+  if (size > limit || size > std::numeric_limits<uint32_t>::max()) {
     return MakeUnexpected(
-        MakeError(ErrorCode::kStorageDumpWriteError,
-                  "Failed to set temporary snapshot permissions: " + std::string(std::strerror(saved_errno))));
+        MakeError(ErrorCode::kStorageDumpWriteError, label + " size exceeds maximum: " + std::to_string(size)));
   }
-  if (::close(fd) != 0) {
-    const int saved_errno = errno;
-    ::unlink(mutable_template.data());
-    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to close temporary snapshot file: " +
-                                                                           std::string(std::strerror(saved_errno))));
+  return static_cast<uint32_t>(size);
+}
+
+Expected<void, Error> WriteSizedPayload(std::ostream& output_stream, const std::string& data, uint32_t limit,
+                                        const std::string& label) {
+  auto size = CheckedSizeToU32(data.size(), limit, label);
+  if (!size) {
+    return MakeUnexpected(size.error());
   }
-  return std::string(mutable_template.data());
-#endif
+  const uint32_t crc = CalculateCRC32(data);
+  if (!WriteBinary(output_stream, *size) || !WriteBinary(output_stream, crc)) {
+    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write " + label + " header"));
+  }
+  output_stream.write(data.data(), *size);
+  if (!output_stream.good()) {
+    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write " + label + " data"));
+  }
+  return {};
+}
+
+bool IsFullyConsumed(std::istream& input_stream) {
+  return input_stream.peek() == std::char_traits<char>::eof();
 }
 
 }  // namespace
@@ -189,48 +238,43 @@ namespace {
  */
 Expected<void, Error> VerifyFileLevelIntegrity(std::istream& input_stream, const HeaderV1& header,
                                                snapshot_format::IntegrityError* integrity_error) {
-  // Verify file size against the value recorded in the header.
-  input_stream.seekg(0, std::ios::end);
-  auto actual_file_size = static_cast<uint64_t>(input_stream.tellg());
-  if (actual_file_size != header.total_file_size) {
-    std::string message = "File size mismatch: expected " + std::to_string(header.total_file_size) + ", got " +
-                          std::to_string(actual_file_size);
+  const auto fail_file_integrity = [&](const std::string& message) -> Expected<void, Error> {
     if (integrity_error != nullptr) {
       integrity_error->type = snapshot_format::CRCErrorType::FileCRC;
       integrity_error->message = message;
     }
     return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, message));
+  };
+  // Verify file size against the value recorded in the header.
+  input_stream.seekg(0, std::ios::end);
+  const auto end_position = input_stream.tellg();
+  if (end_position < 0) {
+    return fail_file_integrity("Failed to determine snapshot file size");
+  }
+  const auto actual_file_size = static_cast<uint64_t>(end_position);
+  if (actual_file_size > kMaxSnapshotFileSize || header.total_file_size > kMaxSnapshotFileSize) {
+    return fail_file_integrity("Snapshot exceeds maximum total file size");
+  }
+  if (actual_file_size != header.total_file_size) {
+    std::string message = "File size mismatch: expected " + std::to_string(header.total_file_size) + ", got " +
+                          std::to_string(actual_file_size);
+    return fail_file_integrity(message);
   }
 
-  // Verify whole-file CRC32 (computed with the file_crc32 field zeroed out).
-  if (header.file_crc32 != 0) {
-    input_stream.seekg(0, std::ios::beg);
-    std::string file_contents(static_cast<size_t>(actual_file_size), '\0');
-    input_stream.read(file_contents.data(), static_cast<std::streamsize>(actual_file_size));
-    if (input_stream.fail()) {
-      std::string message = "Failed to read file contents for CRC verification";
-      if (integrity_error != nullptr) {
-        integrity_error->type = snapshot_format::CRCErrorType::FileCRC;
-        integrity_error->message = message;
-      }
-      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, message));
-    }
-
-    // Zero out the file_crc32 field for CRC computation (it was 0 when written).
-    if (file_contents.size() >= kFileCRC32Offset + sizeof(uint32_t)) {
-      std::memset(&file_contents[kFileCRC32Offset], 0, sizeof(uint32_t));
-    }
-
-    uint32_t computed_crc = CalculateCRC32(file_contents);
-    if (computed_crc != header.file_crc32) {
-      std::string message = "File CRC32 mismatch: expected " + std::to_string(header.file_crc32) + ", got " +
-                            std::to_string(computed_crc);
-      if (integrity_error != nullptr) {
-        integrity_error->type = snapshot_format::CRCErrorType::FileCRC;
-        integrity_error->message = message;
-      }
-      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, message));
-    }
+  if ((header.flags & snapshot_format::flags_v1::kWithCRC) == 0) {
+    return fail_file_integrity("Snapshot does not declare required CRC32 protection");
+  }
+  if (header.file_crc32 == 0) {
+    return fail_file_integrity("Snapshot file CRC32 is missing");
+  }
+  auto computed_crc = CalculateFileCRC32Streaming(input_stream, actual_file_size);
+  if (!computed_crc) {
+    return MakeUnexpected(computed_crc.error());
+  }
+  if (*computed_crc != header.file_crc32) {
+    std::string message =
+        "File CRC32 mismatch: expected " + std::to_string(header.file_crc32) + ", got " + std::to_string(*computed_crc);
+    return fail_file_integrity(message);
   }
 
   return {};
@@ -450,8 +494,11 @@ Expected<void, Error> SerializeEventStore(std::ostream& output_stream, const eve
   std::vector<std::string> contexts = event_store.GetAllContexts();
 
   // Write context count
-  auto context_count = static_cast<uint32_t>(contexts.size());
-  if (!WriteBinary(output_stream, context_count)) {
+  auto context_count = CheckedSizeToU32(contexts.size(), std::numeric_limits<uint32_t>::max(), "event context count");
+  if (!context_count) {
+    return MakeUnexpected(context_count.error());
+  }
+  if (!WriteBinary(output_stream, *context_count)) {
     return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write context count"));
   }
 
@@ -466,8 +513,11 @@ Expected<void, Error> SerializeEventStore(std::ostream& output_stream, const eve
     std::vector<events::Event> events = event_store.GetEvents(ctx);
 
     // Write event count
-    auto event_count = static_cast<uint32_t>(events.size());
-    if (!WriteBinary(output_stream, event_count)) {
+    auto event_count = CheckedSizeToU32(events.size(), std::numeric_limits<uint32_t>::max(), "event count");
+    if (!event_count) {
+      return MakeUnexpected(event_count.error());
+    }
+    if (!WriteBinary(output_stream, *event_count)) {
       return MakeUnexpected(
           MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write event count for context: " + ctx));
     }
@@ -504,6 +554,9 @@ Expected<void, Error> DeserializeEventStore(std::istream& input_stream, events::
   if (!ReadBinary(input_stream, context_count)) {
     return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read context count"));
   }
+  if (!HasRemainingBytes(input_stream, static_cast<uint64_t>(context_count) * (sizeof(uint32_t) * 2))) {
+    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Context count exceeds remaining store data"));
+  }
 
   // Read each context's events
   for (uint32_t ctx_idx = 0; ctx_idx < context_count; ++ctx_idx) {
@@ -518,6 +571,11 @@ Expected<void, Error> DeserializeEventStore(std::istream& input_stream, events::
     if (!ReadBinary(input_stream, event_count)) {
       return MakeUnexpected(
           MakeError(ErrorCode::kStorageDumpReadError, "Failed to read event count for context: " + ctx));
+    }
+    constexpr uint64_t kMinSerializedEventSize = sizeof(uint32_t) + sizeof(int) + sizeof(uint8_t) + sizeof(uint64_t);
+    if (!HasRemainingBytes(input_stream, static_cast<uint64_t>(event_count) * kMinSerializedEventSize)) {
+      return MakeUnexpected(
+          MakeError(ErrorCode::kStorageDumpReadError, "Event count exceeds remaining data for context: " + ctx));
     }
 
     // Read each event
@@ -570,8 +628,11 @@ Expected<void, Error> SerializeCoOccurrenceIndex(std::ostream& output_stream,
   std::vector<std::string> items = co_index.GetAllItems();
 
   // Write item count
-  auto item_count = static_cast<uint32_t>(items.size());
-  if (!WriteBinary(output_stream, item_count)) {
+  auto item_count = CheckedSizeToU32(items.size(), std::numeric_limits<uint32_t>::max(), "co-occurrence item count");
+  if (!item_count) {
+    return MakeUnexpected(item_count.error());
+  }
+  if (!WriteBinary(output_stream, *item_count)) {
     return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write item count"));
   }
 
@@ -588,8 +649,12 @@ Expected<void, Error> SerializeCoOccurrenceIndex(std::ostream& output_stream,
     std::vector<std::pair<std::string, float>> co_items = co_index.GetAllNeighbors(item1);
 
     // Write co-item count
-    auto co_item_count = static_cast<uint32_t>(co_items.size());
-    if (!WriteBinary(output_stream, co_item_count)) {
+    auto co_item_count =
+        CheckedSizeToU32(co_items.size(), std::numeric_limits<uint32_t>::max(), "co-occurrence neighbor count");
+    if (!co_item_count) {
+      return MakeUnexpected(co_item_count.error());
+    }
+    if (!WriteBinary(output_stream, *co_item_count)) {
       return MakeUnexpected(
           MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write co-item count for: " + item1));
     }
@@ -617,6 +682,9 @@ Expected<void, Error> DeserializeCoOccurrenceIndex(std::istream& input_stream, e
   if (!ReadBinary(input_stream, item_count)) {
     return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read item count"));
   }
+  if (!HasRemainingBytes(input_stream, static_cast<uint64_t>(item_count) * (sizeof(uint32_t) * 2))) {
+    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Item count exceeds remaining store data"));
+  }
 
   // Read each item's co-occurrence scores and set them directly
   for (uint32_t item_idx = 0; item_idx < item_count; ++item_idx) {
@@ -630,6 +698,11 @@ Expected<void, Error> DeserializeCoOccurrenceIndex(std::istream& input_stream, e
     uint32_t co_item_count = 0;
     if (!ReadBinary(input_stream, co_item_count)) {
       return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read co-item count for: " + item1));
+    }
+    constexpr uint64_t kMinSerializedNeighborSize = sizeof(uint32_t) + sizeof(float);
+    if (!HasRemainingBytes(input_stream, static_cast<uint64_t>(co_item_count) * kMinSerializedNeighborSize)) {
+      return MakeUnexpected(
+          MakeError(ErrorCode::kStorageDumpReadError, "Neighbor count exceeds remaining data for: " + item1));
     }
 
     for (uint32_t co_idx = 0; co_idx < co_item_count; ++co_idx) {
@@ -668,8 +741,11 @@ Expected<void, Error> SerializeVectorStore(std::ostream& output_stream, const ve
   std::vector<std::string> ids = vector_store.GetAllIds();
 
   // Write vector count
-  auto vector_count = static_cast<uint32_t>(ids.size());
-  if (!WriteBinary(output_stream, vector_count)) {
+  auto vector_count = CheckedSizeToU32(ids.size(), std::numeric_limits<uint32_t>::max(), "vector count");
+  if (!vector_count) {
+    return MakeUnexpected(vector_count.error());
+  }
+  if (!WriteBinary(output_stream, *vector_count)) {
     return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write vector count"));
   }
 
@@ -709,23 +785,42 @@ Expected<void, Error> DeserializeVectorStore(std::istream& input_stream, vectors
   if (!ReadBinary(input_stream, dimension)) {
     return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read dimension"));
   }
+  if (dimension > kMaxVectorDimension || dimension > std::numeric_limits<size_t>::max() / sizeof(float)) {
+    return MakeUnexpected(
+        MakeError(ErrorCode::kStorageDumpReadError, "Vector dimension exceeds maximum: " + std::to_string(dimension)));
+  }
 
   // Read vector count
   uint32_t vector_count = 0;
   if (!ReadBinary(input_stream, vector_count)) {
     return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read vector count"));
   }
+  if (vector_count > 0 && dimension == 0) {
+    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Non-empty vector store has zero dimension"));
+  }
+  const uint64_t min_vector_size = sizeof(uint32_t) + dimension * sizeof(float);
+  if (!HasRemainingBytes(input_stream, static_cast<uint64_t>(vector_count) * min_vector_size)) {
+    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Vector count exceeds remaining store data"));
+  }
 
   // Read each vector
+  std::unordered_set<std::string> seen_vector_ids;
   for (uint32_t vec_idx = 0; vec_idx < vector_count; ++vec_idx) {
     // Read vector ID
     std::string vector_id;
     if (!ReadString(input_stream, vector_id)) {
       return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read vector ID"));
     }
+    if (!seen_vector_ids.insert(vector_id).second) {
+      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Duplicate vector ID: " + vector_id));
+    }
 
     // Read vector data
-    std::vector<float> data(dimension);
+    const uint64_t vector_bytes = dimension * sizeof(float);
+    if (!HasRemainingBytes(input_stream, vector_bytes)) {
+      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Vector exceeds remaining store data"));
+    }
+    std::vector<float> data(static_cast<size_t>(dimension));
     for (uint64_t i = 0; i < dimension; ++i) {
       if (!ReadBinary(input_stream, data[i])) {
         return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read vector component"));
@@ -762,8 +857,11 @@ Expected<void, Error> SerializeMetadataStore(std::ostream& output_stream, const 
     }
   }
 
-  auto item_count = static_cast<uint32_t>(entries.size());
-  if (!WriteBinary(output_stream, item_count)) {
+  auto item_count = CheckedSizeToU32(entries.size(), std::numeric_limits<uint32_t>::max(), "metadata item count");
+  if (!item_count) {
+    return MakeUnexpected(item_count.error());
+  }
+  if (!WriteBinary(output_stream, *item_count)) {
     return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write metadata item count"));
   }
 
@@ -772,8 +870,11 @@ Expected<void, Error> SerializeMetadataStore(std::ostream& output_stream, const 
       return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write metadata item ID: " + id));
     }
 
-    auto field_count = static_cast<uint32_t>(metadata.size());
-    if (!WriteBinary(output_stream, field_count)) {
+    auto field_count = CheckedSizeToU32(metadata.size(), std::numeric_limits<uint32_t>::max(), "metadata field count");
+    if (!field_count) {
+      return MakeUnexpected(field_count.error());
+    }
+    if (!WriteBinary(output_stream, *field_count)) {
       return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write metadata field count"));
     }
 
@@ -820,6 +921,9 @@ Expected<void, Error> DeserializeMetadataStore(std::istream& input_stream, vecto
   if (!ReadBinary(input_stream, item_count)) {
     return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read metadata item count"));
   }
+  if (!HasRemainingBytes(input_stream, static_cast<uint64_t>(item_count) * (sizeof(uint32_t) * 2))) {
+    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Metadata item count exceeds remaining data"));
+  }
 
   for (uint32_t item_idx = 0; item_idx < item_count; ++item_idx) {
     std::string id;
@@ -830,6 +934,11 @@ Expected<void, Error> DeserializeMetadataStore(std::istream& input_stream, vecto
     uint32_t field_count = 0;
     if (!ReadBinary(input_stream, field_count)) {
       return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read metadata field count"));
+    }
+    constexpr uint64_t kMinSerializedMetadataFieldSize = sizeof(uint32_t) + sizeof(uint8_t) + sizeof(bool);
+    if (!HasRemainingBytes(input_stream, static_cast<uint64_t>(field_count) * kMinSerializedMetadataFieldSize)) {
+      return MakeUnexpected(
+          MakeError(ErrorCode::kStorageDumpReadError, "Metadata field count exceeds remaining data for: " + id));
     }
 
     vectors::Metadata metadata;
@@ -899,33 +1008,41 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
                                       const events::EventStore& event_store, const events::CoOccurrenceIndex& co_index,
                                       const vectors::VectorStore& vector_store, const SnapshotStatistics* stats,
                                       const std::unordered_map<std::string, StoreStatistics>* store_stats,
-                                      const vectors::MetadataStore* metadata_store, bool suppress_logging) {
-  auto resolved_path_result = ResolvePrivateStoragePath(filepath);
-  if (!resolved_path_result) {
-    return MakeUnexpected(resolved_path_result.error());
+                                      const vectors::MetadataStore* metadata_store, bool suppress_logging,
+                                      const SnapshotWriteLimits* limits) {
+  const SnapshotWriteLimits default_limits;
+  const auto& write_limits = limits != nullptr ? *limits : default_limits;
+  const uint32_t max_config_size = std::min(kMaxConfigSize, write_limits.max_config_size);
+  const uint32_t max_stats_size = std::min(kMaxStatsSize, write_limits.max_stats_size);
+  const uint32_t max_store_data_size = std::min(kMaxStoreDataSize, write_limits.max_store_data_size);
+  const uint32_t max_store_stats_size = std::min(kMaxStoreStatsSize, write_limits.max_store_stats_size);
+  auto storage_target_result = PrivateStorageTarget::Open(filepath);
+  if (!storage_target_result) {
+    return MakeUnexpected(storage_target_result.error());
   }
-  const std::string resolved_filepath = resolved_path_result->string();
+  auto storage_target = std::move(storage_target_result.value());
+  const std::string resolved_filepath = storage_target.DisplayPath();
 
-  auto temp_file_result = CreateSecureTemporaryFile(resolved_filepath);
+  auto temp_file_result = storage_target.CreateTemporaryFile();
   if (!temp_file_result) {
     return MakeUnexpected(temp_file_result.error());
   }
-  const std::string temp_filepath = *temp_file_result;
+  auto temp_file = std::move(temp_file_result.value());
+  const std::string temp_stream_path = temp_file.StreamPath();
 
-  // Open file for binary writing
-  std::ofstream output_stream(temp_filepath, std::ios::binary | std::ios::trunc);
+  // The /dev/fd path refers to the already validated open inode. It cannot be
+  // redirected by replacing the temporary directory entry.
+  std::ofstream output_stream(temp_stream_path, std::ios::binary | std::ios::trunc);
   if (!output_stream) {
     return MakeUnexpected(
         MakeError(ErrorCode::kStorageDumpWriteError,
-                  "Failed to open file for writing: " + temp_filepath + " (" + std::strerror(errno) + ")"));
+                  "Failed to open secure temporary snapshot stream (" + std::string(std::strerror(errno)) + ")"));
   }
 
   {
     // Write fixed header (magic + version)
     output_stream.write(snapshot_format::kMagicNumber.data(), snapshot_format::kMagicNumber.size());
     if (!output_stream.good()) {
-      std::error_code rm_ec;
-      std::filesystem::remove(temp_filepath, rm_ec);
       return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write magic number"));
     }
     uint32_t version = snapshot_format::kCurrentVersion;
@@ -949,7 +1066,11 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
     if (!header_result) {
       return header_result;
     }
-    header.header_size = static_cast<uint32_t>(header_ss.str().size());
+    auto header_size = CheckedSizeToU32(header_ss.str().size(), kMaxConfigSize, "snapshot header");
+    if (!header_size) {
+      return MakeUnexpected(header_size.error());
+    }
+    header.header_size = *header_size;
 
     // Write V1 header (with placeholder values)
     auto write_header_result = WriteHeaderV1(output_stream, header);
@@ -964,11 +1085,10 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
       return config_result;
     }
     std::string config_data = config_ss.str();
-    auto config_size = static_cast<uint32_t>(config_data.size());
-    uint32_t config_crc = CalculateCRC32(config_data);
-    WriteBinary(output_stream, config_size);
-    WriteBinary(output_stream, config_crc);
-    output_stream.write(config_data.data(), config_size);
+    auto config_write = WriteSizedPayload(output_stream, config_data, max_config_size, "config section");
+    if (!config_write) {
+      return config_write;
+    }
 
     // Write statistics section (if provided)
     if (stats != nullptr) {
@@ -978,11 +1098,10 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
         return stats_result;
       }
       std::string stats_data = stats_ss.str();
-      auto stats_size = static_cast<uint32_t>(stats_data.size());
-      uint32_t stats_crc = CalculateCRC32(stats_data);
-      WriteBinary(output_stream, stats_size);
-      WriteBinary(output_stream, stats_crc);
-      output_stream.write(stats_data.data(), stats_size);
+      auto stats_write = WriteSizedPayload(output_stream, stats_data, max_stats_size, "statistics section");
+      if (!stats_write) {
+        return stats_write;
+      }
     }
 
     // Write store data section
@@ -999,11 +1118,11 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
           return store_stats_result;
         }
         std::string store_stats_data = store_stats_ss.str();
-        auto store_stats_size = static_cast<uint32_t>(store_stats_data.size());
-        uint32_t store_stats_crc = CalculateCRC32(store_stats_data);
-        WriteBinary(output_stream, store_stats_size);
-        WriteBinary(output_stream, store_stats_crc);
-        output_stream.write(store_stats_data.data(), store_stats_size);
+        auto write_result =
+            WriteSizedPayload(output_stream, store_stats_data, max_store_stats_size, "events store statistics");
+        if (!write_result) {
+          return write_result;
+        }
       } else {
         uint32_t zero = 0;
         WriteBinary(output_stream, zero);  // No store stats
@@ -1015,11 +1134,10 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
         return serialize_result;
       }
       std::string store_data = store_data_ss.str();
-      auto store_data_size = static_cast<uint32_t>(store_data.size());
-      uint32_t store_data_crc = CalculateCRC32(store_data);
-      WriteBinary(output_stream, store_data_size);
-      WriteBinary(output_stream, store_data_crc);
-      output_stream.write(store_data.data(), store_data_size);
+      auto write_result = WriteSizedPayload(output_stream, store_data, max_store_data_size, "events store");
+      if (!write_result) {
+        return write_result;
+      }
     }
 
     // Store 2: CoOccurrenceIndex
@@ -1032,11 +1150,11 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
           return store_stats_result;
         }
         std::string store_stats_data = store_stats_ss.str();
-        auto store_stats_size = static_cast<uint32_t>(store_stats_data.size());
-        uint32_t store_stats_crc = CalculateCRC32(store_stats_data);
-        WriteBinary(output_stream, store_stats_size);
-        WriteBinary(output_stream, store_stats_crc);
-        output_stream.write(store_stats_data.data(), store_stats_size);
+        auto write_result =
+            WriteSizedPayload(output_stream, store_stats_data, max_store_stats_size, "co-occurrence store statistics");
+        if (!write_result) {
+          return write_result;
+        }
       } else {
         uint32_t zero = 0;
         WriteBinary(output_stream, zero);  // No store stats
@@ -1048,11 +1166,10 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
         return serialize_result;
       }
       std::string store_data = store_data_ss.str();
-      auto store_data_size = static_cast<uint32_t>(store_data.size());
-      uint32_t store_data_crc = CalculateCRC32(store_data);
-      WriteBinary(output_stream, store_data_size);
-      WriteBinary(output_stream, store_data_crc);
-      output_stream.write(store_data.data(), store_data_size);
+      auto write_result = WriteSizedPayload(output_stream, store_data, max_store_data_size, "co-occurrence store");
+      if (!write_result) {
+        return write_result;
+      }
     }
 
     // Store 3: VectorStore
@@ -1065,11 +1182,11 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
           return store_stats_result;
         }
         std::string store_stats_data = store_stats_ss.str();
-        auto store_stats_size = static_cast<uint32_t>(store_stats_data.size());
-        uint32_t store_stats_crc = CalculateCRC32(store_stats_data);
-        WriteBinary(output_stream, store_stats_size);
-        WriteBinary(output_stream, store_stats_crc);
-        output_stream.write(store_stats_data.data(), store_stats_size);
+        auto write_result =
+            WriteSizedPayload(output_stream, store_stats_data, max_store_stats_size, "vectors store statistics");
+        if (!write_result) {
+          return write_result;
+        }
       } else {
         uint32_t zero = 0;
         WriteBinary(output_stream, zero);  // No store stats
@@ -1081,11 +1198,10 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
         return serialize_result;
       }
       std::string store_data = store_data_ss.str();
-      auto store_data_size = static_cast<uint32_t>(store_data.size());
-      uint32_t store_data_crc = CalculateCRC32(store_data);
-      WriteBinary(output_stream, store_data_size);
-      WriteBinary(output_stream, store_data_crc);
-      output_stream.write(store_data.data(), store_data_size);
+      auto write_result = WriteSizedPayload(output_stream, store_data, max_store_data_size, "vectors store");
+      if (!write_result) {
+        return write_result;
+      }
     }
 
     // Store 4: MetadataStore
@@ -1100,23 +1216,23 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
         return serialize_result;
       }
       std::string store_data = store_data_ss.str();
-      auto store_data_size = static_cast<uint32_t>(store_data.size());
-      uint32_t store_data_crc = CalculateCRC32(store_data);
-      WriteBinary(output_stream, store_data_size);
-      WriteBinary(output_stream, store_data_crc);
-      output_stream.write(store_data.data(), store_data_size);
+      auto write_result = WriteSizedPayload(output_stream, store_data, max_store_data_size, "metadata store");
+      if (!write_result) {
+        return write_result;
+      }
     }
 
     // Check stream state after all store writes
     if (!output_stream.good()) {
       output_stream.close();
-      std::error_code rm_ec;
-      std::filesystem::remove(temp_filepath, rm_ec);
       return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Stream error during snapshot write"));
     }
 
     // Calculate total file size
     header.total_file_size = static_cast<uint64_t>(output_stream.tellp());
+    if (header.total_file_size > kMaxSnapshotFileSize) {
+      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Snapshot exceeds maximum total file size"));
+    }
 
     // Write header with correct total_file_size (file_crc32 still 0 as placeholder)
     header.file_crc32 = 0;
@@ -1126,75 +1242,65 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
       return rewrite_header_result;
     }
 
-    // Close file to flush all data
+    // Close file to flush all data and surface buffered write failures.
     output_stream.close();
+    if (output_stream.fail()) {
+      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to close snapshot temp file"));
+    }
 
     // Compute file-level CRC32: read entire file, zero the file_crc32 field, compute CRC
     {
-      std::ifstream crc_input(temp_filepath, std::ios::binary);
+      std::ifstream crc_input(temp_stream_path, std::ios::binary);
       if (!crc_input) {
-        return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError,
-                                        "Failed to reopen temp file for CRC32 computation: " + temp_filepath));
-      }
-      crc_input.seekg(0, std::ios::end);
-      auto file_size = static_cast<size_t>(crc_input.tellg());
-      crc_input.seekg(0, std::ios::beg);
-      std::string file_contents(file_size, '\0');
-      crc_input.read(file_contents.data(), static_cast<std::streamsize>(file_size));
-      if (crc_input.fail()) {
-        std::error_code rm_ec;
-        std::filesystem::remove(temp_filepath, rm_ec);
         return MakeUnexpected(
-            MakeError(ErrorCode::kStorageDumpWriteError, "Failed to read temp file for CRC32 computation"));
+            MakeError(ErrorCode::kStorageDumpWriteError, "Failed to reopen secure temp inode for CRC32 computation"));
+      }
+      auto file_crc = CalculateFileCRC32Streaming(crc_input, header.total_file_size);
+      if (!file_crc) {
+        return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, file_crc.error().message()));
       }
       crc_input.close();
+      if (crc_input.fail()) {
+        return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to close snapshot CRC input"));
+      }
 
-      // Zero out the file_crc32 field for CRC computation (it was 0 when written)
-      // The field is already 0 in the buffer, so we can compute directly
-      header.file_crc32 = CalculateCRC32(file_contents);
+      header.file_crc32 = *file_crc;
 
       // Write the computed CRC32 at the file_crc32 position
-      std::ofstream crc_output(temp_filepath, std::ios::binary | std::ios::in | std::ios::out);
+      std::ofstream crc_output(temp_stream_path, std::ios::binary | std::ios::in | std::ios::out);
       if (!crc_output) {
-        return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError,
-                                        "Failed to reopen temp file for CRC32 write: " + temp_filepath));
+        return MakeUnexpected(
+            MakeError(ErrorCode::kStorageDumpWriteError, "Failed to reopen secure temp inode for CRC32 write"));
       }
       crc_output.seekp(static_cast<std::streamoff>(kFileCRC32Offset), std::ios::beg);
-      WriteBinary(crc_output, header.file_crc32);
+      if (!WriteBinary(crc_output, header.file_crc32)) {
+        return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write snapshot file CRC32"));
+      }
       crc_output.close();
+      if (crc_output.fail()) {
+        return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to close snapshot CRC output"));
+      }
     }
 
 #ifndef _WIN32
-    // fsync the temp file to ensure data is persisted before rename
-    {
-      // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg): POSIX open() requires varargs
-      int fd = open(temp_filepath.c_str(), O_RDONLY);
-      if (fd >= 0) {
-        fsync(fd);
-        close(fd);
-      }
-
-      // fsync the parent directory to ensure the directory entry is persisted
-      std::filesystem::path parent_dir = std::filesystem::path(temp_filepath).parent_path();
-      // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg): POSIX open() requires varargs
-      int dir_fd = open(parent_dir.c_str(), O_RDONLY);
-      if (dir_fd >= 0) {
-        fsync(dir_fd);
-        close(dir_fd);
-      }
+    // Persist the same opened inode that was written and CRC-checked.
+    if (::fsync(temp_file.Get()) != 0) {
+      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError,
+                                      "Failed to fsync snapshot temp file: " + std::string(std::strerror(errno))));
     }
 #endif
 
-    // Atomic rename
-    std::error_code rename_ec;
-    std::filesystem::rename(temp_filepath, resolved_filepath, rename_ec);
-    if (rename_ec) {
-      std::error_code rm_ec;
-      std::filesystem::remove(temp_filepath, rm_ec);
-      return MakeUnexpected(
-          MakeError(ErrorCode::kStorageDumpWriteError,
-                    "Failed to rename temp file to " + resolved_filepath + ": " + rename_ec.message()));
+    auto publish_result = storage_target.Publish(temp_file);
+    if (!publish_result) {
+      return publish_result;
     }
+
+#ifndef _WIN32
+    auto directory_sync_result = storage_target.FsyncDirectory();
+    if (!directory_sync_result) {
+      return directory_sync_result;
+    }
+#endif
 
     // Skip spdlog when running on a post-fork child path, where the logger is
     // not safe to touch (see suppress_logging in WriteSnapshotV1's docs).
@@ -1211,11 +1317,21 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
                                      std::unordered_map<std::string, StoreStatistics>* store_stats,
                                      snapshot_format::IntegrityError* integrity_error,
                                      vectors::MetadataStore* metadata_store) {
-  // Open file for binary reading
-  std::ifstream input_stream(filepath, std::ios::binary);
+  auto storage_target_result = PrivateStorageTarget::Open(filepath);
+  if (!storage_target_result) {
+    return MakeUnexpected(storage_target_result.error());
+  }
+  auto storage_target = std::move(storage_target_result.value());
+  auto snapshot_fd_result = storage_target.OpenRegularFileReadOnly();
+  if (!snapshot_fd_result) {
+    return MakeUnexpected(snapshot_fd_result.error());
+  }
+  auto snapshot_fd = std::move(snapshot_fd_result.value());
+  std::ifstream input_stream(snapshot_fd.StreamPath(), std::ios::binary);
   if (!input_stream) {
-    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to open file for reading: " + filepath +
-                                                                          " (" + std::strerror(errno) + ")"));
+    return MakeUnexpected(MakeError(
+        ErrorCode::kStorageDumpReadError,
+        "Failed to open validated snapshot inode for reading: " + filepath + " (" + std::strerror(errno) + ")"));
   }
 
   {
@@ -1270,6 +1386,9 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
       return MakeUnexpected(
           MakeError(ErrorCode::kStorageDumpReadError, "Config size exceeds maximum: " + std::to_string(config_size)));
     }
+    if (!HasRemainingBytes(input_stream, config_size)) {
+      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Config section exceeds remaining file"));
+    }
     std::string config_data(config_size, '\0');
     input_stream.read(config_data.data(), config_size);
     if (!input_stream.good()) {
@@ -1293,9 +1412,12 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
     if (!deserialize_config_result) {
       return deserialize_config_result;
     }
+    if (!IsFullyConsumed(config_ss)) {
+      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Trailing bytes in config section"));
+    }
 
     // Read statistics section (if present)
-    if ((header.flags & snapshot_format::flags_v1::kWithStatistics) != 0 && stats != nullptr) {
+    if ((header.flags & snapshot_format::flags_v1::kWithStatistics) != 0) {
       uint32_t stats_size = 0;
       uint32_t stats_crc = 0;
       if (!ReadBinary(input_stream, stats_size)) {
@@ -1307,6 +1429,9 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
       if (stats_size > kMaxStatsSize) {
         return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError,
                                         "Statistics size exceeds maximum: " + std::to_string(stats_size)));
+      }
+      if (!HasRemainingBytes(input_stream, stats_size)) {
+        return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Statistics section exceeds remaining file"));
       }
       std::string stats_data(stats_size, '\0');
       input_stream.read(stats_data.data(), stats_size);
@@ -1326,10 +1451,15 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
                                               std::to_string(stats_crc) + ", got " + std::to_string(actual_crc)));
         }
       }
-      std::istringstream stats_ss(stats_data);
-      auto deserialize_stats_result = DeserializeStatistics(stats_ss, *stats);
-      if (!deserialize_stats_result) {
-        return deserialize_stats_result;
+      if (stats != nullptr) {
+        std::istringstream stats_ss(stats_data);
+        auto deserialize_stats_result = DeserializeStatistics(stats_ss, *stats);
+        if (!deserialize_stats_result) {
+          return deserialize_stats_result;
+        }
+        if (!IsFullyConsumed(stats_ss)) {
+          return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Trailing bytes in statistics section"));
+        }
       }
     }
 
@@ -1338,12 +1468,26 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
     if (!ReadBinary(input_stream, store_count)) {
       return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read store count"));
     }
+    if (store_count < 3 || store_count > 4) {
+      return MakeUnexpected(
+          MakeError(ErrorCode::kStorageDumpReadError, "Snapshot store count must be between 3 and 4"));
+    }
 
+    std::unordered_set<std::string> seen_stores;
+    vectors::MetadataStore discarded_metadata_store;
     for (uint32_t store_idx = 0; store_idx < store_count; ++store_idx) {
       // Read store name
       std::string store_name;
       if (!ReadString(input_stream, store_name)) {
         return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read store name"));
+      }
+      if (store_name != "events" && store_name != "co_occurrence" && store_name != "vectors" &&
+          store_name != "metadata") {
+        return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Unknown store name: '" + store_name + "'"));
+      }
+      if (!seen_stores.insert(store_name).second) {
+        return MakeUnexpected(
+            MakeError(ErrorCode::kStorageDumpReadError, "Duplicate store section: '" + store_name + "'"));
       }
 
       // Read store statistics (if present)
@@ -1352,7 +1496,7 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
         return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError,
                                         "Failed to read store statistics size for '" + store_name + "'"));
       }
-      if (store_stats_size > 0 && store_stats != nullptr) {
+      if (store_stats_size > 0) {
         uint32_t store_stats_crc = 0;
         if (!ReadBinary(input_stream, store_stats_crc)) {
           return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError,
@@ -1361,6 +1505,9 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
         if (store_stats_size > kMaxStoreStatsSize) {
           return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Store statistics size exceeds maximum: " +
                                                                                 std::to_string(store_stats_size)));
+        }
+        if (!HasRemainingBytes(input_stream, store_stats_size)) {
+          return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Store statistics exceed remaining file"));
         }
         std::string store_stats_data(store_stats_size, '\0');
         input_stream.read(store_stats_data.data(), store_stats_size);
@@ -1383,13 +1530,19 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
                                                                 ", got " + std::to_string(actual_crc)));
           }
         }
-        std::istringstream store_stats_ss(store_stats_data);
-        StoreStatistics stats;
-        auto deserialize_store_stats_result = DeserializeStoreStatistics(store_stats_ss, stats);
-        if (!deserialize_store_stats_result) {
-          return deserialize_store_stats_result;
+        if (store_stats != nullptr) {
+          std::istringstream store_stats_ss(store_stats_data);
+          StoreStatistics parsed_stats;
+          auto deserialize_store_stats_result = DeserializeStoreStatistics(store_stats_ss, parsed_stats);
+          if (!deserialize_store_stats_result) {
+            return deserialize_store_stats_result;
+          }
+          if (!IsFullyConsumed(store_stats_ss)) {
+            return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError,
+                                            "Trailing bytes in store statistics for '" + store_name + "'"));
+          }
+          (*store_stats)[store_name] = parsed_stats;
         }
-        (*store_stats)[store_name] = stats;
       }
 
       // Read store data
@@ -1406,6 +1559,9 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
       if (store_data_size > kMaxStoreDataSize) {
         return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError,
                                         "Store data size exceeds maximum: " + std::to_string(store_data_size)));
+      }
+      if (!HasRemainingBytes(input_stream, store_data_size)) {
+        return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Store data exceeds remaining file"));
       }
       std::string store_data(store_data_size, '\0');
       input_stream.read(store_data.data(), store_data_size);
@@ -1458,15 +1614,36 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
           return deserialize_result;
         }
       } else if (store_name == "metadata") {
-        if (metadata_store != nullptr) {
-          auto deserialize_result = DeserializeMetadataStore(store_data_ss, *metadata_store, vector_store);
-          if (!deserialize_result) {
-            return deserialize_result;
-          }
+        auto& metadata_target = metadata_store != nullptr ? *metadata_store : discarded_metadata_store;
+        auto deserialize_result = DeserializeMetadataStore(store_data_ss, metadata_target, vector_store);
+        if (!deserialize_result) {
+          return deserialize_result;
         }
-      } else {
-        LogStorageWarning("snapshot_read", "Unknown store name: " + store_name);
       }
+      if (!IsFullyConsumed(store_data_ss)) {
+        return MakeUnexpected(
+            MakeError(ErrorCode::kStorageDumpReadError, "Trailing bytes in store data for '" + store_name + "'"));
+      }
+    }
+
+    for (const std::string required_store : {"events", "co_occurrence", "vectors"}) {
+      if (seen_stores.count(required_store) == 0) {
+        return MakeUnexpected(
+            MakeError(ErrorCode::kStorageDumpReadError, "Missing required store: '" + required_store + "'"));
+      }
+    }
+    if (seen_stores.count("metadata") > 0) {
+      const auto* validated_metadata = metadata_store != nullptr ? metadata_store : &discarded_metadata_store;
+      auto metadata_lock = validated_metadata->AcquireReadLock();
+      for (const auto& [item_id, _] : validated_metadata->GetAll()) {
+        if (!vector_store.HasVector(item_id)) {
+          return MakeUnexpected(
+              MakeError(ErrorCode::kStorageDumpReadError, "Metadata references missing vector: '" + item_id + "'"));
+        }
+      }
+    }
+    if (!IsFullyConsumed(input_stream)) {
+      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Trailing bytes after final store section"));
     }
 
     LogStorageInfo("snapshot_read", "Snapshot loaded successfully from " + filepath);
@@ -1476,8 +1653,21 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
 
 Expected<void, Error> VerifySnapshotIntegrity(const std::string& filepath,
                                               snapshot_format::IntegrityError& integrity_error) {
-  // Open file for binary reading
-  std::ifstream input_stream(filepath, std::ios::binary);
+  auto storage_target_result = PrivateStorageTarget::Open(filepath);
+  if (!storage_target_result) {
+    integrity_error.type = snapshot_format::CRCErrorType::FileCRC;
+    integrity_error.message = storage_target_result.error().message();
+    return MakeUnexpected(storage_target_result.error());
+  }
+  auto storage_target = std::move(storage_target_result.value());
+  auto snapshot_fd_result = storage_target.OpenRegularFileReadOnly();
+  if (!snapshot_fd_result) {
+    integrity_error.type = snapshot_format::CRCErrorType::FileCRC;
+    integrity_error.message = snapshot_fd_result.error().message();
+    return MakeUnexpected(snapshot_fd_result.error());
+  }
+  auto snapshot_fd = std::move(snapshot_fd_result.value());
+  std::ifstream input_stream(snapshot_fd.StreamPath(), std::ios::binary);
   if (!input_stream) {
     integrity_error.type = snapshot_format::CRCErrorType::FileCRC;
     integrity_error.message = "Failed to open file: " + std::string(std::strerror(errno));
@@ -1532,11 +1722,21 @@ Expected<void, Error> VerifySnapshotIntegrity(const std::string& filepath,
 }
 
 Expected<void, Error> GetSnapshotInfo(const std::string& filepath, SnapshotInfo& info) {
-  // Open file for binary reading
-  std::ifstream input_stream(filepath, std::ios::binary);
+  auto storage_target_result = PrivateStorageTarget::Open(filepath);
+  if (!storage_target_result) {
+    return MakeUnexpected(storage_target_result.error());
+  }
+  auto storage_target = std::move(storage_target_result.value());
+  auto snapshot_fd_result = storage_target.OpenRegularFileReadOnly();
+  if (!snapshot_fd_result) {
+    return MakeUnexpected(snapshot_fd_result.error());
+  }
+  auto snapshot_fd = std::move(snapshot_fd_result.value());
+  std::ifstream input_stream(snapshot_fd.StreamPath(), std::ios::binary);
   if (!input_stream) {
-    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to open file for reading: " + filepath +
-                                                                          " (" + std::strerror(errno) + ")"));
+    return MakeUnexpected(MakeError(
+        ErrorCode::kStorageDumpReadError,
+        "Failed to open validated snapshot inode for reading: " + filepath + " (" + std::strerror(errno) + ")"));
   }
 
   // Read and verify fixed header (magic + version)

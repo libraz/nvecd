@@ -8,10 +8,14 @@
 #include <gtest/gtest.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <zlib.h>
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 
 #include "server/command_parser.h"
 #include "storage/wal.h"
@@ -112,6 +116,21 @@ TEST(WalCodecTest, VecsetMultiDimRoundTrip) {
     EXPECT_FLOAT_EQ(decoded->vector[i], cmd.vector[i]) << "element " << i;
   }
   EXPECT_EQ(decoded->dimension, static_cast<int>(cmd.vector.size()));
+}
+
+TEST(WalCodecTest, VecsetWithMetadataRoundTripsAsSingleRecord) {
+  Command cmd;
+  cmd.type = CommandType::kVecset;
+  cmd.id = "vec-with-metadata";
+  cmd.vector = {1.0F, 2.0F};
+  cmd.metadata = vectors::Metadata{{"category", std::string("news")}, {"rank", int64_t{3}}};
+
+  auto decoded = DecodeWalRecord(MakeRecord(cmd));
+
+  ASSERT_TRUE(decoded.has_value()) << decoded.error().to_string();
+  ASSERT_TRUE(decoded->metadata.has_value());
+  EXPECT_EQ(std::get<std::string>(decoded->metadata->at("category")), "news");
+  EXPECT_EQ(std::get<int64_t>(decoded->metadata->at("rank")), 3);
 }
 
 TEST(WalCodecTest, VecsetEmptyVectorRoundTrip) {
@@ -229,23 +248,34 @@ TEST(WalCodecTest, EmptyPayloadStringLengthReturnsError) {
 }
 
 TEST(WalCheckpointTest, SidecarRoundTrip) {
-  const std::string snapshot_path = ::testing::TempDir() + "/wal_codec_test_snapshot.bin";
+  namespace fs = std::filesystem;
+  const fs::path test_dir =
+      fs::temp_directory_path() / ("nvecd_wal_checkpoint_roundtrip_" + std::to_string(::getpid()));
+  fs::remove_all(test_dir);
+  fs::create_directories(test_dir);
+  fs::permissions(test_dir, fs::perms::owner_all, fs::perm_options::replace);
+  const std::string snapshot_path = (test_dir / "snapshot.bin").string();
+  {
+    std::ofstream snapshot(snapshot_path, std::ios::binary);
+    snapshot << "bound snapshot contents";
+  }
   const uint64_t sequence = 0xA1B2C3D4E5F6ULL;
 
   auto write_result = storage::WriteWalCheckpoint(snapshot_path, sequence);
   ASSERT_TRUE(write_result.has_value()) << write_result.error().to_string();
 
-  EXPECT_EQ(storage::ReadWalCheckpoint(snapshot_path), sequence);
+  auto checkpoint = storage::ReadWalCheckpoint(snapshot_path);
+  ASSERT_TRUE(checkpoint.has_value()) << checkpoint.error().message();
+  EXPECT_EQ(*checkpoint, sequence);
 
   struct stat info {};
   const std::string sidecar_path = snapshot_path + storage::kWalCheckpointSuffix;
   ASSERT_EQ(::stat(sidecar_path.c_str(), &info), 0);
   EXPECT_EQ(info.st_mode & (S_IRWXG | S_IRWXO), 0);
 
-  // Absent sidecar returns 0.
-  EXPECT_EQ(storage::ReadWalCheckpoint(::testing::TempDir() + "/wal_codec_test_missing.bin"), 0ULL);
-
   ::unlink(sidecar_path.c_str());
+  EXPECT_FALSE(storage::ReadWalCheckpoint(snapshot_path).has_value());
+  fs::remove_all(test_dir);
 }
 
 TEST(WalCheckpointTest, DoesNotFollowLegacyTemporaryFileSymlink) {
@@ -256,6 +286,10 @@ TEST(WalCheckpointTest, DoesNotFollowLegacyTemporaryFileSymlink) {
   fs::permissions(test_dir, fs::perms::owner_all, fs::perm_options::replace);
 
   const std::string snapshot_path = (test_dir / "snapshot.dmp").string();
+  {
+    std::ofstream snapshot_file(snapshot_path);
+    snapshot_file << "snapshot";
+  }
   const fs::path victim = test_dir / "victim.txt";
   {
     std::ofstream victim_file(victim);
@@ -275,6 +309,76 @@ TEST(WalCheckpointTest, DoesNotFollowLegacyTemporaryFileSymlink) {
   std::getline(victim_file, victim_contents);
   EXPECT_EQ(victim_contents, "do not overwrite");
 
+  fs::remove_all(test_dir);
+}
+
+TEST(WalCheckpointTest, RejectsMalformedUnboundAndUnsafeFrames) {
+  namespace fs = std::filesystem;
+  const fs::path test_dir = fs::temp_directory_path() / ("nvecd_wal_checkpoint_invalid_" + std::to_string(::getpid()));
+  fs::remove_all(test_dir);
+  fs::create_directories(test_dir);
+  fs::permissions(test_dir, fs::perms::owner_all, fs::perm_options::replace);
+  const fs::path snapshot = test_dir / "snapshot.nvec";
+  {
+    std::ofstream output(snapshot, std::ios::binary);
+    output << "snapshot generation one";
+  }
+  const fs::path sidecar = snapshot.string() + storage::kWalCheckpointSuffix;
+
+  ASSERT_TRUE(storage::WriteWalCheckpoint(snapshot.string(), 7).has_value());
+  fs::resize_file(sidecar, 8);
+  EXPECT_FALSE(storage::ReadWalCheckpoint(snapshot.string()).has_value());
+
+  ASSERT_TRUE(storage::WriteWalCheckpoint(snapshot.string(), 7).has_value());
+  {
+    std::ofstream output(sidecar, std::ios::binary | std::ios::app);
+    output.put('\0');
+  }
+  EXPECT_FALSE(storage::ReadWalCheckpoint(snapshot.string()).has_value());
+
+  ASSERT_TRUE(storage::WriteWalCheckpoint(snapshot.string(), 7).has_value());
+  {
+    std::array<uint8_t, 32> frame{};
+    std::ifstream input(sidecar, std::ios::binary);
+    input.read(reinterpret_cast<char*>(frame.data()), static_cast<std::streamsize>(frame.size()));
+    ASSERT_TRUE(input.good());
+    std::fill(frame.begin() + 8, frame.begin() + 16, 0xFF);
+    const uint32_t crc = static_cast<uint32_t>(crc32(0L, frame.data(), 28));
+    for (size_t i = 0; i < sizeof(crc); ++i) {
+      frame[28 + i] = static_cast<uint8_t>((crc >> (8 * i)) & 0xFFU);
+    }
+    std::ofstream output(sidecar, std::ios::binary | std::ios::trunc);
+    output.write(reinterpret_cast<const char*>(frame.data()), static_cast<std::streamsize>(frame.size()));
+  }
+  EXPECT_FALSE(storage::ReadWalCheckpoint(snapshot.string()).has_value());
+
+  ASSERT_TRUE(storage::WriteWalCheckpoint(snapshot.string(), 7).has_value());
+  {
+    std::fstream frame(sidecar, std::ios::binary | std::ios::in | std::ios::out);
+    ASSERT_TRUE(frame.is_open());
+    frame.seekp(0);
+    frame.put('\0');  // break magic and frame CRC
+  }
+  EXPECT_FALSE(storage::ReadWalCheckpoint(snapshot.string()).has_value());
+
+  ASSERT_TRUE(storage::WriteWalCheckpoint(snapshot.string(), 7).has_value());
+  {
+    std::ofstream output(snapshot, std::ios::binary | std::ios::trunc);
+    output << "snapshot generation two";
+  }
+  EXPECT_FALSE(storage::ReadWalCheckpoint(snapshot.string()).has_value());
+
+  EXPECT_FALSE(storage::WriteWalCheckpoint(snapshot.string(), std::numeric_limits<uint64_t>::max()).has_value());
+
+  ASSERT_TRUE(storage::WriteWalCheckpoint(snapshot.string(), 7).has_value());
+  const fs::path target = test_dir / "sidecar-target";
+  fs::rename(sidecar, target);
+  fs::create_symlink(target, sidecar);
+  EXPECT_FALSE(storage::ReadWalCheckpoint(snapshot.string()).has_value());
+
+  const fs::path snapshot_symlink = test_dir / "snapshot-link.nvec";
+  fs::create_symlink(snapshot, snapshot_symlink);
+  EXPECT_FALSE(storage::WriteWalCheckpoint(snapshot_symlink.string(), 7).has_value());
   fs::remove_all(test_dir);
 }
 

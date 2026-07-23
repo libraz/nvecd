@@ -279,13 +279,20 @@ Expected<void, Error> ReadHeaderV1(std::istream& input_stream, HeaderV1& header)
  * @note All data is written in little-endian format
  * @note CRC32 uses zlib implementation (polynomial: 0xEDB88320)
  */
+struct SnapshotWriteLimits {
+  uint32_t max_config_size = 16U * 1024U * 1024U;
+  uint32_t max_stats_size = 16U * 1024U * 1024U;
+  uint32_t max_store_data_size = 512U * 1024U * 1024U;
+  uint32_t max_store_stats_size = 16U * 1024U * 1024U;
+};
+
 Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config::Config& config,
                                       const events::EventStore& event_store, const events::CoOccurrenceIndex& co_index,
                                       const vectors::VectorStore& vector_store,
                                       const SnapshotStatistics* stats = nullptr,
                                       const std::unordered_map<std::string, StoreStatistics>* store_stats = nullptr,
                                       const vectors::MetadataStore* metadata_store = nullptr,
-                                      bool suppress_logging = false);
+                                      bool suppress_logging = false, const SnapshotWriteLimits* limits = nullptr);
 
 /**
  * @brief Read complete snapshot from file (Version 1 format)

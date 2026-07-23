@@ -95,21 +95,38 @@ utils::Expected<void, utils::Error> ForkSnapshotWriter::StartBackgroundSave(
           utils::ErrorCode::kSnapshotAlreadyInProgress,
           "Background snapshot already in progress (pid: " + std::to_string(current_result_.child_pid) + ")"));
     }
+    // Reserve ownership before taking store locks or calling fork(). A second
+    // caller can no longer pass a status check while this caller is between
+    // the check and publishing its child PID.
+    current_result_.status = SnapshotStatus::kInProgress;
+    current_result_.filepath = filepath;
+    current_result_.error_message.clear();
+    current_result_.child_pid = -1;
+    current_result_.start_time = static_cast<uint64_t>(std::time(nullptr));
+    current_result_.end_time = 0;
+    current_result_.wal_sequence = 0;
   }
 
-  utils::LogStorageInfo("snapshot_fork", "Acquiring write locks for pre-fork barrier");
+  utils::LogStorageInfo("snapshot_fork", "Acquiring store locks for pre-fork barrier");
 
   // Install the fork barrier that flushes spdlog before fork (see
   // EnsureAtForkRegistered). Idempotent across snapshots.
   EnsureAtForkRegistered();
 
-  // Pre-fork barrier: acquire all write locks to ensure consistent mutex state
-  auto lock_es = event_store.AcquireWriteLock();
-  auto lock_co = co_index.AcquireWriteLock();
-  auto lock_vs = vector_store.AcquireWriteLock();
-  auto lock_ms = metadata_store != nullptr ? metadata_store->AcquireWriteLock() : std::unique_lock<std::shared_mutex>();
+  // Pre-fork barrier: hold a shared lock on every store simultaneously. This
+  // drains any active writers and excludes new writers until fork has captured
+  // the COW image. Shared ownership is important here: on Linux a
+  // pthread_rwlock write owner is tracked by TID, and the post-fork child has a
+  // different TID. Attempting to unlock an inherited exclusive shared_mutex in
+  // the child therefore leaves it write-locked and the serializer deadlocks on
+  // its first read. Inherited reader ownership can be released by the child,
+  // after which normal const getters may take their own read locks.
+  auto lock_es = event_store.AcquireReadLock();
+  auto lock_co = co_index.AcquireReadLock();
+  auto lock_vs = vector_store.AcquireReadLock();
+  auto lock_ms = metadata_store != nullptr ? metadata_store->AcquireReadLock() : std::shared_lock<std::shared_mutex>();
 
-  // Capture the WAL sequence WHILE the write-lock barrier is held. Writes are
+  // Capture the WAL sequence WHILE the store-lock barrier is held. Writes are
   // serialized behind these locks, so the captured value is exactly the maximum
   // op reflected in the about-to-be-frozen (COW) snapshot. It is recorded in the
   // checkpoint sidecar and used to truncate the WAL only after the child
@@ -131,6 +148,12 @@ utils::Expected<void, utils::Error> ForkSnapshotWriter::StartBackgroundSave(
   if (pid < 0) {
     // fork failed — locks released by RAII
     std::string err = "fork() failed: " + std::string(strerror(errno));
+    {
+      std::lock_guard lock(status_mutex_);
+      current_result_.status = SnapshotStatus::kFailed;
+      current_result_.error_message = err;
+      current_result_.end_time = static_cast<uint64_t>(std::time(nullptr));
+    }
     utils::LogStorageError("snapshot_fork", filepath, err);
     return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kSnapshotForkFailed, err));
   }
@@ -153,7 +176,7 @@ utils::Expected<void, utils::Error> ForkSnapshotWriter::StartBackgroundSave(
   }
 
   // ===== Parent process =====
-  // Release write locks immediately — parent continues serving
+  // Release store locks immediately — parent continues serving
   lock_es.unlock();
   lock_co.unlock();
   lock_vs.unlock();
@@ -164,12 +187,7 @@ utils::Expected<void, utils::Error> ForkSnapshotWriter::StartBackgroundSave(
   // Update status
   {
     std::lock_guard lock(status_mutex_);
-    current_result_.status = SnapshotStatus::kInProgress;
-    current_result_.filepath = filepath;
-    current_result_.error_message.clear();
     current_result_.child_pid = pid;
-    current_result_.start_time = static_cast<uint64_t>(std::time(nullptr));
-    current_result_.end_time = 0;
     current_result_.wal_sequence = captured_wal_sequence;
   }
 
@@ -241,6 +259,9 @@ void ForkSnapshotWriter::CheckChild() {
       return;
     }
     child_pid = current_result_.child_pid;
+    if (child_pid <= 0) {
+      return;  // StartBackgroundSave still owns the pre-fork reservation.
+    }
   }
 
   int status = 0;
@@ -259,16 +280,11 @@ void ForkSnapshotWriter::CheckChild() {
 
     if (result < 0) {
       if (errno == ECHILD) {
-        // Child was already reaped (e.g., SIGCHLD was SIG_IGN or handled externally).
-        // Determine success by checking if the snapshot file exists.
-        if (std::filesystem::exists(current_result_.filepath)) {
-          current_result_.status = SnapshotStatus::kCompleted;
-          utils::LogStorageInfo("snapshot_fork", "Fork snapshot completed (auto-reaped): " + current_result_.filepath);
-        } else {
-          current_result_.status = SnapshotStatus::kFailed;
-          current_result_.error_message = "Child was auto-reaped and snapshot file not found";
-          utils::LogStorageError("snapshot_fork", current_result_.filepath, current_result_.error_message);
-        }
+        // An existing pathname may predate this child, so it is not proof of
+        // success. Fail closed when child ownership was lost.
+        current_result_.status = SnapshotStatus::kFailed;
+        current_result_.error_message = "Snapshot child ownership lost before exit status was collected";
+        utils::LogStorageError("snapshot_fork", current_result_.filepath, current_result_.error_message);
       } else {
         current_result_.status = SnapshotStatus::kFailed;
         current_result_.error_message = "waitpid failed: " + std::string(strerror(errno));
@@ -303,14 +319,18 @@ void ForkSnapshotWriter::CheckChild() {
   if (completed && wal_ != nullptr) {
     auto checkpoint = WriteWalCheckpoint(completed_filepath, completed_wal_sequence);
     if (!checkpoint) {
-      utils::LogStorageError("snapshot_fork", completed_filepath,
-                             "Failed to write WAL checkpoint: " + checkpoint.error().message());
+      std::lock_guard lock(status_mutex_);
+      current_result_.status = SnapshotStatus::kFailed;
+      current_result_.error_message = "Failed to write WAL checkpoint: " + checkpoint.error().message();
+      utils::LogStorageError("snapshot_fork", completed_filepath, current_result_.error_message);
       return;  // Do not truncate without a durable checkpoint.
     }
     auto truncated = wal_->Truncate(completed_wal_sequence);
     if (!truncated) {
-      utils::LogStorageError("snapshot_fork", completed_filepath,
-                             "Failed to truncate WAL: " + truncated.error().message());
+      std::lock_guard lock(status_mutex_);
+      current_result_.status = SnapshotStatus::kFailed;
+      current_result_.error_message = "Failed to truncate WAL: " + truncated.error().message();
+      utils::LogStorageError("snapshot_fork", completed_filepath, current_result_.error_message);
     }
   }
 }
@@ -333,17 +353,17 @@ void ForkSnapshotWriter::WaitForChild(uint32_t timeout_ms) {
       return;
     }
     child_pid = current_result_.child_pid;
+    if (child_pid <= 0) {
+      return;
+    }
   }
 
   // Poll with short sleeps
   constexpr uint32_t kPollIntervalMs = 100;
   uint32_t elapsed = 0;
   while (elapsed < timeout_ms) {
-    int status = 0;
-    pid_t result = waitpid(child_pid, &status, WNOHANG);
-    if (result != 0) {
-      // Child exited or error
-      CheckChild();
+    CheckChild();
+    if (!IsInProgress()) {
       return;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(kPollIntervalMs));

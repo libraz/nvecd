@@ -21,6 +21,8 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "utils/error.h"
@@ -52,12 +54,13 @@ static constexpr uint32_t kWalVersion = 1;
  * @brief WAL operation types
  */
 enum class WalOpType : uint8_t {
-  kVecSet = 1,    ///< Vector registration
-  kVecDel = 2,    ///< Vector deletion
-  kEventAdd = 3,  ///< Event addition
-  kEventDel = 4,  ///< Event deletion
-  kMetaSet = 5,   ///< Metadata set
-  kMetaDel = 6,   ///< Metadata deletion
+  kVecSet = 1,                   ///< Vector registration
+  kVecDel = 2,                   ///< Vector deletion
+  kEventAdd = 3,                 ///< Event addition
+  kEventDel = 4,                 ///< Event deletion
+  kMetaSet = 5,                  ///< Metadata set
+  kMetaDel = 6,                  ///< Metadata deletion
+  kCoOccurrenceMaintenance = 7,  ///< Durable decay/prune epoch
 };
 
 /**
@@ -122,7 +125,19 @@ class WriteAheadLog {
    * @param callback Called for each replayed record
    * @return Number of records replayed, or error
    */
-  Expected<uint64_t, Error> Replay(uint64_t from_sequence, const std::function<void(const WalRecord&)>& callback) const;
+  template <typename Callback>
+  Expected<uint64_t, Error> Replay(uint64_t from_sequence, Callback&& callback) const {
+    std::function<Expected<void, Error>(const WalRecord&)> wrapped =
+        [callback = std::forward<Callback>(callback)](const WalRecord& record) mutable -> Expected<void, Error> {
+      if constexpr (std::is_void_v<std::invoke_result_t<Callback&, const WalRecord&>>) {
+        callback(record);
+        return {};
+      } else {
+        return callback(record);
+      }
+    };
+    return ReplayValidated(from_sequence, wrapped);
+  }
 
   /**
    * @brief Delete WAL files containing only records up to the given sequence
@@ -142,6 +157,8 @@ class WriteAheadLog {
   bool IsOpen() const;
 
  private:
+  Expected<uint64_t, Error> ReplayValidated(
+      uint64_t from_sequence, const std::function<Expected<void, Error>(const WalRecord&)>& callback) const;
   /// WAL file metadata
   struct WalFile {
     std::string path;

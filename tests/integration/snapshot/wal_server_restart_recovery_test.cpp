@@ -22,7 +22,11 @@
 #include <thread>
 
 #include "config/config.h"
+#include "events/co_occurrence_index.h"
+#include "events/event_store.h"
 #include "server/nvecd_server.h"
+#include "storage/snapshot_format_v1.h"
+#include "vectors/vector_store.h"
 
 namespace fs = std::filesystem;
 
@@ -225,5 +229,60 @@ TEST(WalServerRestartRecovery, SnapshotPlusWalTailRecoveredOnRestart) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
 
+  fs::remove_all(root);
+}
+
+TEST(WalServerRestartRecovery, IgnoresTempAndFallsBackFromNewestCorruptSnapshot) {
+  const auto root =
+      fs::temp_directory_path() / ("nvecd_snapshot_fallback_" + std::to_string(static_cast<unsigned>(::getpid())));
+  fs::remove_all(root);
+  const std::string snapshot_dir = (root / "snapshots").string();
+  const std::string wal_dir = (root / "wal").string();
+  fs::create_directories(snapshot_dir);
+  fs::create_directories(wal_dir);
+
+  config::Config snapshot_config;
+  config::EventsConfig events_config;
+  config::VectorsConfig vectors_config;
+  events::EventStore event_store(events_config);
+  events::CoOccurrenceIndex co_index;
+  vectors::VectorStore vector_store(vectors_config);
+  ASSERT_TRUE(vector_store.SetVector("valid_item", {1.0F, 0.0F}).has_value());
+
+  const fs::path valid_path = root / "snapshots" / "old.nvec";
+  ASSERT_TRUE(
+      storage::snapshot_v1::WriteSnapshotV1(valid_path.string(), snapshot_config, event_store, co_index, vector_store)
+          .has_value());
+  const fs::path corrupt_path = root / "snapshots" / "new.nvec";
+  fs::copy_file(valid_path, corrupt_path);
+  {
+    std::fstream corrupt(corrupt_path, std::ios::binary | std::ios::in | std::ios::out);
+    ASSERT_TRUE(corrupt.is_open());
+    corrupt.seekg(100);
+    char byte = 0;
+    corrupt.read(&byte, 1);
+    corrupt.clear();
+    corrupt.seekp(100);
+    byte ^= static_cast<char>(0x5A);
+    corrupt.write(&byte, 1);
+  }
+  // This represents an unpublished writer artifact and must never be scanned.
+  fs::copy_file(valid_path, root / "snapshots" / "newer.nvec.tmp.abcd");
+  const auto now = fs::file_time_type::clock::now();
+  fs::last_write_time(valid_path, now - std::chrono::seconds(3));
+  fs::last_write_time(corrupt_path, now - std::chrono::seconds(2));
+  fs::last_write_time(root / "snapshots" / "newer.nvec.tmp.abcd", now - std::chrono::seconds(1));
+
+  config::Config server_config = MakeConfig(snapshot_dir, wal_dir);
+  server_config.wal.enabled = false;
+  NvecdServer server(server_config);
+  auto started = server.Start();
+  ASSERT_TRUE(started.has_value()) << started.error().message();
+  {
+    TcpClient client("127.0.0.1", server.GetPort());
+    const std::string response = client.SendCommand("SIMV 10 1 0");
+    EXPECT_NE(response.find("valid_item"), std::string::npos) << response;
+  }
+  server.Stop();
   fs::remove_all(root);
 }

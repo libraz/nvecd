@@ -241,6 +241,9 @@ std::vector<uint8_t> EncodeCommand(const Command& cmd) {
       for (float value : cmd.vector) {
         AppendFloat(buf, value);
       }
+      if (cmd.metadata.has_value()) {
+        EncodeTypedMetadata(buf, *cmd.metadata);
+      }
       break;
     }
     case CommandType::kVecdel: {
@@ -319,6 +322,18 @@ utils::Expected<Command, utils::Error> DecodeWalRecord(const storage::WalRecord&
           return utils::MakeUnexpected(TruncatedError("VECSET vector element"));
         }
         cmd.vector.push_back(value);
+      }
+      if (reader.remaining() > 0) {
+        uint64_t magic = 0;
+        if (!reader.ReadLE(magic, sizeof(uint32_t)) || magic != kTypedMetadataMagic) {
+          return utils::MakeUnexpected(
+              utils::MakeError(utils::ErrorCode::kStorageCorrupted, "VECSET metadata extension is invalid"));
+        }
+        auto metadata = DecodeTypedMetadata(reader);
+        if (!metadata) {
+          return utils::MakeUnexpected(metadata.error());
+        }
+        cmd.metadata = std::move(*metadata);
       }
       break;
     }

@@ -11,9 +11,12 @@
 
 #include <gtest/gtest.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include <filesystem>
 #include <fstream>
+#include <limits>
+#include <sstream>
 #include <string>
 #include <variant>
 
@@ -35,7 +38,8 @@ class SnapshotFormatV1Test : public ::testing::Test {
   void SetUp() override {
     // Create a unique temp directory for each test
     test_dir_ = fs::temp_directory_path() /
-                ("nvecd_snapshot_v1_test_" + std::to_string(::testing::UnitTest::GetInstance()->random_seed()));
+                ("nvecd_snapshot_v1_test_" + std::to_string(::testing::UnitTest::GetInstance()->random_seed()) + "_" +
+                 std::to_string(::getpid()));
     fs::create_directories(test_dir_);
 
     // Create stores with default configs
@@ -180,6 +184,70 @@ TEST_F(SnapshotFormatV1Test, WriteSnapshotDoesNotFollowLegacyPredictableTempSyml
   EXPECT_EQ(info.st_mode & (S_IRWXG | S_IRWXO), 0);
 }
 
+TEST_F(SnapshotFormatV1Test, WriteSnapshotReplacesDestinationSymlinkWithoutTouchingVictim) {
+  PopulateStores();
+
+  const std::string path = TestFilePath("destination_link.dmp");
+  const std::string victim_path = TestFilePath("destination_victim.txt");
+  {
+    std::ofstream victim(victim_path);
+    ASSERT_TRUE(victim);
+    victim << "unchanged";
+  }
+  std::error_code symlink_error;
+  fs::create_symlink(victim_path, path, symlink_error);
+  ASSERT_FALSE(symlink_error) << symlink_error.message();
+
+  auto write_result = WriteSnapshotV1(path, config_, *event_store_, *co_index_, *vector_store_);
+  ASSERT_TRUE(write_result.has_value()) << write_result.error().message();
+
+  std::ifstream victim(victim_path);
+  std::string contents;
+  victim >> contents;
+  EXPECT_EQ(contents, "unchanged");
+  EXPECT_FALSE(fs::is_symlink(path));
+  EXPECT_TRUE(fs::is_regular_file(path));
+}
+
+TEST_F(SnapshotFormatV1Test, SnapshotReadersRejectSymlinkTargets) {
+  PopulateStores();
+  const std::string real_path = TestFilePath("real_snapshot.dmp");
+  const std::string link_path = TestFilePath("snapshot_link.dmp");
+  ASSERT_TRUE(WriteSnapshotV1(real_path, config_, *event_store_, *co_index_, *vector_store_).has_value());
+  std::error_code symlink_error;
+  fs::create_symlink(real_path, link_path, symlink_error);
+  ASSERT_FALSE(symlink_error) << symlink_error.message();
+
+  config::EventsConfig events_config;
+  config::VectorsConfig vectors_config;
+  events::EventStore loaded_events(events_config);
+  events::CoOccurrenceIndex loaded_co;
+  vectors::VectorStore loaded_vectors(vectors_config);
+  config::Config loaded_config;
+  EXPECT_FALSE(ReadSnapshotV1(link_path, loaded_config, loaded_events, loaded_co, loaded_vectors).has_value());
+
+  snapshot_format::IntegrityError integrity_error;
+  EXPECT_FALSE(VerifySnapshotIntegrity(link_path, integrity_error).has_value());
+  SnapshotInfo info;
+  EXPECT_FALSE(GetSnapshotInfo(link_path, info).has_value());
+}
+
+TEST_F(SnapshotFormatV1Test, WriterRejectsSectionAboveConfiguredTestLimitBeforePublish) {
+  PopulateStores();
+  const std::string path = TestFilePath("bounded_write.dmp");
+  SnapshotWriteLimits limits;
+  limits.max_store_data_size = 1;
+
+  auto result = WriteSnapshotV1(path, config_, *event_store_, *co_index_, *vector_store_, nullptr, nullptr, nullptr,
+                                false, &limits);
+
+  ASSERT_FALSE(result.has_value());
+  EXPECT_FALSE(fs::exists(path));
+  for (const auto& entry : fs::directory_iterator(test_dir_)) {
+    EXPECT_EQ(entry.path().filename().string().find("bounded_write.dmp.tmp."), std::string::npos);
+  }
+}
+
 TEST_F(SnapshotFormatV1Test, WriteAndRead_MetadataRoundTrip) {
   PopulateStores();
 
@@ -214,6 +282,30 @@ TEST_F(SnapshotFormatV1Test, WriteAndRead_MetadataRoundTrip) {
   auto info_result = GetSnapshotInfo(path, info);
   ASSERT_TRUE(info_result.has_value());
   EXPECT_EQ(info.store_count, 4u);
+}
+
+TEST_F(SnapshotFormatV1Test, ReadConsumesOptionalSectionsWhenOutputsAreOmitted) {
+  PopulateStores();
+  metadata_store_->Set("item1", {{"category", std::string("test")}});
+  SnapshotStatistics statistics;
+  std::unordered_map<std::string, StoreStatistics> store_statistics;
+  store_statistics["events"] = StoreStatistics{};
+
+  const std::string path = TestFilePath("optional_outputs_omitted.dmp");
+  ASSERT_TRUE(WriteSnapshotV1(path, config_, *event_store_, *co_index_, *vector_store_, &statistics, &store_statistics,
+                              metadata_store_.get())
+                  .has_value());
+
+  config::EventsConfig events_cfg;
+  config::VectorsConfig vectors_cfg;
+  events::EventStore loaded_events(events_cfg);
+  events::CoOccurrenceIndex loaded_co;
+  vectors::VectorStore loaded_vectors(vectors_cfg);
+  config::Config loaded_config;
+
+  auto result = ReadSnapshotV1(path, loaded_config, loaded_events, loaded_co, loaded_vectors);
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+  EXPECT_TRUE(loaded_vectors.HasVector("item1"));
 }
 
 // ---------------------------------------------------------------------------
@@ -595,4 +687,77 @@ TEST_F(SnapshotFormatV1Test, ReadTruncated_FailsNotSilent) {
   auto read_result =
       ReadSnapshotV1(path, loaded_config, loaded_events, loaded_co, loaded_vectors, nullptr, nullptr, &integrity_error);
   EXPECT_FALSE(read_result.has_value()) << "Truncated snapshot must not load successfully";
+}
+
+TEST_F(SnapshotFormatV1Test, RequiredWholeFileCrcCannotBeZero) {
+  PopulateStores();
+  const std::string path = TestFilePath("zero_file_crc.dmp");
+  ASSERT_TRUE(WriteSnapshotV1(path, config_, *event_store_, *co_index_, *vector_store_).has_value());
+
+  // Fixed header (8) + HeaderV1 file_crc32 offset (24).
+  std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
+  ASSERT_TRUE(file.is_open());
+  file.seekp(static_cast<std::streamoff>(snapshot_format::kFixedHeaderSize + 24));
+  const uint32_t zero = 0;
+  file.write(reinterpret_cast<const char*>(&zero), sizeof(zero));
+  file.close();
+
+  snapshot_format::IntegrityError integrity_error;
+  auto verified = VerifySnapshotIntegrity(path, integrity_error);
+  EXPECT_FALSE(verified.has_value());
+  EXPECT_EQ(integrity_error.type, snapshot_format::CRCErrorType::FileCRC);
+}
+
+TEST_F(SnapshotFormatV1Test, DeclaredFileAboveTotalCapIsRejected) {
+  PopulateStores();
+  const std::string path = TestFilePath("oversized_declared_file.dmp");
+  ASSERT_TRUE(WriteSnapshotV1(path, config_, *event_store_, *co_index_, *vector_store_).has_value());
+
+  // Fixed header (8) + HeaderV1 total_file_size offset (16).
+  std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
+  ASSERT_TRUE(file.is_open());
+  file.seekp(static_cast<std::streamoff>(snapshot_format::kFixedHeaderSize + 16));
+  const uint64_t oversized = 4ULL * 1024ULL * 1024ULL * 1024ULL;
+  file.write(reinterpret_cast<const char*>(&oversized), sizeof(oversized));
+  file.close();
+
+  snapshot_format::IntegrityError integrity_error;
+  auto verified = VerifySnapshotIntegrity(path, integrity_error);
+  EXPECT_FALSE(verified.has_value());
+  EXPECT_TRUE(integrity_error.HasError());
+}
+
+TEST_F(SnapshotFormatV1Test, HugeVectorDimensionIsRejectedBeforeAllocation) {
+  std::ostringstream encoded(std::ios::binary);
+  const uint64_t dimension = std::numeric_limits<uint64_t>::max();
+  const uint32_t vector_count = 1;
+  encoded.write(reinterpret_cast<const char*>(&dimension), sizeof(dimension));
+  encoded.write(reinterpret_cast<const char*>(&vector_count), sizeof(vector_count));
+  std::istringstream input(encoded.str(), std::ios::binary);
+
+  config::VectorsConfig vectors_config;
+  vectors::VectorStore vectors(vectors_config);
+  auto result = DeserializeVectorStore(input, vectors);
+  EXPECT_FALSE(result.has_value());
+  EXPECT_EQ(vectors.GetVectorCount(), 0U);
+}
+
+TEST_F(SnapshotFormatV1Test, ImpossibleRecordCountsAreRejectedBeforeIteration) {
+  const uint32_t impossible_count = std::numeric_limits<uint32_t>::max();
+
+  std::string count_only(reinterpret_cast<const char*>(&impossible_count), sizeof(impossible_count));
+  std::istringstream event_input(count_only, std::ios::binary);
+  config::EventsConfig events_config;
+  events::EventStore events(events_config);
+  EXPECT_FALSE(DeserializeEventStore(event_input, events).has_value());
+
+  std::istringstream co_input(count_only, std::ios::binary);
+  events::CoOccurrenceIndex co_index;
+  EXPECT_FALSE(DeserializeCoOccurrenceIndex(co_input, co_index).has_value());
+
+  std::istringstream metadata_input(count_only, std::ios::binary);
+  vectors::MetadataStore metadata;
+  config::VectorsConfig vectors_config;
+  vectors::VectorStore vectors(vectors_config);
+  EXPECT_FALSE(DeserializeMetadataStore(metadata_input, metadata, vectors).has_value());
 }

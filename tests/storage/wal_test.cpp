@@ -9,6 +9,7 @@
 #include <gtest/gtest.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <zlib.h>
 
 #include <algorithm>
 #include <cstring>
@@ -20,6 +21,52 @@ namespace nvecd::storage {
 namespace {
 
 namespace fs = std::filesystem;
+
+bool RewriteRecordSequence(const std::string& path, size_t record_index, uint64_t sequence) {
+  const int fd = ::open(path.c_str(), O_RDWR);
+  if (fd < 0) {
+    return false;
+  }
+
+  off_t offset = kWalFileHeaderSize;
+  for (size_t index = 0; index <= record_index; ++index) {
+    uint8_t header[8]{};
+    if (::pread(fd, header, sizeof(header), offset) != static_cast<ssize_t>(sizeof(header))) {
+      ::close(fd);
+      return false;
+    }
+    uint32_t body_length = 0;
+    std::memcpy(&body_length, header, sizeof(body_length));
+    if (body_length < kWalRecordHeaderSize || body_length > kMaxWalRecordBodySize) {
+      ::close(fd);
+      return false;
+    }
+    if (index != record_index) {
+      offset += static_cast<off_t>(sizeof(header) + body_length);
+      continue;
+    }
+
+    std::vector<uint8_t> body(body_length);
+    if (::pread(fd, body.data(), body.size(), offset + static_cast<off_t>(sizeof(header))) !=
+        static_cast<ssize_t>(body.size())) {
+      ::close(fd);
+      return false;
+    }
+    std::memcpy(body.data(), &sequence, sizeof(sequence));
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    const auto crc = static_cast<uint32_t>(crc32(0L, reinterpret_cast<const Bytef*>(body.data()), body.size()));
+    std::memcpy(header + sizeof(uint32_t), &crc, sizeof(crc));
+
+    const bool body_written = ::pwrite(fd, body.data(), body.size(), offset + static_cast<off_t>(sizeof(header))) ==
+                              static_cast<ssize_t>(body.size());
+    const bool header_written = ::pwrite(fd, header, sizeof(header), offset) == static_cast<ssize_t>(sizeof(header));
+    const bool closed = ::close(fd) == 0;
+    return body_written && header_written && closed;
+  }
+
+  ::close(fd);
+  return false;
+}
 
 class WalTest : public ::testing::Test {
  protected:
@@ -191,6 +238,33 @@ TEST_F(WalTest, ReplayFromMiddle) {
   }
 }
 
+TEST_F(WalTest, ReplayRejectsMissingRequestedFloor) {
+  const auto config = MakeConfig(128);
+  {
+    WriteAheadLog wal;
+    ASSERT_TRUE(wal.Open(config).has_value());
+    for (int i = 0; i < 20; ++i) {
+      const std::string payload = "missing_floor_" + std::to_string(i);
+      ASSERT_TRUE(wal.Append(WalOpType::kVecSet, payload.data(), static_cast<uint32_t>(payload.size())).has_value());
+    }
+  }
+  std::vector<fs::path> segments;
+  for (const auto& entry : fs::directory_iterator(test_dir_)) {
+    if (entry.path().extension() == ".log") {
+      segments.push_back(entry.path());
+    }
+  }
+  std::sort(segments.begin(), segments.end());
+  ASSERT_GT(segments.size(), 1U);
+  ASSERT_TRUE(fs::remove(segments.front()));
+
+  WriteAheadLog recovered;
+  ASSERT_TRUE(recovered.Open(config).has_value());
+  auto replayed = recovered.Replay(1, [](const WalRecord&) {});
+  ASSERT_FALSE(replayed.has_value());
+  EXPECT_EQ(replayed.error().code(), utils::ErrorCode::kWalCorrupted);
+}
+
 TEST_F(WalTest, ReplayEmpty) {
   WriteAheadLog wal;
   ASSERT_TRUE(wal.Open(MakeConfig()));
@@ -247,15 +321,11 @@ TEST_F(WalTest, CRCCorruptionDetected) {
     ::close(fd);
   }
 
-  // Replay should skip the corrupted record
+  // Startup must fail closed rather than silently skipping the record.
   {
     WriteAheadLog wal;
-    ASSERT_TRUE(wal.Open(MakeConfig()));
-
-    uint64_t count = 0;
-    auto result = wal.Replay(1, [&](const WalRecord&) { ++count; });
-    ASSERT_TRUE(result.has_value());
-    EXPECT_EQ(*result, 0U);  // Corrupted record skipped
+    auto opened = wal.Open(MakeConfig());
+    EXPECT_FALSE(opened.has_value());
   }
 }
 
@@ -363,9 +433,34 @@ TEST_F(WalTest, TruncatePreservesCurrentFile) {
   EXPECT_GE(file_count, 1);
 }
 
+TEST_F(WalTest, TruncatePropagatesUnlinkFailure) {
+  WriteAheadLog wal;
+  ASSERT_TRUE(wal.Open(MakeConfig(128)));
+  for (int i = 0; i < 20; ++i) {
+    const std::string payload = "unlink_failure_" + std::to_string(i);
+    ASSERT_TRUE(wal.Append(WalOpType::kVecSet, payload.data(), static_cast<uint32_t>(payload.size())).has_value());
+  }
+
+  std::vector<fs::path> segments;
+  for (const auto& entry : fs::directory_iterator(test_dir_)) {
+    if (entry.path().extension() == ".log") {
+      segments.push_back(entry.path());
+    }
+  }
+  std::sort(segments.begin(), segments.end());
+  ASSERT_GT(segments.size(), 1U);
+  // Simulate an external cleanup/race. The in-memory catalog still owns this
+  // segment, so ENOENT must be reported rather than silently drifting.
+  ASSERT_TRUE(fs::remove(segments.front()));
+
+  auto result = wal.Truncate(wal.CurrentSequence());
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), utils::ErrorCode::kWalTruncateFailed);
+}
+
 // --- Incomplete Records ---
 
-TEST_F(WalTest, IncompleteRecordSkipped) {
+TEST_F(WalTest, LatestIncompleteRecordIsRepaired) {
   // Write valid records
   {
     WriteAheadLog wal;
@@ -374,9 +469,11 @@ TEST_F(WalTest, IncompleteRecordSkipped) {
     ASSERT_TRUE(wal.Append(WalOpType::kVecSet, p1.data(), static_cast<uint32_t>(p1.size())));
   }
 
+  uintmax_t valid_size = 0;
   // Append garbage bytes to simulate crash mid-write
   {
     std::string path = test_dir_ + "/wal-000001.log";
+    valid_size = fs::file_size(path);
     int fd = ::open(path.c_str(), O_WRONLY | O_APPEND);
     ASSERT_GE(fd, 0);
 
@@ -390,6 +487,7 @@ TEST_F(WalTest, IncompleteRecordSkipped) {
   {
     WriteAheadLog wal;
     ASSERT_TRUE(wal.Open(MakeConfig()));
+    EXPECT_EQ(fs::file_size(test_dir_ + "/wal-000001.log"), valid_size);
 
     std::vector<WalRecord> records;
     auto result = wal.Replay(1, [&](const WalRecord& r) { records.push_back(r); });
@@ -397,6 +495,55 @@ TEST_F(WalTest, IncompleteRecordSkipped) {
     EXPECT_EQ(*result, 1U);
     EXPECT_EQ(records[0].sequence, 1U);
   }
+}
+
+TEST_F(WalTest, TornTailInNonLatestSegmentIsRejected) {
+  const auto config = MakeConfig(96);
+  {
+    WriteAheadLog wal;
+    ASSERT_TRUE(wal.Open(config));
+    for (int index = 0; index < 12; ++index) {
+      const std::string payload = "rotated_record_" + std::to_string(index);
+      ASSERT_TRUE(wal.Append(WalOpType::kVecSet, payload.data(), static_cast<uint32_t>(payload.size())));
+    }
+  }
+
+  const std::string first_segment = test_dir_ + "/wal-000001.log";
+  ASSERT_TRUE(fs::exists(test_dir_ + "/wal-000002.log"));
+  const auto original_size = fs::file_size(first_segment);
+  ASSERT_GT(original_size, kWalFileHeaderSize);
+  ASSERT_EQ(::truncate(first_segment.c_str(), static_cast<off_t>(original_size - 1)), 0);
+
+  WriteAheadLog wal;
+  EXPECT_FALSE(wal.Open(config).has_value());
+}
+
+TEST_F(WalTest, SequenceGapIsRejectedEvenWithValidCRC) {
+  {
+    WriteAheadLog wal;
+    ASSERT_TRUE(wal.Open(MakeConfig()));
+    const std::string payload = "sequence";
+    ASSERT_TRUE(wal.Append(WalOpType::kVecSet, payload.data(), static_cast<uint32_t>(payload.size())));
+    ASSERT_TRUE(wal.Append(WalOpType::kVecSet, payload.data(), static_cast<uint32_t>(payload.size())));
+  }
+
+  ASSERT_TRUE(RewriteRecordSequence(test_dir_ + "/wal-000001.log", 1, 3));
+  WriteAheadLog wal;
+  EXPECT_FALSE(wal.Open(MakeConfig()).has_value());
+}
+
+TEST_F(WalTest, DuplicateSequenceIsRejectedEvenWithValidCRC) {
+  {
+    WriteAheadLog wal;
+    ASSERT_TRUE(wal.Open(MakeConfig()));
+    const std::string payload = "sequence";
+    ASSERT_TRUE(wal.Append(WalOpType::kVecSet, payload.data(), static_cast<uint32_t>(payload.size())));
+    ASSERT_TRUE(wal.Append(WalOpType::kVecSet, payload.data(), static_cast<uint32_t>(payload.size())));
+  }
+
+  ASSERT_TRUE(RewriteRecordSequence(test_dir_ + "/wal-000001.log", 1, 1));
+  WriteAheadLog wal;
+  EXPECT_FALSE(wal.Open(MakeConfig()).has_value());
 }
 
 // --- All Operation Types ---
@@ -607,10 +754,40 @@ TEST_F(WalTest, InvalidMagicRejected) {
     ::close(fd);
   }
 
-  // WAL should still open (skipping invalid file)
+  // WAL must fail closed on an invalid segment header.
+  WriteAheadLog wal;
+  EXPECT_FALSE(wal.Open(MakeConfig()).has_value());
+}
+
+TEST_F(WalTest, PartiallyNumericSegmentFilenameIsIgnored) {
+  const auto config = MakeConfig();
+  {
+    WriteAheadLog wal;
+    ASSERT_TRUE(wal.Open(config).has_value());
+    const std::string payload = "canonical";
+    ASSERT_TRUE(wal.Append(WalOpType::kVecSet, payload.data(), static_cast<uint32_t>(payload.size())).has_value());
+  }
+  fs::copy_file(test_dir_ + "/wal-000001.log", test_dir_ + "/wal-00001x.log");
+
+  WriteAheadLog recovered;
+  ASSERT_TRUE(recovered.Open(config).has_value());
+  auto replayed = recovered.Replay(1, [](const WalRecord&) {});
+  ASSERT_TRUE(replayed.has_value());
+  EXPECT_EQ(*replayed, 1U);
+}
+
+TEST_F(WalTest, ReplayPropagatesCallbackFailure) {
   WriteAheadLog wal;
   ASSERT_TRUE(wal.Open(MakeConfig()));
-  EXPECT_EQ(wal.CurrentSequence(), 0U);
+  const std::string payload = "record";
+  ASSERT_TRUE(wal.Append(WalOpType::kVecSet, payload.data(), static_cast<uint32_t>(payload.size())).has_value());
+
+  auto replayed = wal.Replay(1, [](const WalRecord&) -> Expected<void, Error> {
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kStorageCorrupted, "apply failed"));
+  });
+
+  ASSERT_FALSE(replayed.has_value());
+  EXPECT_EQ(replayed.error().message(), "apply failed");
 }
 
 // --- Concurrent Append ---

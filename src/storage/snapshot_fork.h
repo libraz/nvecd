@@ -72,7 +72,7 @@ class ForkSnapshotWriter {
    * @brief Wire the Write-Ahead Log for post-snapshot checkpoint and truncation
    *
    * When set, StartBackgroundSave() captures the WAL's current sequence under
-   * the pre-fork write-lock barrier (so it equals the maximum op included in the
+   * the pre-fork store-lock barrier (so it equals the maximum op included in the
    * frozen snapshot), and CheckChild() writes the checkpoint sidecar and
    * truncates the WAL up to that sequence once the child completes successfully.
    *
@@ -89,9 +89,8 @@ class ForkSnapshotWriter {
   /**
    * @brief Start a background fork-based snapshot
    *
-   * Pre-fork barrier: Acquires exclusive write locks on all stores to
-   * ensure no mutex is held at fork time. After fork, parent releases
-   * locks immediately.
+   * Pre-fork barrier: Acquires shared locks on all stores simultaneously to
+   * drain and exclude writers. After fork, parent releases locks immediately.
    *
    * Child process (post-fork path is async-signal-safe with respect to
    * application locks; it never re-enters spdlog, whose registry/sink mutex a
@@ -103,9 +102,9 @@ class ForkSnapshotWriter {
    *
    * @param filepath Output file path
    * @param config Configuration to serialize
-   * @param event_store EventStore (write lock acquired briefly)
-   * @param co_index CoOccurrenceIndex (write lock acquired briefly)
-   * @param vector_store VectorStore (write lock acquired briefly)
+   * @param event_store EventStore (shared lock acquired briefly)
+   * @param co_index CoOccurrenceIndex (shared lock acquired briefly)
+   * @param vector_store VectorStore (shared lock acquired briefly)
    * @return Expected<void, Error> Success (fork started) or error
    */
   utils::Expected<void, utils::Error> StartBackgroundSave(const std::string& filepath, const config::Config& config,

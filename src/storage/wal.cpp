@@ -12,10 +12,12 @@
 #include <zlib.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <limits>
+#include <optional>
 
 #include "utils/path_utils.h"
 #include "utils/structured_log.h"
@@ -102,6 +104,16 @@ uint64_t ReadU64(const uint8_t* buf) {
   return val;
 }
 
+bool FsyncDirectory(const std::string& directory) {
+  const int fd = ::open(directory.c_str(), O_RDONLY | O_DIRECTORY);
+  if (fd < 0) {
+    return false;
+  }
+  const bool synced = ::fsync(fd) == 0;
+  const bool closed = ::close(fd) == 0;
+  return synced && closed;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -150,10 +162,27 @@ Expected<void, Error> WriteAheadLog::Open(const Config& config) {
   // A previous clean Open/Close without appends leaves a header-only segment.
   // Keeping it forever makes repeated restarts leak one WAL file each time;
   // it has no recovery value, so discard it before creating the next segment.
-  files_.erase(
-      std::remove_if(files_.begin(), files_.end(),
-                     [](const WalFile& file) { return file.max_sequence == 0 && ::unlink(file.path.c_str()) == 0; }),
-      files_.end());
+  bool removed_empty_segment = false;
+  std::vector<WalFile> nonempty_files;
+  nonempty_files.reserve(files_.size());
+  for (auto& file : files_) {
+    if (file.max_sequence != 0) {
+      nonempty_files.push_back(std::move(file));
+      continue;
+    }
+    if (::unlink(file.path.c_str()) != 0) {
+      return utils::MakeUnexpected(utils::MakeError(
+          utils::ErrorCode::kWalTruncateFailed,
+          "Failed to remove empty WAL segment '" + file.path + "': " + std::string(std::strerror(errno))));
+    }
+    removed_empty_segment = true;
+  }
+  files_ = std::move(nonempty_files);
+  if (removed_empty_segment && !FsyncDirectory(config_.directory)) {
+    return utils::MakeUnexpected(utils::MakeError(
+        utils::ErrorCode::kWalTruncateFailed,
+        "Failed to fsync WAL directory after removing empty segments: " + std::string(std::strerror(errno))));
+  }
 
   // Open or create the current file
   auto rotate_result = RotateFile();
@@ -202,6 +231,14 @@ Expected<uint64_t, Error> WriteAheadLog::Append(WalOpType op, const void* payloa
   std::lock_guard<std::mutex> lock(mutex_);
   if (!open_ || current_fd_ < 0) {
     return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kWalNotOpen, "WAL is not open"));
+  }
+  if (current_sequence_ == std::numeric_limits<uint64_t>::max()) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kWalWriteError, "WAL sequence number space exhausted"));
+  }
+  if (payload_size > kMaxWalRecordBodySize - kWalRecordHeaderSize) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kWalWriteError, "WAL payload exceeds maximum record size"));
   }
 
   // Check if rotation is needed
@@ -281,11 +318,12 @@ Expected<uint64_t, Error> WriteAheadLog::Append(WalOpType op, const void* payloa
   return seq;
 }
 
-Expected<uint64_t, Error> WriteAheadLog::Replay(uint64_t from_sequence,
-                                                const std::function<void(const WalRecord&)>& callback) const {
+Expected<uint64_t, Error> WriteAheadLog::ReplayValidated(
+    uint64_t from_sequence, const std::function<Expected<void, Error>(const WalRecord&)>& callback) const {
   std::lock_guard<std::mutex> lock(mutex_);
 
   uint64_t count = 0;
+  bool replay_floor_seen = from_sequence == 0;
 
   // Collect relevant file paths (sorted by file number)
   std::vector<std::string> paths;
@@ -296,24 +334,52 @@ Expected<uint64_t, Error> WriteAheadLog::Replay(uint64_t from_sequence,
     }
   }
 
-  for (const auto& path : paths) {
+  std::optional<uint64_t> previous_sequence;
+  for (size_t path_index = 0; path_index < paths.size(); ++path_index) {
+    const auto& path = paths[path_index];
+    const bool latest_segment = path_index + 1 == paths.size();
     int fd = ::open(path.c_str(), O_RDONLY);
-    if (fd < 0)
-      continue;
+    if (fd < 0) {
+      return utils::MakeUnexpected(
+          utils::MakeError(utils::ErrorCode::kWalReadError,
+                           "Failed to open WAL segment: " + path + ": " + std::string(std::strerror(errno))));
+    }
 
     // Validate file header
     auto header_result = ValidateFileHeader(fd, path);
     if (!header_result) {
       ::close(fd);
-      continue;
+      return utils::MakeUnexpected(header_result.error());
+    }
+
+    struct stat file_info {};
+    if (::fstat(fd, &file_info) != 0) {
+      const auto error = utils::MakeError(utils::ErrorCode::kWalReadError, "Failed to stat WAL segment: " + path);
+      ::close(fd);
+      return utils::MakeUnexpected(error);
     }
 
     // Read records
     while (true) {
       // Read length + crc
       uint8_t rec_header[8];
+      const off_t record_offset = ::lseek(fd, 0, SEEK_CUR);
+      const auto remaining_file_bytes = static_cast<uint64_t>(file_info.st_size - record_offset);
+      if (remaining_file_bytes == 0) {
+        break;
+      }
+      if (remaining_file_bytes < sizeof(rec_header)) {
+        ::close(fd);
+        if (latest_segment) {
+          return count;  // Recoverable torn header at newest segment tail.
+        }
+        return utils::MakeUnexpected(
+            utils::MakeError(utils::ErrorCode::kStorageCorrupted, "Torn WAL header in non-latest segment: " + path));
+      }
       if (!ReadAll(fd, rec_header, sizeof(rec_header))) {
-        break;  // EOF or incomplete header — done with this file
+        const auto error = utils::MakeError(utils::ErrorCode::kWalReadError, "Failed to read WAL record header");
+        ::close(fd);
+        return utils::MakeUnexpected(error);
       }
 
       uint32_t body_length = ReadU32(rec_header);
@@ -325,13 +391,25 @@ Expected<uint64_t, Error> WriteAheadLog::Replay(uint64_t from_sequence,
             .Field("file", path)
             .Field("body_length", static_cast<int64_t>(body_length))
             .Warn();
-        break;  // Invalid record — stop
+        ::close(fd);
+        return utils::MakeUnexpected(
+            utils::MakeError(utils::ErrorCode::kStorageCorrupted, "Invalid WAL record length in " + path));
       }
 
       // Read body
+      if (remaining_file_bytes - sizeof(rec_header) < body_length) {
+        ::close(fd);
+        if (latest_segment) {
+          return count;  // Recoverable torn body at newest segment tail.
+        }
+        return utils::MakeUnexpected(
+            utils::MakeError(utils::ErrorCode::kStorageCorrupted, "Torn WAL body in non-latest segment: " + path));
+      }
       std::vector<uint8_t> body(body_length);
       if (!ReadAll(fd, body.data(), body_length)) {
-        break;  // Incomplete record — skip
+        const auto error = utils::MakeError(utils::ErrorCode::kWalReadError, "Failed to read WAL record body");
+        ::close(fd);
+        return utils::MakeUnexpected(error);
       }
 
       // Verify CRC
@@ -347,7 +425,9 @@ Expected<uint64_t, Error> WriteAheadLog::Replay(uint64_t from_sequence,
             .Field("expected_crc", static_cast<int64_t>(expected_crc))
             .Field("actual_crc", static_cast<int64_t>(actual_crc))
             .Warn();
-        break;
+        ::close(fd);
+        return utils::MakeUnexpected(
+            utils::MakeError(utils::ErrorCode::kStorageCorrupted, "WAL record CRC mismatch in " + path));
       }
 
       // Parse record
@@ -355,6 +435,20 @@ Expected<uint64_t, Error> WriteAheadLog::Replay(uint64_t from_sequence,
       record.sequence = ReadU64(body.data());
       record.timestamp_us = ReadU64(body.data() + 8);
       record.op = static_cast<WalOpType>(body[16]);
+
+      if (previous_sequence.has_value() && (previous_sequence.value() == std::numeric_limits<uint64_t>::max() ||
+                                            record.sequence != previous_sequence.value() + 1)) {
+        ::close(fd);
+        return utils::MakeUnexpected(
+            utils::MakeError(utils::ErrorCode::kStorageCorrupted,
+                             "WAL sequence is not contiguous: previous=" + std::to_string(*previous_sequence) +
+                                 ", current=" + std::to_string(record.sequence)));
+      }
+      previous_sequence = record.sequence;
+
+      if (record.sequence == from_sequence) {
+        replay_floor_seen = true;
+      }
 
       if (record.sequence < from_sequence) {
         continue;  // Skip records before requested sequence
@@ -365,11 +459,21 @@ Expected<uint64_t, Error> WriteAheadLog::Replay(uint64_t from_sequence,
         record.payload.assign(body.begin() + kWalRecordHeaderSize, body.end());
       }
 
-      callback(record);
+      auto applied = callback(record);
+      if (!applied) {
+        ::close(fd);
+        return utils::MakeUnexpected(applied.error());
+      }
       ++count;
     }
 
     ::close(fd);
+  }
+
+  if (!replay_floor_seen && from_sequence <= current_sequence_) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kWalCorrupted,
+                         "WAL does not contain requested replay floor sequence " + std::to_string(from_sequence)));
   }
 
   return count;
@@ -379,7 +483,9 @@ Expected<void, Error> WriteAheadLog::Truncate(uint64_t up_to_sequence) {
   std::lock_guard<std::mutex> lock(mutex_);
 
   std::vector<WalFile> remaining;
+  remaining.reserve(files_.size());
   uint64_t deleted_count = 0;
+  std::optional<Error> unlink_error;
 
   for (auto& f : files_) {
     // Delete files where ALL records are <= up_to_sequence
@@ -387,6 +493,14 @@ Expected<void, Error> WriteAheadLog::Truncate(uint64_t up_to_sequence) {
     if (f.max_sequence <= up_to_sequence && f.max_sequence > 0 && f.file_number != current_file_number_) {
       if (::unlink(f.path.c_str()) == 0) {
         ++deleted_count;
+      } else {
+        const int saved_errno = errno;
+        remaining.push_back(std::move(f));
+        if (!unlink_error.has_value()) {
+          unlink_error = utils::MakeError(utils::ErrorCode::kWalTruncateFailed,
+                                          "Failed to unlink WAL segment '" + remaining.back().path +
+                                              "': " + std::string(std::strerror(saved_errno)));
+        }
       }
     } else {
       remaining.push_back(std::move(f));
@@ -395,6 +509,12 @@ Expected<void, Error> WriteAheadLog::Truncate(uint64_t up_to_sequence) {
 
   files_ = std::move(remaining);
 
+  if (deleted_count > 0 && !FsyncDirectory(config_.directory)) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kWalTruncateFailed,
+                         "Failed to fsync WAL directory after truncate: " + std::string(std::strerror(errno))));
+  }
+
   if (deleted_count > 0) {
     utils::StructuredLog()
         .Event("wal_truncated")
@@ -402,6 +522,10 @@ Expected<void, Error> WriteAheadLog::Truncate(uint64_t up_to_sequence) {
         .Field("up_to_sequence", static_cast<int64_t>(up_to_sequence))
         .Field("remaining_files", static_cast<int64_t>(files_.size()))
         .Info();
+  }
+
+  if (unlink_error.has_value()) {
+    return utils::MakeUnexpected(*unlink_error);
   }
 
   return {};
@@ -424,8 +548,17 @@ bool WriteAheadLog::IsOpen() const {
 Expected<void, Error> WriteAheadLog::RotateFile() {
   // Close current file if open
   if (current_fd_ >= 0) {
-    ::fsync(current_fd_);
-    ::close(current_fd_);
+    if (::fsync(current_fd_) != 0) {
+      return utils::MakeUnexpected(
+          utils::MakeError(utils::ErrorCode::kWalRotationFailed,
+                           "Failed to fsync WAL segment before rotation: " + std::string(std::strerror(errno))));
+    }
+    if (::close(current_fd_) != 0) {
+      current_fd_ = -1;
+      return utils::MakeUnexpected(
+          utils::MakeError(utils::ErrorCode::kWalRotationFailed,
+                           "Failed to close WAL segment before rotation: " + std::string(std::strerror(errno))));
+    }
     current_fd_ = -1;
   }
 
@@ -454,6 +587,24 @@ Expected<void, Error> WriteAheadLog::RotateFile() {
     ::close(current_fd_);
     current_fd_ = -1;
     return utils::MakeUnexpected(result.error());
+  }
+  if (::fsync(current_fd_) != 0) {
+    const int saved_errno = errno;
+    ::close(current_fd_);
+    current_fd_ = -1;
+    ::unlink(path.c_str());
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kWalRotationFailed,
+                         "Failed to fsync new WAL segment: " + std::string(std::strerror(saved_errno))));
+  }
+  if (!FsyncDirectory(config_.directory)) {
+    const int saved_errno = errno;
+    ::close(current_fd_);
+    current_fd_ = -1;
+    ::unlink(path.c_str());
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kWalRotationFailed,
+                         "Failed to fsync WAL directory: " + std::string(std::strerror(saved_errno))));
   }
 
   // Add file to the list
@@ -519,6 +670,10 @@ Expected<void, Error> WriteAheadLog::ScanExistingFiles() {
     // Match wal-NNNNNN.log
     if (name.size() == 14 && name.substr(0, 4) == "wal-" && name.substr(10, 4) == ".log") {
       std::string num_str = name.substr(4, 6);
+      if (!std::all_of(num_str.begin(), num_str.end(),
+                       [](unsigned char character) { return std::isdigit(character) != 0; })) {
+        continue;
+      }
       try {
         auto num = static_cast<uint32_t>(std::stoul(num_str));
         file_numbers.push_back(num);
@@ -531,18 +686,33 @@ Expected<void, Error> WriteAheadLog::ScanExistingFiles() {
 
   // Sort by file number
   std::sort(file_numbers.begin(), file_numbers.end());
+  if (std::adjacent_find(file_numbers.begin(), file_numbers.end()) != file_numbers.end()) {
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kWalCorrupted, "Duplicate WAL segment number"));
+  }
 
   // Scan each file to find sequence ranges
-  for (uint32_t num : file_numbers) {
+  std::optional<uint64_t> previous_sequence;
+  for (size_t file_index = 0; file_index < file_numbers.size(); ++file_index) {
+    const uint32_t num = file_numbers[file_index];
+    const bool latest_segment = file_index + 1 == file_numbers.size();
     std::string path = MakeFilePath(num);
-    int fd = ::open(path.c_str(), O_RDONLY);
-    if (fd < 0)
-      continue;
+    int fd = ::open(path.c_str(), latest_segment ? O_RDWR : O_RDONLY);
+    if (fd < 0) {
+      return utils::MakeUnexpected(
+          utils::MakeError(utils::ErrorCode::kWalReadError, "Failed to open WAL segment: " + path));
+    }
 
     auto header_result = ValidateFileHeader(fd, path);
     if (!header_result) {
       ::close(fd);
-      continue;
+      return utils::MakeUnexpected(header_result.error());
+    }
+
+    struct stat initial_info {};
+    if (::fstat(fd, &initial_info) != 0) {
+      ::close(fd);
+      return utils::MakeUnexpected(
+          utils::MakeError(utils::ErrorCode::kWalReadError, "Failed to stat WAL segment: " + path));
     }
 
     WalFile wf;
@@ -550,33 +720,82 @@ Expected<void, Error> WriteAheadLog::ScanExistingFiles() {
     wf.file_number = num;
     wf.min_sequence = UINT64_MAX;
     wf.max_sequence = 0;
+    off_t last_valid_offset = kWalFileHeaderSize;
 
     // Scan records to find min/max sequence
     while (true) {
       uint8_t rec_header[8];
-      if (!ReadAll(fd, rec_header, sizeof(rec_header)))
+      const off_t record_offset = ::lseek(fd, 0, SEEK_CUR);
+      const uint64_t remaining = static_cast<uint64_t>(initial_info.st_size - record_offset);
+      if (remaining == 0) {
         break;
+      }
+      if (remaining < sizeof(rec_header)) {
+        if (!latest_segment || ::ftruncate(fd, last_valid_offset) != 0) {
+          ::close(fd);
+          return utils::MakeUnexpected(
+              utils::MakeError(utils::ErrorCode::kWalCorrupted, "Torn WAL header in segment: " + path));
+        }
+        break;
+      }
+      if (!ReadAll(fd, rec_header, sizeof(rec_header))) {
+        ::close(fd);
+        return utils::MakeUnexpected(
+            utils::MakeError(utils::ErrorCode::kWalReadError, "Failed to read WAL record header: " + path));
+      }
 
       uint32_t body_length = ReadU32(rec_header);
-      if (body_length < kWalRecordHeaderSize)
+      uint32_t expected_crc = ReadU32(rec_header + 4);
+      if (body_length < kWalRecordHeaderSize || body_length > kMaxWalRecordBodySize) {
+        ::close(fd);
+        return utils::MakeUnexpected(
+            utils::MakeError(utils::ErrorCode::kWalCorrupted, "Invalid WAL record length: " + path));
+      }
+      if (remaining - sizeof(rec_header) < body_length) {
+        if (!latest_segment || ::ftruncate(fd, last_valid_offset) != 0) {
+          ::close(fd);
+          return utils::MakeUnexpected(
+              utils::MakeError(utils::ErrorCode::kWalCorrupted, "Torn WAL body in segment: " + path));
+        }
         break;
+      }
 
-      // Read just enough for sequence number
       std::vector<uint8_t> body(body_length);
-      if (!ReadAll(fd, body.data(), body_length))
-        break;
+      if (!ReadAll(fd, body.data(), body_length)) {
+        ::close(fd);
+        return utils::MakeUnexpected(
+            utils::MakeError(utils::ErrorCode::kWalReadError, "Failed to read WAL record body: " + path));
+      }
+      if (CalcCRC32(body.data(), body.size()) != expected_crc) {
+        ::close(fd);
+        return utils::MakeUnexpected(
+            utils::MakeError(utils::ErrorCode::kWalCorrupted, "WAL record CRC mismatch: " + path));
+      }
 
       uint64_t seq = ReadU64(body.data());
+      if (previous_sequence.has_value() &&
+          (*previous_sequence == std::numeric_limits<uint64_t>::max() || seq != *previous_sequence + 1)) {
+        ::close(fd);
+        return utils::MakeUnexpected(
+            utils::MakeError(utils::ErrorCode::kWalCorrupted,
+                             "WAL sequence is not contiguous: previous=" + std::to_string(*previous_sequence) +
+                                 ", current=" + std::to_string(seq)));
+      }
+      previous_sequence = seq;
       if (seq < wf.min_sequence)
         wf.min_sequence = seq;
       if (seq > wf.max_sequence)
         wf.max_sequence = seq;
+      last_valid_offset = ::lseek(fd, 0, SEEK_CUR);
     }
 
     struct stat st {};
-    if (::fstat(fd, &st) == 0) {
-      wf.file_size = static_cast<uint64_t>(st.st_size);
+    if (::fstat(fd, &st) != 0) {
+      ::close(fd);
+      return utils::MakeUnexpected(
+          utils::MakeError(utils::ErrorCode::kWalReadError, "Failed to restat WAL segment: " + path));
     }
+    wf.file_size = static_cast<uint64_t>(st.st_size);
     ::close(fd);
 
     if (wf.min_sequence == UINT64_MAX) {
@@ -613,7 +832,13 @@ void WriteAheadLog::SyncLoop() {
     if (needs_sync_.exchange(false)) {
       std::lock_guard<std::mutex> wal_lock(mutex_);
       if (current_fd_ >= 0) {
-        ::fsync(current_fd_);
+        if (::fsync(current_fd_) != 0) {
+          const std::string message = "Asynchronous WAL fsync failed: " + std::string(std::strerror(errno));
+          ::close(current_fd_);
+          current_fd_ = -1;
+          open_ = false;
+          utils::StructuredLog().Event("wal_async_fsync_failed").Field("error", message).Error();
+        }
       }
     }
   }

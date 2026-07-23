@@ -8,9 +8,11 @@
 #include <gtest/gtest.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <thread>
+#include <vector>
 
 #include "config/config.h"
 #include "events/co_occurrence_index.h"
@@ -115,6 +117,34 @@ TEST_F(SnapshotForkTest, RejectsSecondConcurrentSave) {
 
   writer.WaitForChild(10000);
   std::filesystem::remove(second_snapshot_path);
+}
+
+TEST_F(SnapshotForkTest, ConcurrentStartsReserveExactlyOneChild) {
+  storage::ForkSnapshotWriter writer;
+  constexpr size_t kCallers = 100;
+  std::atomic<bool> start{false};
+  std::atomic<size_t> successes{0};
+  std::vector<std::thread> callers;
+  callers.reserve(kCallers);
+  for (size_t index = 0; index < kCallers; ++index) {
+    callers.emplace_back([&, index] {
+      while (!start.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+      const auto path = (test_dir_ / ("concurrent-" + std::to_string(index) + ".dmp")).string();
+      if (writer.StartBackgroundSave(path, config_, *event_store_, *co_index_, *vector_store_).has_value()) {
+        successes.fetch_add(1, std::memory_order_relaxed);
+      }
+    });
+  }
+
+  start.store(true, std::memory_order_release);
+  for (auto& caller : callers) {
+    caller.join();
+  }
+  EXPECT_EQ(successes.load(std::memory_order_relaxed), 1U);
+  writer.WaitForChild(10000);
+  EXPECT_EQ(writer.GetStatus().status, storage::SnapshotStatus::kCompleted);
 }
 
 TEST_F(SnapshotForkTest, CheckChildUpdatesStatus) {

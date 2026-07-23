@@ -64,3 +64,21 @@ gtest_discover_tests(wal_server_restart_recovery_test
     TIMEOUT 120
     LABELS integration
 )
+
+add_executable(wal_crash_recovery_test
+  wal_crash_recovery_test.cpp
+)
+target_link_libraries(wal_crash_recovery_test
+  nvecd_server
+  nvecd_storage
+  gtest_main
+)
+target_include_directories(wal_crash_recovery_test PRIVATE ${CMAKE_SOURCE_DIR}/tests/integration)
+gtest_discover_tests(wal_crash_recovery_test
+  DISCOVERY_MODE POST_BUILD
+  DISCOVERY_TIMEOUT 30
+  PROPERTIES
+    RESOURCE_LOCK server_port_and_storage_io
+    TIMEOUT 120
+    LABELS "integration;crash"
+)
