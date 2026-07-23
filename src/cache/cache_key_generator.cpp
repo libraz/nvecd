@@ -29,6 +29,7 @@ CacheKey GenerateSimCacheKey(const SimCacheKeyParams& params) {
   std::ostringstream oss;
   oss << "SIM:" << params.id << ":" << params.top_k << ":" << params.mode << ":a" << AdaptiveCachePart(params.adaptive)
       << ":g" << params.cooccurrence_generation << ":v" << params.vector_generation;
+  oss << ":m" << params.metadata_generation << ":d" << params.dataset_generation;
   if (!params.filter_expr.empty()) {
     oss << ":f" << params.filter_expr;
   }
@@ -38,6 +39,7 @@ CacheKey GenerateSimCacheKey(const SimCacheKeyParams& params) {
 CacheKey GenerateSimvCacheKey(const SimvCacheKeyParams& params) {
   std::ostringstream oss;
   oss << "SIMV:" << HashVector(params.vector) << ":" << params.top_k << ":v" << params.vector_generation;
+  oss << ":m" << params.metadata_generation << ":d" << params.dataset_generation;
   if (!params.filter_expr.empty()) {
     oss << ":f" << params.filter_expr;
   }

@@ -33,6 +33,8 @@ struct SimCacheKeyParams {
   uint64_t cooccurrence_generation = 0;
   uint64_t vector_generation = 0;
   std::string filter_expr;
+  uint64_t metadata_generation = 0;
+  uint64_t dataset_generation = 0;
 };
 
 /**
@@ -43,6 +45,8 @@ struct SimvCacheKeyParams {
   int top_k = 0;
   uint64_t vector_generation = 0;
   std::string filter_expr;
+  uint64_t metadata_generation = 0;
+  uint64_t dataset_generation = 0;
 };
 
 /**

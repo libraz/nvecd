@@ -22,8 +22,13 @@ namespace {
 constexpr size_t kSerializedResultSize = 256 + sizeof(float);
 }  // namespace
 
-SimilarityCache::SimilarityCache(size_t max_memory_bytes, double min_query_cost_ms, int ttl_seconds)
-    : max_memory_bytes_(max_memory_bytes), min_query_cost_ms_(min_query_cost_ms), ttl_seconds_(ttl_seconds) {
+SimilarityCache::SimilarityCache(size_t max_memory_bytes, double min_query_cost_ms, int ttl_seconds,
+                                 bool compression_enabled, size_t eviction_batch_size)
+    : max_memory_bytes_(max_memory_bytes),
+      compression_enabled_(compression_enabled),
+      eviction_batch_size_(std::max<size_t>(1, eviction_batch_size)),
+      min_query_cost_ms_(min_query_cost_ms),
+      ttl_seconds_(ttl_seconds) {
   // Default policies: item_search enabled, vector_search disabled, filtered_search enabled with 60s TTL
   policies_[static_cast<size_t>(SearchType::kItemSearch)] = {true, 0};
   policies_[static_cast<size_t>(SearchType::kVectorSearch)] = {false, 0};
@@ -134,7 +139,9 @@ std::optional<std::vector<similarity::SimilarityResult>> SimilarityCache::Lookup
   // Decompress result and copy query_cost_ms before releasing lock
   const auto& entry = iter->second.first;
   auto entry_created_at = entry.created_at;
-  auto decompress_result = ResultCompressor::DecompressSimilarityResults(entry.compressed_data, entry.original_size);
+  auto decompress_result =
+      entry.compressed ? ResultCompressor::DecompressSimilarityResults(entry.compressed_data, entry.original_size)
+                       : ResultCompressor::DeserializeSimilarityResults(entry.compressed_data);
   if (!decompress_result.has_value()) {
     // Decompression failed, treat as miss
     stats_.cache_misses++;
@@ -197,7 +204,8 @@ bool SimilarityCache::Insert(const CacheKey& key, const std::vector<similarity::
 }
 
 bool SimilarityCache::InsertWithTtl(const CacheKey& key, const std::vector<similarity::SimilarityResult>& results,
-                                    double query_cost_ms, int effective_ttl_seconds) {
+                                    double query_cost_ms, int effective_ttl_seconds,
+                                    const std::vector<std::string>* item_ids) {
   if (!enabled_.load(std::memory_order_relaxed)) {
     return false;
   }
@@ -207,8 +215,8 @@ bool SimilarityCache::InsertWithTtl(const CacheKey& key, const std::vector<simil
     return false;
   }
 
-  // Compress result
-  auto compress_result = ResultCompressor::CompressSimilarityResults(results);
+  auto compress_result = compression_enabled_ ? ResultCompressor::CompressSimilarityResults(results)
+                                              : ResultCompressor::SerializeSimilarityResults(results);
   if (!compress_result.has_value()) {
     return false;
   }
@@ -249,6 +257,7 @@ bool SimilarityCache::InsertWithTtl(const CacheKey& key, const std::vector<simil
   // Create cache entry
   CachedEntry entry;
   entry.compressed_data = std::move(compressed);
+  entry.compressed = compression_enabled_;
   entry.original_size = original_size;
   entry.query_cost_ms = query_cost_ms;
   entry.created_at = std::chrono::steady_clock::now();
@@ -263,11 +272,20 @@ bool SimilarityCache::InsertWithTtl(const CacheKey& key, const std::vector<simil
 
   // Insert into cache map
   cache_map_.emplace(key, std::make_pair(std::move(entry), lru_it));
-
-  // Update memory tracking
-  total_memory_bytes_ += entry_memory;
   stats_.current_entries++;
-  stats_.current_memory_bytes = total_memory_bytes_;
+
+  auto inserted = cache_map_.find(key);
+  if (item_ids != nullptr) {
+    RegisterResultItemsLocked(key, inserted->second.first, *item_ids);
+  }
+
+  // Account for cache-map/LRU nodes, entry strings, and the full reverse index.
+  RefreshMemoryLocked();
+  EvictForSpace(0);
+  if (cache_map_.find(key) == cache_map_.end()) {
+    // The newly inserted entry could not fit even after evicting older keys.
+    return false;
+  }
 
   return true;
 }
@@ -280,14 +298,24 @@ void SimilarityCache::RegisterResultItems(const CacheKey& key, const std::vector
     return;  // Entry was evicted before registration
   }
 
-  auto& entry = it->second.first;
+  RegisterResultItemsLocked(key, it->second.first, item_ids);
+  RefreshMemoryLocked();
+  EvictForSpace(0);
+}
 
-  // Limit tracked items to bound memory usage
-  size_t track_count = std::min(item_ids.size(), kMaxTrackedItemsPerEntry);
-  entry.referenced_item_ids.reserve(track_count);
-  for (size_t i = 0; i < track_count; ++i) {
-    entry.referenced_item_ids.push_back(item_ids[i]);
-    item_to_cache_keys_[item_ids[i]].insert(key);
+void SimilarityCache::RegisterResultItemsLocked(const CacheKey& key, CachedEntry& entry,
+                                                const std::vector<std::string>& item_ids) {
+  std::unordered_set<std::string> already_registered(entry.referenced_item_ids.begin(),
+                                                     entry.referenced_item_ids.end());
+  for (const auto& item_id : item_ids) {
+    if (entry.referenced_item_ids.size() >= kMaxTrackedItemsPerEntry) {
+      break;
+    }
+    if (!already_registered.insert(item_id).second) {
+      continue;
+    }
+    entry.referenced_item_ids.push_back(item_id);
+    item_to_cache_keys_[item_id].insert(key);
   }
 }
 
@@ -305,24 +333,9 @@ size_t SimilarityCache::InvalidateByItemId(const std::string& item_id) {
 
   size_t count = 0;
   for (const auto& cache_key : keys_to_invalidate) {
-    // Clean up reverse index for OTHER item_ids referenced by this entry
-    auto entry_it = cache_map_.find(cache_key);
-    if (entry_it != cache_map_.end()) {
-      const auto& entry = entry_it->second.first;
-      for (const auto& ref_id : entry.referenced_item_ids) {
-        if (ref_id != item_id) {
-          auto other_rev_it = item_to_cache_keys_.find(ref_id);
-          if (other_rev_it != item_to_cache_keys_.end()) {
-            other_rev_it->second.erase(cache_key);
-            if (other_rev_it->second.empty()) {
-              item_to_cache_keys_.erase(other_rev_it);
-            }
-          }
-        }
-      }
+    if (EraseLocked(cache_key)) {
+      ++count;
     }
-    EraseLocked(cache_key);
-    ++count;
   }
 
   return count;
@@ -353,21 +366,56 @@ bool SimilarityCache::EraseLocked(const CacheKey& key) {
     return false;
   }
 
-  // Calculate entry memory before removal
-  const size_t entry_memory = sizeof(CachedEntry) + iter->second.first.compressed_data.capacity() + sizeof(CacheKey);
+  for (const auto& ref_id : iter->second.first.referenced_item_ids) {
+    auto reverse = item_to_cache_keys_.find(ref_id);
+    if (reverse == item_to_cache_keys_.end()) {
+      continue;
+    }
+    reverse->second.erase(key);
+    if (reverse->second.empty()) {
+      item_to_cache_keys_.erase(reverse);
+    }
+  }
 
   // Remove from LRU list
   lru_list_.erase(iter->second.second);
 
-  // Update memory tracking
-  total_memory_bytes_ -= entry_memory;
   stats_.current_entries--;
-  stats_.current_memory_bytes = total_memory_bytes_;
 
   // Remove from cache map
   cache_map_.erase(iter);
+  RefreshMemoryLocked();
 
   return true;
+}
+
+size_t SimilarityCache::EstimateMemoryLocked() const {
+  if (cache_map_.empty() && item_to_cache_keys_.empty()) {
+    return 0;
+  }
+
+  size_t bytes = cache_map_.bucket_count() * sizeof(void*) + item_to_cache_keys_.bucket_count() * sizeof(void*);
+  bytes += lru_list_.size() * (sizeof(CacheKey) + 2 * sizeof(void*));
+  for (const auto& [key, entry_pair] : cache_map_) {
+    (void)key;
+    const auto& entry = entry_pair.first;
+    bytes += sizeof(key) + sizeof(entry_pair) + 2 * sizeof(void*) + entry.compressed_data.capacity();
+    bytes += entry.referenced_item_ids.capacity() * sizeof(std::string);
+    for (const auto& item_id : entry.referenced_item_ids) {
+      bytes += item_id.capacity() + 1;
+    }
+  }
+  for (const auto& [item_id, keys] : item_to_cache_keys_) {
+    bytes += sizeof(item_id) + sizeof(keys) + 2 * sizeof(void*) + item_id.capacity() + 1;
+    bytes += keys.bucket_count() * sizeof(void*);
+    bytes += keys.size() * (sizeof(CacheKey) + 2 * sizeof(void*));
+  }
+  return bytes;
+}
+
+void SimilarityCache::RefreshMemoryLocked() {
+  total_memory_bytes_ = EstimateMemoryLocked();
+  stats_.current_memory_bytes = total_memory_bytes_;
 }
 
 void SimilarityCache::Clear() {
@@ -394,36 +442,8 @@ void SimilarityCache::ClearIf(std::function<bool(const CacheKey&)> predicate) {
 
   // Erase entries
   for (const auto& key : to_erase) {
-    auto iter = cache_map_.find(key);
-    if (iter != cache_map_.end()) {
-      // Clean up reverse index for erased entry
-      for (const auto& ref_id : iter->second.first.referenced_item_ids) {
-        auto rev_it = item_to_cache_keys_.find(ref_id);
-        if (rev_it != item_to_cache_keys_.end()) {
-          rev_it->second.erase(key);
-          if (rev_it->second.empty()) {
-            item_to_cache_keys_.erase(rev_it);
-          }
-        }
-      }
-
-      // Calculate entry memory
-      const size_t entry_memory =
-          sizeof(CachedEntry) + iter->second.first.compressed_data.capacity() + sizeof(CacheKey);
-
-      // Remove from LRU list
-      lru_list_.erase(iter->second.second);
-
-      // Update memory tracking
-      total_memory_bytes_ -= entry_memory;
-      stats_.current_entries--;
-
-      // Remove from cache map
-      cache_map_.erase(iter);
-    }
+    EraseLocked(key);
   }
-
-  stats_.current_memory_bytes = total_memory_bytes_;
 }
 
 size_t SimilarityCache::PurgeExpired() {
@@ -435,55 +455,35 @@ size_t SimilarityCache::PurgeExpired() {
   std::unique_lock lock(mutex_);
 
   auto now = std::chrono::steady_clock::now();
-  size_t purged = 0;
-
-  for (auto it = cache_map_.begin(); it != cache_map_.end();) {
-    const auto& entry = it->second.first;
+  std::vector<CacheKey> expired_keys;
+  for (const auto& [key, entry_pair] : cache_map_) {
+    const auto& entry = entry_pair.first;
     bool expired = now >= entry.expires_at;
     if (!expired && global_ttl > 0) {
       auto age_seconds = std::chrono::duration_cast<std::chrono::seconds>(now - entry.created_at).count();
       expired = age_seconds >= global_ttl;
     }
     if (expired || entry.invalidated.load()) {
-      // Clean up reverse index for purged entry
-      for (const auto& ref_id : it->second.first.referenced_item_ids) {
-        auto rev_it = item_to_cache_keys_.find(ref_id);
-        if (rev_it != item_to_cache_keys_.end()) {
-          rev_it->second.erase(it->first);
-          if (rev_it->second.empty()) {
-            item_to_cache_keys_.erase(rev_it);
-          }
-        }
-      }
-
-      // Calculate entry memory before removal
-      const size_t entry_memory = sizeof(CachedEntry) + it->second.first.compressed_data.capacity() + sizeof(CacheKey);
-
-      // Remove from LRU list
-      lru_list_.erase(it->second.second);
-
-      // Update memory tracking
-      total_memory_bytes_ -= entry_memory;
-      stats_.current_entries--;
-
-      it = cache_map_.erase(it);
-      ++purged;
-    } else {
-      ++it;
+      expired_keys.push_back(key);
     }
   }
 
-  if (purged > 0) {
-    stats_.current_memory_bytes = total_memory_bytes_;
-    stats_.ttl_expirations += purged;
+  for (const auto& key : expired_keys) {
+    EraseLocked(key);
   }
+  stats_.ttl_expirations += expired_keys.size();
 
-  return purged;
+  return expired_keys.size();
 }
 
 bool SimilarityCache::EvictForSpace(size_t required_bytes) {
+  if (total_memory_bytes_ + required_bytes <= max_memory_bytes_) {
+    return true;
+  }
   // Evict from LRU tail until enough space is available
-  while (total_memory_bytes_ + required_bytes > max_memory_bytes_ && !lru_list_.empty()) {
+  size_t evicted_in_batch = 0;
+  while ((total_memory_bytes_ + required_bytes > max_memory_bytes_ || evicted_in_batch < eviction_batch_size_) &&
+         !lru_list_.empty()) {
     // Get least recently used key
     const CacheKey lru_key = lru_list_.back();
 
@@ -494,31 +494,10 @@ bool SimilarityCache::EvictForSpace(size_t required_bytes) {
       continue;
     }
 
-    // Clean up reverse index for evicted entry
-    for (const auto& ref_id : iter->second.first.referenced_item_ids) {
-      auto rev_it = item_to_cache_keys_.find(ref_id);
-      if (rev_it != item_to_cache_keys_.end()) {
-        rev_it->second.erase(lru_key);
-        if (rev_it->second.empty()) {
-          item_to_cache_keys_.erase(rev_it);
-        }
-      }
-    }
-
-    // Calculate entry memory
-    const size_t entry_memory = sizeof(CachedEntry) + iter->second.first.compressed_data.capacity() + sizeof(CacheKey);
-
-    // Remove entry
-    lru_list_.pop_back();
-    cache_map_.erase(iter);
-
-    // Update memory tracking
-    total_memory_bytes_ -= entry_memory;
-    stats_.current_entries--;
+    EraseLocked(lru_key);
     stats_.evictions++;
+    ++evicted_in_batch;
   }
-
-  stats_.current_memory_bytes = total_memory_bytes_;
 
   // Check if enough space was freed
   return total_memory_bytes_ + required_bytes <= max_memory_bytes_;
@@ -570,6 +549,23 @@ bool SimilarityCache::Insert(const CacheKey& key, const std::vector<similarity::
   }
 
   return InsertWithTtl(key, results, query_cost_ms, effective_ttl);
+}
+
+bool SimilarityCache::InsertAndRegister(const CacheKey& key, const std::vector<similarity::SimilarityResult>& results,
+                                        const std::vector<std::string>& item_ids, double query_cost_ms,
+                                        SearchType search_type) {
+  const auto index = static_cast<size_t>(search_type);
+  int effective_ttl = ttl_seconds_.load(std::memory_order_relaxed);
+  {
+    std::lock_guard<std::mutex> lock(policy_mutex_);
+    if (!policies_[index].enabled) {
+      return false;
+    }
+    if (policies_[index].ttl_seconds > 0) {
+      effective_ttl = policies_[index].ttl_seconds;
+    }
+  }
+  return InsertWithTtl(key, results, query_cost_ms, effective_ttl, &item_ids);
 }
 
 void SimilarityCache::SetSearchTypePolicy(SearchType search_type, const CachePolicy& policy) {

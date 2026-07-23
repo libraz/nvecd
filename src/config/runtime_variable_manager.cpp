@@ -15,7 +15,7 @@
 #include <shared_mutex>
 #include <string_view>
 
-#include "cache/similarity_cache.h"
+#include "cache/similarity_cache_controller.h"
 #include "utils/structured_log.h"
 
 namespace nvecd::config {
@@ -281,12 +281,8 @@ bool RuntimeVariableManager::IsMutable(const std::string& variable_name) {
   return (var_iter != kVariableMutability.end()) && var_iter->second;
 }
 
-void RuntimeVariableManager::SetCacheToggleCallback(std::function<Expected<void, Error>(bool enabled)> callback) {
-  cache_toggle_callback_ = std::move(callback);
-}
-
-void RuntimeVariableManager::SetSimilarityCache(cache::SimilarityCache* cache) {
-  similarity_cache_ = cache;
+void RuntimeVariableManager::SetCacheController(cache::SimilarityCacheController* controller) {
+  cache_controller_ = controller;
 }
 
 // ========== Apply functions ==========
@@ -328,11 +324,10 @@ Expected<void, Error> RuntimeVariableManager::ApplyLoggingFormat(const std::stri
 }
 
 Expected<void, Error> RuntimeVariableManager::ApplyCacheEnabled(bool value) {
-  if (cache_toggle_callback_) {
-    return cache_toggle_callback_(value);
+  if (cache_controller_ == nullptr) {
+    return MakeUnexpected(MakeError(ErrorCode::kInternalError, "Cache controller is not initialized"));
   }
-  // No callback registered - just update the runtime value
-  return {};
+  return cache_controller_->SetEnabled(value);
 }
 
 Expected<void, Error> RuntimeVariableManager::ApplyCacheMinQueryCost(double value) {
@@ -340,11 +335,10 @@ Expected<void, Error> RuntimeVariableManager::ApplyCacheMinQueryCost(double valu
     return MakeUnexpected(MakeError(ErrorCode::kInvalidArgument, "cache.min_query_cost_ms must be >= 0"));
   }
 
-  if (similarity_cache_) {
-    similarity_cache_->SetMinQueryCost(value);
+  if (cache_controller_ == nullptr) {
+    return MakeUnexpected(MakeError(ErrorCode::kInternalError, "Cache controller is not initialized"));
   }
-
-  return {};
+  return cache_controller_->SetMinQueryCost(value);
 }
 
 Expected<void, Error> RuntimeVariableManager::ApplyCacheTtl(int value) {
@@ -352,11 +346,10 @@ Expected<void, Error> RuntimeVariableManager::ApplyCacheTtl(int value) {
     return MakeUnexpected(MakeError(ErrorCode::kInvalidArgument, "cache.ttl_seconds must be >= 0"));
   }
 
-  if (similarity_cache_) {
-    similarity_cache_->SetTtl(value);
+  if (cache_controller_ == nullptr) {
+    return MakeUnexpected(MakeError(ErrorCode::kInternalError, "Cache controller is not initialized"));
   }
-
-  return {};
+  return cache_controller_->SetTtl(value);
 }
 
 std::string RuntimeVariableManager::GetVariableInternal(const std::string& variable_name) const {

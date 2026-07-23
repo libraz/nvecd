@@ -69,6 +69,14 @@ TEST(GenerateSimCacheKeyTest, CanonicalKeyIncludesAllCrossSurfaceInvalidationFie
   auto changed_filter = base;
   changed_filter.filter_expr = "status:draft";
   EXPECT_NE(GenerateSimCacheKey(base), GenerateSimCacheKey(changed_filter));
+
+  auto changed_metadata_generation = base;
+  ++changed_metadata_generation.metadata_generation;
+  EXPECT_NE(GenerateSimCacheKey(base), GenerateSimCacheKey(changed_metadata_generation));
+
+  auto changed_dataset_generation = base;
+  ++changed_dataset_generation.dataset_generation;
+  EXPECT_NE(GenerateSimCacheKey(base), GenerateSimCacheKey(changed_dataset_generation));
 }
 
 // ========== GenerateSimvCacheKey tests ==========
@@ -111,6 +119,14 @@ TEST(GenerateSimvCacheKeyTest, CanonicalKeyIncludesVectorGenerationAndFilter) {
   auto different_filter = base;
   different_filter.filter_expr = "tenant:beta";
   EXPECT_NE(GenerateSimvCacheKey(base), GenerateSimvCacheKey(different_filter));
+
+  auto changed_metadata_generation = base;
+  ++changed_metadata_generation.metadata_generation;
+  EXPECT_NE(GenerateSimvCacheKey(base), GenerateSimvCacheKey(changed_metadata_generation));
+
+  auto changed_dataset_generation = base;
+  ++changed_dataset_generation.dataset_generation;
+  EXPECT_NE(GenerateSimvCacheKey(base), GenerateSimvCacheKey(changed_dataset_generation));
 }
 
 // ========== HashVector tests ==========

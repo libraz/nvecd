@@ -35,6 +35,17 @@ class SimilarityCacheTestHelper {
     }
     return true;
   }
+
+  static size_t ReverseItemCount(SimilarityCache& cache) {
+    std::shared_lock lock(cache.mutex_);
+    return cache.item_to_cache_keys_.size();
+  }
+
+  static bool EntryIsCompressed(SimilarityCache& cache, const CacheKey& key) {
+    std::shared_lock lock(cache.mutex_);
+    auto iter = cache.cache_map_.find(key);
+    return iter != cache.cache_map_.end() && iter->second.first.compressed;
+  }
 };
 
 namespace {
@@ -87,6 +98,31 @@ TEST(SimilarityCacheTest, SingleQuery) {
   EXPECT_EQ(stats.total_queries, 2);  // 1 miss + 1 hit
   EXPECT_EQ(stats.cache_hits, 1);
   EXPECT_EQ(stats.cache_misses, 1);
+}
+
+TEST(SimilarityCacheTest, CompressionSettingChangesStoredRepresentation) {
+  const auto key = MakeKey("uncompressed", 1);
+  const std::vector<similarity::SimilarityResult> results = {{"item", 0.75F}};
+  SimilarityCache uncompressed(1024 * 1024, 0.0, 0, false, 1);
+  ASSERT_FALSE(uncompressed.CompressionEnabled());
+  ASSERT_TRUE(uncompressed.Insert(key, results, 1.0));
+  EXPECT_FALSE(SimilarityCacheTestHelper::EntryIsCompressed(uncompressed, key));
+  auto loaded = uncompressed.Lookup(key);
+  ASSERT_TRUE(loaded.has_value());
+  ASSERT_EQ(loaded->size(), 1U);
+  EXPECT_EQ(loaded->front().item_id, "item");
+  EXPECT_FLOAT_EQ(loaded->front().score, 0.75F);
+}
+
+TEST(SimilarityCacheTest, EvictionBatchSettingEvictsInConfiguredGroups) {
+  SimilarityCache cache(4096, 0.0, 0, false, 2);
+  ASSERT_EQ(cache.EvictionBatchSize(), 2U);
+  for (int index = 0; index < 30; ++index) {
+    cache.Insert(MakeKey("batch_" + std::to_string(index), 1), {{"result", 0.5F}}, 1.0);
+  }
+  const auto stats = cache.GetStatistics();
+  ASSERT_GT(stats.evictions, 0U);
+  EXPECT_EQ(stats.evictions % 2U, 0U);
 }
 
 // ============================================================================
@@ -514,9 +550,13 @@ TEST(SimilarityCacheTest, ConcurrentReadsAndWrites) {
   EXPECT_EQ(stats.total_queries, 400);
   // Hits + misses must account for all queries
   EXPECT_EQ(stats.cache_hits + stats.cache_misses, stats.total_queries);
-  // Some hits should occur since writer and readers run concurrently
-  // (writer inserts 100 items while readers query 50 items repeatedly)
-  EXPECT_GT(stats.cache_hits, 0);
+  // Thread scheduling may let every reader finish before the writer runs, so a
+  // concurrent hit count is not deterministic. Once all threads join, every
+  // inserted key must be readable and intact.
+  auto inserted = cache.Lookup(MakeKey("item0", 10));
+  ASSERT_TRUE(inserted.has_value());
+  ASSERT_EQ(inserted->size(), 1U);
+  EXPECT_EQ(inserted->front().item_id, "result");
 }
 
 // ============================================================================
@@ -904,6 +944,66 @@ TEST(SimilarityCacheTest, RegisterResultItems_CapsAtMax) {
 
   auto result = cache.Lookup(key1);
   EXPECT_FALSE(result.has_value());
+}
+
+TEST(SimilarityCacheTest, ReverseIndexMemoryParticipatesInAdmissionAndEviction) {
+  constexpr size_t kMemoryLimit = 4096;
+  SimilarityCache cache(kMemoryLimit, 0.0);
+  const std::vector<similarity::SimilarityResult> results = {{"result", 0.95F}};
+
+  for (int query = 0; query < 100; ++query) {
+    std::vector<std::string> references;
+    for (int item = 0; item < 50; ++item) {
+      references.push_back("long_unique_item_identifier_" + std::to_string(query) + "_" + std::to_string(item));
+    }
+    cache.InsertAndRegister(MakeKey("bounded_" + std::to_string(query), 10), results, references, 1.0,
+                            SearchType::kItemSearch);
+    EXPECT_LE(cache.GetStatistics().current_memory_bytes, kMemoryLimit);
+  }
+
+  EXPECT_LT(SimilarityCacheTestHelper::ReverseItemCount(cache), 100U * 50U);
+  cache.Clear();
+  EXPECT_EQ(SimilarityCacheTestHelper::ReverseItemCount(cache), 0U);
+  EXPECT_EQ(cache.GetStatistics().current_memory_bytes, 0U);
+}
+
+TEST(SimilarityCacheTest, TtlPurgeRemovesAllReverseIndexMemory) {
+  SimilarityCache cache(1024 * 1024, 0.0, 1);
+  const auto key = MakeKey("ttl_reverse", 10);
+  ASSERT_TRUE(cache.InsertAndRegister(key, {{"result", 0.9F}}, {"query", "result", "filter-value"}, 1.0,
+                                      SearchType::kItemSearch));
+  EXPECT_EQ(SimilarityCacheTestHelper::ReverseItemCount(cache), 3U);
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+  EXPECT_EQ(cache.PurgeExpired(), 1U);
+  EXPECT_EQ(SimilarityCacheTestHelper::ReverseItemCount(cache), 0U);
+  EXPECT_EQ(cache.GetStatistics().current_memory_bytes, 0U);
+}
+
+TEST(SimilarityCacheTest, ConcurrentInsertAndRegisterPublishesOnlyWinnerReferences) {
+  SimilarityCache cache(1024 * 1024, 0.0);
+  const auto key = MakeKey("same-key", 10);
+  std::atomic<bool> start{false};
+  std::atomic<int> winners{0};
+  std::vector<std::thread> threads;
+  for (int thread_index = 0; thread_index < 20; ++thread_index) {
+    threads.emplace_back([&, thread_index]() {
+      while (!start.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+      if (cache.InsertAndRegister(key, {{"result", 0.9F}}, {"owner-" + std::to_string(thread_index)}, 1.0,
+                                  SearchType::kItemSearch)) {
+        winners.fetch_add(1, std::memory_order_relaxed);
+      }
+    });
+  }
+  start.store(true, std::memory_order_release);
+  for (auto& thread : threads) {
+    thread.join();
+  }
+
+  EXPECT_EQ(winners.load(), 1);
+  EXPECT_EQ(SimilarityCacheTestHelper::ReverseItemCount(cache), 1U);
 }
 
 TEST(SimilarityCacheTest, ConcurrentRegisterAndInvalidate) {

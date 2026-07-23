@@ -7,7 +7,11 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <memory>
 #include <string>
+
+#include "cache/similarity_cache_controller.h"
 
 using namespace nvecd::config;
 
@@ -37,6 +41,16 @@ static Config MakeDefaultConfig() {
   config.snapshot.dir = "/tmp/snapshots";
   config.perf.thread_pool_size = 8;
   return config;
+}
+
+static std::unique_ptr<nvecd::cache::SimilarityCacheController> AttachCacheController(
+    RuntimeVariableManager& manager, const Config& config, std::atomic<nvecd::cache::SimilarityCache*>& publication) {
+  auto controller = std::make_unique<nvecd::cache::SimilarityCacheController>(
+      config.cache.max_memory_bytes, config.cache.min_query_cost_ms, config.cache.ttl_seconds,
+      config.cache.compression_enabled, static_cast<size_t>(config.cache.eviction_batch_size), config.cache.enabled,
+      &publication);
+  manager.SetCacheController(controller.get());
+  return controller;
 }
 
 // ============================================================================
@@ -205,10 +219,14 @@ TEST(RuntimeVariableManagerTest, SetVariable_LoggingLevel_InvalidValue_Fails) {
 TEST(RuntimeVariableManagerTest, SetVariable_CacheEnabled_Toggle) {
   Config config = MakeDefaultConfig();
   auto manager = *RuntimeVariableManager::Create(config);
+  std::atomic<nvecd::cache::SimilarityCache*> publication{nullptr};
+  auto controller = AttachCacheController(*manager, config, publication);
 
   // Disable cache
   auto result = manager->SetVariable("cache.enabled", "false");
   ASSERT_TRUE(result) << result.error().message();
+  EXPECT_FALSE(controller->IsEnabled());
+  EXPECT_EQ(publication.load(), nullptr);
 
   auto val = manager->GetVariable("cache.enabled");
   ASSERT_TRUE(val);
@@ -217,6 +235,8 @@ TEST(RuntimeVariableManagerTest, SetVariable_CacheEnabled_Toggle) {
   // Re-enable cache
   result = manager->SetVariable("cache.enabled", "true");
   ASSERT_TRUE(result) << result.error().message();
+  EXPECT_TRUE(controller->IsEnabled());
+  EXPECT_EQ(publication.load(), &controller->Cache());
 
   val = manager->GetVariable("cache.enabled");
   ASSERT_TRUE(val);
@@ -234,6 +254,8 @@ TEST(RuntimeVariableManagerTest, SetVariable_CacheEnabled_InvalidValue_Fails) {
 TEST(RuntimeVariableManagerTest, SetVariable_CacheTtlSeconds) {
   Config config = MakeDefaultConfig();
   auto manager = *RuntimeVariableManager::Create(config);
+  std::atomic<nvecd::cache::SimilarityCache*> publication{nullptr};
+  auto controller = AttachCacheController(*manager, config, publication);
 
   auto result = manager->SetVariable("cache.ttl_seconds", "7200");
   ASSERT_TRUE(result) << result.error().message();
@@ -241,6 +263,7 @@ TEST(RuntimeVariableManagerTest, SetVariable_CacheTtlSeconds) {
   auto val = manager->GetVariable("cache.ttl_seconds");
   ASSERT_TRUE(val);
   EXPECT_EQ(*val, "7200");
+  EXPECT_EQ(controller->Cache().GetTtl(), 7200);
 }
 
 TEST(RuntimeVariableManagerTest, SetVariable_CacheTtlSeconds_Negative_Fails) {
@@ -262,6 +285,8 @@ TEST(RuntimeVariableManagerTest, SetVariable_CacheTtlSeconds_InvalidInt_Fails) {
 TEST(RuntimeVariableManagerTest, SetVariable_CacheMinQueryCostMs) {
   Config config = MakeDefaultConfig();
   auto manager = *RuntimeVariableManager::Create(config);
+  std::atomic<nvecd::cache::SimilarityCache*> publication{nullptr};
+  auto controller = AttachCacheController(*manager, config, publication);
 
   auto result = manager->SetVariable("cache.min_query_cost_ms", "5.5");
   ASSERT_TRUE(result) << result.error().message();
@@ -269,6 +294,7 @@ TEST(RuntimeVariableManagerTest, SetVariable_CacheMinQueryCostMs) {
   auto val = manager->GetVariable("cache.min_query_cost_ms");
   ASSERT_TRUE(val);
   EXPECT_EQ(*val, "5.5");
+  EXPECT_DOUBLE_EQ(controller->Cache().GetMinQueryCost(), 5.5);
 }
 
 TEST(RuntimeVariableManagerTest, SetVariable_CacheMinQueryCostMs_Negative_Fails) {
@@ -302,6 +328,8 @@ TEST(RuntimeVariableManagerTest, SetVariable_LoggingJson_Toggle) {
 TEST(RuntimeVariableManagerTest, SetVariable_CanonicalizesAcceptedValueAliases) {
   Config config = MakeDefaultConfig();
   auto manager = *RuntimeVariableManager::Create(config);
+  std::atomic<nvecd::cache::SimilarityCache*> publication{nullptr};
+  auto controller = AttachCacheController(*manager, config, publication);
 
   ASSERT_TRUE(manager->SetVariable("cache.enabled", "on"));
   EXPECT_EQ(*manager->GetVariable("cache.enabled"), "true");
@@ -473,40 +501,57 @@ TEST(RuntimeVariableManagerTest, SetVariable_ReflectedInGetAllVariables) {
 }
 
 // ============================================================================
-// CacheToggleCallback integration
+// Cache controller integration
 // ============================================================================
 
-TEST(RuntimeVariableManagerTest, SetCacheToggleCallback_CalledOnToggle) {
+TEST(RuntimeVariableManagerTest, CacheControllerAppliesToggleAndPublication) {
   Config config = MakeDefaultConfig();
   auto manager = *RuntimeVariableManager::Create(config);
-
-  bool callback_called = false;
-  bool callback_value = false;
-  manager->SetCacheToggleCallback([&](bool enabled) -> nvecd::utils::Expected<void, nvecd::utils::Error> {
-    callback_called = true;
-    callback_value = enabled;
-    return {};
-  });
+  std::atomic<nvecd::cache::SimilarityCache*> publication{nullptr};
+  auto controller = AttachCacheController(*manager, config, publication);
 
   auto result = manager->SetVariable("cache.enabled", "false");
   ASSERT_TRUE(result) << result.error().message();
-  EXPECT_TRUE(callback_called);
-  EXPECT_FALSE(callback_value);
+  EXPECT_FALSE(controller->IsEnabled());
+  EXPECT_EQ(publication.load(), nullptr);
 }
 
-TEST(RuntimeVariableManagerTest, SetVariable_CallbackCanReadManagerWithoutDeadlock) {
+TEST(RuntimeVariableManagerTest, StartupDisabledCacheCanBeTunedAndEnabledWithoutRecreation) {
+  Config config = MakeDefaultConfig();
+  config.cache.enabled = false;
+  auto manager = *RuntimeVariableManager::Create(config);
+  std::atomic<nvecd::cache::SimilarityCache*> publication{nullptr};
+  auto controller = AttachCacheController(*manager, config, publication);
+
+  EXPECT_FALSE(controller->IsEnabled());
+  EXPECT_EQ(publication.load(), nullptr);
+  auto* const retained_instance = &controller->Cache();
+
+  ASSERT_TRUE(manager->SetVariable("cache.ttl_seconds", "31"));
+  ASSERT_TRUE(manager->SetVariable("cache.min_query_cost_ms", "3.75"));
+  ASSERT_TRUE(manager->SetVariable("cache.enabled", "true"));
+
+  EXPECT_TRUE(controller->IsEnabled());
+  EXPECT_EQ(publication.load(), retained_instance);
+  EXPECT_EQ(controller->Cache().GetTtl(), 31);
+  EXPECT_DOUBLE_EQ(controller->Cache().GetMinQueryCost(), 3.75);
+  EXPECT_EQ(*manager->GetVariable("cache.enabled"), "true");
+}
+
+TEST(RuntimeVariableManagerTest, CacheChangeKeepsIntrospectionAndEffectiveStateConsistent) {
   Config config = MakeDefaultConfig();
   auto manager = *RuntimeVariableManager::Create(config);
-  auto* raw_manager = manager.get();
-  bool callback_read_succeeded = false;
-  manager->SetCacheToggleCallback(
-      [raw_manager, &callback_read_succeeded](bool) -> nvecd::utils::Expected<void, nvecd::utils::Error> {
-        auto value = raw_manager->GetVariable("cache.enabled");
-        callback_read_succeeded = value.has_value();
-        return {};
-      });
+  std::atomic<nvecd::cache::SimilarityCache*> publication{nullptr};
+  auto controller = AttachCacheController(*manager, config, publication);
 
   ASSERT_TRUE(manager->SetVariable("cache.enabled", "false"));
-  EXPECT_TRUE(callback_read_succeeded);
   EXPECT_EQ(*manager->GetVariable("cache.enabled"), "false");
+  EXPECT_FALSE(controller->IsEnabled());
+
+  ASSERT_TRUE(manager->SetVariable("cache.ttl_seconds", "17"));
+  ASSERT_TRUE(manager->SetVariable("cache.min_query_cost_ms", "2.25"));
+  EXPECT_EQ(*manager->GetVariable("cache.ttl_seconds"), "17");
+  EXPECT_EQ(*manager->GetVariable("cache.min_query_cost_ms"), "2.25");
+  EXPECT_EQ(controller->Cache().GetTtl(), 17);
+  EXPECT_DOUBLE_EQ(controller->Cache().GetMinQueryCost(), 2.25);
 }

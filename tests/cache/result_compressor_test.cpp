@@ -95,5 +95,23 @@ TEST(ResultCompressorTest, DecompressEmptyInput) {
   EXPECT_TRUE(result->empty());
 }
 
+TEST(ResultCompressorTest, UncompressedSerializationRoundTrip) {
+  const std::vector<similarity::SimilarityResult> results = {{"first", 1.0F}, {"second", -0.25F}};
+  auto serialized = ResultCompressor::SerializeSimilarityResults(results);
+  ASSERT_TRUE(serialized.has_value());
+  auto decoded = ResultCompressor::DeserializeSimilarityResults(*serialized);
+  ASSERT_TRUE(decoded.has_value());
+  ASSERT_EQ(decoded->size(), results.size());
+  EXPECT_EQ((*decoded)[1].item_id, "second");
+  EXPECT_FLOAT_EQ((*decoded)[1].score, -0.25F);
+}
+
+TEST(ResultCompressorTest, RejectsMalformedSizeAndEmbeddedNulId) {
+  EXPECT_FALSE(ResultCompressor::DeserializeSimilarityResults({1, 2, 3}).has_value());
+  std::string id_with_nul("bad\0id", 6);
+  EXPECT_FALSE(ResultCompressor::SerializeSimilarityResults({{id_with_nul, 1.0F}}).has_value());
+  EXPECT_FALSE(ResultCompressor::DecompressSimilarityResults({1, 2, 3}, 1).has_value());
+}
+
 }  // namespace
 }  // namespace nvecd::cache

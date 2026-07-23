@@ -11,7 +11,10 @@
 
 #include <lz4.h>
 
+#include <algorithm>
+#include <climits>
 #include <cstring>
+#include <iterator>
 
 namespace nvecd::cache {
 
@@ -22,40 +25,80 @@ struct SerializedSimilarityResult {
   float score;
 };
 
-utils::Expected<std::vector<uint8_t>, utils::Error> ResultCompressor::CompressSimilarityResults(
+utils::Expected<std::vector<uint8_t>, utils::Error> ResultCompressor::SerializeSimilarityResults(
     const std::vector<similarity::SimilarityResult>& results) {
   if (results.empty()) {
     return std::vector<uint8_t>{};
   }
+  if (results.size() > static_cast<size_t>(INT_MAX) / sizeof(SerializedSimilarityResult)) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kCacheCompressionFailed, "Serialized cache result size exceeds limit"));
+  }
 
-  // Serialize SimilarityResult to POD format
-  std::vector<SerializedSimilarityResult> serialized;
-  serialized.reserve(results.size());
+  std::vector<uint8_t> serialized(results.size() * sizeof(SerializedSimilarityResult));
 
-  for (const auto& result : results) {
+  for (size_t index = 0; index < results.size(); ++index) {
+    const auto& result = results[index];
     // The fixed buffer must hold the id plus a null terminator. An id that does
     // not fit cannot be stored without silent truncation, which would make a
     // cache hit return a different (truncated) id than the uncached path.
     // Reject such results so the entry is never cached truncated and lookups
     // fall through to the authoritative uncached path.
-    if (result.item_id.size() >= sizeof(SerializedSimilarityResult::id)) {
+    if (result.item_id.size() >= sizeof(SerializedSimilarityResult::id) ||
+        result.item_id.find('\0') != std::string::npos) {
       return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCacheCompressionFailed,
-                                                    "item_id length " + std::to_string(result.item_id.size()) +
-                                                        " exceeds cache id buffer capacity " +
-                                                        std::to_string(sizeof(SerializedSimilarityResult::id) - 1)));
+                                                    "item_id is too long or contains an embedded NUL byte"));
     }
 
     SerializedSimilarityResult ser{};
     std::memcpy(ser.id, result.item_id.c_str(), result.item_id.size());
     ser.id[result.item_id.size()] = '\0';  // Ensure null-termination
     ser.score = result.score;
-    serialized.push_back(ser);
+    std::memcpy(serialized.data() + index * sizeof(SerializedSimilarityResult), &ser,
+                sizeof(SerializedSimilarityResult));
+  }
+  return serialized;
+}
+
+utils::Expected<std::vector<similarity::SimilarityResult>, utils::Error> ResultCompressor::DeserializeSimilarityResults(
+    const std::vector<uint8_t>& serialized) {
+  if (serialized.empty()) {
+    return std::vector<similarity::SimilarityResult>{};
+  }
+  if (serialized.size() % sizeof(SerializedSimilarityResult) != 0 || serialized.size() > static_cast<size_t>(INT_MAX)) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kCacheDecompressionFailed, "Invalid serialized cache result size"));
+  }
+  const size_t count = serialized.size() / sizeof(SerializedSimilarityResult);
+  std::vector<similarity::SimilarityResult> results;
+  results.reserve(count);
+  for (size_t index = 0; index < count; ++index) {
+    SerializedSimilarityResult value{};
+    std::memcpy(&value, serialized.data() + index * sizeof(SerializedSimilarityResult), sizeof(value));
+    const auto terminator = std::find(std::begin(value.id), std::end(value.id), '\0');
+    if (terminator == std::end(value.id)) {
+      return utils::MakeUnexpected(
+          utils::MakeError(utils::ErrorCode::kCacheDecompressionFailed, "Cached result ID is not terminated"));
+    }
+    results.emplace_back(std::string(value.id, terminator), value.score);
+  }
+  return results;
+}
+
+utils::Expected<std::vector<uint8_t>, utils::Error> ResultCompressor::CompressSimilarityResults(
+    const std::vector<similarity::SimilarityResult>& results) {
+  auto serialized = SerializeSimilarityResults(results);
+  if (!serialized) {
+    return utils::MakeUnexpected(serialized.error());
+  }
+  if (serialized->empty()) {
+    return std::vector<uint8_t>{};
   }
 
-  const size_t src_size = serialized.size() * sizeof(SerializedSimilarityResult);
+  const size_t src_size = serialized->size();
   // reinterpret_cast required for LZ4 C API (expects char*)
   const auto* src_data =
-      reinterpret_cast<const char*>(serialized.data());  // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+      reinterpret_cast<const char*>(serialized->data());  // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
 
   // Calculate maximum compressed size
   const int max_dst_size = LZ4_compressBound(static_cast<int>(src_size));
@@ -86,12 +129,13 @@ utils::Expected<std::vector<similarity::SimilarityResult>, utils::Error> ResultC
   if (compressed.empty() || original_size == 0) {
     return std::vector<similarity::SimilarityResult>{};
   }
+  if (original_size % sizeof(SerializedSimilarityResult) != 0 || original_size > static_cast<size_t>(INT_MAX) ||
+      compressed.size() > static_cast<size_t>(INT_MAX)) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kCacheDecompressionFailed, "Invalid compressed cache result size"));
+  }
 
-  // original_size is in bytes
-  const size_t num_results = original_size / sizeof(SerializedSimilarityResult);
-
-  // Allocate buffer for serialized data
-  std::vector<SerializedSimilarityResult> serialized(num_results);
+  std::vector<uint8_t> serialized(original_size);
 
   // Decompress
   // reinterpret_cast required for LZ4 C API (expects char*)
@@ -112,15 +156,7 @@ utils::Expected<std::vector<similarity::SimilarityResult>, utils::Error> ResultC
                                                       std::to_string(decompressed_size) + " bytes"));
   }
 
-  // Deserialize to SimilarityResult
-  std::vector<similarity::SimilarityResult> results;
-  results.reserve(num_results);
-
-  for (const auto& ser : serialized) {
-    results.emplace_back(std::string(ser.id), ser.score);
-  }
-
-  return results;
+  return DeserializeSimilarityResults(serialized);
 }
 
 }  // namespace nvecd::cache

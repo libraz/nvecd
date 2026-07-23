@@ -8,7 +8,8 @@
 #include <iomanip>
 #include <sstream>
 
-#include "cache/similarity_cache.h"
+#include "cache/similarity_cache_controller.h"
+#include "config/runtime_variable_manager.h"
 
 namespace nvecd::server::handlers {
 
@@ -16,20 +17,21 @@ utils::Expected<std::string, utils::Error> HandleCacheStats(const HandlerContext
   std::ostringstream oss;
   oss << "OK CACHE_STATS\n";
 
-  auto* cache_ptr = ctx.cache.load(std::memory_order_acquire);
-  if (cache_ptr == nullptr) {
-    oss << "cache_enabled: false\n";
-    oss << "cache_entries: 0\n";
-    oss << "END\r\n";
-    return oss.str();
+  if (ctx.cache_controller == nullptr) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kInternalError, "Cache controller is not initialized"));
   }
 
-  auto stats = cache_ptr->GetStatistics();
+  auto stats = ctx.cache_controller->Cache().GetStatistics();
   const double current_memory_mb = static_cast<double>(stats.current_memory_bytes) / (1024.0 * 1024.0);
-  oss << "cache_enabled: " << (cache_ptr->IsEnabled() ? "true" : "false") << "\n";
+  oss << "cache_enabled: " << (ctx.cache_controller->IsEnabled() ? "true" : "false") << "\n";
   oss << "cache_entries: " << stats.current_entries << "\n";
   oss << "cache_memory_bytes: " << stats.current_memory_bytes << "\n";
   oss << "current_memory_mb: " << std::fixed << std::setprecision(2) << current_memory_mb << "\n";
+  oss << "min_query_cost_ms: " << ctx.cache_controller->Cache().GetMinQueryCost() << "\n";
+  oss << "ttl_seconds: " << ctx.cache_controller->Cache().GetTtl() << "\n";
+  oss << "compression_enabled: " << (ctx.cache_controller->Cache().CompressionEnabled() ? "true" : "false") << "\n";
+  oss << "eviction_batch_size: " << ctx.cache_controller->Cache().EvictionBatchSize() << "\n";
   oss << "total_queries: " << stats.total_queries << "\n";
   oss << "cache_hits: " << stats.cache_hits << "\n";
   oss << "cache_misses: " << stats.cache_misses << "\n";
@@ -47,32 +49,38 @@ utils::Expected<std::string, utils::Error> HandleCacheStats(const HandlerContext
 }
 
 utils::Expected<std::string, utils::Error> HandleCacheClear(HandlerContext& ctx) {
-  auto* cache_ptr = ctx.cache.load(std::memory_order_acquire);
-  if (cache_ptr == nullptr) {
-    return std::string("OK CACHE_CLEARED (no cache)\n");
+  if (ctx.cache_controller == nullptr) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kInternalError, "Cache controller is not initialized"));
   }
-
-  cache_ptr->Clear();
+  auto result = ctx.cache_controller->Clear();
+  if (!result) {
+    return utils::MakeUnexpected(result.error());
+  }
   return std::string("OK CACHE_CLEARED\n");
 }
 
 utils::Expected<std::string, utils::Error> HandleCacheEnable(HandlerContext& ctx) {
-  auto* cache_ptr = ctx.cache.load(std::memory_order_acquire);
-  if (cache_ptr == nullptr) {
-    return std::string("OK CACHE_ENABLED (no cache instance)\n");
+  if (ctx.variable_manager == nullptr) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kInternalError, "Runtime variable manager is not initialized"));
   }
-
-  cache_ptr->SetEnabled(true);
+  auto result = ctx.variable_manager->SetVariable("cache.enabled", "true");
+  if (!result) {
+    return utils::MakeUnexpected(result.error());
+  }
   return std::string("OK CACHE_ENABLED\n");
 }
 
 utils::Expected<std::string, utils::Error> HandleCacheDisable(HandlerContext& ctx) {
-  auto* cache_ptr = ctx.cache.load(std::memory_order_acquire);
-  if (cache_ptr == nullptr) {
-    return std::string("OK CACHE_DISABLED (no cache instance)\n");
+  if (ctx.variable_manager == nullptr) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kInternalError, "Runtime variable manager is not initialized"));
   }
-
-  cache_ptr->SetEnabled(false);
+  auto result = ctx.variable_manager->SetVariable("cache.enabled", "false");
+  if (!result) {
+    return utils::MakeUnexpected(result.error());
+  }
   return std::string("OK CACHE_DISABLED\n");
 }
 

@@ -805,6 +805,14 @@ utils::Expected<void, utils::Error> ValidateConfig(const Config& config) {
     return utils::MakeUnexpected(
         utils::MakeError(utils::ErrorCode::kConfigInvalidValue, "cache.ttl_seconds must be >= 0 (0 = no TTL)"));
   }
+  if (config.cache.min_query_cost_ms < 0.0) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kConfigInvalidValue, "cache.min_query_cost_ms must be >= 0"));
+  }
+  if (config.cache.eviction_batch_size <= 0) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kConfigInvalidValue, "cache.eviction_batch_size must be greater than 0"));
+  }
 
   // Validate WAL configuration
   if (config.wal.enabled && config.wal.dir.empty()) {

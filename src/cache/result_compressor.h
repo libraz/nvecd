@@ -30,6 +30,14 @@ namespace nvecd::cache {
  */
 class ResultCompressor {
  public:
+  /** Serialize results into the fixed-width cache wire representation. */
+  static utils::Expected<std::vector<uint8_t>, utils::Error> SerializeSimilarityResults(
+      const std::vector<similarity::SimilarityResult>& results);
+
+  /** Decode an uncompressed fixed-width cache wire representation. */
+  static utils::Expected<std::vector<similarity::SimilarityResult>, utils::Error> DeserializeSimilarityResults(
+      const std::vector<uint8_t>& serialized);
+
   /**
    * @brief Compress vector of similarity results
    * @param results Vector of similarity results to compress

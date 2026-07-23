@@ -8,7 +8,6 @@
 
 #pragma once
 
-#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -21,7 +20,7 @@
 #include "utils/expected.h"
 
 namespace nvecd::cache {
-class SimilarityCache;
+class SimilarityCacheController;
 }  // namespace nvecd::cache
 
 namespace nvecd::config {
@@ -126,16 +125,10 @@ class RuntimeVariableManager {
   static bool IsMutable(const std::string& variable_name);
 
   /**
-   * @brief Set cache toggle callback
-   * @param callback Function to call when cache.enabled changes
+   * @brief Set the cache controller used for all runtime configuration updates
+   * @param controller Pointer to SimilarityCacheController (non-owning)
    */
-  void SetCacheToggleCallback(std::function<utils::Expected<void, utils::Error>(bool enabled)> callback);
-
-  /**
-   * @brief Set similarity cache for runtime configuration updates
-   * @param cache Pointer to SimilarityCache (non-owning)
-   */
-  void SetSimilarityCache(cache::SimilarityCache* cache);
+  void SetCacheController(cache::SimilarityCacheController* controller);
 
  private:
   RuntimeVariableManager() = default;
@@ -153,9 +146,8 @@ class RuntimeVariableManager {
   // Original config (immutable variables + defaults)
   Config base_config_;
 
-  // Callbacks and component references
-  std::function<utils::Expected<void, utils::Error>(bool enabled)> cache_toggle_callback_;
-  cache::SimilarityCache* similarity_cache_ = nullptr;  // Non-owning pointer
+  // Component reference. Registered once during server initialization.
+  cache::SimilarityCacheController* cache_controller_ = nullptr;  // Non-owning pointer
 
   /**
    * @brief Apply logging.level change

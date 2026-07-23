@@ -151,7 +151,11 @@ class SimilarityCache {
    * @param min_query_cost_ms Minimum query cost to cache (ms)
    * @param ttl_seconds TTL for cache entries (0 = no expiration)
    */
-  explicit SimilarityCache(size_t max_memory_bytes, double min_query_cost_ms, int ttl_seconds = 0);
+  explicit SimilarityCache(size_t max_memory_bytes, double min_query_cost_ms, int ttl_seconds = 0,
+                           bool compression_enabled = true, size_t eviction_batch_size = 1);
+
+  [[nodiscard]] bool CompressionEnabled() const { return compression_enabled_; }
+  [[nodiscard]] size_t EvictionBatchSize() const { return eviction_batch_size_; }
 
   /**
    * @brief Destructor
@@ -199,6 +203,13 @@ class SimilarityCache {
    */
   bool Insert(const CacheKey& key, const std::vector<similarity::SimilarityResult>& results, double query_cost_ms,
               SearchType search_type);
+
+  /**
+   * @brief Atomically insert an entry and its reverse-index references
+   * @return true only when this caller's entry remains admitted
+   */
+  bool InsertAndRegister(const CacheKey& key, const std::vector<similarity::SimilarityResult>& results,
+                         const std::vector<std::string>& item_ids, double query_cost_ms, SearchType search_type);
 
   /**
    * @brief Set cache policy for a search type
@@ -348,6 +359,7 @@ class SimilarityCache {
    */
   struct CachedEntry {
     std::vector<uint8_t> compressed_data;              ///< Compressed result data
+    bool compressed = true;                            ///< Whether compressed_data is LZ4 encoded
     size_t original_size = 0;                          ///< Original size before compression
     double query_cost_ms = 0.0;                        ///< Original query execution time
     std::chrono::steady_clock::time_point created_at;  ///< Creation timestamp
@@ -361,6 +373,7 @@ class SimilarityCache {
     ~CachedEntry() = default;
     CachedEntry(const CachedEntry& other)
         : compressed_data(other.compressed_data),
+          compressed(other.compressed),
           original_size(other.original_size),
           query_cost_ms(other.query_cost_ms),
           created_at(other.created_at),
@@ -371,6 +384,7 @@ class SimilarityCache {
       if (this != &other) {
         compressed_data = other.compressed_data;
         original_size = other.original_size;
+        compressed = other.compressed;
         query_cost_ms = other.query_cost_ms;
         created_at = other.created_at;
         expires_at = other.expires_at;
@@ -381,6 +395,7 @@ class SimilarityCache {
     }
     CachedEntry(CachedEntry&& other) noexcept
         : compressed_data(std::move(other.compressed_data)),
+          compressed(other.compressed),
           original_size(other.original_size),
           query_cost_ms(other.query_cost_ms),
           created_at(other.created_at),
@@ -391,6 +406,7 @@ class SimilarityCache {
       if (this != &other) {
         compressed_data = std::move(other.compressed_data);
         original_size = other.original_size;
+        compressed = other.compressed;
         query_cost_ms = other.query_cost_ms;
         created_at = other.created_at;
         expires_at = other.expires_at;
@@ -409,6 +425,8 @@ class SimilarityCache {
 
   // Configuration
   size_t max_memory_bytes_;
+  bool compression_enabled_ = true;
+  size_t eviction_batch_size_ = 1;
   std::atomic<double> min_query_cost_ms_;
   std::atomic<int> ttl_seconds_{0};  ///< TTL in seconds (0 = no expiration)
   std::atomic<bool> enabled_{true};  ///< Cache enabled flag
@@ -465,7 +483,13 @@ class SimilarityCache {
    * @return true if inserted, false if not cached
    */
   bool InsertWithTtl(const CacheKey& key, const std::vector<similarity::SimilarityResult>& results,
-                     double query_cost_ms, int effective_ttl_seconds);
+                     double query_cost_ms, int effective_ttl_seconds,
+                     const std::vector<std::string>* item_ids = nullptr);
+
+  void RegisterResultItemsLocked(const CacheKey& key, CachedEntry& entry, const std::vector<std::string>& item_ids);
+
+  [[nodiscard]] size_t EstimateMemoryLocked() const;
+  void RefreshMemoryLocked();
 
   /**
    * @brief Erase a cache entry (caller must hold unique_lock on mutex_)
