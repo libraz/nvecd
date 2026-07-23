@@ -321,7 +321,7 @@ snapshot:
 
 2. **重要な操作前の手動スナップショット**
    ```
-   DUMP SAVE /backup/before_upgrade.nvec
+   DUMP SAVE before_upgrade.nvec
    ```
 
 3. **定期的なスナップショット検証**
@@ -345,8 +345,8 @@ snapshot:
 systemctl stop nvecd
 
 # テストサーバーで読み込みテスト
-nvecd-test -c config.yaml
-> DUMP LOAD /backup/snapshot.nvec
+nvecd -c config.yaml
+> DUMP LOAD snapshot.nvec
 > INFO
 > (データ整合性を確認)
 ```

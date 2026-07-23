@@ -599,7 +599,7 @@ DEBUG OFF
 **例**:
 ```
 DEBUG ON
-→ OK Debug mode enabled
+→ OK DEBUG_ON
 ```
 
 #### DEBUG OFF

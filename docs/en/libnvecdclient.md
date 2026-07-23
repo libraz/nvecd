@@ -10,7 +10,7 @@ libnvecdclient is a C/C++ client library for connecting to and querying nvecd se
 - Modern C++17 API with RAII and type safety
 - C API for easy integration with other languages (Python, Node.js, etc.)
 - Thread-safe connection management
-- Both static and shared library builds
+- Shared library build with a CMake package target (`nvecd::client`)
 
 ## Building
 
@@ -20,9 +20,7 @@ The library is built automatically with nvecd:
 make
 ```
 
-This creates:
-- `build/lib/libnvecdclient.a` - Static library
-- `build/lib/libnvecdclient.dylib` (macOS) or `libnvecdclient.so` (Linux) - Shared library
+This creates `build/lib/libnvecdclient.dylib` (macOS) or `libnvecdclient.so` (Linux).
 
 ## Installation
 
@@ -83,8 +81,10 @@ int main() {
 ### Compiling with libnvecdclient
 
 ```bash
-g++ -std=c++17 -o myapp myapp.cpp -lnvecdclient
+cmake -S . -B build && cmake --build build
 ```
+
+Use `find_package(nvecd CONFIG REQUIRED)` and link your target with `nvecd::client`.
 
 ### Event Tracking
 
@@ -151,12 +151,12 @@ if (info) {
 
 ```cpp
 // Save snapshot
-if (auto result = client.Save("/backup/snapshot.dmp"); !result) {
+if (auto result = client.Save("snapshot.dmp"); !result) {
     std::cerr << "Save failed: " << result.error().message() << std::endl;
 }
 
 // Load snapshot
-if (auto result = client.Load("/backup/snapshot.dmp"); !result) {
+if (auto result = client.Load("snapshot.dmp"); !result) {
     std::cerr << "Load failed: " << result.error().message() << std::endl;
 }
 ```
@@ -281,9 +281,9 @@ lib = ctypes.CDLL('/usr/local/lib/libnvecdclient.dylib')  # macOS
 class NvecdClientConfig(ctypes.Structure):
     _fields_ = [
         ("host", ctypes.c_char_p),
-        ("port", ctypes.c_int),
-        ("timeout_ms", ctypes.c_int),
-        ("recv_buffer_size", ctypes.c_int)
+        ("port", ctypes.c_uint16),
+        ("timeout_ms", ctypes.c_uint32),
+        ("recv_buffer_size", ctypes.c_uint32)
     ]
 
 # Create client
@@ -295,6 +295,13 @@ config = NvecdClientConfig(
 )
 
 lib.nvecdclient_create.restype = ctypes.c_void_p
+lib.nvecdclient_create.argtypes = [ctypes.POINTER(NvecdClientConfig)]
+lib.nvecdclient_connect.argtypes = [ctypes.c_void_p]
+lib.nvecdclient_vecset.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
+                                    ctypes.POINTER(ctypes.c_float), ctypes.c_size_t]
+lib.nvecdclient_disconnect.argtypes = [ctypes.c_void_p]
+lib.nvecdclient_destroy.argtypes = [ctypes.c_void_p]
+lib.nvecdclient_get_last_error.argtypes = [ctypes.c_void_p]
 client = lib.nvecdclient_create(ctypes.byref(config))
 
 # Connect

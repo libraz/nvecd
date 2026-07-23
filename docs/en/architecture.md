@@ -433,7 +433,7 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    Client["Client Request<br/>VECSET item456 3<br/>0.1 0.2 0.3"]
+    Client["Client Request<br/>VECSET item456<br/>0.1 0.2 0.3"]
     Dispatcher["RequestDispatcher<br/>Parse VECSET command"]
     VectorStore["VectorStore<br/>1. Validate dimension (3)<br/>2. Optionally normalize to unit length<br/>3. Append to compact matrix_<br/>4. Pre-compute L2 norm<br/>5. Update id_to_idx_ mapping"]
     Cache["SimilarityCache<br/>InvalidateByItemId(item456)<br/>Mark affected entries"]

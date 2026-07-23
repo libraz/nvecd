@@ -249,7 +249,7 @@ curl http://localhost:8080/health/detail
 
 ```bash
 # 手動スナップショット
-echo "DUMP SAVE /backup/nvecd-$(date +%Y%m%d-%H%M%S).dmp" | nc localhost 11017
+echo "DUMP SAVE nvecd-$(date +%Y%m%d-%H%M%S).dmp" | nc localhost 11017
 
 # 自動化された日次スナップショット (cron)
 0 2 * * * echo "DUMP SAVE" | nc localhost 11017
@@ -378,7 +378,7 @@ events:
 **4. スナップショット + 再起動:**
 
 ```bash
-echo "DUMP SAVE /backup/snapshot.dmp" | nc localhost 11017
+echo "DUMP SAVE snapshot.dmp" | nc localhost 11017
 # クリーンな状態でサーバーを再起動
 ```
 

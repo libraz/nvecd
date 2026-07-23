@@ -433,7 +433,7 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    Client["クライアントリクエスト<br/>VECSET item456 3<br/>0.1 0.2 0.3"]
+    Client["クライアントリクエスト<br/>VECSET item456<br/>0.1 0.2 0.3"]
     Dispatcher["RequestDispatcher<br/>VECSETコマンドを解析"]
     VectorStore["VectorStore<br/>1. 次元を検証（3）<br/>2. オプションで単位長に正規化<br/>3. コンパクトmatrix_に追記<br/>4. L2ノルムを事前計算<br/>5. id_to_idx_マッピングを更新"]
     Cache["SimilarityCache<br/>InvalidateByItemId(item456)<br/>影響するエントリをマーク"]

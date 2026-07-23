@@ -599,7 +599,7 @@ Enable debug logging for this connection.
 **Example**:
 ```
 DEBUG ON
-→ OK Debug mode enabled
+→ OK DEBUG_ON
 ```
 
 #### DEBUG OFF

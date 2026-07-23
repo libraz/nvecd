@@ -220,14 +220,14 @@ sudo make uninstall
 または CMake で:
 
 ```bash
-sudo cmake --build build --target uninstall
+sudo cmake --build build --target nvecd-uninstall
 ```
 
 ---
 
 ## テストの実行
 
-nvecd には包括的なテストカバレッジが含まれています (950 以上のテスト、63 テストバイナリ)。
+nvecd には 1,100 件を超える通常 CTest と、明示的に実行する性能・大規模ベンチマークが含まれています。
 
 ### Makefile を使用
 
@@ -269,7 +269,7 @@ cd build
 - **クライアントライブラリ**: C++ / C クライアントテスト (22 以上)
 - **結合テスト (E2E)**: エンドツーエンド、並行性、敵対的、パフォーマンス、TikTok シナリオ (90 以上)
 
-**合計**: 950 以上のテスト、63 テストバイナリ
+**合計**: 1,100 件を超える通常 CTest と、明示的に実行する性能・大規模ベンチマーク
 
 ---
 
@@ -331,13 +331,26 @@ nc localhost 11017
 
 # コマンドを試す
 EVENT user1 ADD item1 100
-VECSET item1 3 0.1 0.5 0.8
+VECSET item1 0.1 0.5 0.8
 SIM item1 10 using=fusion
 
 # 期待されるレスポンス
 OK
 OK
 OK RESULTS 0
+```
+
+`requirepass`を設定した場合、プロセスの引数一覧にパスワードを露出させずに
+CLIを認証できます。パスワードファイルは、実行ユーザーが所有する通常ファイルで、
+グループとその他のユーザーの権限を付けないでください。
+
+```bash
+chmod 600 /path/to/nvecd-password
+nvecd-cli --password-file /path/to/nvecd-password INFO
+
+# 環境変数も利用できます。このオプションには変数名を指定します。
+export NVECD_PASSWORD='replace-me'
+nvecd-cli --password-env NVECD_PASSWORD INFO
 ```
 
 ### システムサービスとして実行 (systemd)
@@ -378,7 +391,7 @@ cmake -B build \
 cmake --build build --parallel
 
 # デバッグログ付きで実行
-./build/bin/nvecd -c examples/config.yaml --log-level debug
+./build/bin/nvecd -c examples/config.yaml
 ```
 
 ### コードフォーマット

@@ -30,6 +30,7 @@ cache:
 
 snapshot:
   dir: "/tmp/nvecd-e2e-dumps"
+  mode: "lock"
 
 network:
   allow_cidrs:

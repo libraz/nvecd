@@ -220,14 +220,14 @@ sudo make uninstall
 Or with CMake:
 
 ```bash
-sudo cmake --build build --target uninstall
+sudo cmake --build build --target nvecd-uninstall
 ```
 
 ---
 
 ## Running Tests
 
-nvecd includes comprehensive test coverage (950+ tests across 63 test binaries).
+nvecd includes more than 1,100 active CTest cases, plus opt-in performance and scale benchmarks.
 
 ### Using Makefile
 
@@ -269,7 +269,7 @@ cd build
 - **Client Library**: C++ and C client tests (22+ tests)
 - **Integration (E2E)**: End-to-end, concurrency, adversarial, performance, TikTok scenarios (90+ tests)
 
-**Total**: 950+ tests across 63 test binaries
+**Total**: More than 1,100 active CTest cases, plus opt-in performance and scale benchmarks
 
 ---
 
@@ -331,13 +331,26 @@ nc localhost 11017
 
 # Try commands
 EVENT user1 ADD item1 100
-VECSET item1 3 0.1 0.5 0.8
+VECSET item1 0.1 0.5 0.8
 SIM item1 10 using=fusion
 
 # Expected responses
 OK
 OK
 OK RESULTS 0
+```
+
+When `requirepass` is configured, authenticate the CLI without exposing the
+password in the process argument list. The password file must be a regular,
+privately owned file with no group or other permissions.
+
+```bash
+chmod 600 /path/to/nvecd-password
+nvecd-cli --password-file /path/to/nvecd-password INFO
+
+# Environment-variable lookup is also supported; the option names the variable.
+export NVECD_PASSWORD='replace-me'
+nvecd-cli --password-env NVECD_PASSWORD INFO
 ```
 
 ### Running as System Service (systemd)
@@ -378,7 +391,7 @@ cmake -B build \
 cmake --build build --parallel
 
 # Run with debug logging
-./build/bin/nvecd -c examples/config.yaml --log-level debug
+./build/bin/nvecd -c examples/config.yaml
 ```
 
 ### Code Formatting

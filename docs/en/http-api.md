@@ -569,7 +569,7 @@ POST /dump/save HTTP/1.1
 Content-Type: application/json
 
 {
-  "filepath": "/backup/snapshot-20250118.dmp"
+  "filepath": "snapshot-20250118.dmp"
 }
 ```
 
@@ -586,7 +586,7 @@ This endpoint requires authentication when `security.requirepass` is set.
 ```json
 {
   "status": "ok",
-  "filepath": "/backup/snapshot-20250118.dmp"
+  "filepath": "snapshot-20250118.dmp"
 }
 ```
 
@@ -597,7 +597,7 @@ real error message; it never reports `status: ok` for a failed save.
 
 ```json
 {
-  "error": "Failed to save snapshot to /backup/snapshot-20250118.dmp: ..."
+  "error": "Failed to save snapshot to snapshot-20250118.dmp: ..."
 }
 ```
 
@@ -612,7 +612,7 @@ POST /dump/load HTTP/1.1
 Content-Type: application/json
 
 {
-  "filepath": "/backup/snapshot-20250118.dmp"
+  "filepath": "snapshot-20250118.dmp"
 }
 ```
 
@@ -623,7 +623,7 @@ This endpoint requires authentication when `security.requirepass` is set.
 ```json
 {
   "status": "ok",
-  "filepath": "/backup/snapshot-20250118.dmp"
+  "filepath": "snapshot-20250118.dmp"
 }
 ```
 
@@ -634,7 +634,7 @@ the underlying error.
 
 ```json
 {
-  "error": "Failed to load snapshot from /backup/snapshot-20250118.dmp: ..."
+  "error": "Failed to load snapshot from snapshot-20250118.dmp: ..."
 }
 ```
 
@@ -649,7 +649,7 @@ POST /dump/verify HTTP/1.1
 Content-Type: application/json
 
 {
-  "filepath": "/backup/snapshot-20250118.dmp"
+  "filepath": "snapshot-20250118.dmp"
 }
 ```
 
@@ -660,7 +660,7 @@ This endpoint requires authentication when `security.requirepass` is set.
 ```json
 {
   "status": "ok",
-  "filepath": "/backup/snapshot-20250118.dmp",
+  "filepath": "snapshot-20250118.dmp",
   "valid": true
 }
 ```
@@ -673,7 +673,7 @@ When integrity verification fails, the endpoint returns a non-2xx status with
 ```json
 {
   "status": "error",
-  "filepath": "/backup/snapshot-20250118.dmp",
+  "filepath": "snapshot-20250118.dmp",
   "valid": false,
   "error": "Snapshot verification failed for ...: CRC mismatch"
 }
@@ -690,7 +690,7 @@ POST /dump/info HTTP/1.1
 Content-Type: application/json
 
 {
-  "filepath": "/backup/snapshot-20250118.dmp"
+  "filepath": "snapshot-20250118.dmp"
 }
 ```
 
@@ -701,7 +701,7 @@ This endpoint requires authentication when `security.requirepass` is set.
 ```json
 {
   "status": "ok",
-  "filepath": "/backup/snapshot-20250118.dmp",
+  "filepath": "snapshot-20250118.dmp",
   "info": {
     "version": "1",
     "stores": "3",
@@ -810,7 +810,7 @@ Disable the similarity cache.
 
 ### POST /debug/on
 
-Enable debug mode (shows detailed query timing in logs).
+Deprecated. HTTP is stateless and does not support per-connection debug mode. This endpoint returns `410 Gone`; use `DEBUG ON` on a persistent TCP connection.
 
 **Request:**
 
@@ -818,17 +818,17 @@ Enable debug mode (shows detailed query timing in logs).
 POST /debug/on HTTP/1.1
 ```
 
-**Response (200 OK):**
+**Response (410 Gone):**
 
 ```json
 {
-  "status": "ok"
+  "error": "HTTP debug mode is not supported; use DEBUG ON on a persistent TCP connection"
 }
 ```
 
 ### POST /debug/off
 
-Disable debug mode.
+Deprecated. This endpoint returns `410 Gone`; use `DEBUG OFF` on the same persistent TCP connection.
 
 **Request:**
 
@@ -836,11 +836,11 @@ Disable debug mode.
 POST /debug/off HTTP/1.1
 ```
 
-**Response (200 OK):**
+**Response (410 Gone):**
 
 ```json
 {
-  "status": "ok"
+  "error": "HTTP debug mode is not supported; use DEBUG OFF on a persistent TCP connection"
 }
 ```
 

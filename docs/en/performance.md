@@ -249,7 +249,7 @@ curl http://localhost:8080/health/detail
 
 ```bash
 # Manual snapshot
-echo "DUMP SAVE /backup/nvecd-$(date +%Y%m%d-%H%M%S).dmp" | nc localhost 11017
+echo "DUMP SAVE nvecd-$(date +%Y%m%d-%H%M%S).dmp" | nc localhost 11017
 
 # Automated daily snapshot (cron)
 0 2 * * * echo "DUMP SAVE" | nc localhost 11017
@@ -378,7 +378,7 @@ events:
 **4. Use snapshot + restart:**
 
 ```bash
-echo "DUMP SAVE /backup/snapshot.dmp" | nc localhost 11017
+echo "DUMP SAVE snapshot.dmp" | nc localhost 11017
 # Restart server with clean state
 ```
 

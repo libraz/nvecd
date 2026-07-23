@@ -25,12 +25,12 @@ nc localhost 11017
 
 ```bash
 # Register a vector for item "item1"
-VECSET item1 3 0.1 0.5 0.8
+VECSET item1 0.1 0.5 0.8
 # Response: OK
 
 # Register more vectors
-VECSET item2 3 0.2 0.4 0.9
-VECSET item3 3 0.1 0.6 0.7
+VECSET item2 0.2 0.4 0.9
+VECSET item3 0.1 0.6 0.7
 ```
 
 ### 4. Record Events
@@ -105,9 +105,9 @@ EVENT user2 ADD movie123 90
 EVENT user2 ADD movie789 85
 
 # Register movie vectors (metadata embeddings)
-VECSET movie123 128 ...
-VECSET movie456 128 ...
-VECSET movie789 128 ...
+VECSET movie123 0.12 0.34 ...
+VECSET movie456 0.23 0.45 ...
+VECSET movie789 0.34 0.56 ...
 
 # Find movies similar to movie123 (fusion mode)
 SIM movie123 10 using=fusion
@@ -260,7 +260,7 @@ sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 sock.connect(('localhost', 11017))
 
 # Send command
-sock.sendall(b'VECSET item1 3 0.1 0.5 0.8\n')
+sock.sendall(b'VECSET item1 0.1 0.5 0.8\n')
 response = sock.recv(1024).decode().strip()
 print(response)  # "OK"
 
@@ -343,7 +343,7 @@ snapshot:
 
 Manual snapshot before maintenance:
 ```bash
-DUMP SAVE /backup/before_maintenance.nvec
+DUMP SAVE before_maintenance.nvec
 ```
 
 ### 3. Performance Tuning

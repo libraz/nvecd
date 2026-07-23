@@ -472,7 +472,7 @@ POST /dump/save HTTP/1.1
 Content-Type: application/json
 
 {
-  "filepath": "/backup/snapshot-20250118.dmp"
+  "filepath": "snapshot-20250118.dmp"
 }
 ```
 
@@ -487,7 +487,7 @@ Content-Type: application/json
 ```json
 {
   "status": "ok",
-  "filepath": "/backup/snapshot-20250118.dmp",
+  "filepath": "snapshot-20250118.dmp",
   "size_bytes": 314572800
 }
 ```
@@ -503,7 +503,7 @@ POST /dump/load HTTP/1.1
 Content-Type: application/json
 
 {
-  "filepath": "/backup/snapshot-20250118.dmp"
+  "filepath": "snapshot-20250118.dmp"
 }
 ```
 
@@ -536,7 +536,7 @@ POST /dump/verify HTTP/1.1
 Content-Type: application/json
 
 {
-  "filepath": "/backup/snapshot-20250118.dmp"
+  "filepath": "snapshot-20250118.dmp"
 }
 ```
 
@@ -560,7 +560,7 @@ POST /dump/info HTTP/1.1
 Content-Type: application/json
 
 {
-  "filepath": "/backup/snapshot-20250118.dmp"
+  "filepath": "snapshot-20250118.dmp"
 }
 ```
 
@@ -670,7 +670,7 @@ Content-Type: application/json
 
 ### POST /debug/on
 
-デバッグモードを有効化（ログに詳細なクエリタイミングを表示）。
+非推奨です。HTTPはステートレスで接続単位のデバッグモードを保持できないため、このendpointは`410 Gone`を返します。永続TCP接続で`DEBUG ON`を使用してください。
 
 **リクエスト:**
 
@@ -678,17 +678,17 @@ Content-Type: application/json
 POST /debug/on HTTP/1.1
 ```
 
-**レスポンス（200 OK）:**
+**レスポンス（410 Gone）:**
 
 ```json
 {
-  "status": "ok"
+  "error": "HTTP debug mode is not supported; use DEBUG ON on a persistent TCP connection"
 }
 ```
 
 ### POST /debug/off
 
-デバッグモードを無効化します。
+非推奨です。このendpointは`410 Gone`を返します。同じ永続TCP接続で`DEBUG OFF`を使用してください。
 
 **リクエスト:**
 
@@ -696,11 +696,11 @@ POST /debug/on HTTP/1.1
 POST /debug/off HTTP/1.1
 ```
 
-**レスポンス（200 OK）:**
+**レスポンス（410 Gone）:**
 
 ```json
 {
-  "status": "ok"
+  "error": "HTTP debug mode is not supported; use DEBUG OFF on a persistent TCP connection"
 }
 ```
 

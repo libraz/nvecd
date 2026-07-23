@@ -18,7 +18,7 @@ class TestBoundaryValues:
     def test_event_large_score(self, nvecd):
         resp = nvecd.event("boundary_ctx", "item_large", 999999)
         assert resp is not None
-        assert resp.startswith("OK")
+        assert resp.startswith("ERROR")
 
     def test_sim_top_k_zero(self, nvecd):
         resp = nvecd.sim("any_item", 0, mode="events")
