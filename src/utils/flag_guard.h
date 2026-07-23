@@ -41,8 +41,15 @@ class FlagGuard {
  */
 class FlagResetGuard {
  public:
-  explicit FlagResetGuard(std::atomic<bool>& flag) : flag_(flag) {}
-  ~FlagResetGuard() { flag_ = false; }
+  explicit FlagResetGuard(std::atomic<bool>& flag) : flag_(&flag) {}
+  ~FlagResetGuard() {
+    if (flag_ != nullptr) {
+      flag_->store(false, std::memory_order_release);
+    }
+  }
+
+  /** Keep the guarded flag set after destruction (fail-stop ownership). */
+  void KeepSet() { flag_ = nullptr; }
 
   // Non-copyable and non-movable
   FlagResetGuard(const FlagResetGuard&) = delete;
@@ -51,7 +58,7 @@ class FlagResetGuard {
   FlagResetGuard& operator=(FlagResetGuard&&) = delete;
 
  private:
-  std::atomic<bool>& flag_;
+  std::atomic<bool>* flag_;
 };
 
 }  // namespace nvecd::utils

@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include <sys/types.h>
+
 #include <atomic>
 #include <functional>
 #include <memory>
@@ -146,6 +148,10 @@ class ConnectionAcceptor {
   std::unordered_map<int, std::string> fd_to_ip_;  ///< Map fd to client IP for cleanup
 
   std::string unix_socket_path_;  ///< Non-empty when in UDS mode
+  int unix_socket_parent_fd_ = -1;
+  std::string unix_socket_filename_;
+  dev_t unix_socket_device_ = 0;
+  ino_t unix_socket_inode_ = 0;
 };
 
 }  // namespace nvecd::server

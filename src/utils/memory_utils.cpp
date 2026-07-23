@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 
 #include "utils/string_utils.h"
@@ -36,7 +37,34 @@ namespace {
 constexpr double kHealthyThreshold = 0.2;  // 20% available = healthy
 constexpr double kWarningThreshold = 0.1;  // 10% available = warning
 // Below 10% = critical
+
+#ifdef __linux__
+std::optional<uint64_t> ReadCgroupCounter(const char* path) {
+  std::ifstream input(path);
+  std::string value;
+  if (!(input >> value) || value == "max") {
+    return std::nullopt;
+  }
+  try {
+    size_t consumed = 0;
+    const uint64_t parsed = std::stoull(value, &consumed);
+    return consumed == value.size() ? std::optional<uint64_t>(parsed) : std::nullopt;
+  } catch (...) {
+    return std::nullopt;
+  }
+}
+#endif
 }  // namespace
+
+SystemMemoryInfo detail::ApplyCgroupLimit(SystemMemoryInfo host, uint64_t limit_bytes, uint64_t usage_bytes) {
+  if (limit_bytes == 0 || limit_bytes >= host.total_physical_bytes) {
+    return host;
+  }
+  host.total_physical_bytes = limit_bytes;
+  const uint64_t cgroup_available = usage_bytes >= limit_bytes ? 0 : limit_bytes - usage_bytes;
+  host.available_physical_bytes = std::min(host.available_physical_bytes, cgroup_available);
+  return host;
+}
 
 std::optional<SystemMemoryInfo> GetSystemMemoryInfo() {
   SystemMemoryInfo info{};
@@ -129,6 +157,16 @@ std::optional<SystemMemoryInfo> GetSystemMemoryInfo() {
   if (info.total_physical_bytes == 0) {
     spdlog::error("Failed to parse total physical memory from /proc/meminfo");
     return std::nullopt;
+  }
+
+  auto cgroup_limit = ReadCgroupCounter("/sys/fs/cgroup/memory.max");
+  auto cgroup_usage = ReadCgroupCounter("/sys/fs/cgroup/memory.current");
+  if (!cgroup_limit.has_value() || !cgroup_usage.has_value()) {
+    cgroup_limit = ReadCgroupCounter("/sys/fs/cgroup/memory/memory.limit_in_bytes");
+    cgroup_usage = ReadCgroupCounter("/sys/fs/cgroup/memory/memory.usage_in_bytes");
+  }
+  if (cgroup_limit.has_value() && cgroup_usage.has_value() && *cgroup_limit != std::numeric_limits<uint64_t>::max()) {
+    info = detail::ApplyCgroupLimit(info, *cgroup_limit, *cgroup_usage);
   }
 
 #else

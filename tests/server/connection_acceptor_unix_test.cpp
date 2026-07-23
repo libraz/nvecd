@@ -30,13 +30,14 @@ namespace fs = std::filesystem;
 class ConnectionAcceptorUnixTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    // Generate unique socket path per test
-    socket_path_ = "/tmp/nvecd_test_" + std::to_string(getpid()) + "_" + std::to_string(test_counter_++) + ".sock";
-    // Ensure no leftover
-    unlink(socket_path_.c_str());
+    test_directory_ = fs::temp_directory_path() /
+                      ("nvecd_uds_test_" + std::to_string(getpid()) + "_" + std::to_string(test_counter_++));
+    fs::create_directories(test_directory_);
+    fs::permissions(test_directory_, fs::perms::owner_all, fs::perm_options::replace);
+    socket_path_ = (test_directory_ / "server.sock").string();
   }
 
-  void TearDown() override { unlink(socket_path_.c_str()); }
+  void TearDown() override { fs::remove_all(test_directory_); }
 
   nvecd::server::ServerConfig MakeUdsConfig() {
     nvecd::server::ServerConfig config;
@@ -91,6 +92,7 @@ class ConnectionAcceptorUnixTest : public ::testing::Test {
   }
 
   std::string socket_path_;
+  fs::path test_directory_;
   static int test_counter_;
 };
 
@@ -162,8 +164,7 @@ TEST_F(ConnectionAcceptorUnixTest, IsUnixSocket_False) {
 // Test 4: StaleSocketCleanup
 // ============================================================================
 
-TEST_F(ConnectionAcceptorUnixTest, StaleSocketCleanup) {
-  // Create a dummy file at the socket path (simulating a stale socket)
+TEST_F(ConnectionAcceptorUnixTest, RegularFileAtSocketPathIsPreservedAndRejected) {
   {
     std::ofstream ofs(socket_path_);
     ASSERT_TRUE(ofs.good()) << "Failed to create stale file at " << socket_path_;
@@ -176,14 +177,50 @@ TEST_F(ConnectionAcceptorUnixTest, StaleSocketCleanup) {
 
   acceptor.SetConnectionHandler([](int client_fd) { close(client_fd); });
 
-  // Start should succeed by removing the stale file and creating a new socket
   auto result = acceptor.Start();
-  ASSERT_TRUE(result.has_value()) << "Start failed with stale socket: " << result.error().message();
-
-  EXPECT_TRUE(acceptor.IsRunning());
+  EXPECT_FALSE(result.has_value());
   EXPECT_TRUE(fs::exists(socket_path_));
+  EXPECT_TRUE(fs::is_regular_file(socket_path_));
+}
+
+TEST_F(ConnectionAcceptorUnixTest, OwnedStaleSocketIsRemovedByIdentity) {
+  const int stale_fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+  ASSERT_GE(stale_fd, 0);
+  struct sockaddr_un stale_address {};
+  stale_address.sun_family = AF_UNIX;
+  std::strncpy(stale_address.sun_path, socket_path_.c_str(), sizeof(stale_address.sun_path) - 1);
+  ASSERT_EQ(::bind(stale_fd, reinterpret_cast<sockaddr*>(&stale_address), sizeof(stale_address)), 0);
+  ::close(stale_fd);
+
+  nvecd::server::ThreadPool pool(2);
+  auto config = MakeUdsConfig();
+  nvecd::server::ConnectionAcceptor acceptor(config, &pool);
+  acceptor.SetConnectionHandler([](int client_fd) { close(client_fd); });
+
+  auto result = acceptor.Start();
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+  EXPECT_TRUE(acceptor.IsRunning());
+  EXPECT_TRUE(fs::is_socket(socket_path_));
 
   acceptor.Stop();
+}
+
+TEST_F(ConnectionAcceptorUnixTest, StopPreservesReplacementAtSocketPath) {
+  nvecd::server::ThreadPool pool(2);
+  auto config = MakeUdsConfig();
+  nvecd::server::ConnectionAcceptor acceptor(config, &pool);
+  acceptor.SetConnectionHandler([](int client_fd) { close(client_fd); });
+  ASSERT_TRUE(acceptor.Start());
+
+  ASSERT_EQ(::unlink(socket_path_.c_str()), 0);
+  {
+    std::ofstream replacement(socket_path_);
+    ASSERT_TRUE(replacement.good());
+    replacement << "preserve me";
+  }
+  acceptor.Stop();
+
+  EXPECT_TRUE(fs::is_regular_file(socket_path_));
 }
 
 // ============================================================================

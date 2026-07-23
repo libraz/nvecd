@@ -30,6 +30,10 @@ struct ProcessMemoryInfo {
   uint64_t peak_rss_bytes;  ///< Peak RSS (high water mark)
 };
 
+namespace detail {
+SystemMemoryInfo ApplyCgroupLimit(SystemMemoryInfo host, uint64_t limit_bytes, uint64_t usage_bytes);
+}
+
 /**
  * @brief Memory health status
  */

@@ -88,6 +88,15 @@ TEST_F(PathUtilsTest, GroupWritableDumpDirectoryRejected) {
   EXPECT_FALSE(result.has_value());
 }
 
+TEST_F(PathUtilsTest, GroupWritableNestedDirectoryRejected) {
+  const auto nested = test_dir_ / "nested";
+  ASSERT_TRUE(std::filesystem::create_directory(nested));
+  ASSERT_EQ(::chmod(nested.c_str(), 0770), 0);
+
+  auto result = ValidateDumpPath("nested/snapshot.dmp", test_dir_.string());
+  EXPECT_FALSE(result.has_value());
+}
+
 TEST_F(PathUtilsTest, ResolvesStoragePathThroughPrivateSymlink) {
   const auto symlink_path = test_dir_.parent_path() / ("nvecd_path_link_" + std::to_string(::getpid()));
   std::error_code error;
@@ -99,4 +108,29 @@ TEST_F(PathUtilsTest, ResolvesStoragePathThroughPrivateSymlink) {
   EXPECT_EQ(result->parent_path(), std::filesystem::canonical(test_dir_));
 
   std::filesystem::remove(symlink_path, error);
+}
+
+TEST_F(PathUtilsTest, DirectoryDescriptorPreventsAncestorRenameRedirection) {
+  const auto original = test_dir_ / "private";
+  const auto moved = test_dir_ / "private-moved";
+  ASSERT_TRUE(std::filesystem::create_directory(original));
+  ASSERT_EQ(::chmod(original.c_str(), 0700), 0);
+
+  auto target_result = PrivateStorageTarget::Open(original / "snapshot.dmp");
+  ASSERT_TRUE(target_result.has_value()) << target_result.error().message();
+  auto target = std::move(target_result.value());
+
+  std::filesystem::rename(original, moved);
+  ASSERT_TRUE(std::filesystem::create_directory(original));
+  ASSERT_EQ(::chmod(original.c_str(), 0700), 0);
+
+  auto temporary_result = target.CreateTemporaryFile();
+  ASSERT_TRUE(temporary_result.has_value()) << temporary_result.error().message();
+  auto temporary = std::move(temporary_result.value());
+  constexpr char contents[] = "trusted";
+  ASSERT_EQ(::write(temporary.Get(), contents, sizeof(contents) - 1), static_cast<ssize_t>(sizeof(contents) - 1));
+  ASSERT_TRUE(target.Publish(temporary).has_value());
+
+  EXPECT_TRUE(std::filesystem::exists(moved / "snapshot.dmp"));
+  EXPECT_FALSE(std::filesystem::exists(original / "snapshot.dmp"));
 }

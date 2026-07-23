@@ -13,7 +13,9 @@
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -305,9 +307,10 @@ class StructuredLog {
    * @brief Create a text field (key=value or key="value")
    */
   static std::string MakeTextField(const std::string& key, const std::string& value) {
-    // Quote string values that contain spaces or special characters
-    if (value.find(' ') != std::string::npos || value.find('"') != std::string::npos ||
-        value.find('\n') != std::string::npos) {
+    const bool needs_quoting = std::any_of(value.begin(), value.end(), [](unsigned char character) {
+      return character <= 0x20 || character == 0x7f || character == '"' || character == '\\';
+    });
+    if (needs_quoting) {
       return key + "=\"" + EscapeText(value) + "\"";
     }
     return key + "=" + value;
@@ -341,7 +344,7 @@ class StructuredLog {
    */
   static std::string Escape(const std::string& str) {
     // Control character threshold for JSON escaping (0x20 = space)
-    constexpr char kControlCharThreshold = 0x20;
+    constexpr unsigned char kControlCharThreshold = 0x20;
 
     std::string escaped;
     escaped.reserve(str.size());
@@ -369,7 +372,7 @@ class StructuredLog {
           escaped += R"(\t)";
           break;
         default:
-          if (chr >= 0 && chr < kControlCharThreshold) {
+          if (static_cast<unsigned char>(chr) < kControlCharThreshold) {
             // Control characters: \u00XX format
             char buf[7];  // NOLINT(modernize-avoid-c-arrays)
             std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(chr));
@@ -454,12 +457,28 @@ inline void LogStorageWarning(const std::string& operation, const std::string& m
  * @brief Log command parsing error in structured format
  */
 inline void LogCommandParseError(const std::string& command, const std::string& error_msg, size_t error_position = 0) {
-  // Maximum command length to log (prevent log spam)
-  constexpr size_t kMaxCommandLogLength = 200;
+  constexpr size_t kMaxVerbLength = 32;
+  std::string verb;
+  size_t cursor = 0;
+  while (cursor < command.size() && std::isspace(static_cast<unsigned char>(command[cursor])) != 0) {
+    ++cursor;
+  }
+  while (cursor < command.size() && std::isspace(static_cast<unsigned char>(command[cursor])) == 0 &&
+         verb.size() < kMaxVerbLength) {
+    const unsigned char character = static_cast<unsigned char>(command[cursor++]);
+    if (character < 0x21 || character > 0x7e) {
+      verb = "<invalid>";
+      break;
+    }
+    verb.push_back(static_cast<char>(std::toupper(character)));
+  }
+  if (verb.empty()) {
+    verb = "<empty>";
+  }
 
   StructuredLog()
       .Event("command_parse_error")
-      .Field("command", command.substr(0, kMaxCommandLogLength))
+      .Field("command", verb)
       .Field("error", error_msg)
       .Field("position", static_cast<int64_t>(error_position))
       .Error();

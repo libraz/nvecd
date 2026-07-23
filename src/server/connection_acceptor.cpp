@@ -15,6 +15,7 @@
 
 #include <chrono>
 #include <cstring>
+#include <filesystem>
 #include <thread>
 
 #include "server/server_types.h"
@@ -22,6 +23,7 @@
 #include "utils/error.h"
 #include "utils/expected.h"
 #include "utils/network_utils.h"
+#include "utils/path_utils.h"
 #include "utils/structured_log.h"
 
 namespace nvecd::server {
@@ -80,7 +82,21 @@ nvecd::utils::Expected<void, nvecd::utils::Error> ConnectionAcceptor::Start() {
 
   // Unix domain socket mode
   if (!config_.unix_socket_path.empty()) {
-    unix_socket_path_ = config_.unix_socket_path;
+    const std::filesystem::path configured_path(config_.unix_socket_path);
+    const auto parent =
+        configured_path.parent_path().empty() ? std::filesystem::path(".") : configured_path.parent_path();
+    std::error_code path_error;
+    const auto canonical_parent = std::filesystem::canonical(parent, path_error);
+    if (path_error || configured_path.filename().empty()) {
+      return MakeUnexpected(
+          MakeError(ErrorCode::kNetworkUnixSocketStale, "Invalid Unix socket parent directory: " + parent.string()));
+    }
+    auto private_parent = nvecd::utils::ValidatePrivateDirectory(canonical_parent);
+    if (!private_parent) {
+      return MakeUnexpected(private_parent.error());
+    }
+    unix_socket_path_ = (canonical_parent / configured_path.filename()).string();
+    unix_socket_filename_ = configured_path.filename().string();
 
     // Validate path length
     struct sockaddr_un addr_check {};
@@ -90,8 +106,25 @@ nvecd::utils::Expected<void, nvecd::utils::Error> ConnectionAcceptor::Start() {
                                           std::to_string(sizeof(addr_check.sun_path) - 1) + "): " + unix_socket_path_));
     }
 
-    // Check for stale socket file
-    if (access(unix_socket_path_.c_str(), F_OK) == 0) {
+    // Keep the validated parent inode open for all identity checks and unlink.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg): POSIX open requires mode only with O_CREAT.
+    unix_socket_parent_fd_ = ::open(canonical_parent.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    if (unix_socket_parent_fd_ < 0) {
+      return MakeUnexpected(MakeError(ErrorCode::kPermissionDenied, "Failed to securely open Unix socket directory: " +
+                                                                        std::string(strerror(errno))));
+    }
+
+    // Check for a stale socket without following a replacement symlink. Never
+    // remove an arbitrary regular file at the configured path.
+    struct stat existing_info {};
+    if (::fstatat(unix_socket_parent_fd_, unix_socket_filename_.c_str(), &existing_info, AT_SYMLINK_NOFOLLOW) == 0) {
+      if (!S_ISSOCK(existing_info.st_mode) || existing_info.st_uid != ::geteuid()) {
+        ::close(unix_socket_parent_fd_);
+        unix_socket_parent_fd_ = -1;
+        return MakeUnexpected(
+            MakeError(ErrorCode::kNetworkUnixSocketStale,
+                      "Refusing to replace non-socket or foreign-owned Unix socket path: " + unix_socket_path_));
+      }
       // File exists -- probe to check if another server is listening
       int probe_fd = socket(AF_UNIX, SOCK_STREAM, 0);
       if (probe_fd >= 0) {
@@ -102,20 +135,38 @@ nvecd::utils::Expected<void, nvecd::utils::Error> ConnectionAcceptor::Start() {
         if (connect(probe_fd, ToSockaddrUn(&probe_addr), sizeof(probe_addr)) == 0) {
           // Connection succeeded -- another server is active
           close(probe_fd);
+          ::close(unix_socket_parent_fd_);
+          unix_socket_parent_fd_ = -1;
           return MakeUnexpected(MakeError(ErrorCode::kNetworkUnixSocketStale,
                                           "Another server is already listening on: " + unix_socket_path_));
         }
         close(probe_fd);
       }
 
-      // Stale socket file -- remove it
-      unlink(unix_socket_path_.c_str());
+      struct stat rechecked_info {};
+      if (::fstatat(unix_socket_parent_fd_, unix_socket_filename_.c_str(), &rechecked_info, AT_SYMLINK_NOFOLLOW) != 0 ||
+          rechecked_info.st_dev != existing_info.st_dev || rechecked_info.st_ino != existing_info.st_ino ||
+          !S_ISSOCK(rechecked_info.st_mode) || rechecked_info.st_uid != ::geteuid() ||
+          ::unlinkat(unix_socket_parent_fd_, unix_socket_filename_.c_str(), 0) != 0) {
+        ::close(unix_socket_parent_fd_);
+        unix_socket_parent_fd_ = -1;
+        return MakeUnexpected(MakeError(ErrorCode::kNetworkUnixSocketStale,
+                                        "Unix socket path changed while removing stale socket: " + unix_socket_path_));
+      }
       nvecd::utils::StructuredLog().Event("unix_socket_stale_removed").Field("path", unix_socket_path_).Info();
+    } else if (errno != ENOENT) {
+      const int saved_errno = errno;
+      ::close(unix_socket_parent_fd_);
+      unix_socket_parent_fd_ = -1;
+      return MakeUnexpected(MakeError(ErrorCode::kNetworkUnixSocketStale,
+                                      "Failed to inspect Unix socket path: " + std::string(strerror(saved_errno))));
     }
 
     // Create unix socket
     server_fd_ = socket(AF_UNIX, SOCK_STREAM, 0);
     if (server_fd_ < 0) {
+      ::close(unix_socket_parent_fd_);
+      unix_socket_parent_fd_ = -1;
       return MakeUnexpected(MakeError(ErrorCode::kNetworkSocketCreationFailed,
                                       "Failed to create unix socket: " + std::string(strerror(errno))));
     }
@@ -128,11 +179,27 @@ nvecd::utils::Expected<void, nvecd::utils::Error> ConnectionAcceptor::Start() {
     if (bind(server_fd_, ToSockaddrUn(&bind_addr), sizeof(bind_addr)) < 0) {
       close(server_fd_);
       server_fd_ = -1;
+      ::close(unix_socket_parent_fd_);
+      unix_socket_parent_fd_ = -1;
       return MakeUnexpected(
           MakeError(ErrorCode::kNetworkBindFailed, "Failed to bind unix socket: " + std::string(strerror(errno))));
     }
 
-    // Set permissions (owner + group only)
+    struct stat bound_info {};
+    if (::fstatat(unix_socket_parent_fd_, unix_socket_filename_.c_str(), &bound_info, AT_SYMLINK_NOFOLLOW) != 0 ||
+        !S_ISSOCK(bound_info.st_mode) || bound_info.st_uid != ::geteuid()) {
+      close(server_fd_);
+      server_fd_ = -1;
+      (void)::unlinkat(unix_socket_parent_fd_, unix_socket_filename_.c_str(), 0);
+      ::close(unix_socket_parent_fd_);
+      unix_socket_parent_fd_ = -1;
+      return MakeUnexpected(MakeError(ErrorCode::kNetworkBindFailed, "Bound Unix socket identity validation failed"));
+    }
+    unix_socket_device_ = bound_info.st_dev;
+    unix_socket_inode_ = bound_info.st_ino;
+
+    // Set permissions (owner + group only). The private parent prevents path
+    // replacement, and identity is rechecked immediately afterwards.
     // NOLINTNEXTLINE(readability-magic-numbers,cppcoreguidelines-avoid-magic-numbers)
     if (chmod(unix_socket_path_.c_str(), 0770) < 0) {
       nvecd::utils::StructuredLog()
@@ -141,12 +208,24 @@ nvecd::utils::Expected<void, nvecd::utils::Error> ConnectionAcceptor::Start() {
           .Field("error", strerror(errno))
           .Warn();
     }
+    struct stat chmod_info {};
+    if (::fstatat(unix_socket_parent_fd_, unix_socket_filename_.c_str(), &chmod_info, AT_SYMLINK_NOFOLLOW) != 0 ||
+        chmod_info.st_dev != unix_socket_device_ || chmod_info.st_ino != unix_socket_inode_ ||
+        !S_ISSOCK(chmod_info.st_mode)) {
+      close(server_fd_);
+      server_fd_ = -1;
+      ::close(unix_socket_parent_fd_);
+      unix_socket_parent_fd_ = -1;
+      return MakeUnexpected(MakeError(ErrorCode::kNetworkBindFailed, "Unix socket changed during chmod"));
+    }
 
     // Listen
     if (listen(server_fd_, config_.max_connections) < 0) {
       close(server_fd_);
       server_fd_ = -1;
-      unlink(unix_socket_path_.c_str());
+      (void)::unlinkat(unix_socket_parent_fd_, unix_socket_filename_.c_str(), 0);
+      ::close(unix_socket_parent_fd_);
+      unix_socket_parent_fd_ = -1;
       return MakeUnexpected(MakeError(ErrorCode::kNetworkListenFailed,
                                       "Failed to listen on unix socket: " + std::string(strerror(errno))));
     }
@@ -284,9 +363,25 @@ void ConnectionAcceptor::Stop() {
 
   // Remove unix socket file
   if (!unix_socket_path_.empty()) {
-    unlink(unix_socket_path_.c_str());
-    nvecd::utils::StructuredLog().Event("unix_socket_removed").Field("path", unix_socket_path_).Debug();
+    struct stat current_info {};
+    const bool same_socket =
+        unix_socket_parent_fd_ >= 0 &&
+        ::fstatat(unix_socket_parent_fd_, unix_socket_filename_.c_str(), &current_info, AT_SYMLINK_NOFOLLOW) == 0 &&
+        S_ISSOCK(current_info.st_mode) && current_info.st_uid == ::geteuid() &&
+        current_info.st_dev == unix_socket_device_ && current_info.st_ino == unix_socket_inode_;
+    if (same_socket && ::unlinkat(unix_socket_parent_fd_, unix_socket_filename_.c_str(), 0) == 0) {
+      nvecd::utils::StructuredLog().Event("unix_socket_removed").Field("path", unix_socket_path_).Debug();
+    } else if (!same_socket) {
+      nvecd::utils::StructuredLog().Event("unix_socket_replacement_preserved").Field("path", unix_socket_path_).Warn();
+    }
+    if (unix_socket_parent_fd_ >= 0) {
+      ::close(unix_socket_parent_fd_);
+      unix_socket_parent_fd_ = -1;
+    }
     unix_socket_path_.clear();
+    unix_socket_filename_.clear();
+    unix_socket_device_ = 0;
+    unix_socket_inode_ = 0;
   }
 
   // In reactor mode, IoReactor owns the client fds and releases accounting
