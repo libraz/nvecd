@@ -6,8 +6,12 @@
 #include "server/wal_codec.h"
 
 #include <gtest/gtest.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 
 #include "server/command_parser.h"
 #include "storage/wal.h"
@@ -233,10 +237,45 @@ TEST(WalCheckpointTest, SidecarRoundTrip) {
 
   EXPECT_EQ(storage::ReadWalCheckpoint(snapshot_path), sequence);
 
+  struct stat info {};
+  const std::string sidecar_path = snapshot_path + storage::kWalCheckpointSuffix;
+  ASSERT_EQ(::stat(sidecar_path.c_str(), &info), 0);
+  EXPECT_EQ(info.st_mode & (S_IRWXG | S_IRWXO), 0);
+
   // Absent sidecar returns 0.
   EXPECT_EQ(storage::ReadWalCheckpoint(::testing::TempDir() + "/wal_codec_test_missing.bin"), 0ULL);
 
-  ::unlink((snapshot_path + storage::kWalCheckpointSuffix).c_str());
+  ::unlink(sidecar_path.c_str());
+}
+
+TEST(WalCheckpointTest, DoesNotFollowLegacyTemporaryFileSymlink) {
+  namespace fs = std::filesystem;
+  const fs::path test_dir = fs::temp_directory_path() / ("nvecd_wal_checkpoint_test_" + std::to_string(::getpid()));
+  fs::remove_all(test_dir);
+  fs::create_directories(test_dir);
+  fs::permissions(test_dir, fs::perms::owner_all, fs::perm_options::replace);
+
+  const std::string snapshot_path = (test_dir / "snapshot.dmp").string();
+  const fs::path victim = test_dir / "victim.txt";
+  {
+    std::ofstream victim_file(victim);
+    victim_file << "do not overwrite";
+  }
+
+  const fs::path legacy_temporary_file = snapshot_path + ".tmp";
+  std::error_code error;
+  fs::create_symlink(victim, legacy_temporary_file, error);
+  ASSERT_FALSE(error) << error.message();
+
+  auto result = storage::WriteWalCheckpoint(snapshot_path, 42);
+  ASSERT_TRUE(result.has_value()) << result.error().to_string();
+
+  std::ifstream victim_file(victim);
+  std::string victim_contents;
+  std::getline(victim_file, victim_contents);
+  EXPECT_EQ(victim_contents, "do not overwrite");
+
+  fs::remove_all(test_dir);
 }
 
 }  // namespace

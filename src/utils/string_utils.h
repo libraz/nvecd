@@ -88,4 +88,9 @@ std::string CodepointsToUtf8(const std::vector<uint32_t>& codepoints);
  */
 std::string FormatBytes(size_t bytes);
 
+/**
+ * @brief Compare two opaque secrets without revealing the matching prefix length.
+ */
+bool ConstantTimeEquals(std::string_view left, std::string_view right);
+
 }  // namespace nvecd::utils

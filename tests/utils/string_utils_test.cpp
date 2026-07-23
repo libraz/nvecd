@@ -22,6 +22,16 @@ TEST(Utf8ToCodepointsTest, AsciiString) {
   EXPECT_EQ(cps[2], 'c');
 }
 
+TEST(ConstantTimeEqualsTest, EqualValuesMatch) {
+  EXPECT_TRUE(ConstantTimeEquals("same-secret", "same-secret"));
+}
+
+TEST(ConstantTimeEqualsTest, DifferentValuesAndLengthsDoNotMatch) {
+  EXPECT_FALSE(ConstantTimeEquals("same-secret", "same-secreT"));
+  EXPECT_FALSE(ConstantTimeEquals("same-secret", "same-secret-extra"));
+  EXPECT_FALSE(ConstantTimeEquals("", "x"));
+}
+
 TEST(Utf8ToCodepointsTest, EmptyString) {
   auto cps = Utf8ToCodepoints("");
   EXPECT_TRUE(cps.empty());

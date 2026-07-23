@@ -2,6 +2,10 @@
 
 Nvecd は Web アプリケーションや HTTP クライアントとの統合を容易にする RESTful JSON API を提供します。
 
+## 認証
+
+`security.requirepass` を設定すると、書込み・管理 endpoint は認証必須です。`GET /dump/status` も管理 endpoint のため認証が必要です。`Authorization: Bearer <password>` または `Authorization: Basic base64(<user>:<password>)` を指定してください。
+
 ## 設定
 
 `config.yaml` で HTTP サーバーを有効化します：
@@ -575,6 +579,8 @@ Content-Type: application/json
 ### GET /dump/status
 
 バックグラウンドスナップショット操作のステータスを取得します。
+
+`security.requirepass` を設定している場合、この endpoint には認証が必要です。
 
 **リクエスト:**
 

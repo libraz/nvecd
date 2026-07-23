@@ -34,7 +34,10 @@ class NvecdTestFixture : public ::testing::Test {
     config_.api.tcp.bind = "127.0.0.1";
     config_.api.tcp.port = 0;  // Random port
     config_.network.allow_cidrs = {"127.0.0.1/32"};
-    config_.perf.max_connections = 10;
+    // Concurrent tests retain their setup connection while ten worker clients
+    // connect. Keep capacity above that workload so they exercise request
+    // concurrency rather than the unrelated admission-control limit.
+    config_.perf.max_connections = 32;
     config_.perf.thread_pool_size = 4;
     config_.snapshot.dir = test_dir_.string();
 

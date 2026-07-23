@@ -55,6 +55,15 @@ TEST_F(WalTest, OpenClose) {
   EXPECT_FALSE(wal.IsOpen());
 }
 
+TEST_F(WalTest, CreatesPrivateSegments) {
+  WriteAheadLog wal;
+  ASSERT_TRUE(wal.Open(MakeConfig()));
+
+  struct stat info {};
+  ASSERT_EQ(::stat((test_dir_ + "/wal-000001.log").c_str(), &info), 0);
+  EXPECT_EQ(info.st_mode & (S_IRWXG | S_IRWXO), 0);
+}
+
 TEST_F(WalTest, ReopenClosesPreviousSegmentWithoutDeadlock) {
   WriteAheadLog wal;
   auto config = MakeConfig();

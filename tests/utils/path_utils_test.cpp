@@ -6,6 +6,8 @@
 #include "utils/path_utils.h"
 
 #include <gtest/gtest.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include <filesystem>
 
@@ -78,4 +80,23 @@ TEST_F(PathUtilsTest, DoubleDotsInFilenameRejected) {
   // Even if ".." is part of a filename, it is rejected as defense-in-depth
   auto result = ValidateDumpPath("my..file.dmp", test_dir_.string());
   EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(PathUtilsTest, GroupWritableDumpDirectoryRejected) {
+  ASSERT_EQ(::chmod(test_dir_.c_str(), 0770), 0);
+  auto result = ValidateDumpPath("snapshot.dmp", test_dir_.string());
+  EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(PathUtilsTest, ResolvesStoragePathThroughPrivateSymlink) {
+  const auto symlink_path = test_dir_.parent_path() / ("nvecd_path_link_" + std::to_string(::getpid()));
+  std::error_code error;
+  std::filesystem::create_directory_symlink(test_dir_, symlink_path, error);
+  ASSERT_FALSE(error) << error.message();
+
+  auto result = ResolvePrivateStoragePath(symlink_path / "snapshot.dmp");
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+  EXPECT_EQ(result->parent_path(), std::filesystem::canonical(test_dir_));
+
+  std::filesystem::remove(symlink_path, error);
 }

@@ -10,6 +10,7 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <filesystem>
@@ -46,6 +47,11 @@ using ::testing::HasSubstr;
 class HandlerTest : public ::testing::Test {
  protected:
   void SetUp() override {
+    dump_dir_ = std::filesystem::temp_directory_path() / ("nvecd_handler_test_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(dump_dir_);
+    std::filesystem::create_directories(dump_dir_);
+    std::filesystem::permissions(dump_dir_, std::filesystem::perms::owner_all, std::filesystem::perm_options::replace);
+
     // Create real objects for all handler dependencies
     config_ = std::make_unique<nvecd::config::Config>();
 
@@ -80,7 +86,7 @@ class HandlerTest : public ::testing::Test {
                                              /*.config=*/config_.get(),
                                              /*.loading=*/loading_,
                                              /*.read_only=*/read_only_,
-                                             /*.dump_dir=*/"/tmp",
+                                             /*.dump_dir=*/dump_dir_.string(),
                                              /*.requirepass=*/""};
     ctx_->cache.store(cache_.get(), std::memory_order_release);
   }
@@ -90,6 +96,7 @@ class HandlerTest : public ::testing::Test {
       ctx_->~HandlerContext();
       ctx_ = nullptr;
     }
+    std::filesystem::remove_all(dump_dir_);
   }
 
   ServerStats stats_;
@@ -102,6 +109,7 @@ class HandlerTest : public ::testing::Test {
   std::unique_ptr<nvecd::similarity::SimilarityEngine> similarity_engine_;
   std::unique_ptr<nvecd::cache::SimilarityCache> cache_;
   std::unique_ptr<nvecd::config::RuntimeVariableManager> variable_manager_;
+  std::filesystem::path dump_dir_;
 
   // Placement-new storage for HandlerContext (avoids copy/move of atomics)
   alignas(HandlerContext) char ctx_storage_[sizeof(HandlerContext)]{};  // NOLINT(modernize-avoid-c-arrays)
@@ -383,9 +391,9 @@ TEST_F(HandlerTest, DumpSave_WithValidData_Succeeds) {
 
   // Use lock mode since fork_snapshot_writer is not available in test
   config_->snapshot.mode = "lock";
-  config_->snapshot.dir = "/tmp";
+  config_->snapshot.dir = dump_dir_.string();
 
-  std::string dump_path = "/tmp/nvecd_handler_test_dump.dmp";
+  const std::string dump_path = (dump_dir_ / "snapshot.dmp").string();
   auto result = HandleDumpSave(*ctx_, dump_path);
   ASSERT_TRUE(result.has_value()) << "DumpSave failed: " << (result.has_value() ? "" : result.error().message());
   EXPECT_THAT(*result, HasSubstr("DUMP_SAVED"));
@@ -403,9 +411,9 @@ TEST_F(HandlerTest, DumpLoad_RoundTrip_RestoresData) {
   vector_store_->SetVector("item2", {0.4f, 0.5f, 0.6f});
 
   config_->snapshot.mode = "lock";
-  config_->snapshot.dir = "/tmp";
+  config_->snapshot.dir = dump_dir_.string();
 
-  std::string dump_path = "/tmp/nvecd_handler_test_roundtrip.dmp";
+  const std::string dump_path = (dump_dir_ / "roundtrip.dmp").string();
 
   // Save
   auto save_result = HandleDumpSave(*ctx_, dump_path);
@@ -466,14 +474,14 @@ TEST_F(HandlerTest, DumpVerify_ValidFile_Succeeds) {
   vector_store_->SetVector("item1", {0.1f, 0.2f, 0.3f});
 
   config_->snapshot.mode = "lock";
-  config_->snapshot.dir = "/tmp";
+  config_->snapshot.dir = dump_dir_.string();
 
-  std::string dump_path = "/tmp/nvecd_handler_test_verify.dmp";
+  const std::string dump_path = (dump_dir_ / "verify.dmp").string();
   auto save_result = HandleDumpSave(*ctx_, dump_path);
   ASSERT_TRUE(save_result.has_value()) << "DumpSave failed: " << save_result.error().message();
 
   // Verify the saved file
-  auto verify_result = HandleDumpVerify("/tmp", dump_path);
+  auto verify_result = HandleDumpVerify(dump_dir_.string(), dump_path);
   ASSERT_TRUE(verify_result.has_value()) << "DumpVerify failed: " << verify_result.error().message();
   EXPECT_THAT(*verify_result, HasSubstr("DUMP_VERIFIED"));
 

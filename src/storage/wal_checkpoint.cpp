@@ -12,6 +12,9 @@
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
+#include <vector>
+
+#include "utils/path_utils.h"
 
 namespace nvecd::storage {
 
@@ -20,8 +23,8 @@ namespace {
 /// Sidecar payload size: a single uint64 little-endian sequence number.
 constexpr size_t kCheckpointSize = sizeof(uint64_t);
 
-/// File mode for newly created sidecar files (rw-r--r--).
-constexpr mode_t kSidecarMode = 0644;
+/// File mode for newly created sidecar files (rw-------).
+constexpr mode_t kSidecarMode = 0600;
 
 std::string SidecarPath(const std::string& snapshot_path) {
   return snapshot_path + kWalCheckpointSuffix;
@@ -86,19 +89,35 @@ bool FsyncParentDirectory(const std::string& path) {
 }  // namespace
 
 utils::Expected<void, utils::Error> WriteWalCheckpoint(const std::string& snapshot_path, uint64_t sequence) {
-  const std::string final_path = SidecarPath(snapshot_path);
-  const std::string tmp_path = final_path + ".tmp";
+  auto resolved_path_result = utils::ResolvePrivateStoragePath(SidecarPath(snapshot_path));
+  if (!resolved_path_result) {
+    return utils::MakeUnexpected(resolved_path_result.error());
+  }
+  const std::string final_path = resolved_path_result->string();
+
+  std::string tmp_template = final_path + ".tmp.XXXXXX";
+  std::vector<char> mutable_template(tmp_template.begin(), tmp_template.end());
+  mutable_template.push_back('\0');
 
   std::array<uint8_t, kCheckpointSize> bytes{};
   for (size_t i = 0; i < kCheckpointSize; ++i) {
     bytes[i] = static_cast<uint8_t>((sequence >> (8 * i)) & 0xFF);
   }
 
-  const int fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, kSidecarMode);
+  const int fd = ::mkstemp(mutable_template.data());
   if (fd < 0) {
-    return utils::MakeUnexpected(utils::MakeError(
-        utils::ErrorCode::kStorageWriteError,
-        "Failed to open WAL checkpoint temp file '" + tmp_path + "': " + std::string(std::strerror(errno))));
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kStorageWriteError,
+                         "Failed to create WAL checkpoint temp file: " + std::string(std::strerror(errno))));
+  }
+  const std::string tmp_path(mutable_template.data());
+  if (::fchmod(fd, kSidecarMode) != 0) {
+    const int saved_errno = errno;
+    ::close(fd);
+    ::unlink(tmp_path.c_str());
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kStorageWriteError,
+                         "Failed to set WAL checkpoint permissions: " + std::string(std::strerror(saved_errno))));
   }
 
   if (!WriteAll(fd, bytes.data(), bytes.size())) {

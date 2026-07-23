@@ -6,6 +6,7 @@
 #include "storage/snapshot_fork.h"
 
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <chrono>
 #include <filesystem>
@@ -36,15 +37,20 @@ class SnapshotForkTest : public ::testing::Test {
     vector_store_->SetVector("item1", {1.0f, 0.0f, 0.0f});
     vector_store_->SetVector("item2", {0.0f, 1.0f, 0.0f});
 
-    snapshot_path_ = "/tmp/nvecd_fork_test_snapshot.dmp";
+    test_dir_ = std::filesystem::temp_directory_path() / ("nvecd_fork_test_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(test_dir_);
+    std::filesystem::create_directories(test_dir_);
+    std::filesystem::permissions(test_dir_, std::filesystem::perms::owner_all, std::filesystem::perm_options::replace);
+    snapshot_path_ = (test_dir_ / "snapshot.dmp").string();
   }
 
-  void TearDown() override { std::filesystem::remove(snapshot_path_); }
+  void TearDown() override { std::filesystem::remove_all(test_dir_); }
 
   config::Config config_;
   std::unique_ptr<events::EventStore> event_store_;
   std::unique_ptr<events::CoOccurrenceIndex> co_index_;
   std::unique_ptr<vectors::VectorStore> vector_store_;
+  std::filesystem::path test_dir_;
   std::string snapshot_path_;
 };
 
@@ -102,13 +108,13 @@ TEST_F(SnapshotForkTest, RejectsSecondConcurrentSave) {
   ASSERT_TRUE(result1) << result1.error().message();
 
   // Try to start another while first is in progress
-  auto result2 = writer.StartBackgroundSave("/tmp/nvecd_fork_test_snapshot2.dmp", config_, *event_store_, *co_index_,
-                                            *vector_store_);
+  const auto second_snapshot_path = (test_dir_ / "snapshot2.dmp").string();
+  auto result2 = writer.StartBackgroundSave(second_snapshot_path, config_, *event_store_, *co_index_, *vector_store_);
   EXPECT_FALSE(result2);
   EXPECT_EQ(result2.error().code(), utils::ErrorCode::kSnapshotAlreadyInProgress);
 
   writer.WaitForChild(10000);
-  std::filesystem::remove("/tmp/nvecd_fork_test_snapshot2.dmp");
+  std::filesystem::remove(second_snapshot_path);
 }
 
 TEST_F(SnapshotForkTest, CheckChildUpdatesStatus) {

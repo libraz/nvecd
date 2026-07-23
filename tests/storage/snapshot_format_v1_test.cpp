@@ -10,6 +10,7 @@
 #include "storage/snapshot_format_v1.h"
 
 #include <gtest/gtest.h>
+#include <sys/stat.h>
 
 #include <filesystem>
 #include <fstream>
@@ -149,6 +150,34 @@ TEST_F(SnapshotFormatV1Test, WriteAndRead_RoundTrip) {
   for (size_t i = 0; i < orig_vec1->data.size(); ++i) {
     EXPECT_FLOAT_EQ(loaded_vec1->data[i], orig_vec1->data[i]);
   }
+}
+
+TEST_F(SnapshotFormatV1Test, WriteSnapshotDoesNotFollowLegacyPredictableTempSymlink) {
+  PopulateStores();
+
+  const std::string path = TestFilePath("safe_temp.dmp");
+  const std::string victim_path = TestFilePath("victim.txt");
+  const std::string legacy_temp_path = path + ".tmp";
+  {
+    std::ofstream victim(victim_path);
+    ASSERT_TRUE(victim);
+    victim << "unchanged";
+  }
+  std::error_code symlink_ec;
+  fs::create_symlink(victim_path, legacy_temp_path, symlink_ec);
+  ASSERT_FALSE(symlink_ec) << symlink_ec.message();
+
+  auto write_result = WriteSnapshotV1(path, config_, *event_store_, *co_index_, *vector_store_);
+  ASSERT_TRUE(write_result.has_value()) << write_result.error().message();
+
+  std::ifstream victim(victim_path);
+  std::string victim_contents;
+  victim >> victim_contents;
+  EXPECT_EQ(victim_contents, "unchanged");
+
+  struct stat info {};
+  ASSERT_EQ(::stat(path.c_str(), &info), 0);
+  EXPECT_EQ(info.st_mode & (S_IRWXG | S_IRWXO), 0);
 }
 
 TEST_F(SnapshotFormatV1Test, WriteAndRead_MetadataRoundTrip) {

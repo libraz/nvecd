@@ -15,8 +15,14 @@
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <limits>
 
+#include "utils/path_utils.h"
 #include "utils/structured_log.h"
+
+#ifndef O_NOFOLLOW
+#define O_NOFOLLOW 0
+#endif
 
 namespace nvecd::storage {
 
@@ -117,11 +123,23 @@ Expected<void, Error> WriteAheadLog::Open(const Config& config) {
   config_ = config;
 
   // Ensure directory exists
-  if (::mkdir(config_.directory.c_str(), 0755) != 0 && errno != EEXIST) {
+  if (::mkdir(config_.directory.c_str(), 0700) != 0 && errno != EEXIST) {
     return utils::MakeUnexpected(
         utils::MakeError(utils::ErrorCode::kWalWriteError,
                          "Failed to create WAL directory: " + std::string(std::strerror(errno)), config_.directory));
   }
+  auto directory_valid = utils::ValidatePrivateDirectory(config_.directory);
+  if (!directory_valid) {
+    return utils::MakeUnexpected(directory_valid.error());
+  }
+  std::error_code canonical_error;
+  const auto canonical_directory = std::filesystem::canonical(config_.directory, canonical_error);
+  if (canonical_error) {
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kWalWriteError,
+                                                  "Failed to resolve WAL directory: " + canonical_error.message(),
+                                                  config_.directory));
+  }
+  config_.directory = canonical_directory.string();
 
   // Scan existing files to recover state
   auto scan_result = ScanExistingFiles();
@@ -411,10 +429,18 @@ Expected<void, Error> WriteAheadLog::RotateFile() {
     current_fd_ = -1;
   }
 
-  ++current_file_number_;
-  std::string path = MakeFilePath(current_file_number_);
+  std::string path;
+  int fd = -1;
+  do {
+    if (current_file_number_ == std::numeric_limits<uint32_t>::max()) {
+      return utils::MakeUnexpected(
+          utils::MakeError(utils::ErrorCode::kWalRotationFailed, "WAL file number space exhausted"));
+    }
+    ++current_file_number_;
+    path = MakeFilePath(current_file_number_);
+    fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+  } while (fd < 0 && errno == EEXIST);
 
-  int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (fd < 0) {
     return utils::MakeUnexpected(utils::MakeError(
         utils::ErrorCode::kWalRotationFailed, "Failed to create WAL file: " + std::string(std::strerror(errno)), path));

@@ -482,7 +482,7 @@ bool HttpServer::IsAuthorized(const httplib::Request& req) const {
   // "Bearer <password>"
   static constexpr std::string_view kBearerPrefix = "Bearer ";
   if (auth.size() > kBearerPrefix.size() && auth.compare(0, kBearerPrefix.size(), kBearerPrefix) == 0) {
-    return auth.substr(kBearerPrefix.size()) == config_.requirepass;
+    return utils::ConstantTimeEquals(auth.substr(kBearerPrefix.size()), config_.requirepass);
   }
 
   // "Basic base64(user:password)" - the username is ignored, only the password
@@ -495,7 +495,7 @@ bool HttpServer::IsAuthorized(const httplib::Request& req) const {
     }
     auto colon = decoded->find(':');
     const std::string password = (colon == std::string::npos) ? *decoded : decoded->substr(colon + 1);
-    return password == config_.requirepass;
+    return utils::ConstantTimeEquals(password, config_.requirepass);
   }
 
   return false;

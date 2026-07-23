@@ -18,7 +18,9 @@ endif()
 FetchContent_Declare(
   yaml-cpp
   GIT_REPOSITORY https://github.com/jbeder/yaml-cpp.git
-  GIT_TAG master
+  # yaml-cpp 0.8.0. Pin the immutable commit rather than a mutable branch so
+  # clean builds are reproducible and reviewable.
+  GIT_TAG f7320141120f720aecc4c32be25586e7da9eb978
 )
 set(YAML_CPP_FORMAT_SOURCE OFF CACHE BOOL "" FORCE)
 set(YAML_BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)

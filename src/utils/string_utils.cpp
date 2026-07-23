@@ -374,4 +374,15 @@ std::string FormatBytes(size_t bytes) {
   return oss.str();
 }
 
+bool ConstantTimeEquals(std::string_view left, std::string_view right) {
+  const size_t max_size = std::max(left.size(), right.size());
+  size_t difference = left.size() ^ right.size();
+  for (size_t i = 0; i < max_size; ++i) {
+    const unsigned char left_byte = i < left.size() ? static_cast<unsigned char>(left[i]) : 0;
+    const unsigned char right_byte = i < right.size() ? static_cast<unsigned char>(right[i]) : 0;
+    difference |= static_cast<size_t>(left_byte ^ right_byte);
+  }
+  return difference == 0;
+}
+
 }  // namespace nvecd::utils

@@ -167,6 +167,11 @@ snapshot:
 
 **Auto-snapshot filenames**: `auto_YYYYMMDD_HHMMSS.snapshot`
 
+**Security requirement**: On POSIX systems, `snapshot.dir` must be owned by the
+user running nvecd and must not be writable by its group or by other users.
+Snapshot files are created with mode `0600`; use a service-private directory
+(normally mode `0700`).
+
 ---
 
 ### Write-Ahead Log Configuration
@@ -193,6 +198,9 @@ wal:
 | `sync_on_write` | false | fsync every append for maximum durability. |
 | `sync_interval_ms` | 100 | Batched fsync interval when `sync_on_write` is false. |
 | `include_vectors` | true | Persist VECSET payloads. Disable only when snapshots provide the required vector durability. |
+
+The same ownership and non-shared-write requirement applies to `wal.dir`.
+WAL directories and segment files are created with modes `0700` and `0600`.
 
 ---
 

@@ -25,8 +25,8 @@ api:
 
 When `security.requirepass` is set, the HTTP server enforces authentication on
 all mutating and administrative endpoints, mirroring the TCP `AUTH` gate. Read-only
-endpoints (health, `/info`, `/config`, `/metrics`, `/cache/stats`, `/sim`, `/simv`,
-`/dump/status`) remain open.
+endpoints (health, `/info`, `/config`, `/metrics`, `/cache/stats`, `/sim`, and `/simv`)
+remain open. `/dump/status` is an administrative endpoint and requires authentication.
 
 Provide the password via the `Authorization` request header, using either scheme:
 
@@ -36,7 +36,8 @@ Provide the password via the `Authorization` request header, using either scheme
 
 Gated endpoints: `POST /event`, `POST /vecset`, `POST /metaset`,
 `POST /cache/clear`, `POST /cache/enable`, `POST /cache/disable`,
-`POST /dump/save`, `POST /dump/load`, `POST /dump/verify`, `POST /dump/info`.
+`POST /dump/save`, `POST /dump/load`, `POST /dump/verify`, `POST /dump/info`, and
+`GET /dump/status`.
 
 Requests without a valid credential receive `401 Unauthorized`:
 
@@ -715,6 +716,8 @@ This endpoint requires authentication when `security.requirepass` is set.
 ### GET /dump/status
 
 Get the status of background snapshot operations.
+
+This endpoint requires authentication when `security.requirepass` is set.
 
 **Request:**
 

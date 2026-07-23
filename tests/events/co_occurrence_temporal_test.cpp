@@ -38,14 +38,14 @@ TEST(CoOccurrenceTemporalTest, TemporalDisabledByDefault) {
 TEST(CoOccurrenceTemporalTest, RecentEventsScoreHigher) {
   CoOccurrenceIndex index;
 
-  // Old events
-  std::vector<Event> events = {MakeEvent("a", 10, 1000), MakeEvent("b", 10, 1000), MakeEvent("c", 10, 9000),
+  // a-b spans one half-life, while c-d is simultaneous. Decay is pair-local,
+  // so absolute wall-clock position must not affect a pair with equal times.
+  std::vector<Event> events = {MakeEvent("a", 10, 1000), MakeEvent("b", 10, 4600), MakeEvent("c", 10, 9000),
                                MakeEvent("d", 10, 9000)};
 
   index.UpdateFromEvents("ctx", events, true, 3600.0);  // 1 hour half-life
 
-  // c-d co-occurrence (recent, timestamps close to max) should be higher
-  // than a-b co-occurrence (old, timestamps far from max)
+  // c-d has no intra-pair age, while a-b has a one-half-life age difference.
   float score_cd = index.GetScore("c", "d");
   float score_ab = index.GetScore("a", "b");
 

@@ -8,7 +8,6 @@
 
 #include <spdlog/spdlog.h>
 
-#include <algorithm>
 #include <chrono>
 #include <mutex>
 #include <optional>
@@ -35,6 +34,7 @@
 #include "similarity/similarity_engine.h"
 #include "storage/wal.h"
 #include "utils/error.h"
+#include "utils/string_utils.h"
 #include "utils/structured_log.h"
 #include "vectors/metadata_store.h"
 #include "vectors/vector_store.h"
@@ -46,17 +46,6 @@ namespace {
 bool IsSnapshotProtectedWrite(CommandType type) {
   return type == CommandType::kEvent || type == CommandType::kVecset || type == CommandType::kVecdel ||
          type == CommandType::kMetaset;
-}
-
-bool ConstantTimeEquals(const std::string& left, const std::string& right) {
-  const size_t max_size = std::max(left.size(), right.size());
-  size_t difference = left.size() ^ right.size();
-  for (size_t i = 0; i < max_size; ++i) {
-    const unsigned char left_byte = i < left.size() ? static_cast<unsigned char>(left[i]) : 0;
-    const unsigned char right_byte = i < right.size() ? static_cast<unsigned char>(right[i]) : 0;
-    difference |= static_cast<size_t>(left_byte ^ right_byte);
-  }
-  return difference == 0;
 }
 
 }  // namespace
@@ -761,7 +750,7 @@ std::string RequestDispatcher::HandleAuth(const Command& cmd, ConnectionContext&
     return "+OK (no password required)\r\n";
   }
 
-  if (ConstantTimeEquals(cmd.variable_value, ctx_.requirepass)) {
+  if (utils::ConstantTimeEquals(cmd.variable_value, ctx_.requirepass)) {
     conn_ctx.authenticated = true;
     return "+OK\r\n";
   }

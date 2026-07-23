@@ -6,6 +6,7 @@
 #include "storage/snapshot_lock.h"
 
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <filesystem>
 
@@ -34,15 +35,20 @@ class SnapshotLockTest : public ::testing::Test {
     vector_store_->SetVector("item1", {1.0f, 0.0f, 0.0f});
     vector_store_->SetVector("item2", {0.0f, 1.0f, 0.0f});
 
-    snapshot_path_ = "/tmp/nvecd_lock_test_snapshot.dmp";
+    test_dir_ = std::filesystem::temp_directory_path() / ("nvecd_lock_test_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(test_dir_);
+    std::filesystem::create_directories(test_dir_);
+    std::filesystem::permissions(test_dir_, std::filesystem::perms::owner_all, std::filesystem::perm_options::replace);
+    snapshot_path_ = (test_dir_ / "snapshot.dmp").string();
   }
 
-  void TearDown() override { std::filesystem::remove(snapshot_path_); }
+  void TearDown() override { std::filesystem::remove_all(test_dir_); }
 
   config::Config config_;
   std::unique_ptr<events::EventStore> event_store_;
   std::unique_ptr<events::CoOccurrenceIndex> co_index_;
   std::unique_ptr<vectors::VectorStore> vector_store_;
+  std::filesystem::path test_dir_;
   std::string snapshot_path_;
 };
 

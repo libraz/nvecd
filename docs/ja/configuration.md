@@ -166,6 +166,10 @@ snapshot:
 
 **自動スナップショットのファイル名**: `auto_YYYYMMDD_HHMMSS.snapshot`
 
+**セキュリティ要件**: POSIX 環境では `snapshot.dir` は nvecd を実行するユーザーが所有し、
+グループまたは他ユーザーから書き込み可能であってはなりません。スナップショットは
+`0600` で作成されるため、通常はサービス専用の `0700` ディレクトリを使用してください。
+
 ---
 
 ### Write-Ahead Log（WAL）設定
@@ -191,6 +195,9 @@ wal:
 | `sync_on_write` | false | 最大の耐久性のため各 append ごとに fsync します。 |
 | `sync_interval_ms` | 100 | `sync_on_write` が false のときのバッチ fsync 間隔。 |
 | `include_vectors` | true | VECSET のペイロードを永続化します。無効化するのは、ベクトル永続性をスナップショットで満たせる場合だけです。 |
+
+同じ所有者・非共有書込みの要件が `wal.dir` にも適用されます。WAL のディレクトリと
+セグメントはそれぞれ `0700`、`0600` で作成されます。
 
 ---
 

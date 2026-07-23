@@ -19,6 +19,7 @@
 #include <variant>
 #include <vector>
 
+#include "utils/path_utils.h"
 #include "utils/structured_log.h"
 
 #ifdef _WIN32
@@ -115,6 +116,43 @@ bool ReadString(std::istream& input_stream, std::string& str) {
     str.clear();
   }
   return input_stream.good();
+}
+
+Expected<std::string, Error> CreateSecureTemporaryFile(const std::string& filepath) {
+#ifdef _WIN32
+  return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError,
+                                  "Secure temporary snapshot files are not supported on this platform"));
+#else
+  const std::filesystem::path parent = std::filesystem::path(filepath).parent_path();
+  auto directory_valid = ValidatePrivateDirectory(parent.empty() ? std::filesystem::path(".") : parent);
+  if (!directory_valid) {
+    return MakeUnexpected(directory_valid.error());
+  }
+
+  std::string path_template = filepath + ".tmp.XXXXXX";
+  std::vector<char> mutable_template(path_template.begin(), path_template.end());
+  mutable_template.push_back('\0');
+  const int fd = ::mkstemp(mutable_template.data());
+  if (fd < 0) {
+    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError,
+                                    "Failed to create temporary snapshot file: " + std::string(std::strerror(errno))));
+  }
+  if (::fchmod(fd, S_IRUSR | S_IWUSR) != 0) {
+    const int saved_errno = errno;
+    ::close(fd);
+    ::unlink(mutable_template.data());
+    return MakeUnexpected(
+        MakeError(ErrorCode::kStorageDumpWriteError,
+                  "Failed to set temporary snapshot permissions: " + std::string(std::strerror(saved_errno))));
+  }
+  if (::close(fd) != 0) {
+    const int saved_errno = errno;
+    ::unlink(mutable_template.data());
+    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to close temporary snapshot file: " +
+                                                                           std::string(std::strerror(saved_errno))));
+  }
+  return std::string(mutable_template.data());
+#endif
 }
 
 }  // namespace
@@ -862,8 +900,17 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
                                       const vectors::VectorStore& vector_store, const SnapshotStatistics* stats,
                                       const std::unordered_map<std::string, StoreStatistics>* store_stats,
                                       const vectors::MetadataStore* metadata_store, bool suppress_logging) {
-  // Create temporary file path
-  std::string temp_filepath = filepath + ".tmp";
+  auto resolved_path_result = ResolvePrivateStoragePath(filepath);
+  if (!resolved_path_result) {
+    return MakeUnexpected(resolved_path_result.error());
+  }
+  const std::string resolved_filepath = resolved_path_result->string();
+
+  auto temp_file_result = CreateSecureTemporaryFile(resolved_filepath);
+  if (!temp_file_result) {
+    return MakeUnexpected(temp_file_result.error());
+  }
+  const std::string temp_filepath = *temp_file_result;
 
   // Open file for binary writing
   std::ofstream output_stream(temp_filepath, std::ios::binary | std::ios::trunc);
@@ -1140,18 +1187,19 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
 
     // Atomic rename
     std::error_code rename_ec;
-    std::filesystem::rename(temp_filepath, filepath, rename_ec);
+    std::filesystem::rename(temp_filepath, resolved_filepath, rename_ec);
     if (rename_ec) {
       std::error_code rm_ec;
       std::filesystem::remove(temp_filepath, rm_ec);
-      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError,
-                                      "Failed to rename temp file to " + filepath + ": " + rename_ec.message()));
+      return MakeUnexpected(
+          MakeError(ErrorCode::kStorageDumpWriteError,
+                    "Failed to rename temp file to " + resolved_filepath + ": " + rename_ec.message()));
     }
 
     // Skip spdlog when running on a post-fork child path, where the logger is
     // not safe to touch (see suppress_logging in WriteSnapshotV1's docs).
     if (!suppress_logging) {
-      LogStorageInfo("snapshot_write", "Snapshot written successfully to " + filepath);
+      LogStorageInfo("snapshot_write", "Snapshot written successfully to " + resolved_filepath);
     }
     return {};
   }
