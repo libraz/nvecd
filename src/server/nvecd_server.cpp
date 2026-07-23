@@ -22,6 +22,7 @@
 #include "cache/similarity_cache.h"
 #include "server/connection_io_handler.h"
 #include "server/http_server.h"
+#include "server/reactor_connection.h"
 #include "server/request_dispatcher.h"
 #include "storage/snapshot_format_v1.h"
 #include "storage/wal_checkpoint.h"
@@ -121,6 +122,73 @@ utils::Expected<void, utils::Error> NvecdServer::Start() {
 
   spdlog::info("Thread pool created with {} workers", worker_threads);
 
+  // Start() can fail after worker/reactor construction (for example, an
+  // unsupported poller or a bind failure). NvecdServer is not marked running
+  // until the listener is live, so Stop() would intentionally be a no-op in
+  // this path; clean up the partially-started network stack explicitly.
+  const auto abort_network_start = [this] {
+    if (unix_acceptor_) {
+      unix_acceptor_->Stop();
+      unix_acceptor_.reset();
+    }
+    if (acceptor_) {
+      acceptor_->Stop();
+      acceptor_.reset();
+    }
+    if (reactor_) {
+      reactor_->Stop();
+      reactor_.reset();
+    }
+    if (thread_pool_) {
+      thread_pool_->Shutdown(false, static_cast<uint32_t>(config_.perf.shutdown_timeout_ms));
+      thread_pool_.reset();
+    }
+  };
+
+  // Idle sockets are kept in the reactor, not on worker threads. Workers run
+  // only the request callbacks extracted from readable connections.
+  ReactorConfig reactor_config;
+  reactor_config.idle_timeout_sec = config_.perf.connection_timeout_sec;
+  reactor_config.initial_read_timeout_sec = config_.perf.connection_timeout_sec;
+  reactor_config.max_total_buffered_bytes = static_cast<size_t>(config_.perf.reactor_max_total_buffered_bytes);
+  reactor_ = std::make_unique<IoReactor>(reactor_config);
+  reactor_->SetCloseCallback([this](int client_fd) {
+    // A descriptor can belong to either listener; RemoveConnection is
+    // idempotent, so this keeps both TCP and UDS accounting correct.
+    if (acceptor_)
+      acceptor_->RemoveConnection(client_fd);
+    if (unix_acceptor_)
+      unix_acceptor_->RemoveConnection(client_fd);
+    stats_.active_connections.fetch_sub(1, std::memory_order_relaxed);
+  });
+  auto reactor_result = reactor_->Start();
+  if (!reactor_result) {
+    abort_network_start();
+    return reactor_result;
+  }
+
+  auto register_connection = [this](int client_fd) {
+    IOConfig io_config;
+    io_config.recv_buffer_size = static_cast<size_t>(config_.perf.recv_buffer_size);
+    io_config.max_query_length = static_cast<size_t>(config_.perf.max_query_length);
+    io_config.max_accumulated_bytes = static_cast<size_t>(config_.perf.max_query_length) * 2;
+    io_config.recv_timeout_sec = config_.perf.connection_timeout_sec;
+    auto connection = ReactorConnection::Create(
+        client_fd, reactor_.get(), thread_pool_.get(), io_config,
+        [this](const std::string& request, ConnectionContext& context) { return ProcessRequest(request, context); });
+    // Increment before Register: the event loop may close a peer immediately
+    // after registration and invoke the close callback on another thread.
+    stats_.total_connections.fetch_add(1, std::memory_order_relaxed);
+    stats_.active_connections.fetch_add(1, std::memory_order_relaxed);
+    auto result = reactor_->Register(std::move(connection));
+    if (!result) {
+      stats_.active_connections.fetch_sub(1, std::memory_order_relaxed);
+      spdlog::warn("Failed to register accepted fd with reactor: {}", result.error().message());
+      return false;
+    }
+    return true;
+  };
+
   // Create ServerConfig for connection acceptor
   ServerConfig server_config;
   server_config.host = config_.api.tcp.bind;
@@ -128,6 +196,8 @@ utils::Expected<void, utils::Error> NvecdServer::Start() {
   server_config.max_connections = config_.perf.max_connections;
   server_config.max_connections_per_ip = config_.perf.max_connections_per_ip;
   server_config.worker_threads = worker_threads;
+  server_config.recv_buffer_size = config_.perf.recv_buffer_size;
+  server_config.send_buffer_size = config_.perf.send_buffer_size;
 
   // Parse allowed CIDRs
   server_config.allow_cidrs = config_.network.allow_cidrs;
@@ -144,12 +214,13 @@ utils::Expected<void, utils::Error> NvecdServer::Start() {
   acceptor_ = std::make_unique<ConnectionAcceptor>(server_config, thread_pool_.get());
 
   // Set connection handler
-  acceptor_->SetConnectionHandler([this](int client_fd) { this->HandleConnection(client_fd); });
+  acceptor_->SetReactorHandler(register_connection);
 
   // Start accepting connections
   auto start_result = acceptor_->Start();
   if (!start_result) {
     spdlog::error("Failed to start connection acceptor: {}", start_result.error().message());
+    abort_network_start();
     return start_result;
   }
 
@@ -162,9 +233,11 @@ utils::Expected<void, utils::Error> NvecdServer::Start() {
     ServerConfig uds_config;
     uds_config.unix_socket_path = config_.api.unix_socket.path;
     uds_config.max_connections = config_.perf.max_connections;
+    uds_config.recv_buffer_size = config_.perf.recv_buffer_size;
+    uds_config.send_buffer_size = config_.perf.send_buffer_size;
 
     unix_acceptor_ = std::make_unique<ConnectionAcceptor>(uds_config, thread_pool_.get());
-    unix_acceptor_->SetConnectionHandler([this](int client_fd) { this->HandleConnection(client_fd); });
+    unix_acceptor_->SetReactorHandler(register_connection);
 
     auto uds_result = unix_acceptor_->Start();
     if (!uds_result) {
@@ -251,6 +324,13 @@ void NvecdServer::Stop() {
     acceptor_->Stop();
   }
 
+  // The acceptors have stopped admitting sockets. Now unregister all reactor
+  // clients before worker shutdown so close callbacks and queued responses
+  // still see valid server state.
+  if (reactor_) {
+    reactor_->Stop();
+  }
+
   // Wait for existing connections to finish (with timeout)
   auto start_time = std::chrono::steady_clock::now();
   while (stats_.active_connections.load() > 0) {
@@ -271,6 +351,7 @@ void NvecdServer::Stop() {
     thread_pool_->Shutdown(false, static_cast<uint32_t>(config_.perf.shutdown_timeout_ms));
     thread_pool_.reset();
   }
+  reactor_.reset();
 
   // Connection tasks capture their acceptor while removing/closing fds, so
   // keep the UDS acceptor alive until all worker tasks have stopped.

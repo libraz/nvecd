@@ -125,6 +125,7 @@ static const std::map<std::string, bool> kVariableMutability = {
     {"performance.send_buffer_size", false},
     {"performance.max_query_length", false},
     {"performance.shutdown_timeout_ms", false},
+    {"performance.reactor_max_total_buffered_bytes", false},
 
     // API HTTP timeout (immutable)
     {"api.http.timeout_sec", false},
@@ -527,6 +528,9 @@ std::string RuntimeVariableManager::GetVariableInternal(const std::string& varia
   }
   if (variable_name == "performance.shutdown_timeout_ms") {
     return std::to_string(base_config_.perf.shutdown_timeout_ms);
+  }
+  if (variable_name == "performance.reactor_max_total_buffered_bytes") {
+    return std::to_string(base_config_.perf.reactor_max_total_buffered_bytes);
   }
 
   // API HTTP timeout

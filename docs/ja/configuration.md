@@ -203,13 +203,15 @@ performance:
   thread_pool_size: 8          # ワーカースレッドプールサイズ
   max_connections: 1000        # 最大同時接続数
   connection_timeout_sec: 300  # 接続タイムアウト（秒）
+  reactor_max_total_buffered_bytes: 268435456  # 全接続の保留データ上限（256 MiB）
 ```
 
 | オプション | 型 | デフォルト | 説明 |
 |--------|------|---------|-------------|
 | `thread_pool_size` | int | 8 | ワーカースレッドプールサイズ（推奨: CPU コア数）。 |
 | `max_connections` | int | 1000 | 最大同時接続数（システム制限に基づいて設定）。 |
-| `connection_timeout_sec` | int | 300 | アイドル接続タイムアウト（秒）。 |
+| `connection_timeout_sec` | int | 300 | アイドル接続タイムアウトと、最初の完全なリクエストを待つ期限（秒）。 |
+| `reactor_max_total_buffered_bytes` | int | 268435456 | TCP リアクターが全接続で保持できる未処理・未送信データの上限（バイト）。 |
 
 ---
 

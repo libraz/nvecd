@@ -54,6 +54,7 @@ constexpr int kRecvBufferSize = 4096;
 constexpr int kSendBufferSize = 65536;
 constexpr int kMaxQueryLength = 1024 * 1024;  // 1MB
 constexpr int kShutdownTimeoutMs = 5000;
+constexpr int kReactorMaxTotalBufferedBytes = 256 * 1024 * 1024;  // 256MB
 
 // HTTP defaults
 constexpr int kHttpTimeoutSec = 5;
@@ -140,6 +141,7 @@ struct PerformanceConfig {
   int send_buffer_size = defaults::kSendBufferSize;              ///< TCP send buffer size in bytes
   int max_query_length = defaults::kMaxQueryLength;              ///< Maximum query length in bytes
   int shutdown_timeout_ms = defaults::kShutdownTimeoutMs;        ///< Graceful shutdown timeout in milliseconds
+  int reactor_max_total_buffered_bytes = defaults::kReactorMaxTotalBufferedBytes;  ///< Reactor buffer cap
 };
 
 /**

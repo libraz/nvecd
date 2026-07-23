@@ -26,6 +26,7 @@ performance:
   thread_pool_size: 4
   max_connections: 500
   connection_timeout_sec: 60
+  reactor_max_total_buffered_bytes: 33554432
 
 api:
   tcp:

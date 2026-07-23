@@ -335,6 +335,13 @@
           "default": 5000,
           "minimum": 100,
           "maximum": 60000
+        },
+        "reactor_max_total_buffered_bytes": {
+          "type": "integer",
+          "description": "Process-wide cap for bytes buffered by the TCP reactor",
+          "default": 268435456,
+          "minimum": 1048576,
+          "maximum": 1073741824
         }
       }
     },

@@ -22,6 +22,23 @@ gtest_discover_tests(end_to_end_test
     LABELS integration
 )
 
+add_executable(reactor_integration_test
+  reactor_integration_test.cpp
+)
+target_link_libraries(reactor_integration_test
+  nvecd_server
+  nvecd_storage
+  gtest_main
+)
+gtest_discover_tests(reactor_integration_test
+  DISCOVERY_MODE POST_BUILD
+  DISCOVERY_TIMEOUT 30
+  PROPERTIES
+    RESOURCE_LOCK server_port
+    TIMEOUT 60
+    LABELS integration
+)
+
 # Similarity End-to-End Tests
 
 add_executable(similarity_e2e_test

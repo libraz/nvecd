@@ -22,6 +22,9 @@ add_library(nvecd_server STATIC
   server/thread_pool.cpp
   server/connection_acceptor.cpp
   server/connection_io_handler.cpp
+  server/reactor/event_multiplexer.cpp
+  server/io_reactor.cpp
+  server/reactor_connection.cpp
   server/command_parser.cpp
   server/handlers/admin_handler.cpp
   server/handlers/info_handler.cpp

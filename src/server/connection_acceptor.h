@@ -52,6 +52,9 @@ class ConnectionAcceptor {
    */
   using ConnectionHandler = std::function<void(int client_fd)>;
 
+  /// Invoked inline by the accept thread; true transfers fd ownership to the reactor.
+  using ReactorHandler = std::function<bool(int client_fd)>;
+
   /**
    * @brief Construct a ConnectionAcceptor
    * @param config Server configuration
@@ -86,6 +89,12 @@ class ConnectionAcceptor {
    */
   void SetConnectionHandler(ConnectionHandler handler);
 
+  /** Install the reactor registration callback before Start(). */
+  void SetReactorHandler(ReactorHandler handler);
+
+  /** Remove a connection from accounting after the reactor releases it. */
+  void RemoveConnection(int socket_fd);
+
   /**
    * @brief Get actual port being listened on
    * @return Port number (useful when config.port = 0)
@@ -117,15 +126,13 @@ class ConnectionAcceptor {
    */
   bool SetSocketOptions(int socket_fd) const;
 
-  /**
-   * @brief Remove connection from active list
-   * @param socket_fd Socket file descriptor
-   */
-  void RemoveConnection(int socket_fd);
+  /** Apply receive/send buffer settings to an accepted client socket. */
+  void SetClientSocketOptions(int socket_fd) const;
 
   ServerConfig config_;
   ThreadPool* thread_pool_;
   ConnectionHandler connection_handler_;
+  ReactorHandler reactor_handler_;
 
   int server_fd_ = -1;
   uint16_t actual_port_ = 0;

@@ -205,13 +205,15 @@ performance:
   thread_pool_size: 8          # Worker thread pool size
   max_connections: 1000        # Maximum concurrent connections
   connection_timeout_sec: 300  # Connection timeout (seconds)
+  reactor_max_total_buffered_bytes: 268435456  # Aggregate buffered-data cap (256 MiB)
 ```
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `thread_pool_size` | int | 8 | Worker thread pool size (recommended: number of CPU cores). |
 | `max_connections` | int | 1000 | Maximum concurrent connections (set based on system limits). |
-| `connection_timeout_sec` | int | 300 | Idle connection timeout in seconds. |
+| `connection_timeout_sec` | int | 300 | Idle timeout and deadline for receiving the first complete request, in seconds. |
+| `reactor_max_total_buffered_bytes` | int | 268435456 | Maximum bytes the TCP reactor may hold across all pending and unsent data. |
 
 ---
 

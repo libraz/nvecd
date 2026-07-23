@@ -129,6 +129,7 @@ nlohmann::json ConfigToJson(const Config& config) {
       {"send_buffer_size", config.perf.send_buffer_size},
       {"max_query_length", config.perf.max_query_length},
       {"shutdown_timeout_ms", config.perf.shutdown_timeout_ms},
+      {"reactor_max_total_buffered_bytes", config.perf.reactor_max_total_buffered_bytes},
   };
 
   // API configuration

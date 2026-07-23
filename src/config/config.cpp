@@ -291,6 +291,9 @@ PerformanceConfig ParsePerformanceConfig(const YAML::Node& node) {
   if (node["shutdown_timeout_ms"]) {
     config.shutdown_timeout_ms = node["shutdown_timeout_ms"].as<int>();
   }
+  if (node["reactor_max_total_buffered_bytes"]) {
+    config.reactor_max_total_buffered_bytes = node["reactor_max_total_buffered_bytes"].as<int>();
+  }
 
   return config;
 }
@@ -749,6 +752,12 @@ utils::Expected<void, utils::Error> ValidateConfig(const Config& config) {
   if (config.perf.shutdown_timeout_ms < 100 || config.perf.shutdown_timeout_ms > 60000) {
     return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
                                                   "performance.shutdown_timeout_ms must be between 100 and 60000"));
+  }
+  if (config.perf.reactor_max_total_buffered_bytes < 1024 * 1024 ||
+      config.perf.reactor_max_total_buffered_bytes > 1024 * 1024 * 1024) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
+                         "performance.reactor_max_total_buffered_bytes must be between 1048576 and 1073741824"));
   }
 
   // Validate API configuration

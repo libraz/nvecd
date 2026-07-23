@@ -48,6 +48,7 @@ TEST(ConfigTest, LoadValidConfig) {
   EXPECT_EQ(config.perf.thread_pool_size, 4);
   EXPECT_EQ(config.perf.max_connections, 500);
   EXPECT_EQ(config.perf.connection_timeout_sec, 60);
+  EXPECT_EQ(config.perf.reactor_max_total_buffered_bytes, 32 * 1024 * 1024);
 
   // API config
   EXPECT_EQ(config.api.tcp.bind, "127.0.0.1");

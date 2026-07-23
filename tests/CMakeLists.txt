@@ -96,6 +96,17 @@ target_link_libraries(connection_io_handler_test
 )
 gtest_discover_tests(connection_io_handler_test)
 
+add_executable(io_reactor_test
+  server/io_reactor_test.cpp
+)
+target_link_libraries(io_reactor_test
+  nvecd_server
+  gtest_main
+)
+gtest_discover_tests(io_reactor_test
+  PROPERTIES TIMEOUT 30
+)
+
 add_executable(http_server_test
   server/http_server_test.cpp
 )

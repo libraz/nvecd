@@ -19,6 +19,7 @@
 #include "server/connection_acceptor.h"
 #include "server/decay_scheduler.h"
 #include "server/http_server.h"
+#include "server/io_reactor.h"
 #include "server/rate_limiter.h"
 #include "server/request_dispatcher.h"
 #include "server/server_types.h"
@@ -188,6 +189,7 @@ class NvecdServer {
   // Server components (owned)
   std::unique_ptr<RequestDispatcher> dispatcher_;
   std::unique_ptr<ThreadPool> thread_pool_;
+  std::unique_ptr<IoReactor> reactor_;
   std::unique_ptr<ConnectionAcceptor> acceptor_;
   std::unique_ptr<ConnectionAcceptor> unix_acceptor_;         ///< Unix domain socket acceptor (optional)
   std::unique_ptr<HttpServer> http_server_;                   // HTTP API server (optional)

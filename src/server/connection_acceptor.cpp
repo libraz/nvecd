@@ -13,7 +13,9 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <cstring>
+#include <thread>
 
 #include "server/server_types.h"
 #include "server/thread_pool.h"
@@ -287,11 +289,11 @@ void ConnectionAcceptor::Stop() {
     unix_socket_path_.clear();
   }
 
-  // Close all active connections
-  {
+  // In reactor mode, IoReactor owns the client fds and releases accounting
+  // through RemoveConnection(). Closing here would race its event loop.
+  if (!reactor_handler_) {
     std::lock_guard<std::mutex> lock(fds_mutex_);
     for (int socket_fd : active_fds_) {
-      // Shutdown socket to unblock recv/send calls in other threads
       shutdown(socket_fd, SHUT_RDWR);
       close(socket_fd);
     }
@@ -303,6 +305,10 @@ void ConnectionAcceptor::Stop() {
 
 void ConnectionAcceptor::SetConnectionHandler(ConnectionHandler handler) {
   connection_handler_ = std::move(handler);
+}
+
+void ConnectionAcceptor::SetReactorHandler(ReactorHandler handler) {
+  reactor_handler_ = std::move(handler);
 }
 
 void ConnectionAcceptor::AcceptLoop() {
@@ -339,6 +345,15 @@ void ConnectionAcceptor::AcceptLoop() {
 
     if (client_fd < 0) {
       if (!should_stop_) {
+        if (errno == EMFILE || errno == ENFILE) {
+          nvecd::utils::StructuredLog()
+              .Event("server_error")
+              .Field("operation", "accept_fd_exhaustion")
+              .Field("error", strerror(errno))
+              .Error();
+          std::this_thread::sleep_for(std::chrono::milliseconds(50));
+          continue;
+        }
         nvecd::utils::StructuredLog()
             .Event("server_error")
             .Field("operation", "accept")
@@ -349,6 +364,8 @@ void ConnectionAcceptor::AcceptLoop() {
       }
       continue;
     }
+
+    SetClientSocketOptions(client_fd);
 
     // SECURITY: Check connection limit BEFORE any processing to prevent resource exhaustion
     {
@@ -395,17 +412,20 @@ void ConnectionAcceptor::AcceptLoop() {
       }
     }
 
-    // Set receive timeout to avoid blocking indefinitely
-    struct timeval timeout {};
-    timeout.tv_sec = 1;  // 1 second timeout (short for quick shutdown)
-    timeout.tv_usec = 0;
-    if (setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
-      nvecd::utils::StructuredLog()
-          .Event("server_warning")
-          .Field("type", "setsockopt_failed")
-          .Field("option", "SO_RCVTIMEO")
-          .Field("error", strerror(errno))
-          .Warn();
+    // The legacy worker-per-connection handler uses a short receive timeout.
+    // Reactor sockets are non-blocking and use IoReactor's idle reaper instead.
+    if (!reactor_handler_) {
+      struct timeval timeout {};
+      timeout.tv_sec = 1;
+      timeout.tv_usec = 0;
+      if (setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
+        nvecd::utils::StructuredLog()
+            .Event("server_warning")
+            .Field("type", "setsockopt_failed")
+            .Field("option", "SO_RCVTIMEO")
+            .Field("error", strerror(errno))
+            .Warn();
+      }
     }
 
     // Track connection (global and per-IP)
@@ -418,8 +438,15 @@ void ConnectionAcceptor::AcceptLoop() {
       }
     }
 
-    // Submit to thread pool
-    if (thread_pool_ != nullptr && connection_handler_) {
+    // Registration is intentionally done on the accept thread: it is a small
+    // map insertion plus one poller call, and must not consume a worker for an
+    // idle socket's lifetime.
+    if (reactor_handler_) {
+      if (!reactor_handler_(client_fd)) {
+        close(client_fd);
+        RemoveConnection(client_fd);
+      }
+    } else if (thread_pool_ != nullptr && connection_handler_) {
       bool submitted = thread_pool_->Submit([this, client_fd]() {
         connection_handler_(client_fd);
         RemoveConnection(client_fd);
@@ -505,6 +532,21 @@ bool ConnectionAcceptor::SetSocketOptions(int socket_fd) const {
   }
 
   return true;
+}
+
+void ConnectionAcceptor::SetClientSocketOptions(int socket_fd) const {
+  if (config_.recv_buffer_size > 0 &&
+      setsockopt(socket_fd, SOL_SOCKET, SO_RCVBUF, &config_.recv_buffer_size, sizeof(config_.recv_buffer_size)) < 0) {
+    spdlog::warn("Failed to set SO_RCVBUF on accepted socket: {}", strerror(errno));
+  }
+  if (config_.send_buffer_size > 0 &&
+      setsockopt(socket_fd, SOL_SOCKET, SO_SNDBUF, &config_.send_buffer_size, sizeof(config_.send_buffer_size)) < 0) {
+    spdlog::warn("Failed to set SO_SNDBUF on accepted socket: {}", strerror(errno));
+  }
+#ifdef __APPLE__
+  const int enabled = 1;
+  (void)setsockopt(socket_fd, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled));
+#endif
 }
 
 void ConnectionAcceptor::RemoveConnection(int socket_fd) {
