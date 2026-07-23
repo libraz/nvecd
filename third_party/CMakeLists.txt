@@ -61,7 +61,9 @@ endif()
 FetchContent_Declare(
   spdlog
   GIT_REPOSITORY https://github.com/gabime/spdlog.git
-  GIT_TAG v1.12.0
+  # v1.15.2 fixed CVE-2025-6140 (pattern formatter resource consumption).
+  # Pin the current stable tag so the dependency remains reproducible.
+  GIT_TAG v1.17.0
 )
 FetchContent_MakeAvailable(spdlog)
 

@@ -69,10 +69,14 @@ endif()
 # Compiler flags
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wpedantic")
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  # Architecture flags: use -march=x86-64 for CI compatibility, -march=native for local builds
-  # CI sets NVECD_PORTABLE_BUILD=ON to avoid "Illegal instruction" on different CPUs
+  # Architecture flags: use a baseline for the actual target architecture in
+  # portable/CI builds, and tune for the host only in local builds.
   if(NVECD_PORTABLE_BUILD)
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=x86-64")
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+      set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=x86-64")
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+      set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=armv8-a")
+    endif()
   else()
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=native")
   endif()
@@ -137,6 +141,23 @@ endif()
 # Source
 add_subdirectory(src)
 
+include(CMakePackageConfigHelpers)
+configure_package_config_file(
+  ${CMAKE_SOURCE_DIR}/cmake/nvecdConfig.cmake.in
+  ${CMAKE_CURRENT_BINARY_DIR}/nvecdConfig.cmake
+  INSTALL_DESTINATION lib/cmake/nvecd
+)
+write_basic_package_version_file(
+  ${CMAKE_CURRENT_BINARY_DIR}/nvecdConfigVersion.cmake
+  VERSION ${PROJECT_VERSION}
+  COMPATIBILITY SameMajorVersion
+)
+install(FILES
+  ${CMAKE_CURRENT_BINARY_DIR}/nvecdConfig.cmake
+  ${CMAKE_CURRENT_BINARY_DIR}/nvecdConfigVersion.cmake
+  DESTINATION lib/cmake/nvecd
+)
+
 # Tests
 if(BUILD_TESTS)
   enable_testing()
@@ -181,13 +202,14 @@ if(ENABLE_COVERAGE)
   endif()
 endif()
 
-# Install (disabled until main executable is implemented)
-# install(TARGETS nvecd DESTINATION bin)
+install(FILES examples/config.yaml src/config/config-schema.json
+  DESTINATION etc/nvecd
+)
+install(FILES README.md DESTINATION share/doc/nvecd)
+install(DIRECTORY docs/en docs/ja DESTINATION share/doc/nvecd)
 
-# Install configuration example
-# if(EXISTS examples/config.yaml)
-#   install(FILES examples/config.yaml DESTINATION etc/nvecd RENAME config.yaml.example)
-# endif()
-
-# Install documentation
-# install(FILES README.md DESTINATION share/doc/nvecd)
+configure_file(cmake/uninstall.cmake.in ${CMAKE_CURRENT_BINARY_DIR}/uninstall.cmake @ONLY)
+add_custom_target(nvecd-uninstall
+  COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_BINARY_DIR}/uninstall.cmake
+  COMMENT "Removing files listed in install_manifest.txt"
+)

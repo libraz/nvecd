@@ -5,6 +5,26 @@
 
 include(GoogleTest)
 
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+
+add_test(NAME docs_contract_test
+  COMMAND ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/docs_contract_test.py
+          ${CMAKE_SOURCE_DIR}
+          $<TARGET_FILE:nvecd-cli>
+)
+set_tests_properties(docs_contract_test PROPERTIES LABELS "docs")
+
+configure_file(
+  ${CMAKE_CURRENT_SOURCE_DIR}/install_consumer/install_consumer_smoke.cmake.in
+  ${CMAKE_CURRENT_BINARY_DIR}/install_consumer_smoke.cmake
+  @ONLY
+)
+add_test(NAME install_consumer_smoke
+  COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_BINARY_DIR}/install_consumer_smoke.cmake
+)
+set_tests_properties(install_consumer_smoke PROPERTIES LABELS "install" TIMEOUT 120)
+
 # Include source directory
 include_directories(${CMAKE_SOURCE_DIR}/src)
 
@@ -26,6 +46,15 @@ target_link_libraries(network_utils_test
 )
 gtest_discover_tests(network_utils_test)
 
+add_executable(memory_utils_test
+  utils/memory_utils_test.cpp
+)
+target_link_libraries(memory_utils_test
+  nvecd_utils
+  gtest_main
+)
+gtest_discover_tests(memory_utils_test)
+
 add_executable(path_utils_test
   utils/path_utils_test.cpp
 )
@@ -35,6 +64,15 @@ target_link_libraries(path_utils_test
 )
 gtest_discover_tests(path_utils_test)
 
+add_executable(decay_scheduler_test
+  server/decay_scheduler_test.cpp
+)
+target_link_libraries(decay_scheduler_test
+  nvecd_server
+  gtest_main
+)
+gtest_discover_tests(decay_scheduler_test)
+
 add_executable(string_utils_test
   utils/string_utils_test.cpp
 )
@@ -43,6 +81,15 @@ target_link_libraries(string_utils_test
   gtest_main
 )
 gtest_discover_tests(string_utils_test)
+
+add_executable(structured_log_test
+  utils/structured_log_test.cpp
+)
+target_link_libraries(structured_log_test
+  nvecd_utils
+  gtest_main
+)
+gtest_discover_tests(structured_log_test)
 
 # Config tests
 add_executable(config_test
@@ -359,7 +406,7 @@ target_link_libraries(ivf_index_test
   gtest
   gtest_main
 )
-gtest_discover_tests(ivf_index_test)
+gtest_discover_tests(ivf_index_test PROPERTIES LABELS "sanitizer;concurrency")
 
 # HNSW index tests
 add_executable(hnsw_index_test
@@ -371,7 +418,7 @@ target_link_libraries(hnsw_index_test
   gtest
   gtest_main
 )
-gtest_discover_tests(hnsw_index_test)
+gtest_discover_tests(hnsw_index_test PROPERTIES LABELS "sanitizer;concurrency")
 
 # Metadata filter tests
 add_executable(metadata_filter_test
@@ -408,7 +455,7 @@ target_link_libraries(tiered_vector_store_test
   gtest_main
 )
 gtest_discover_tests(tiered_vector_store_test
-  PROPERTIES TIMEOUT 30
+  PROPERTIES TIMEOUT 30 LABELS "sanitizer;concurrency"
 )
 
 # Quantizer tests
@@ -473,7 +520,7 @@ target_link_libraries(concurrency_stress_test
   nvecd_similarity
   gtest_main
 )
-gtest_discover_tests(concurrency_stress_test)
+gtest_discover_tests(concurrency_stress_test PROPERTIES LABELS "sanitizer;concurrency")
 
 # Cache tests
 add_executable(result_compressor_test
@@ -584,9 +631,21 @@ gtest_discover_tests(nvecdclient_c_test
   PROPERTIES LABELS "client"
 )
 
-# Note: CLI tests removed - nvecd-cli should be tested manually
-# Interactive REPL testing is difficult to automate reliably
-# Manual testing procedure documented in docs/en/libnvecdclient.md
+add_executable(nvecd_cli_test
+  client/nvecd_cli_test.cpp
+)
+target_link_libraries(nvecd_cli_test
+  nvecd_server
+  nvecd_config
+  gtest
+  gtest_main
+)
+target_compile_definitions(nvecd_cli_test PRIVATE NVECD_CLI_PATH="$<TARGET_FILE:nvecd-cli>")
+add_dependencies(nvecd_cli_test nvecd-cli)
+gtest_discover_tests(nvecd_cli_test
+  DISCOVERY_TIMEOUT 30
+  PROPERTIES LABELS "client;e2e"
+)
 
 # Storage tests
 add_executable(snapshot_format_v1_test

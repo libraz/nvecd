@@ -168,6 +168,7 @@ add_library(nvecd_cache STATIC
   cache/md5.cpp
   cache/result_compressor.cpp
   cache/similarity_cache.cpp
+  cache/similarity_cache_controller.cpp
 )
 target_link_libraries(nvecd_cache PUBLIC
   nvecd_utils
@@ -202,11 +203,18 @@ add_library(nvecdclient SHARED
   client/nvecdclient.cpp
   client/nvecdclient_c.cpp
 )
-target_link_libraries(nvecdclient PUBLIC
+add_library(nvecd::client ALIAS nvecdclient)
+target_include_directories(nvecdclient PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+  $<INSTALL_INTERFACE:include/nvecd>
+)
+target_link_libraries(nvecdclient PRIVATE
   nvecd_utils
   Threads::Threads
 )
+target_compile_definitions(nvecdclient PRIVATE $<$<BOOL:${BUILD_TESTS}>:NVECD_ENABLE_TEST_HOOKS>)
 set_target_properties(nvecdclient PROPERTIES
+  EXPORT_NAME client
   VERSION 0.1.0
   SOVERSION 0
   PUBLIC_HEADER "client/nvecdclient.h;client/nvecdclient_c.h"
@@ -253,7 +261,19 @@ install(TARGETS nvecd-cli
 
 # Install client library
 install(TARGETS nvecdclient
+  EXPORT nvecdTargets
   LIBRARY DESTINATION lib
   ARCHIVE DESTINATION lib
+  RUNTIME DESTINATION bin
   PUBLIC_HEADER DESTINATION include/nvecd
+)
+install(FILES
+  utils/error.h
+  utils/expected.h
+  DESTINATION include/nvecd/utils
+)
+install(EXPORT nvecdTargets
+  FILE nvecdTargets.cmake
+  NAMESPACE nvecd::
+  DESTINATION lib/cmake/nvecd
 )

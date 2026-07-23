@@ -127,10 +127,7 @@ install: build
 # Uninstall
 uninstall:
 	@echo "Uninstalling nvecd from $(PREFIX)..."
-	rm -f $(PREFIX)/bin/nvecd
-	rm -f $(PREFIX)/bin/nvecd-cli
-	rm -rf $(PREFIX)/etc/nvecd
-	rm -rf $(PREFIX)/share/doc/nvecd
+	cmake --build $(BUILD_DIR) --target nvecd-uninstall
 	@echo "Uninstall complete!"
 
 # Format code with clang-format

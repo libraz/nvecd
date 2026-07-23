@@ -1,0 +1,41 @@
+set(smoke_root "@CMAKE_CURRENT_BINARY_DIR@/install-consumer-smoke")
+set(prefix "${smoke_root}/prefix")
+set(consumer_build "${smoke_root}/build")
+file(REMOVE_RECURSE "${smoke_root}")
+
+execute_process(
+  COMMAND "@CMAKE_COMMAND@" --install "@CMAKE_BINARY_DIR@" --prefix "${prefix}"
+  RESULT_VARIABLE install_result
+  OUTPUT_VARIABLE install_output
+  ERROR_VARIABLE install_error
+)
+if(NOT install_result EQUAL 0)
+  message(FATAL_ERROR "install failed: ${install_output}${install_error}")
+endif()
+
+execute_process(
+  COMMAND "@CMAKE_COMMAND@" -S "@CMAKE_CURRENT_SOURCE_DIR@/install_consumer" -B "${consumer_build}"
+          -G "@CMAKE_GENERATOR@" -DCMAKE_PREFIX_PATH=${prefix}
+  RESULT_VARIABLE configure_result
+  OUTPUT_VARIABLE configure_output
+  ERROR_VARIABLE configure_error
+)
+if(NOT configure_result EQUAL 0)
+  message(FATAL_ERROR "consumer configure failed: ${configure_output}${configure_error}")
+endif()
+
+execute_process(
+  COMMAND "@CMAKE_COMMAND@" --build "${consumer_build}"
+  RESULT_VARIABLE build_result
+  OUTPUT_VARIABLE build_output
+  ERROR_VARIABLE build_error
+)
+if(NOT build_result EQUAL 0)
+  message(FATAL_ERROR "consumer build failed: ${build_output}${build_error}")
+endif()
+
+execute_process(COMMAND "${consumer_build}/nvecd_cpp_consumer" RESULT_VARIABLE cpp_result)
+execute_process(COMMAND "${consumer_build}/nvecd_c_consumer" RESULT_VARIABLE c_result)
+if(NOT cpp_result EQUAL 0 OR NOT c_result EQUAL 0)
+  message(FATAL_ERROR "installed consumers failed: C++=${cpp_result}, C=${c_result}")
+endif()
