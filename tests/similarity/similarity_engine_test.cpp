@@ -8,6 +8,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <limits>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -240,6 +241,15 @@ TEST_F(SimilarityEngineTest, SearchByVector_DimensionMismatch) {
   EXPECT_EQ(results.error().code(), utils::ErrorCode::kVectorDimensionMismatch);
 }
 
+TEST_F(SimilarityEngineTest, SearchByVectorRejectsNonFiniteComponentsAndNorm) {
+  ASSERT_TRUE(vector_store_->SetVector("item1", {1.0F, 0.0F, 0.0F}).has_value());
+  EXPECT_FALSE(engine_->SearchByVector({std::numeric_limits<float>::quiet_NaN(), 0.0F, 0.0F}, 10).has_value());
+  EXPECT_FALSE(engine_->SearchByVector({std::numeric_limits<float>::infinity(), 0.0F, 0.0F}, 10).has_value());
+  EXPECT_FALSE(engine_->SearchByVector({std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), 0.0F}, 10)
+                   .has_value());
+  EXPECT_FALSE(engine_->SearchByVector({0.0F, 0.0F, 0.0F}, 10).has_value());
+}
+
 TEST_F(SimilarityEngineTest, SearchByVector_ValidQuery) {
   // Add vectors
   ASSERT_TRUE(vector_store_->SetVector("item1", {0.1f, 0.2f, 0.3f}).has_value());
@@ -313,6 +323,37 @@ TEST(SimilarityEngineAnnDeleteTest, HnswRebuildAfterDefragmentDoesNotReturnDelet
   EXPECT_NE(ids.find("first"), ids.end());
   EXPECT_NE(ids.find("shifted"), ids.end());
   EXPECT_EQ(ids.find("deleted"), ids.end());
+}
+
+TEST(SimilarityEngineAnnDeleteTest, StaleAnnGenerationFallsBackWithoutWrongIdScore) {
+  auto vectors_config = MakeVectorsConfig();
+  auto similarity_config = MakeSimilarityConfig();
+  similarity_config.index_type = "hnsw";
+  similarity_config.hnsw_m = 8;
+  similarity_config.hnsw_ef_construction = 32;
+  similarity_config.hnsw_ef_search = 16;
+
+  events::EventStore event_store(MakeEventsConfig());
+  events::CoOccurrenceIndex co_index;
+  vectors::VectorStore vector_store(vectors_config);
+  SimilarityEngine engine(&event_store, &co_index, &vector_store, similarity_config, vectors_config);
+
+  ASSERT_TRUE(vector_store.SetVector("first", {1.0F, 0.0F, 0.0F}));
+  ASSERT_TRUE(vector_store.SetVector("deleted", {0.0F, 1.0F, 0.0F}));
+  ASSERT_TRUE(vector_store.SetVector("shifted", {0.0F, 0.0F, 1.0F}));
+  engine.RebuildAnnFromStore();
+
+  // Deliberately mutate/compact the store without rebuilding ANN. Old ANN
+  // label 1 has score 1 for "deleted", but new store label 1 is "shifted".
+  ASSERT_TRUE(vector_store.DeleteVector("deleted"));
+  vector_store.Defragment();
+
+  auto results = engine.SearchByVector({0.0F, 1.0F, 0.0F}, 2);
+  ASSERT_TRUE(results.has_value());
+  ASSERT_EQ(results->size(), 2U);
+  for (const auto& result : *results) {
+    EXPECT_NEAR(result.score, 0.0F, 0.0001F) << result.item_id;
+  }
 }
 
 // ============================================================================
@@ -400,6 +441,19 @@ TEST_F(SimilarityEngineTest, FusionParameters_AlphaOnly) {
   if (!vector_results->empty() && !results->empty()) {
     EXPECT_EQ((*results)[0].item_id, (*vector_results)[0].item_id);
   }
+}
+
+TEST_F(SimilarityEngineTest, EventOnlyFallbackUsesUnitWeightWhenConfiguredEventWeightIsZero) {
+  config::SimilarityConfig config;
+  config.fusion_alpha = 1.0;
+  config.fusion_beta = 0.0;
+  SimilarityEngine engine(event_store_.get(), co_index_.get(), vector_store_.get(), config);
+  co_index_->SetScore("query", "candidate", 42.0F);
+
+  auto results = engine.SearchByIdFusion("query", 10);
+  ASSERT_TRUE(results.has_value()) << results.error().message();
+  ASSERT_EQ(results->size(), 1U);
+  EXPECT_FLOAT_EQ(results->front().score, 1.0F);
 }
 
 TEST_F(SimilarityEngineTest, FusionParameters_BetaOnly) {

@@ -248,6 +248,40 @@ std::vector<uint32_t> HnswIndex::SelectNeighbors(const std::vector<std::pair<flo
 void HnswIndex::Add(uint32_t compact_index, const float* vector) {
   std::unique_lock lock(mutex_);
   AddLocked(compact_index, vector);
+  MaybeCompactLocked();
+}
+
+void HnswIndex::MaybeCompactLocked() {
+  if (nodes_.size() < config_.rebuild_min_nodes || nodes_.empty()) {
+    return;
+  }
+  const size_t tombstones = nodes_.size() - active_count_;
+  if (static_cast<double>(tombstones) / static_cast<double>(nodes_.size()) <
+      static_cast<double>(config_.rebuild_tombstone_ratio)) {
+    return;
+  }
+
+  std::vector<std::pair<uint32_t, std::vector<float>>> live_vectors;
+  live_vectors.reserve(active_count_);
+  for (uint32_t compact_index = 0; compact_index < compact_to_internal_.size(); ++compact_index) {
+    const uint32_t internal_id = compact_to_internal_[compact_index];
+    if (internal_id == UINT32_MAX || internal_id >= nodes_.size() || nodes_[internal_id].deleted) {
+      continue;
+    }
+    const float* source = GetNodeVector(internal_id);
+    live_vectors.emplace_back(compact_index, std::vector<float>(source, source + dimension_));
+  }
+
+  nodes_.clear();
+  vectors_.clear();
+  vector_norms_.clear();
+  compact_to_internal_.clear();
+  entry_point_ = UINT32_MAX;
+  max_level_ = 0;
+  active_count_ = 0;
+  for (const auto& [compact_index, vector] : live_vectors) {
+    AddLocked(compact_index, vector.data());
+  }
 }
 
 void HnswIndex::AddLocked(uint32_t compact_index, const float* vector) {
@@ -386,6 +420,7 @@ void HnswIndex::MarkDeleted(uint32_t compact_index) {
   if (!nodes_[internal_id].deleted) {
     nodes_[internal_id].deleted = true;
     active_count_--;
+    MaybeCompactLocked();
   }
 }
 
@@ -420,21 +455,26 @@ std::vector<std::pair<uint32_t, float>> HnswIndex::Search(const float* query, ui
     }
   }
 
-  // Search layer 0 with ef candidates
-  auto candidates = SearchLayer(query, query_norm, cur_node, 0, ef);
-
-  // Filter deleted nodes and convert to (compact_index, score) pairs
   std::vector<std::pair<uint32_t, float>> results;
-  results.reserve(std::min(static_cast<uint32_t>(candidates.size()), top_k));
-
-  for (const auto& [score, internal_id] : candidates) {
-    if (nodes_[internal_id].deleted) {
-      continue;
+  while (true) {
+    auto candidates = SearchLayer(query, query_norm, cur_node, 0, ef);
+    results.clear();
+    results.reserve(std::min(static_cast<uint32_t>(candidates.size()), top_k));
+    for (const auto& [score, internal_id] : candidates) {
+      if (nodes_[internal_id].deleted) {
+        continue;
+      }
+      results.push_back({nodes_[internal_id].compact_index, score});
+      if (static_cast<uint32_t>(results.size()) >= top_k) {
+        break;
+      }
     }
-    results.push_back({nodes_[internal_id].compact_index, score});
-    if (static_cast<uint32_t>(results.size()) >= top_k) {
+    if (results.size() >= top_k || ef >= nodes_.size()) {
       break;
     }
+    // Deleted candidates consume the first search budget. Expand until the
+    // requested live count is found or every node has been considered.
+    ef = static_cast<uint32_t>(std::min<size_t>(nodes_.size(), std::max<size_t>(ef + 1, ef * 2ULL)));
   }
 
   return results;
@@ -682,6 +722,24 @@ uint32_t HnswIndex::GetMaxLevel() const {
 uint32_t HnswIndex::GetNodeCount() const {
   std::shared_lock lock(mutex_);
   return static_cast<uint32_t>(nodes_.size());
+}
+
+uint32_t HnswIndex::GetTombstoneCount() const {
+  std::shared_lock lock(mutex_);
+  return static_cast<uint32_t>(nodes_.size() - active_count_);
+}
+
+size_t HnswIndex::MemoryUsage() const {
+  std::shared_lock lock(mutex_);
+  size_t bytes = sizeof(*this) + nodes_.capacity() * sizeof(Node) + vectors_.capacity() * sizeof(float) +
+                 vector_norms_.capacity() * sizeof(float) + compact_to_internal_.capacity() * sizeof(uint32_t);
+  for (const auto& node : nodes_) {
+    bytes += node.neighbors.capacity() * sizeof(std::vector<uint32_t>);
+    for (const auto& layer : node.neighbors) {
+      bytes += layer.capacity() * sizeof(uint32_t);
+    }
+  }
+  return bytes;
 }
 
 }  // namespace nvecd::vectors

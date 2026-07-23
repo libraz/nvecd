@@ -8,9 +8,11 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <numeric>
 #include <random>
+#include <thread>
 #include <vector>
 
 #include "vectors/distance.h"
@@ -445,6 +447,53 @@ TEST_F(IvfIndexTest, SealBufferMovesToIvf) {
 
   EXPECT_EQ(index.GetBufferSize(), 0);
   EXPECT_EQ(index.GetIndexedCount(), 450);
+}
+
+TEST_F(IvfIndexTest, SealingTierRemainsSearchableUntilCommit) {
+  constexpr size_t kTotal = 12000;
+  constexpr size_t kTrainCount = 512;
+  std::mt19937 rng(314159);
+  std::vector<std::vector<float>> all_vectors;
+  all_vectors.reserve(kTotal);
+  for (size_t index = 0; index < kTotal; ++index) {
+    all_vectors.push_back(RandomVector(kDim, rng));
+  }
+  const auto matrix = BuildMatrix(all_vectors);
+  const auto norms = ComputeNorms(all_vectors);
+  std::vector<size_t> training_indices(kTrainCount);
+  std::iota(training_indices.begin(), training_indices.end(), size_t{0});
+
+  IvfIndex::Config config;
+  config.nlist = 64;
+  config.nprobe = 64;
+  config.seal_threshold = 1;
+  IvfIndex index(kDim, config);
+  index.Train(matrix.data(), training_indices.data(), training_indices.size(), kDim);
+  for (size_t vector_index = kTrainCount; vector_index < kTotal; ++vector_index) {
+    index.AppendToBuffer(vector_index, all_vectors[vector_index].data());
+  }
+
+  std::thread sealer([&index]() { index.SealBuffer(); });
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (index.GetSealingSize() == 0 && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+  const bool observed_sealing = index.GetSealingSize() > 0;
+
+  constexpr size_t kTarget = 1000;
+  std::vector<std::pair<float, size_t>> during;
+  if (observed_sealing) {
+    during = index.Search(all_vectors[kTarget].data(), norms[kTarget], matrix.data(), norms.data(), kTotal, kDim, 1);
+  }
+  sealer.join();
+
+  ASSERT_TRUE(observed_sealing);
+  ASSERT_EQ(during.size(), 1U);
+  EXPECT_EQ(during.front().second, kTarget);
+
+  auto after = index.Search(all_vectors[kTarget].data(), norms[kTarget], matrix.data(), norms.data(), kTotal, kDim, 1);
+  ASSERT_EQ(after.size(), 1U);
+  EXPECT_EQ(after.front().second, kTarget);
 }
 
 TEST_F(IvfIndexTest, SealBufferWhenNotTrained) {

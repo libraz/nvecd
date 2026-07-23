@@ -95,6 +95,9 @@ class DedupCache {
    */
   bool IsDuplicate(const EventKey& key, uint64_t current_timestamp) const;
 
+  /** Check duplicate state without updating counters, LRU state, or entries. */
+  bool WouldDeduplicate(const EventKey& key, uint64_t current_timestamp) const;
+
   /**
    * @brief Atomically test for a duplicate and record a new event.
    *
@@ -148,8 +151,11 @@ class DedupCache {
   // Cache entry: timestamp + iterator to LRU list
   struct CacheEntry {
     uint64_t timestamp{0};
+    std::chrono::steady_clock::time_point last_seen_at{};
     LRUIterator lru_iter;
   };
+
+  bool IsWithinWindow(const CacheEntry& entry, uint64_t timestamp, std::chrono::steady_clock::time_point now) const;
 
   size_t max_size_;      ///< Maximum cache size
   uint32_t window_sec_;  ///< Time window in seconds

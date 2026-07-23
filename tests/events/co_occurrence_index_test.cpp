@@ -250,22 +250,21 @@ TEST(CoOccurrenceIndexTest, ApplyDecayMultipleTimes) {
   EXPECT_FLOAT_EQ(index.GetScore("item1", "item2"), 162.0f);
 }
 
-TEST(CoOccurrenceIndexTest, ApplyDecayInvalidAlpha) {
+TEST(CoOccurrenceIndexTest, ApplyDecayZeroClearsAndInvalidAlphaIsIgnored) {
   CoOccurrenceIndex index;
   auto events = MakeEvents({{"item1", 10, 1000}, {"item2", 20, 1001}});
   index.UpdateFromEvents("ctx1", events);
 
   float original_score = index.GetScore("item1", "item2");
 
-  // Invalid alpha values should be ignored
-  index.ApplyDecay(0.0);
-  EXPECT_FLOAT_EQ(index.GetScore("item1", "item2"), original_score);
-
   index.ApplyDecay(-0.5);
   EXPECT_FLOAT_EQ(index.GetScore("item1", "item2"), original_score);
 
   index.ApplyDecay(1.5);
   EXPECT_FLOAT_EQ(index.GetScore("item1", "item2"), original_score);
+
+  index.ApplyDecay(0.0);
+  EXPECT_FLOAT_EQ(index.GetScore("item1", "item2"), 0.0F);
 }
 
 // ============================================================================

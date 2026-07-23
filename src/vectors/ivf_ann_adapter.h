@@ -42,7 +42,9 @@ class IvfAnnAdapter : public AnnIndex {
    * @param dimension Vector dimension
    */
   IvfAnnAdapter(std::unique_ptr<IvfIndex> ivf, VectorStore* vector_store, uint32_t dimension)
-      : ivf_(std::move(ivf)), vector_store_(vector_store), dimension_(dimension) {}
+      : ivf_(std::move(ivf)), vector_store_(vector_store) {
+    (void)dimension;
+  }
 
   void Add(uint32_t compact_index, const float* vector) override {
     ivf_->AppendToBuffer(static_cast<size_t>(compact_index), vector);
@@ -56,10 +58,11 @@ class IvfAnnAdapter : public AnnIndex {
       return {};
     }
 
-    float query_norm = simd::GetOptimalImpl().l2_norm(query, static_cast<size_t>(dimension_));
+    const auto dimension = static_cast<uint32_t>(snap.dim);
+    float query_norm = simd::GetOptimalImpl().l2_norm(query, snap.dim);
 
     auto ivf_results =
-        ivf_->Search(query, query_norm, snap.matrix, snap.norms, snap.count, dimension_, static_cast<size_t>(top_k));
+        ivf_->Search(query, query_norm, snap.matrix, snap.norms, snap.count, dimension, static_cast<size_t>(top_k));
 
     std::vector<std::pair<uint32_t, float>> results;
     results.reserve(ivf_results.size());
@@ -73,7 +76,6 @@ class IvfAnnAdapter : public AnnIndex {
     // Adopt the caller's dimension so Search (query_norm / stride) matches the
     // real data dimension even when the index was provisionally constructed for
     // a different configured default_dimension.
-    dimension_ = dimension;
     ivf_->ResetTrained();
     if (count == 0 || all_vectors == nullptr) {
       return;  // Dimension-only rebind: nothing to train yet.
@@ -116,7 +118,6 @@ class IvfAnnAdapter : public AnnIndex {
  private:
   std::unique_ptr<IvfIndex> ivf_;
   VectorStore* vector_store_;
-  uint32_t dimension_;
 };
 
 }  // namespace nvecd::vectors

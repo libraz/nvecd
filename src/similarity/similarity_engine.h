@@ -15,6 +15,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <unordered_set>
@@ -97,7 +98,8 @@ class SimilarityEngine {
    * @param top_k Maximum number of results
    * @return Expected<vector<SimilarityResult>, Error> Results or error
    */
-  utils::Expected<std::vector<SimilarityResult>, utils::Error> SearchByIdEvents(const std::string& item_id, int top_k);
+  utils::Expected<std::vector<SimilarityResult>, utils::Error> SearchByIdEvents(
+      const std::string& item_id, int top_k, const vectors::MetadataFilter& filter = {});
 
   /**
    * @brief Search similar items using vectors (distance)
@@ -264,6 +266,10 @@ class SimilarityEngine {
 
   /// ANN index (HNSW or IVF adapter; null for flat/brute-force)
   std::unique_ptr<vectors::AnnIndex> ann_index_;
+
+  /// Publishes ANN labels and the VectorStore generation as one mapping.
+  mutable std::shared_mutex ann_publication_mutex_;
+  std::atomic<uint64_t> ann_generation_{0};
 
   /// Legacy direct IVF pointer (non-owning, null if index_type != "ivf")
   vectors::IvfIndex* ivf_index_raw_ = nullptr;

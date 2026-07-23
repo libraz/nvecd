@@ -16,6 +16,7 @@
 #include <queue>
 #include <random>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "utils/structured_log.h"
@@ -231,25 +232,28 @@ void IvfIndex::BulkAddVectors(const size_t* compact_indices, const float* vector
 }
 
 void IvfIndex::RemoveVector(size_t compact_index) {
-  // First check the write buffer
+  // Remove from both searchable transient tiers. A vector may exist in both
+  // when it is updated while an older embedding is being sealed.
   {
     std::unique_lock buf_lock(buffer_mutex_);
     const size_t dim = dimension_.load(std::memory_order_relaxed);
-    for (size_t i = 0; i < buffer_indices_.size(); ++i) {
-      if (buffer_indices_[i] == compact_index) {
-        // Swap with last and pop for O(1) removal
-        size_t last = buffer_indices_.size() - 1;
-        if (i != last) {
-          buffer_indices_[i] = buffer_indices_[last];
-          // Swap vector data
-          std::copy(buffer_vectors_.data() + last * dim, buffer_vectors_.data() + (last + 1) * dim,
-                    buffer_vectors_.data() + i * dim);
+    const auto remove_from_tier = [compact_index, dim](std::vector<size_t>& indices, std::vector<float>& vectors) {
+      for (size_t i = 0; i < indices.size();) {
+        if (indices[i] != compact_index) {
+          ++i;
+          continue;
         }
-        buffer_indices_.pop_back();
-        buffer_vectors_.resize(buffer_indices_.size() * dim);
-        return;
+        const size_t last = indices.size() - 1;
+        if (i != last) {
+          indices[i] = indices[last];
+          std::copy(vectors.data() + last * dim, vectors.data() + (last + 1) * dim, vectors.data() + i * dim);
+        }
+        indices.pop_back();
+        vectors.resize(indices.size() * dim);
       }
-    }
+    };
+    remove_from_tier(buffer_indices_, buffer_vectors_);
+    remove_from_tier(sealing_indices_, sealing_vectors_);
   }
 
   // Then check IVF inverted lists
@@ -261,13 +265,7 @@ void IvfIndex::RemoveVector(size_t compact_index) {
 
   // Search all inverted lists for the compact_index
   for (auto& list : inverted_lists_) {
-    auto it = std::find(list.begin(), list.end(), compact_index);
-    if (it != list.end()) {
-      // Swap with last and pop for O(1) removal
-      *it = list.back();
-      list.pop_back();
-      return;
-    }
+    list.erase(std::remove(list.begin(), list.end(), compact_index), list.end());
   }
 }
 
@@ -473,7 +471,12 @@ void IvfIndex::AppendToBuffer(size_t compact_index, const float* vector) {
 
 size_t IvfIndex::GetBufferSize() const {
   std::shared_lock lock(buffer_mutex_);
-  return buffer_indices_.size();
+  return buffer_indices_.size() + sealing_indices_.size();
+}
+
+size_t IvfIndex::GetSealingSize() const {
+  std::shared_lock lock(buffer_mutex_);
+  return sealing_indices_.size();
 }
 
 bool IvfIndex::NeedsSeal() const {
@@ -482,16 +485,18 @@ bool IvfIndex::NeedsSeal() const {
 }
 
 void IvfIndex::SealBuffer() {
-  // Phase 1: Swap buffer contents out under brief lock (fast, unblocks writers)
+  // Phase 1: Move buffer contents into a distinct searchable sealing tier.
   std::vector<size_t> seal_indices;
   std::vector<float> seal_vectors;
   {
     std::unique_lock buf_lock(buffer_mutex_);
-    if (buffer_indices_.empty()) {
+    if (buffer_indices_.empty() || !sealing_indices_.empty()) {
       return;
     }
-    seal_indices.swap(buffer_indices_);
-    seal_vectors.swap(buffer_vectors_);
+    sealing_indices_.swap(buffer_indices_);
+    sealing_vectors_.swap(buffer_vectors_);
+    seal_indices = sealing_indices_;
+    seal_vectors = sealing_vectors_;
   }
   // Buffer lock released: AppendToBuffer can proceed immediately
 
@@ -508,8 +513,16 @@ void IvfIndex::SealBuffer() {
     std::shared_lock ivf_lock(mutex_);
     if (!trained_) {
       std::unique_lock buf_lock(buffer_mutex_);
-      buffer_indices_.insert(buffer_indices_.end(), seal_indices.begin(), seal_indices.end());
-      buffer_vectors_.insert(buffer_vectors_.end(), seal_vectors.begin(), seal_vectors.end());
+      for (size_t i = 0; i < sealing_indices_.size(); ++i) {
+        if (std::find(buffer_indices_.begin(), buffer_indices_.end(), sealing_indices_[i]) != buffer_indices_.end()) {
+          continue;  // A newer buffered embedding wins.
+        }
+        buffer_indices_.push_back(sealing_indices_[i]);
+        buffer_vectors_.insert(buffer_vectors_.end(), sealing_vectors_.begin() + static_cast<ptrdiff_t>(i * dim),
+                               sealing_vectors_.begin() + static_cast<ptrdiff_t>((i + 1) * dim));
+      }
+      sealing_indices_.clear();
+      sealing_vectors_.clear();
       return;
     }
     nlist = config_.nlist;
@@ -567,13 +580,26 @@ void IvfIndex::SealBuffer() {
     std::unique_lock ivf_lock(mutex_);
     if (!trained_ || layout_generation_ != layout_generation) {
       std::unique_lock buf_lock(buffer_mutex_);
-      buffer_indices_.insert(buffer_indices_.end(), seal_indices.begin(), seal_indices.end());
-      buffer_vectors_.insert(buffer_vectors_.end(), seal_vectors.begin(), seal_vectors.end());
+      for (size_t i = 0; i < sealing_indices_.size(); ++i) {
+        if (std::find(buffer_indices_.begin(), buffer_indices_.end(), sealing_indices_[i]) != buffer_indices_.end()) {
+          continue;
+        }
+        buffer_indices_.push_back(sealing_indices_[i]);
+        buffer_vectors_.insert(buffer_vectors_.end(), sealing_vectors_.begin() + static_cast<ptrdiff_t>(i * dim),
+                               sealing_vectors_.begin() + static_cast<ptrdiff_t>((i + 1) * dim));
+      }
+      sealing_indices_.clear();
+      sealing_vectors_.clear();
       return;
     }
+    std::unique_lock buf_lock(buffer_mutex_);
     for (size_t i = 0; i < seal_indices.size(); ++i) {
-      inverted_lists_[cluster_assignments[i]].push_back(seal_indices[i]);
+      if (std::find(sealing_indices_.begin(), sealing_indices_.end(), seal_indices[i]) != sealing_indices_.end()) {
+        inverted_lists_[cluster_assignments[i]].push_back(seal_indices[i]);
+      }
     }
+    sealing_indices_.clear();
+    sealing_vectors_.clear();
   }
 
   utils::StructuredLog()
@@ -588,36 +614,44 @@ std::vector<std::pair<float, size_t>> IvfIndex::SearchBuffer(const float* query_
 
   // A zero-norm query is only meaningless for cosine; dot/L2 remain well-defined.
   bool cosine_undefined = (config_.metric == IvfMetric::kCosine) && query_norm < kNormEpsilon;
-  if (buffer_indices_.empty() || query_vec == nullptr || cosine_undefined) {
+  if ((buffer_indices_.empty() && sealing_indices_.empty()) || query_vec == nullptr || cosine_undefined) {
     return {};
   }
 
   const auto& simd_impl = simd::GetOptimalImpl();
 
-  // Bounded min-heap for top-k selection
+  // Score both transient tiers and deduplicate by compact index. A newer
+  // buffered embedding may coexist with the older sealing copy.
   using ScoreIdx = std::pair<float, size_t>;
+  std::unordered_map<size_t, float> best_scores;
+  best_scores.reserve(buffer_indices_.size() + sealing_indices_.size());
+  const auto score_tier = [&](const std::vector<size_t>& indices, const std::vector<float>& vectors,
+                              bool overwrite_existing) {
+    for (size_t i = 0; i < indices.size(); ++i) {
+      const float* vec = vectors.data() + i * dimension;
+      const float vec_norm = simd_impl.l2_norm(vec, dimension);
+      const float score = Similarity(query_vec, query_norm, vec, vec_norm, dimension);
+      if (score == kWorstScore) {
+        continue;
+      }
+      auto [it, inserted] = best_scores.emplace(indices[i], score);
+      if (!inserted && (overwrite_existing || score > it->second)) {
+        it->second = score;
+      }
+    }
+  };
+  score_tier(sealing_indices_, sealing_vectors_, false);
+  score_tier(buffer_indices_, buffer_vectors_, true);  // Newer writes win.
+
+  // Bounded min-heap for top-k selection.
   auto cmp = [](const ScoreIdx& a, const ScoreIdx& b) { return a.first > b.first; };
   std::priority_queue<ScoreIdx, std::vector<ScoreIdx>, decltype(cmp)> min_heap(cmp);
-
-  for (size_t i = 0; i < buffer_indices_.size(); ++i) {
-    // Prefetch upcoming buffer vector data
-    if (i + kPrefetchAhead < buffer_indices_.size()) {
-      __builtin_prefetch(buffer_vectors_.data() + (i + kPrefetchAhead) * dimension, 0, 0);
-    }
-
-    const float* vec = buffer_vectors_.data() + i * dimension;
-    float vec_norm = simd_impl.l2_norm(vec, dimension);
-
-    float score = Similarity(query_vec, query_norm, vec, vec_norm, dimension);
-    if (score == kWorstScore) {
-      continue;  // Cosine undefined (zero norm); skip candidate
-    }
-
+  for (const auto& [index, score] : best_scores) {
     if (min_heap.size() < top_k) {
-      min_heap.push({score, buffer_indices_[i]});
+      min_heap.push({score, index});
     } else if (score > min_heap.top().first) {
       min_heap.pop();
-      min_heap.push({score, buffer_indices_[i]});
+      min_heap.push({score, index});
     }
   }
 

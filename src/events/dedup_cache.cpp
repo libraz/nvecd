@@ -12,6 +12,20 @@ namespace nvecd::events {
 
 DedupCache::DedupCache(size_t max_size, uint32_t window_sec) : max_size_(max_size), window_sec_(window_sec) {}
 
+bool DedupCache::IsWithinWindow(const CacheEntry& entry, uint64_t timestamp,
+                                std::chrono::steady_clock::time_point now) const {
+  const uint64_t event_time_distance =
+      timestamp >= entry.timestamp ? timestamp - entry.timestamp : entry.timestamp - timestamp;
+  if (event_time_distance <= window_sec_) {
+    return true;
+  }
+  // A client timestamp that jumps backwards beyond the event-time window must
+  // not turn every retry into a miss after one future-dated event. Bound that
+  // skew by the server's monotonic arrival window; after the real-time window
+  // expires, the older event may establish a new event-time baseline.
+  return timestamp < entry.timestamp && now - entry.last_seen_at <= std::chrono::seconds(window_sec_);
+}
+
 bool DedupCache::IsDuplicate(const EventKey& key, uint64_t current_timestamp) const {
   // Window of 0 means deduplication is disabled
   if (window_sec_ == 0) {
@@ -27,9 +41,7 @@ bool DedupCache::IsDuplicate(const EventKey& key, uint64_t current_timestamp) co
     return false;  // Not in cache = new event
   }
 
-  // Check if within time window
-  uint64_t prev_timestamp = it->second.timestamp;
-  if (current_timestamp >= prev_timestamp && (current_timestamp - prev_timestamp) <= window_sec_) {
+  if (IsWithinWindow(it->second, current_timestamp, std::chrono::steady_clock::now())) {
     total_hits_.fetch_add(1, std::memory_order_relaxed);
     return true;  // Duplicate within window
   }
@@ -39,6 +51,18 @@ bool DedupCache::IsDuplicate(const EventKey& key, uint64_t current_timestamp) co
   return false;
 }
 
+bool DedupCache::WouldDeduplicate(const EventKey& key, uint64_t current_timestamp) const {
+  if (window_sec_ == 0) {
+    return false;
+  }
+  std::shared_lock lock(mutex_);
+  const auto it = cache_.find(key);
+  if (it == cache_.end()) {
+    return false;
+  }
+  return IsWithinWindow(it->second, current_timestamp, std::chrono::steady_clock::now());
+}
+
 bool DedupCache::CheckAndInsert(const EventKey& key, uint64_t timestamp) {
   if (window_sec_ == 0) {
     total_misses_.fetch_add(1, std::memory_order_relaxed);
@@ -46,16 +70,19 @@ bool DedupCache::CheckAndInsert(const EventKey& key, uint64_t timestamp) {
   }
 
   std::unique_lock lock(mutex_);
+  const auto now = std::chrono::steady_clock::now();
   auto it = cache_.find(key);
   if (it != cache_.end()) {
-    const uint64_t previous = it->second.timestamp;
-    if (timestamp >= previous && timestamp - previous <= window_sec_) {
+    if (IsWithinWindow(it->second, timestamp, now)) {
       total_hits_.fetch_add(1, std::memory_order_relaxed);
+      it->second.last_seen_at = now;
+      lru_list_.splice(lru_list_.begin(), lru_list_, it->second.lru_iter);
       return true;
     }
 
     total_misses_.fetch_add(1, std::memory_order_relaxed);
-    it->second.timestamp = std::max(previous, timestamp);
+    it->second.timestamp = timestamp;
+    it->second.last_seen_at = now;
     lru_list_.splice(lru_list_.begin(), lru_list_, it->second.lru_iter);
     return false;
   }
@@ -65,21 +92,19 @@ bool DedupCache::CheckAndInsert(const EventKey& key, uint64_t timestamp) {
     EvictLRU();
   }
   lru_list_.push_front(key);
-  cache_[key] = CacheEntry{timestamp, lru_list_.begin()};
+  cache_[key] = CacheEntry{timestamp, now, lru_list_.begin()};
   return false;
 }
 
 void DedupCache::Insert(const EventKey& key, uint64_t timestamp) {
   std::unique_lock lock(mutex_);
+  const auto now = std::chrono::steady_clock::now();
 
   auto it = cache_.find(key);
 
   if (it != cache_.end()) {
-    // Key exists: keep the latest seen timestamp and move to front of LRU.
-    // Using max() guards against out-of-order (non-monotonic) client
-    // timestamps: an earlier-than-stored timestamp must not roll back the
-    // dedup window, otherwise subsequent in-window events could slip through.
-    it->second.timestamp = std::max(it->second.timestamp, timestamp);
+    it->second.timestamp = timestamp;
+    it->second.last_seen_at = now;
     lru_list_.splice(lru_list_.begin(), lru_list_, it->second.lru_iter);
     return;
   }
@@ -91,7 +116,7 @@ void DedupCache::Insert(const EventKey& key, uint64_t timestamp) {
 
   // Insert new entry
   lru_list_.push_front(key);
-  cache_[key] = CacheEntry{timestamp, lru_list_.begin()};
+  cache_[key] = CacheEntry{timestamp, now, lru_list_.begin()};
 }
 
 void DedupCache::Clear() {

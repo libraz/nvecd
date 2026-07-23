@@ -243,6 +243,9 @@ class IvfIndex {
    */
   size_t GetBufferSize() const;
 
+  /** @brief Get entries currently in the searchable sealing tier. */
+  size_t GetSealingSize() const;
+
   /**
    * @brief Check if the write buffer has reached the seal threshold
    * @return True if buffer size >= seal_threshold
@@ -351,6 +354,11 @@ class IvfIndex {
 
   /// Contiguous vector data for buffer entries [n x dimension_]
   std::vector<float> buffer_vectors_;
+
+  /// Entries currently being assigned to clusters. They remain searchable
+  /// until the IVF commit publishes them, so sealing never creates a gap.
+  std::vector<size_t> sealing_indices_;
+  std::vector<float> sealing_vectors_;
 
   /// Separate reader-writer lock for write buffer (independent of mutex_)
   mutable std::shared_mutex buffer_mutex_;

@@ -91,6 +91,14 @@ void MetadataStore::Clear() {
   metadata_.clear();
 }
 
+void MetadataStore::SwapState(MetadataStore& other) {
+  if (this == &other) {
+    return;
+  }
+  std::scoped_lock lock(mutex_, other.mutex_);
+  metadata_.swap(other.metadata_);
+}
+
 std::shared_lock<std::shared_mutex> MetadataStore::AcquireReadLock() const {
   return std::shared_lock(mutex_);
 }

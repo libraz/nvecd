@@ -103,6 +103,49 @@ TEST_F(HnswIndexTest, AddSameCompactIndexReplacesOldEmbeddingWithoutDuplicates) 
   EXPECT_NEAR(results[0].second, 1.0F, 0.01F);
 }
 
+TEST_F(HnswIndexTest, RepeatedUpdatesAutoCompactAndBoundMemory) {
+  std::vector<float> vector(kDim, 0.0F);
+  for (uint32_t update = 0; update < 5000; ++update) {
+    std::fill(vector.begin(), vector.end(), 0.0F);
+    vector[update % kDim] = 1.0F;
+    index_->Add(0, vector.data());
+  }
+
+  EXPECT_EQ(index_->Size(), 1U);
+  EXPECT_LT(index_->GetNodeCount(), 64U);
+  EXPECT_LT(index_->GetTombstoneCount(), 64U);
+  EXPECT_LT(index_->MemoryUsage(), 1024U * 1024U);
+  auto results = index_->Search(vector.data(), 10);
+  ASSERT_EQ(results.size(), 1U);
+  EXPECT_EQ(results.front().first, 0U);
+}
+
+TEST_F(HnswIndexTest, DeletedCandidatesDoNotUnderfillRequestedLiveTopK) {
+  HnswIndex::Config config;
+  config.m = 8;
+  config.ef_construction = 32;
+  config.ef_search = 4;
+  config.rebuild_min_nodes = 10000;  // Exercise search expansion, not compaction.
+  HnswIndex index(kDim, CosineDistanceRaw, config);
+
+  std::mt19937 rng(7);
+  std::vector<std::vector<float>> vectors;
+  for (uint32_t item = 0; item < 100; ++item) {
+    vectors.push_back(RandomVector(rng));
+    index.Add(item, vectors.back().data());
+  }
+  for (uint32_t item = 0; item < 95; ++item) {
+    index.MarkDeleted(item);
+  }
+
+  auto results = index.Search(vectors.back().data(), 5);
+  ASSERT_EQ(results.size(), 5U);
+  for (const auto& [compact_index, score] : results) {
+    (void)score;
+    EXPECT_GE(compact_index, 95U);
+  }
+}
+
 TEST_F(HnswIndexTest, SearchReturnsTopK) {
   std::mt19937 rng(42);
   constexpr uint32_t kCount = 50;

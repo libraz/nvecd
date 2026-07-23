@@ -271,6 +271,9 @@ class CoOccurrenceIndex {
    */
   void Clear();
 
+  /** Exchange snapshot-managed state with a staged index. */
+  void SwapState(CoOccurrenceIndex& other);
+
   /**
    * @brief Get co-occurrence index statistics
    * @return Statistics snapshot

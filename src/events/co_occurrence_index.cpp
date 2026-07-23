@@ -112,13 +112,23 @@ void CoOccurrenceIndex::AddEventIncrementalInternal(const std::vector<Event>& pr
 
   generation_.fetch_add(1, std::memory_order_release);
 
-  // Only the new event's neighbor list can grow here, so prune just that item.
-  // min_support is a live retention policy too: delaying it until a periodic
-  // decay lets low-support edges accumulate unboundedly when decay is off.
+  // Both endpoints of every new edge grow. In particular, a frequently seen
+  // hub can exceed its cap while each newly ingested leaf remains small.
+  // Prune every affected ID under the same lock so the symmetric matrix never
+  // exposes an over-limit existing endpoint after this update returns.
   if (config_.max_neighbors_per_item > 0 || config_.min_support > 0.0F) {
-    auto it = co_scores_.find(new_event.item_id);
-    if (it != co_scores_.end() && it->second.size() > config_.max_neighbors_per_item) {
-      PruneItemLocked(new_event.item_id);
+    std::vector<std::string> affected_ids;
+    affected_ids.reserve(prior_events.size() + 1);
+    affected_ids.push_back(new_event.item_id);
+    for (const auto& prior : prior_events) {
+      if (prior.item_id != new_event.item_id) {
+        affected_ids.push_back(prior.item_id);
+      }
+    }
+    std::sort(affected_ids.begin(), affected_ids.end());
+    affected_ids.erase(std::unique(affected_ids.begin(), affected_ids.end()), affected_ids.end());
+    for (const auto& item_id : affected_ids) {
+      PruneItemLocked(item_id);
     }
   }
 }
@@ -259,11 +269,18 @@ float CoOccurrenceIndex::GetScore(const std::string& item_id_1, const std::strin
 }
 
 void CoOccurrenceIndex::ApplyDecay(double alpha) {
-  if (alpha <= 0.0 || alpha > 1.0) {
+  if (alpha < 0.0 || alpha > 1.0) {
     return;  // Invalid alpha, skip decay
   }
 
   std::unique_lock lock(mutex_);
+  if (alpha == 0.0) {
+    if (!co_scores_.empty()) {
+      co_scores_.clear();
+      generation_.fetch_add(1, std::memory_order_acq_rel);
+    }
+    return;
+  }
 
   constexpr float kDecayThreshold = 1e-6F;
   float threshold = (config_.min_support > 0.0F) ? config_.min_support : kDecayThreshold;
@@ -408,6 +425,17 @@ void CoOccurrenceIndex::Clear() {
   std::unique_lock lock(mutex_);
   co_scores_.clear();
   generation_.fetch_add(1, std::memory_order_release);
+}
+
+void CoOccurrenceIndex::SwapState(CoOccurrenceIndex& other) {
+  if (this == &other) {
+    return;
+  }
+  std::scoped_lock lock(mutex_, other.mutex_);
+  co_scores_.swap(other.co_scores_);
+  const uint64_t this_generation = generation_.load(std::memory_order_relaxed);
+  generation_.store(other.generation_.load(std::memory_order_relaxed), std::memory_order_release);
+  other.generation_.store(this_generation, std::memory_order_release);
 }
 
 CoOccurrenceIndexStatistics CoOccurrenceIndex::GetStatistics() const {

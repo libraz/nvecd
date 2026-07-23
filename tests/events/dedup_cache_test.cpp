@@ -7,6 +7,7 @@
 
 #include <gtest/gtest.h>
 
+#include <limits>
 #include <thread>
 #include <vector>
 
@@ -176,6 +177,23 @@ TEST_F(DedupCacheTest, ZeroWindowDisabled) {
 
   // Even immediate duplicate should not be detected (window = 0)
   EXPECT_FALSE(cache.IsDuplicate(key, 1000));
+}
+
+TEST_F(DedupCacheTest, FutureTimestampDoesNotAllowRepeatedOlderRetries) {
+  DedupCache cache(100, 60);
+  EventKey key("ctx1", "id1", 100);
+
+  EXPECT_FALSE(cache.CheckAndInsert(key, 1'000'000));
+  EXPECT_TRUE(cache.CheckAndInsert(key, 1'000));
+  EXPECT_TRUE(cache.CheckAndInsert(key, 1'000));
+  EXPECT_EQ(cache.GetStatistics().total_hits, 2U);
+}
+
+TEST_F(DedupCacheTest, TimestampDistanceUsesOverflowSafeSubtraction) {
+  DedupCache cache(100, 60);
+  EventKey key("ctx1", "id1", 100);
+  cache.Insert(key, std::numeric_limits<uint64_t>::max());
+  EXPECT_TRUE(cache.IsDuplicate(key, 0));
 }
 
 TEST_F(DedupCacheTest, ThreadSafety) {

@@ -83,6 +83,9 @@ class VectorStore {
    */
   explicit VectorStore(config::VectorsConfig config);
 
+  /** Validate a vector mutation without changing store state. */
+  utils::Expected<void, utils::Error> ValidateVector(const std::string& vector_id, const std::vector<float>& vec) const;
+
   /**
    * @brief Store a vector with ID
    *
@@ -143,10 +146,16 @@ class VectorStore {
    */
   size_t GetDimension() const { return dimension_.load(std::memory_order_acquire); }
 
+  /** @brief Get the current corpus layout/content generation. */
+  uint64_t GetGeneration() const { return generation_.load(std::memory_order_acquire); }
+
   /**
    * @brief Clear all vectors
    */
   void Clear();
+
+  /** Exchange snapshot-managed state with a staged vector store. */
+  void SwapState(VectorStore& other);
 
   /**
    * @brief Get vector store statistics
@@ -246,6 +255,7 @@ class VectorStore {
     const float* norms = nullptr;   ///< Pointer to norm array
     size_t count = 0;               ///< Number of vectors (including tombstones)
     size_t dim = 0;                 ///< Vector dimension
+    uint64_t generation = 0;        ///< Corpus layout/content generation
     const std::unordered_map<std::string, size_t>* id_to_idx = nullptr;
     const std::vector<std::string>* idx_to_id = nullptr;
     const std::vector<bool>* deleted = nullptr;  ///< Tombstone flags per slot
@@ -309,8 +319,9 @@ class VectorStore {
   size_t MemoryUsageLocked() const;
   config::VectorsConfig config_;  ///< Configuration
 
-  mutable std::shared_mutex mutex_;   ///< Reader-writer lock
-  std::atomic<size_t> dimension_{0};  ///< Fixed dimension (0 = not set)
+  mutable std::shared_mutex mutex_;      ///< Reader-writer lock
+  std::atomic<size_t> dimension_{0};     ///< Fixed dimension (0 = not set)
+  std::atomic<uint64_t> generation_{0};  ///< Bumped after every published corpus mutation
 
   // Compact storage (single source of truth)
   std::vector<float> matrix_;                          ///< [n x dim] contiguous float array

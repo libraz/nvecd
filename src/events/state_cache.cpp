@@ -30,6 +30,12 @@ bool StateCache::IsDuplicateSet(const StateKey& key, int score) {
   return false;  // State transition
 }
 
+bool StateCache::WouldDeduplicateSet(const StateKey& key, int score) const {
+  std::shared_lock lock(mutex_);
+  const auto it = states_.find(key);
+  return it != states_.end() && it->second.first == score;
+}
+
 bool StateCache::CheckAndUpdateSet(const StateKey& key, int score) {
   std::unique_lock lock(mutex_);
   auto it = states_.find(key);
@@ -68,6 +74,12 @@ bool StateCache::IsDuplicateDel(const StateKey& key) {
 
   total_misses_.fetch_add(1, std::memory_order_relaxed);
   return false;  // Not deleted yet
+}
+
+bool StateCache::WouldDeduplicateDel(const StateKey& key) const {
+  std::shared_lock lock(mutex_);
+  const auto it = states_.find(key);
+  return it != states_.end() && it->second.first == kDeletedScore;
 }
 
 bool StateCache::CheckAndMarkDeleted(const StateKey& key) {

@@ -52,6 +52,40 @@ utils::Expected<void, utils::Error> EventStore::AddEvent(const std::string& ctx,
   return {};
 }
 
+utils::Expected<EventStore::PreparedEvent, utils::Error> EventStore::PrepareEvent(const std::string& ctx,
+                                                                                  const std::string& id, int score,
+                                                                                  EventType type,
+                                                                                  uint64_t timestamp) const {
+  if (ctx.empty()) {
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kEventStoreError, "Context cannot be empty"));
+  }
+  if (id.empty()) {
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kEventStoreError, "ID cannot be empty"));
+  }
+  if (type != EventType::DEL && (score < kMinEventScore || score > kMaxEventScore)) {
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kEventInvalidScore,
+                                                  "Score must be in range [0, 100], got " + std::to_string(score)));
+  }
+
+  const uint64_t resolved_timestamp = ResolveTimestamp(timestamp);
+  PreparedEvent prepared;
+  switch (type) {
+    case EventType::ADD:
+      prepared.deduped =
+          dedup_cache_ != nullptr && dedup_cache_->WouldDeduplicate(EventKey(ctx, id, score), resolved_timestamp);
+      break;
+    case EventType::SET:
+      prepared.deduped = state_cache_ != nullptr && state_cache_->WouldDeduplicateSet(StateKey(ctx, id), score);
+      break;
+    case EventType::DEL:
+      prepared.deduped = state_cache_ != nullptr && state_cache_->WouldDeduplicateDel(StateKey(ctx, id));
+      score = 0;
+      break;
+  }
+  prepared.event = Event(id, score, resolved_timestamp, type);
+  return prepared;
+}
+
 utils::Expected<EventStore::IngestResult, utils::Error> EventStore::AddEventAndGetPrior(const std::string& ctx,
                                                                                         const std::string& id,
                                                                                         int score, EventType type,
@@ -243,6 +277,25 @@ void EventStore::Clear() {
   if (state_cache_) {
     state_cache_->Clear();
   }
+}
+
+void EventStore::SwapState(EventStore& other) {
+  if (this == &other) {
+    return;
+  }
+  std::scoped_lock lock(mutex_, other.mutex_);
+  ctx_events_.swap(other.ctx_events_);
+  ctx_last_access_.swap(other.ctx_last_access_);
+  std::swap(context_access_sequence_, other.context_access_sequence_);
+
+  const uint64_t this_total = total_events_.load(std::memory_order_relaxed);
+  total_events_.store(other.total_events_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+  other.total_events_.store(this_total, std::memory_order_relaxed);
+  const uint64_t this_deduped = deduped_events_.load(std::memory_order_relaxed);
+  deduped_events_.store(other.deduped_events_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+  other.deduped_events_.store(this_deduped, std::memory_order_relaxed);
+  dedup_cache_.swap(other.dedup_cache_);
+  state_cache_.swap(other.state_cache_);
 }
 
 EventStoreStatistics EventStore::GetStatistics() const {

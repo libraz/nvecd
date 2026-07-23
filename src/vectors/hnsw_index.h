@@ -44,10 +44,12 @@ class HnswIndex : public AnnIndex {
    * @brief HNSW configuration parameters
    */
   struct Config {
-    uint32_t m = 16;                 ///< Number of connections per node (upper layers)
-    uint32_t ef_construction = 200;  ///< Search width during construction
-    uint32_t ef_search = 50;         ///< Search width during query (higher = better recall)
-    uint32_t max_elements = 0;       ///< Pre-allocate capacity (0 = grow dynamically)
+    uint32_t m = 16;                        ///< Number of connections per node (upper layers)
+    uint32_t ef_construction = 200;         ///< Search width during construction
+    uint32_t ef_search = 50;                ///< Search width during query (higher = better recall)
+    uint32_t max_elements = 0;              ///< Pre-allocate capacity (0 = grow dynamically)
+    float rebuild_tombstone_ratio = 0.25F;  ///< Churn ratio that triggers compaction
+    uint32_t rebuild_min_nodes = 64;        ///< Minimum graph size before auto-compaction
   };
 
   /**
@@ -105,6 +107,12 @@ class HnswIndex : public AnnIndex {
    */
   uint32_t GetNodeCount() const;
 
+  /** @brief Get the number of retired nodes. */
+  uint32_t GetTombstoneCount() const;
+
+  /** @brief Estimate all memory owned by vectors, nodes, and adjacency lists. */
+  size_t MemoryUsage() const;
+
  private:
   /// Node in the HNSW graph
   struct Node {
@@ -125,6 +133,9 @@ class HnswIndex : public AnnIndex {
 
   /// Insert one vector while mutex_ is already held exclusively.
   void AddLocked(uint32_t compact_index, const float* vector);
+
+  /// Rebuild from the latest live node per compact index when churn is high.
+  void MaybeCompactLocked();
 
   /**
    * @brief Greedy search from entry point at a single layer

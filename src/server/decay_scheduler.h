@@ -9,10 +9,13 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <thread>
 
 #include "events/co_occurrence_index.h"
+#include "utils/error.h"
+#include "utils/expected.h"
 
 namespace nvecd::server {
 
@@ -31,13 +34,15 @@ namespace nvecd::server {
  */
 class DecayScheduler {
  public:
+  using MaintenanceCallback = std::function<utils::Expected<void, utils::Error>(double alpha, bool prune)>;
   /**
    * @brief Construct a DecayScheduler
    * @param co_index Co-occurrence index to decay (non-owning, must outlive this)
    * @param interval_sec Decay interval in seconds (<= 0 disables the scheduler)
    * @param alpha Decay factor passed to ApplyDecay (0.0 < alpha <= 1.0)
    */
-  DecayScheduler(events::CoOccurrenceIndex* co_index, int interval_sec, double alpha);
+  DecayScheduler(events::CoOccurrenceIndex* co_index, int interval_sec, double alpha,
+                 MaintenanceCallback maintenance_callback = {});
 
   // Non-copyable and non-movable
   DecayScheduler(const DecayScheduler&) = delete;
@@ -81,6 +86,7 @@ class DecayScheduler {
   events::CoOccurrenceIndex* co_index_;
   int interval_sec_;
   double alpha_;
+  MaintenanceCallback maintenance_callback_;
 
   std::atomic<bool> running_{false};
   std::unique_ptr<std::thread> scheduler_thread_;

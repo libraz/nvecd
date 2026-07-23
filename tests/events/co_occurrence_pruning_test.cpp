@@ -101,6 +101,20 @@ TEST(CoOccurrencePruningTest, MaxNeighborsExactLimit) {
   EXPECT_EQ(index.GetNeighborCount("item0"), 3U);
 }
 
+TEST(CoOccurrencePruningTest, IncrementalUpdatesAlsoBoundExistingHub) {
+  CoOccurrenceIndex::Config cfg;
+  cfg.max_neighbors_per_item = 2;
+  CoOccurrenceIndex index(cfg);
+
+  const Event hub("hub", 10, 1000);
+  for (int i = 0; i < 20; ++i) {
+    const Event leaf("leaf" + std::to_string(i), i + 1, 1001 + static_cast<uint64_t>(i));
+    index.AddEventIncremental("ctx", {hub}, leaf, false, 0.0);
+    EXPECT_LE(index.GetNeighborCount("hub"), 2U);
+    EXPECT_LE(index.GetNeighborCount(leaf.item_id), 2U);
+  }
+}
+
 // ============================================================================
 // min_support pruning
 // ============================================================================

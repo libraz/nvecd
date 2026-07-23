@@ -6,6 +6,7 @@
 #include "server/decay_scheduler.h"
 
 #include <chrono>
+#include <utility>
 
 #include "utils/structured_log.h"
 
@@ -16,8 +17,12 @@ constexpr int kCheckIntervalMs = 1000;  // Check for shutdown every second
 constexpr int kPruneEveryNCycles = 10;  // Prune once per this many decay cycles
 }  // namespace
 
-DecayScheduler::DecayScheduler(events::CoOccurrenceIndex* co_index, int interval_sec, double alpha)
-    : co_index_(co_index), interval_sec_(interval_sec), alpha_(alpha) {}
+DecayScheduler::DecayScheduler(events::CoOccurrenceIndex* co_index, int interval_sec, double alpha,
+                               MaintenanceCallback maintenance_callback)
+    : co_index_(co_index),
+      interval_sec_(interval_sec),
+      alpha_(alpha),
+      maintenance_callback_(std::move(maintenance_callback)) {}
 
 DecayScheduler::~DecayScheduler() {
   Stop();
@@ -80,10 +85,20 @@ void DecayScheduler::SchedulerLoop() {
 
     // Check if it's time to decay
     if (now >= next_decay_time) {
-      co_index_->ApplyDecay(alpha_);
-
-      if (++cycles_since_prune >= kPruneEveryNCycles) {
-        co_index_->Prune();
+      const bool prune = ++cycles_since_prune >= kPruneEveryNCycles;
+      utils::Expected<void, utils::Error> maintained;
+      if (maintenance_callback_) {
+        maintained = maintenance_callback_(alpha_, prune);
+      } else {
+        co_index_->ApplyDecay(alpha_);
+        if (prune) {
+          co_index_->Prune();
+        }
+      }
+      if (!maintained) {
+        utils::StructuredLog().Event("decay_maintenance_failed").Field("error", maintained.error().message()).Error();
+      }
+      if (prune) {
         cycles_since_prune = 0;
       }
 

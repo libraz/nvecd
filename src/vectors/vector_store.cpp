@@ -21,9 +21,8 @@ constexpr size_t kMaxVectorDimension = 4096;
 
 VectorStore::VectorStore(config::VectorsConfig config) : config_(std::move(config)) {}
 
-utils::Expected<void, utils::Error> VectorStore::SetVector(const std::string& vector_id, const std::vector<float>& vec,
-                                                           bool normalize) {
-  // Validate inputs
+utils::Expected<void, utils::Error> VectorStore::ValidateVector(const std::string& vector_id,
+                                                                const std::vector<float>& vec) const {
   if (vector_id.empty()) {
     auto error = utils::MakeError(utils::ErrorCode::kInvalidArgument, "ID cannot be empty");
     utils::LogVectorStoreError("set_vector", vector_id, static_cast<int>(vec.size()), error.message());
@@ -40,6 +39,34 @@ utils::Expected<void, utils::Error> VectorStore::SetVector(const std::string& ve
                                   "Vector dimension exceeds maximum of " + std::to_string(kMaxVectorDimension));
     utils::LogVectorStoreError("set_vector", vector_id, static_cast<int>(vec.size()), error.message());
     return utils::MakeUnexpected(error);
+  }
+  if (!std::all_of(vec.begin(), vec.end(), [](float component) { return std::isfinite(component); })) {
+    auto error = utils::MakeError(utils::ErrorCode::kInvalidArgument, "Vector components must be finite");
+    utils::LogVectorStoreError("validate_vector", vector_id, static_cast<int>(vec.size()), error.message());
+    return utils::MakeUnexpected(error);
+  }
+  const float norm = simd::GetOptimalImpl().l2_norm(vec.data(), vec.size());
+  if (!std::isfinite(norm)) {
+    auto error = utils::MakeError(utils::ErrorCode::kInvalidArgument, "Vector norm must be finite");
+    utils::LogVectorStoreError("validate_vector", vector_id, static_cast<int>(vec.size()), error.message());
+    return utils::MakeUnexpected(error);
+  }
+  const size_t current_dim = dimension_.load(std::memory_order_acquire);
+  if (current_dim > 0 && vec.size() != current_dim) {
+    auto error = utils::MakeError(
+        utils::ErrorCode::kVectorDimensionMismatch,
+        "Vector dimension mismatch: expected " + std::to_string(current_dim) + ", got " + std::to_string(vec.size()));
+    utils::LogVectorStoreError("validate_vector", vector_id, static_cast<int>(vec.size()), error.message());
+    return utils::MakeUnexpected(error);
+  }
+  return {};
+}
+
+utils::Expected<void, utils::Error> VectorStore::SetVector(const std::string& vector_id, const std::vector<float>& vec,
+                                                           bool normalize) {
+  auto validation = ValidateVector(vector_id, vec);
+  if (!validation) {
+    return validation;
   }
 
   // Prepare vector (normalize if requested)
@@ -98,6 +125,7 @@ utils::Expected<void, utils::Error> VectorStore::SetVector(const std::string& ve
         idx_to_id_[idx] = vector_id;
         id_to_idx_[vector_id] = idx;
         ++active_count_;
+        generation_.fetch_add(1, std::memory_order_release);
         return {};
       }
 
@@ -111,6 +139,7 @@ utils::Expected<void, utils::Error> VectorStore::SetVector(const std::string& ve
       id_to_idx_[vector_id] = idx;
       ++active_count_;
     }
+    generation_.fetch_add(1, std::memory_order_release);
   }
 
   return {};
@@ -159,6 +188,8 @@ bool VectorStore::DeleteVector(const std::string& vector_id) {
     DefragmentLocked();
   }
 
+  generation_.fetch_add(1, std::memory_order_release);
+
   return true;
 }
 
@@ -197,6 +228,28 @@ void VectorStore::Clear() {
   active_count_ = 0;
   tombstone_count_ = 0;
   dimension_.store(0, std::memory_order_release);
+  generation_.fetch_add(1, std::memory_order_release);
+}
+
+void VectorStore::SwapState(VectorStore& other) {
+  if (this == &other) {
+    return;
+  }
+  std::scoped_lock lock(mutex_, other.mutex_);
+  matrix_.swap(other.matrix_);
+  norms_.swap(other.norms_);
+  normalized_.swap(other.normalized_);
+  id_to_idx_.swap(other.id_to_idx_);
+  idx_to_id_.swap(other.idx_to_id_);
+  deleted_.swap(other.deleted_);
+  free_slots_.swap(other.free_slots_);
+  std::swap(active_count_, other.active_count_);
+  std::swap(tombstone_count_, other.tombstone_count_);
+  const size_t this_dimension = dimension_.load(std::memory_order_relaxed);
+  dimension_.store(other.dimension_.load(std::memory_order_relaxed), std::memory_order_release);
+  other.dimension_.store(this_dimension, std::memory_order_release);
+  generation_.fetch_add(1, std::memory_order_release);
+  other.generation_.fetch_add(1, std::memory_order_release);
 }
 
 VectorStoreStatistics VectorStore::GetStatistics() const {
@@ -283,6 +336,7 @@ VectorStore::CompactSnapshot VectorStore::GetCompactSnapshot() const {
   // reallocated or defragmented out from under the consumer.
   std::shared_lock<std::shared_mutex> lock(mutex_);
   CompactSnapshot snap;
+  snap.generation = generation_.load(std::memory_order_relaxed);
   if (matrix_.empty()) {
     // Still move the lock so the Empty() snapshot's contract is uniform;
     // an empty store has nothing to protect but holding the lock is harmless.
@@ -319,6 +373,7 @@ bool VectorStore::IsDeleted(size_t idx) const {
 void VectorStore::Defragment() {
   std::unique_lock lock(mutex_);
   DefragmentLocked();
+  generation_.fetch_add(1, std::memory_order_release);
 }
 
 void VectorStore::DefragmentLocked() {

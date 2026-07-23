@@ -130,6 +130,16 @@ class EventStore {
     std::vector<Event> prior_events;  ///< Context buffer contents immediately before the append
   };
 
+  struct PreparedEvent {
+    bool deduped = false;
+    Event event;
+  };
+
+  /** Validate and preview an event without mutating store or dedup state. */
+  utils::Expected<PreparedEvent, utils::Error> PrepareEvent(const std::string& ctx, const std::string& item_id,
+                                                            int score, EventType type = EventType::ADD,
+                                                            uint64_t timestamp = 0) const;
+
   /**
    * @brief Atomically append an event and capture the prior buffer state
    *
@@ -207,6 +217,13 @@ class EventStore {
    * @brief Clear all events from all contexts
    */
   void Clear();
+
+  /**
+   * @brief Atomically exchange snapshot-managed state with another store
+   * @param other Staged store populated by snapshot deserialization
+   * @note Configuration is not exchanged; both stores must use compatible configuration.
+   */
+  void SwapState(EventStore& other);
 
   /**
    * @brief Get event store statistics

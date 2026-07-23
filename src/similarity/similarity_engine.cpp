@@ -6,6 +6,7 @@
 #include "similarity/similarity_engine.h"
 
 #include <algorithm>
+#include <limits>
 #include <map>
 #include <numeric>
 #include <queue>
@@ -110,16 +111,20 @@ void SimilarityEngine::RebuildAnnFromStore() {
   if (!ann_index_) {
     return;  // flat: nothing to rebuild
   }
-  // Hold the store read lock for the whole rebuild so the matrix cannot
-  // reallocate while the ANN reads it.
-  auto lock = vector_store_->AcquireReadLock();
-  auto dim = static_cast<uint32_t>(vector_store_->GetDimension());
+  JoinTrainThread();
+  std::unique_lock publication_lock(ann_publication_mutex_);
+  // Hold one store snapshot for both the index build and the generation
+  // publication. A search can therefore observe either the old pair or the
+  // complete new pair, never old ANN labels mapped through a new ID layout.
+  auto snap = vector_store_->GetCompactSnapshot();
+  const auto dim = static_cast<uint32_t>(snap.dim);
+  const auto count = static_cast<uint32_t>(snap.count);
+  ann_index_->Rebuild(snap.matrix, count, dim == 0 ? ann_dimension_ : dim);
+  ann_generation_.store(snap.generation, std::memory_order_release);
   if (dim == 0) {
-    return;  // Empty store; leave the index unbound until the first vector.
+    ann_dimension_bound_ = false;
+    return;
   }
-  auto count = static_cast<uint32_t>(vector_store_->GetMatrixCount());
-  const float* data = vector_store_->GetMatrixData();
-  ann_index_->Rebuild(data, count, dim);
   ann_dimension_ = dim;
   ann_dimension_bound_ = true;
 
@@ -160,21 +165,35 @@ SimilarityEngine::DistanceFunc SimilarityEngine::SelectDistanceFunction(const st
 // ============================================================================
 
 utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::SearchByIdEvents(
-    const std::string& item_id, int top_k) {
+    const std::string& item_id, int top_k, const vectors::MetadataFilter& filter) {
   auto validated_top_k = ValidateTopK(top_k);
   if (!validated_top_k) {
     return utils::MakeUnexpected(validated_top_k.error());
   }
 
-  // Get similar items from co-occurrence index
-  auto co_results = co_index_->GetSimilar(item_id, validated_top_k.value());
-
-  // Convert to SimilarityResult
   std::vector<SimilarityResult> results;
-  results.reserve(co_results.size());
-
-  for (const auto& [item_id, score] : co_results) {
-    results.emplace_back(item_id, score);
+  const bool filtering = !filter.Empty() && metadata_store_ != nullptr;
+  const size_t neighbor_count = co_index_->GetNeighborCount(item_id);
+  int fetch_k = validated_top_k.value();
+  while (true) {
+    auto co_results = co_index_->GetSimilar(item_id, fetch_k);
+    results.clear();
+    results.reserve(std::min(co_results.size(), static_cast<size_t>(validated_top_k.value())));
+    for (const auto& [candidate_id, score] : co_results) {
+      if (!filtering || metadata_store_->Matches(candidate_id, filter)) {
+        results.emplace_back(candidate_id, score);
+        if (static_cast<int>(results.size()) >= validated_top_k.value()) {
+          break;
+        }
+      }
+    }
+    if (!filtering || static_cast<int>(results.size()) >= validated_top_k.value() ||
+        co_results.size() < static_cast<size_t>(fetch_k) || static_cast<size_t>(fetch_k) >= neighbor_count) {
+      break;
+    }
+    const size_t doubled = static_cast<size_t>(fetch_k) * 2;
+    fetch_k = static_cast<int>(
+        std::min(neighbor_count, std::min(doubled, static_cast<size_t>(std::numeric_limits<int>::max()))));
   }
 
   return results;
@@ -216,16 +235,19 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
       has_filter ? static_cast<int64_t>(validated_top_k.value()) * kOversamplingFactor : validated_top_k.value();
   int fetch_k = static_cast<int>(std::min<int64_t>(oversampled, config_.max_top_k));
 
-  // ANN accelerated path (HNSW or IVF)
-  if (ann_index_ && IsAnnIndexReady()) {
-    // Copy the query vector out of the snapshot, then release the snapshot's
-    // read lock BEFORE calling the ANN index. The IVF adapter acquires its own
-    // snapshot internally; holding our snapshot across that call would attempt
-    // a recursive shared_lock on the same mutex (UB under C++17).
-    std::vector<float> query_copy(query_ptr, query_ptr + snap.dim);
-    const size_t total_count = snap.count;
-    snap.lock.unlock();
+  // Never acquire the ANN publication lock while holding a VectorStore
+  // snapshot: writers publish in the opposite (ANN → store) order.
+  std::vector<float> query_copy(query_ptr, query_ptr + snap.dim);
+  const size_t total_count = snap.count;
+  snap.lock.unlock();
 
+  // ANN accelerated path (HNSW or IVF). Keep the ANN generation stable while
+  // searching, then compare it with the store snapshot used for label→ID
+  // mapping. Direct VectorStore mutations can still advance the store while
+  // this shared lock is held; a mismatch falls back to a fresh flat snapshot.
+  bool ann_mapping_stale = false;
+  std::shared_lock publication_lock(ann_publication_mutex_);
+  if (ann_index_ && IsAnnIndexReady()) {
     // When a metadata filter is active the post-filter can discard most ANN
     // candidates, so a single fetch_k under-fetches relative to a flat scan.
     // Grow fetch_k until top_k filtered results are gathered or the index is
@@ -249,6 +271,10 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
         auto map_snap = vector_store_->GetCompactSnapshot();
         if (map_snap.Empty()) {
           return std::vector<SimilarityResult>{};
+        }
+        if (map_snap.generation != ann_generation_.load(std::memory_order_acquire)) {
+          ann_mapping_stale = true;
+          break;
         }
         results.clear();
         results.reserve(ann_results.size());
@@ -279,9 +305,28 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
       }
       current_fetch *= 2;
     }
-    std::sort(results.begin(), results.end());
-    return results;
+    if (!ann_mapping_stale) {
+      std::sort(results.begin(), results.end());
+      return results;
+    }
   }
+  publication_lock.unlock();
+
+  // ANN may be unavailable or stale. Re-resolve the query in one fresh flat
+  // snapshot because the original snapshot was released before publication.
+  snap = vector_store_->GetCompactSnapshot();
+  if (snap.Empty()) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kVectorNotFound, "Query vector not found: " + item_id));
+  }
+  query_it = snap.id_to_idx->find(item_id);
+  if (query_it == snap.id_to_idx->end()) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kVectorNotFound, "Query vector not found: " + item_id));
+  }
+  query_idx = query_it->second;
+  query_ptr = snap.matrix + query_idx * snap.dim;
+  query_norm = snap.norms[query_idx];
 
   // For non-cosine metrics, build query vector once
   std::vector<float> query_vec_data;
@@ -371,7 +416,7 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
   int fetch_k =
       static_cast<int>(std::min<int64_t>(static_cast<int64_t>(validated_top_k.value()) * 3, config_.max_top_k));
 
-  auto event_results = SearchByIdEvents(item_id, fetch_k);
+  auto event_results = SearchByIdEvents(item_id, fetch_k, filter);
 
   // Determine adaptive fusion weights. Maturity is derived from the
   // co-occurrence index directly (true neighbor count), NOT from the truncated
@@ -453,10 +498,14 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
   // has identical semantics in fusion and its single-source fallback.
   float event_weight = has_event_candidates ? beta : 0.0F;
   float vector_weight = has_vector_candidates ? alpha : 0.0F;
-  const float contributing_weight = event_weight + vector_weight;
-  if (contributing_weight > 0.0F) {
+  if (has_event_candidates != has_vector_candidates) {
+    event_weight = has_event_candidates ? 1.0F : 0.0F;
+    vector_weight = has_vector_candidates ? 1.0F : 0.0F;
+  } else if (const float contributing_weight = event_weight + vector_weight; contributing_weight > 0.0F) {
     event_weight /= contributing_weight;
     vector_weight /= contributing_weight;
+  } else {
+    return std::vector<SimilarityResult>{};
   }
 
   // Merge scores with computed weights
@@ -519,6 +568,11 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
     auto error = utils::MakeError(utils::ErrorCode::kInvalidArgument, "Query vector cannot be empty");
     return utils::MakeUnexpected(error);
   }
+  if (!std::all_of(query_vector.begin(), query_vector.end(),
+                   [](float component) { return std::isfinite(component); })) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kInvalidArgument, "Query vector components must be finite"));
+  }
 
   // Validate dimension
   size_t expected_dim = vector_store_->GetDimension();
@@ -531,6 +585,10 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
 
   // Compute query norm using SIMD
   float query_norm = vectors::simd::GetOptimalImpl().l2_norm(query_vector.data(), query_vector.size());
+  if (!std::isfinite(query_norm) || (use_prenorm_ && query_norm <= 0.0F)) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kInvalidArgument, "Query vector norm must be finite and non-zero"));
+  }
 
   // The oversampling product is computed in int64_t and clamped to max_top_k so
   // it cannot overflow int even if a large top_k slips through.
@@ -543,6 +601,8 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
   // ANN accelerated path (HNSW or IVF). The query vector is caller-owned, so
   // no snapshot is needed for the search itself; the IVF adapter takes its own
   // snapshot internally. Take a snapshot only to map result indices to IDs.
+  bool ann_mapping_stale = false;
+  std::shared_lock publication_lock(ann_publication_mutex_);
   if (ann_index_ && IsAnnIndexReady()) {
     // With an active metadata filter, the post-filter can discard most ANN
     // candidates. Grow fetch_k until top_k filtered results are gathered or the
@@ -565,6 +625,10 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
         auto map_snap = vector_store_->GetCompactSnapshot();
         if (map_snap.Empty()) {
           return std::vector<SimilarityResult>{};
+        }
+        if (map_snap.generation != ann_generation_.load(std::memory_order_acquire)) {
+          ann_mapping_stale = true;
+          break;
         }
         const auto total_count = static_cast<uint32_t>(map_snap.count);
         results.clear();
@@ -590,9 +654,12 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
       }
       current_fetch *= 2;
     }
-    std::sort(results.begin(), results.end());
-    return results;
+    if (!ann_mapping_stale) {
+      std::sort(results.begin(), results.end());
+      return results;
+    }
   }
+  publication_lock.unlock();
 
   // Brute-force path: hold a snapshot (read lock) for the full scan.
   auto snap = vector_store_->GetCompactSnapshot();
@@ -781,29 +848,57 @@ void SimilarityEngine::NotifyVectorAdded(size_t compact_index, const float* vect
     return;
   }
 
+  (void)vector;
+  std::unique_lock publication_lock(ann_publication_mutex_);
+  auto snap = vector_store_->GetCompactSnapshot();
+  if (snap.Empty() || compact_index >= snap.count || snap.IsDeleted(compact_index)) {
+    return;
+  }
+
   // Bind the index to the real data dimension before the first insert so Add()
   // never reads past the vector buffer.
   EnsureAnnDimension();
 
+  const uint64_t published_generation = ann_generation_.load(std::memory_order_relaxed);
+  if (published_generation == std::numeric_limits<uint64_t>::max() || published_generation + 1 != snap.generation) {
+    ann_index_->Rebuild(snap.matrix, static_cast<uint32_t>(snap.count), static_cast<uint32_t>(snap.dim));
+    ann_dimension_ = static_cast<uint32_t>(snap.dim);
+    ann_dimension_bound_ = true;
+    ann_generation_.store(snap.generation, std::memory_order_release);
+    return;
+  }
+
+  const float* published_vector = snap.matrix + compact_index * snap.dim;
+  bool start_ivf_training = false;
+  bool start_ivf_seal = false;
   if (config_.index_type == "hnsw") {
     // HNSW: direct incremental insertion
-    ann_index_->Add(static_cast<uint32_t>(compact_index), vector);
+    ann_index_->Add(static_cast<uint32_t>(compact_index), published_vector);
   } else if (config_.index_type == "ivf") {
     // IVF: append to write buffer (fast path)
     auto* adapter = static_cast<vectors::IvfAnnAdapter*>(ann_index_.get());
-    adapter->GetIvfIndex()->AppendToBuffer(compact_index, vector);
+    adapter->GetIvfIndex()->AppendToBuffer(compact_index, published_vector);
 
-    if (!adapter->IsTrained()) {
-      MaybeTrainIvfIndex();
-    } else if (adapter->NeedsSeal()) {
-      bool expected = false;
-      if (ivf_training_.compare_exchange_strong(expected, true)) {
-        JoinTrainThread();
-        ivf_train_thread_ = std::make_unique<std::thread>([this, adapter]() {
-          adapter->SealBuffer();
-          ivf_training_.store(false);
-        });
-      }
+    start_ivf_training = !adapter->IsTrained();
+    start_ivf_seal = !start_ivf_training && adapter->NeedsSeal();
+  }
+  ann_generation_.store(snap.generation, std::memory_order_release);
+  snap.lock.unlock();
+  publication_lock.unlock();
+
+  // Training takes its own VectorStore snapshot. Do not recursively acquire
+  // the store/shared publication locks held by the incremental publish above.
+  if (start_ivf_training) {
+    MaybeTrainIvfIndex();
+  } else if (start_ivf_seal) {
+    auto* adapter = static_cast<vectors::IvfAnnAdapter*>(ann_index_.get());
+    bool expected = false;
+    if (ivf_training_.compare_exchange_strong(expected, true)) {
+      JoinTrainThread();
+      ivf_train_thread_ = std::make_unique<std::thread>([this, adapter]() {
+        adapter->SealBuffer();
+        ivf_training_.store(false);
+      });
     }
   }
 }
@@ -812,6 +907,7 @@ void SimilarityEngine::NotifyVectorRemoved(size_t compact_index) {
   if (!ann_index_) {
     return;
   }
+  std::unique_lock publication_lock(ann_publication_mutex_);
   ann_index_->MarkDeleted(static_cast<uint32_t>(compact_index));
 }
 

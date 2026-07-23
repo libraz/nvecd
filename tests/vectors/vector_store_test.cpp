@@ -7,6 +7,7 @@
 
 #include <gtest/gtest.h>
 
+#include <limits>
 #include <thread>
 #include <vector>
 
@@ -202,6 +203,15 @@ TEST(VectorStoreTest, RejectsDimensionAboveConfiguredSafetyLimit) {
   auto result = store.SetVector("oversized", oversized);
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code(), utils::ErrorCode::kVectorDimensionMismatch);
+  EXPECT_EQ(store.GetVectorCount(), 0U);
+}
+
+TEST(VectorStoreTest, RejectsNonFiniteComponentsAndOverflowedNorm) {
+  VectorStore store(MakeConfig());
+  EXPECT_FALSE(store.SetVector("nan", {std::numeric_limits<float>::quiet_NaN(), 1.0F}).has_value());
+  EXPECT_FALSE(store.SetVector("inf", {std::numeric_limits<float>::infinity(), 1.0F}).has_value());
+  EXPECT_FALSE(
+      store.SetVector("overflow", {std::numeric_limits<float>::max(), std::numeric_limits<float>::max()}).has_value());
   EXPECT_EQ(store.GetVectorCount(), 0U);
 }
 

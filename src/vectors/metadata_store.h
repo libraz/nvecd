@@ -88,6 +88,9 @@ class MetadataStore {
    */
   void Clear();
 
+  /** Exchange snapshot-managed state with a staged metadata store. */
+  void SwapState(MetadataStore& other);
+
   /**
    * @brief Acquire read lock for batch operations
    */
