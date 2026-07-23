@@ -40,13 +40,11 @@ namespace detail {
  *   <idN> <scoreN>\r\n
  * @endcode
  *
- * A single recv() may return only part of such a response (e.g. just the header
- * line), or several responses at once. Using "buffer ends with a newline" as the
- * completion signal therefore truncates SIM/SIMV results. This helper inspects
- * the accumulated buffer and reports completion using length-aware framing:
- * when the buffer starts with "OK RESULTS <count>", it is complete only once
- * <count> + 1 newline-terminated lines have been received; otherwise a single
- * newline-terminated line marks completion.
+ * A single recv() may return only part of a response or several responses at
+ * once. The shared parser understands result counts, RESP bulk lengths and
+ * arrays, END-terminated administrative responses, and DEBUG result blocks.
+ * It returns the exact byte length of the first complete response so trailing
+ * bytes remain available for the next command.
  *
  * @param buffer Accumulated bytes received so far.
  * @return true if @p buffer contains at least one complete response.

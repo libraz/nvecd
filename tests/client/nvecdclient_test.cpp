@@ -8,13 +8,20 @@
 
 #include "client/nvecdclient.h"
 
+#include <arpa/inet.h>
 #include <gtest/gtest.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <chrono>
 #include <filesystem>
+#include <future>
 #include <memory>
+#include <string>
 #include <thread>
 
+#include "client/protocol_transport.h"
 #include "config/config.h"
 #include "server/nvecd_server.h"
 
@@ -37,14 +44,16 @@ class NvecdClientTest : public ::testing::Test {
     config_ = std::make_unique<config::Config>();
     config_->api.tcp.port = kTestPort;  // Random port
     config_->api.http.enable = false;
-    config_->perf.thread_pool_size = 2;                   // NOLINT
-    config_->events.ctx_buffer_size = 100;                // NOLINT
-    config_->events.decay_interval_sec = 60;              // NOLINT
-    config_->events.decay_alpha = 0.9;                    // NOLINT
-    config_->vectors.default_dimension = 3;               // Small dimension for tests
-    config_->network.allow_cidrs = {"127.0.0.1/32"};      // Allow localhost
-    config_->snapshot.dir = "/tmp/nvecd_test_snapshots";  // Use temp dir for tests
-    config_->snapshot.mode = "lock";                      // Save/Load round-trip is synchronous
+    config_->perf.thread_pool_size = 2;               // NOLINT
+    config_->events.ctx_buffer_size = 100;            // NOLINT
+    config_->events.decay_interval_sec = 60;          // NOLINT
+    config_->events.decay_alpha = 0.9;                // NOLINT
+    config_->vectors.default_dimension = 3;           // Small dimension for tests
+    config_->network.allow_cidrs = {"127.0.0.1/32"};  // Allow localhost
+    snapshot_dir_ = std::filesystem::temp_directory_path() / ("nvecd_client_test_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(snapshot_dir_);
+    config_->snapshot.dir = snapshot_dir_.string();  // Isolated from parallel CTest processes
+    config_->snapshot.mode = "lock";                 // Save/Load round-trip is synchronous
 
     // Create and start server (server owns stores)
     server_ = std::make_unique<server::NvecdServer>(*config_);
@@ -63,10 +72,12 @@ class NvecdClientTest : public ::testing::Test {
     if (server_) {
       server_->Stop();
     }
+    std::filesystem::remove_all(snapshot_dir_);
   }
 
   std::unique_ptr<config::Config> config_;
   std::unique_ptr<server::NvecdServer> server_;
+  std::filesystem::path snapshot_dir_;
   uint16_t port_ = 0;
 };
 
@@ -137,6 +148,95 @@ TEST(NvecdClientFramingTest, CompleteResponseLengthPreservesCoalescedNextRespons
   EXPECT_EQ(*length, first.size());
 }
 
+TEST(NvecdClientFramingTest, BulkAndArrayFramesWaitForTheDeclaredPayload) {
+  const std::string bulk = "$5\r\nhello\r\n";
+  for (size_t length = 0; length < bulk.size(); ++length) {
+    EXPECT_FALSE(detail::CompleteResponseLength(bulk.substr(0, length)).has_value()) << length;
+  }
+  EXPECT_EQ(*detail::CompleteResponseLength(bulk), bulk.size());
+
+  const std::string array = "*2\r\n$3\r\none\r\n$3\r\ntwo\r\n";
+  for (size_t length = 0; length < array.size(); ++length) {
+    EXPECT_FALSE(detail::CompleteResponseLength(array.substr(0, length)).has_value()) << length;
+  }
+  EXPECT_EQ(*detail::CompleteResponseLength(array), array.size());
+}
+
+TEST(NvecdClientFramingTest, DebugSimilarityWaitsForExplicitDebugBlockShape) {
+  const std::string response =
+      "OK RESULTS 1\r\nitem 0.9000\r\n# DEBUG 4\r\nmode: vectors\r\nquery_time_us: 4\r\n"
+      "candidates: 1\r\nresults: 1\r\n";
+  const auto frame = transport::FrameForCommand("SIM item 1 using=vectors", true);
+  EXPECT_FALSE(transport::CompleteResponseLength(response.substr(0, response.size() - 1), frame).has_value());
+  EXPECT_EQ(*transport::CompleteResponseLength(response, frame), response.size());
+}
+
+TEST(NvecdClientTransportTest, SendAllHandlesPartialWritesAndSuppressesSigpipe) {
+  int sockets[2] = {-1, -1};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets), 0);
+  ASSERT_TRUE(transport::ConfigureNoSigpipe(sockets[0]));
+  int small_buffer = 1024;
+  ASSERT_EQ(::setsockopt(sockets[0], SOL_SOCKET, SO_SNDBUF, &small_buffer, sizeof(small_buffer)), 0);
+
+  const std::string payload(1024U * 1024U, 'x');
+  auto reader = std::async(std::launch::async, [&]() {
+    std::string received;
+    received.resize(payload.size());
+    size_t offset = 0;
+    while (offset < received.size()) {
+      const ssize_t count = ::recv(sockets[1], received.data() + offset, received.size() - offset, 0);
+      if (count <= 0) {
+        break;
+      }
+      offset += static_cast<size_t>(count);
+    }
+    received.resize(offset);
+    return received;
+  });
+
+  int io_error = 0;
+  EXPECT_TRUE(transport::SendAll(sockets[0], payload, &io_error));
+  EXPECT_EQ(reader.get(), payload);
+  ::close(sockets[1]);
+
+  EXPECT_FALSE(transport::SendAll(sockets[0], "after-close", &io_error));
+  EXPECT_TRUE(io_error == EPIPE || io_error == ECONNRESET);
+  ::close(sockets[0]);
+}
+
+TEST(NvecdClientTransportTest, PeerCloseClearsConnectedStateAndBufferedBytes) {
+  const int listener = ::socket(AF_INET, SOCK_STREAM, 0);
+  ASSERT_GE(listener, 0);
+  sockaddr_in address = {};
+  address.sin_family = AF_INET;
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  address.sin_port = 0;
+  ASSERT_EQ(::bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)), 0);
+  ASSERT_EQ(::listen(listener, 1), 0);
+  socklen_t address_length = sizeof(address);
+  ASSERT_EQ(::getsockname(listener, reinterpret_cast<sockaddr*>(&address), &address_length), 0);
+
+  auto peer = std::async(std::launch::async, [listener]() {
+    const int accepted = ::accept(listener, nullptr, nullptr);
+    if (accepted >= 0) {
+      char byte = 0;
+      (void)::recv(accepted, &byte, 1, 0);
+      ::close(accepted);
+    }
+    ::close(listener);
+  });
+
+  ClientConfig config;
+  config.host = "127.0.0.1";
+  config.port = ntohs(address.sin_port);
+  config.timeout_ms = 1000;
+  NvecdClient client(config);
+  ASSERT_TRUE(client.Connect());
+  EXPECT_FALSE(client.Event("ctx", "ADD", "item", 1));
+  EXPECT_FALSE(client.IsConnected());
+  peer.get();
+}
+
 TEST(NvecdClientValidationTest, RejectsWhitespaceInTokenArgumentsInsteadOfQuoting) {
   NvecdClient client(ClientConfig{});
   EXPECT_FALSE(client.Vecset("item with space", {1.0F, 0.0F, 0.0F}));
@@ -182,7 +282,10 @@ TEST(NvecdClientAuthTest, AuthPreservesWhitespacePassword) {
   server_config.api.http.enable = false;
   server_config.network.allow_cidrs = {"127.0.0.1/32"};
   server_config.security.requirepass = " leading  and trailing ";
-  server_config.snapshot.dir = "/tmp/nvecd_client_auth_snapshots";
+  const auto snapshot_dir =
+      std::filesystem::temp_directory_path() / ("nvecd_client_auth_snapshots_" + std::to_string(::getpid()));
+  std::filesystem::remove_all(snapshot_dir);
+  server_config.snapshot.dir = snapshot_dir.string();
 
   server::NvecdServer server(server_config);
   ASSERT_TRUE(server.Start());
@@ -197,6 +300,7 @@ TEST(NvecdClientAuthTest, AuthPreservesWhitespacePassword) {
 
   client.Disconnect();
   server.Stop();
+  std::filesystem::remove_all(snapshot_dir);
 }
 
 //
@@ -416,6 +520,29 @@ TEST_F(NvecdClientTest, AuthNoPasswordConfigured) {
   EXPECT_TRUE(result) << "Auth failed: " << result.error().message();
 }
 
+TEST_F(NvecdClientTest, ConcurrentCallsOnOneClientRemainResponseAligned) {
+  ClientConfig config;
+  config.host = "127.0.0.1";
+  config.port = port_;
+
+  NvecdClient client(config);
+  ASSERT_TRUE(client.Connect());
+
+  constexpr size_t kCallerCount = 24;
+  std::vector<std::future<bool>> calls;
+  calls.reserve(kCallerCount);
+  for (size_t index = 0; index < kCallerCount; ++index) {
+    calls.emplace_back(std::async(std::launch::async, [&client]() {
+      const auto info = client.Info();
+      return info.has_value() && !info->version.empty();
+    }));
+  }
+  for (auto& call : calls) {
+    EXPECT_TRUE(call.get());
+  }
+  EXPECT_TRUE(client.IsConnected());
+}
+
 //
 // CACHE command tests
 //
@@ -594,6 +721,26 @@ TEST_F(NvecdClientTest, DebugCommands) {
 
   auto disable_result = client.DisableDebug();
   EXPECT_TRUE(disable_result) << "DisableDebug failed: " << disable_result.error().message();
+}
+
+TEST_F(NvecdClientTest, DebugSimilarityConsumesBlockBeforeNextCommand) {
+  ClientConfig config;
+  config.host = "127.0.0.1";
+  config.port = port_;
+
+  NvecdClient client(config);
+  ASSERT_TRUE(client.Connect());
+  ASSERT_TRUE(client.Vecset("debug_a", {1.0F, 0.0F, 0.0F}));
+  ASSERT_TRUE(client.Vecset("debug_b", {0.9F, 0.1F, 0.0F}));
+  ASSERT_TRUE(client.EnableDebug());
+
+  auto similarity = client.Sim("debug_a", 1, "vectors");
+  ASSERT_TRUE(similarity) << similarity.error().message();
+  ASSERT_EQ(similarity->results.size(), 1U);
+
+  // This command used to consume the first leftover DEBUG line as its reply.
+  EXPECT_TRUE(client.Vecset("after_debug", {0.0F, 1.0F, 0.0F}));
+  EXPECT_TRUE(client.DisableDebug());
 }
 
 //

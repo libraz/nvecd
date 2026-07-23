@@ -20,11 +20,13 @@
 #include <charconv>
 #include <cstring>
 #include <iomanip>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
 
+#include "client/protocol_transport.h"
 #include "utils/error.h"
 #include "utils/expected.h"
 
@@ -130,92 +132,13 @@ std::optional<std::string> ValidateProtocolToken(const std::string& value, const
 namespace detail {
 
 std::optional<size_t> CompleteResponseLength(const std::string& buffer, bool requires_end_terminator) {
-  // Locate the end of the first line (the header).
-  size_t first_newline = buffer.find('\n');
-  if (first_newline == std::string::npos) {
-    return std::nullopt;  // Header line not yet fully received.
-  }
-
-  // Extract the header without its trailing CR/LF.
-  std::string header = buffer.substr(0, first_newline);
-  if (!header.empty() && header.back() == '\r') {
-    header.pop_back();
-  }
-
-  // Multi-line administrative responses use an END line. Errors remain
-  // single-line even for such commands, so do not wait for END after ERROR.
-  if (requires_end_terminator && header.rfind("ERROR", 0) != 0 && header.rfind("-ERR", 0) != 0) {
-    constexpr std::string_view kEndCrLf = "\nEND\r\n";
-    constexpr std::string_view kEndLf = "\nEND\n";
-    const size_t crlf_pos = buffer.find(kEndCrLf);
-    const size_t lf_pos = buffer.find(kEndLf);
-    if (crlf_pos != std::string::npos && (lf_pos == std::string::npos || crlf_pos <= lf_pos)) {
-      return crlf_pos + kEndCrLf.size();
-    }
-    if (lf_pos != std::string::npos) {
-      return lf_pos + kEndLf.size();
-    }
-    return std::nullopt;
-  }
-
-  // Multi-line SIM/SIMV responses are framed by an explicit result count.
-  // Header format: "OK RESULTS <count>".
-  constexpr char kResultsPrefix[] = "OK RESULTS ";
-  constexpr size_t kResultsPrefixLen = sizeof(kResultsPrefix) - 1;
-  if (header.compare(0, kResultsPrefixLen, kResultsPrefix) == 0) {
-    long count = 0;
-    try {
-      size_t pos = 0;
-      count = std::stol(header.substr(kResultsPrefixLen), &pos);
-    } catch (const std::exception&) {
-      // Malformed count: fall back to single-line framing so the caller can
-      // surface a protocol error instead of blocking forever.
-      return first_newline + 1;
-    }
-    if (count < 0) {
-      return first_newline + 1;
-    }
-
-    // The complete response is the header line plus <count> result lines, each
-    // terminated by a newline. Count the newlines received so far.
-    size_t expected_lines = static_cast<size_t>(count) + 1;
-    size_t newline_count = 0;
-    for (size_t i = 0; i < buffer.size(); ++i) {
-      if (buffer[i] == '\n') {
-        ++newline_count;
-        if (newline_count >= expected_lines) {
-          return i + 1;
-        }
-      }
-    }
-    return std::nullopt;
-  }
-
-  // Single-line response: complete as soon as the first line terminates.
-  return first_newline + 1;
+  transport::ResponseFrame frame;
+  frame.end_terminated = requires_end_terminator;
+  return transport::CompleteResponseLength(buffer, frame);
 }
 
 bool IsResponseComplete(const std::string& buffer) {
   return CompleteResponseLength(buffer).has_value();
-}
-
-bool CommandRequiresEndTerminator(std::string_view command) {
-  while (!command.empty() && std::isspace(static_cast<unsigned char>(command.front())) != 0) {
-    command.remove_prefix(1);
-  }
-  const auto starts_with = [&command](std::string_view prefix) {
-    if (command.size() < prefix.size()) {
-      return false;
-    }
-    for (size_t i = 0; i < prefix.size(); ++i) {
-      if (std::toupper(static_cast<unsigned char>(command[i])) != prefix[i]) {
-        return false;
-      }
-    }
-    return true;
-  };
-  return (command.size() == 4 && starts_with("INFO")) || starts_with("CONFIG") || starts_with("CACHE STATS") ||
-         starts_with("DUMP INFO") || starts_with("DUMP STATUS");
 }
 
 }  // namespace detail
@@ -229,13 +152,15 @@ class NvecdClient::Impl {
 
   ~Impl() { Disconnect(); }
 
-  // Non-copyable, movable
+  // Non-copyable/non-movable: the public object moves its owning unique_ptr,
+  // while this implementation retains a stable round-trip mutex address.
   Impl(const Impl&) = delete;
   Impl& operator=(const Impl&) = delete;
-  Impl(Impl&&) = default;
-  Impl& operator=(Impl&&) = default;
+  Impl(Impl&&) = delete;
+  Impl& operator=(Impl&&) = delete;
 
   Expected<void, Error> Connect() {
+    std::lock_guard lock(round_trip_mutex_);
     if (sock_ >= 0) {
       return MakeUnexpected(MakeError(ErrorCode::kClientAlreadyConnected, "Already connected"));
     }
@@ -247,6 +172,7 @@ class NvecdClient::Impl {
         return MakeUnexpected(MakeError(ErrorCode::kClientConnectionFailed,
                                         "Failed to create unix socket: " + std::string(strerror(errno))));
       }
+      (void)transport::ConfigureNoSigpipe(sock_);
 
       // Set timeouts
       struct timeval timeout_val = {};
@@ -258,7 +184,12 @@ class NvecdClient::Impl {
 
       struct sockaddr_un server_addr = {};
       server_addr.sun_family = AF_UNIX;
-      std::strncpy(server_addr.sun_path, config_.unix_socket_path.c_str(), sizeof(server_addr.sun_path) - 1);
+      if (config_.unix_socket_path.size() >= sizeof(server_addr.sun_path)) {
+        close(sock_);
+        sock_ = -1;
+        return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, "Unix socket path is too long"));
+      }
+      std::memcpy(server_addr.sun_path, config_.unix_socket_path.c_str(), config_.unix_socket_path.size() + 1);
 
       // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) - Required for socket API
       if (connect(sock_, reinterpret_cast<struct sockaddr*>(&server_addr), sizeof(server_addr)) < 0) {
@@ -276,6 +207,7 @@ class NvecdClient::Impl {
       return MakeUnexpected(
           MakeError(ErrorCode::kClientConnectionFailed, std::string("Failed to create socket: ") + strerror(errno)));
     }
+    (void)transport::ConfigureNoSigpipe(sock_);
 
     // Set socket timeout
     struct timeval timeout_val = {};
@@ -307,27 +239,38 @@ class NvecdClient::Impl {
     return {};
   }
 
-  void Disconnect() {
+  void Disconnect() const {
+    std::lock_guard lock(round_trip_mutex_);
+    DisconnectUnlocked();
+  }
+
+  void DisconnectUnlocked() const {
     if (sock_ >= 0) {
       close(sock_);
       sock_ = -1;
     }
     response_buffer_.clear();
+    debug_mode_ = false;
   }
 
-  [[nodiscard]] bool IsConnected() const { return sock_ >= 0; }
+  [[nodiscard]] bool IsConnected() const {
+    std::lock_guard lock(round_trip_mutex_);
+    return sock_ >= 0;
+  }
 
   Expected<std::string, Error> SendCommand(const std::string& command) const {
-    if (!IsConnected()) {
+    std::lock_guard lock(round_trip_mutex_);
+    if (sock_ < 0) {
       return MakeUnexpected(MakeError(ErrorCode::kClientNotConnected, "Not connected"));
     }
 
     // Send command with \r\n terminator
     std::string msg = command + "\r\n";
-    ssize_t sent = send(sock_, msg.c_str(), msg.length(), 0);
-    if (sent < 0) {
+    int io_error = 0;
+    if (!transport::SendAll(sock_, msg, &io_error)) {
+      DisconnectUnlocked();
       return MakeUnexpected(
-          MakeError(ErrorCode::kClientCommandFailed, std::string("Failed to send command: ") + strerror(errno)));
+          MakeError(ErrorCode::kClientCommandFailed, std::string("Failed to send command: ") + strerror(io_error)));
     }
 
     // Receive response. A single recv() may deliver only part of a multi-line
@@ -336,28 +279,43 @@ class NvecdClient::Impl {
     std::string response;
     std::vector<char> buffer(config_.recv_buffer_size);
 
-    const bool requires_end_terminator = detail::CommandRequiresEndTerminator(command);
+    const auto frame = transport::FrameForCommand(command, debug_mode_);
     while (true) {
-      if (const auto response_length = detail::CompleteResponseLength(response_buffer_, requires_end_terminator)) {
+      if (const auto response_length = transport::CompleteResponseLength(response_buffer_, frame)) {
         response.assign(response_buffer_.data(), *response_length);
         response_buffer_.erase(0, *response_length);
         break;
       }
-      ssize_t received = recv(sock_, buffer.data(), buffer.size(), 0);
+      const ssize_t received = transport::ReceiveRetryingEintr(sock_, buffer.data(), buffer.size(), &io_error);
       if (received <= 0) {
+        DisconnectUnlocked();
         if (received == 0) {
           return MakeUnexpected(MakeError(ErrorCode::kClientConnectionClosed, "Connection closed by server"));
         }
-        return MakeUnexpected(
-            MakeError(ErrorCode::kClientCommandFailed, std::string("Failed to receive response: ") + strerror(errno)));
+        return MakeUnexpected(MakeError(ErrorCode::kClientCommandFailed,
+                                        std::string("Failed to receive response: ") + strerror(io_error)));
       }
 
       response_buffer_.append(buffer.data(), static_cast<size_t>(received));
+      constexpr size_t kMaxBufferedResponseBytes = 64U * 1024U * 1024U;
+      if (response_buffer_.size() > kMaxBufferedResponseBytes) {
+        DisconnectUnlocked();
+        return MakeUnexpected(MakeError(ErrorCode::kClientProtocolError, "Response exceeds 64 MiB limit"));
+      }
     }
 
     // Remove trailing \r\n
     while (!response.empty() && (response.back() == '\n' || response.back() == '\r')) {
       response.pop_back();
+    }
+
+    if (!IsErrorResponse(response)) {
+      const std::string upper = transport::UpperCommand(command);
+      if (upper == "DEBUG ON") {
+        debug_mode_ = true;
+      } else if (upper == "DEBUG OFF") {
+        debug_mode_ = false;
+      }
     }
 
     return response;
@@ -907,8 +865,10 @@ class NvecdClient::Impl {
   }
 
   ClientConfig config_;
+  mutable std::mutex round_trip_mutex_;
   mutable int sock_ = -1;
   mutable std::string response_buffer_;
+  mutable bool debug_mode_ = false;
 };
 
 //

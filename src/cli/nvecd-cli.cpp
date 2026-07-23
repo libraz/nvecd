@@ -7,8 +7,10 @@
  */
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -25,6 +27,8 @@
 #include <utility>
 #include <vector>
 
+#include "client/protocol_transport.h"
+
 // Try to use readline if available
 #ifdef HAVE_READLINE
 #include <readline/history.h>
@@ -40,88 +44,63 @@ constexpr size_t kReceiveBufferSize = 65536;  // Receive buffer size (64KB)
 constexpr size_t kOkPrefixLength = 3;         // "OK " length
 constexpr size_t kErrorPrefixLength = 6;      // "ERROR " length
 constexpr int kMaxWaitReadyRetries = 100;     // Maximum retries for --wait-ready (~5 minutes)
+constexpr size_t kMaxPasswordBytes = 4096;
 
-/**
- * @brief Determine whether a received response is complete (framing).
- *
- * Mirrors nvecd::client::detail::IsResponseComplete (the CLI is a standalone
- * binary and does not link the client library). Single-line responses complete
- * at the first newline; multi-line SIM/SIMV responses framed by an
- * "OK RESULTS <count>" header complete only once <count> + 1 newline-terminated
- * lines have been received, so partial TCP segments do not truncate results.
- *
- * @param buffer Accumulated bytes received so far.
- * @return true if @p buffer contains at least one complete response.
- */
-std::optional<size_t> CompleteResponseLength(const std::string& buffer, bool requires_end_terminator) {
-  size_t first_newline = buffer.find('\n');
-  if (first_newline == std::string::npos) {
-    return std::nullopt;  // Header line not yet fully received.
+bool ValidatePassword(std::string* password, std::string* error) {
+  if (password->empty()) {
+    *error = "password is empty";
+    return false;
   }
-
-  std::string header = buffer.substr(0, first_newline);
-  if (!header.empty() && header.back() == '\r') {
-    header.pop_back();
+  if (password->size() > kMaxPasswordBytes) {
+    *error = "password exceeds 4096 bytes";
+    return false;
   }
-
-  if (requires_end_terminator && header.rfind("ERROR", 0) != 0 && header.rfind("-ERR", 0) != 0) {
-    constexpr std::string_view kEndCrLf = "\nEND\r\n";
-    constexpr std::string_view kEndLf = "\nEND\n";
-    const size_t crlf_pos = buffer.find(kEndCrLf);
-    const size_t lf_pos = buffer.find(kEndLf);
-    if (crlf_pos != std::string::npos && (lf_pos == std::string::npos || crlf_pos <= lf_pos)) {
-      return crlf_pos + kEndCrLf.size();
-    }
-    if (lf_pos != std::string::npos) {
-      return lf_pos + kEndLf.size();
-    }
-    return std::nullopt;
+  if (password->find_first_of("\r\n\0", 0, 3) != std::string::npos) {
+    *error = "password contains a line delimiter";
+    return false;
   }
-
-  constexpr char kResultsPrefix[] = "OK RESULTS ";
-  constexpr size_t kResultsPrefixLen = sizeof(kResultsPrefix) - 1;
-  if (header.compare(0, kResultsPrefixLen, kResultsPrefix) == 0) {
-    long count = 0;
-    try {
-      size_t pos = 0;
-      count = std::stol(header.substr(kResultsPrefixLen), &pos);
-    } catch (const std::exception&) {
-      return first_newline + 1;  // Malformed count: let the caller surface a protocol error.
-    }
-    if (count < 0) {
-      return first_newline + 1;
-    }
-
-    size_t expected_lines = static_cast<size_t>(count) + 1;
-    size_t newline_count = 0;
-    for (size_t i = 0; i < buffer.size(); ++i) {
-      if (buffer[i] == '\n') {
-        ++newline_count;
-        if (newline_count >= expected_lines) {
-          return i + 1;
-        }
-      }
-    }
-    return std::nullopt;
-  }
-
-  return first_newline + 1;
+  return true;
 }
 
-bool CommandRequiresEndTerminator(const std::string& command) {
-  const auto starts_with = [&command](std::string_view prefix) {
-    if (command.size() < prefix.size()) {
-      return false;
+std::optional<std::string> ReadPasswordFile(const std::string& path, std::string* error) {
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  if (fd < 0) {
+    *error = "cannot open password file: " + std::string(strerror(errno));
+    return std::nullopt;
+  }
+
+  struct stat file_stat = {};
+  if (::fstat(fd, &file_stat) != 0 || !S_ISREG(file_stat.st_mode)) {
+    *error = "password file must be a regular file";
+    ::close(fd);
+    return std::nullopt;
+  }
+  if (file_stat.st_uid != ::geteuid() || (file_stat.st_mode & 077) != 0) {
+    *error = "password file must be owned by the current user and mode 0600 or stricter";
+    ::close(fd);
+    return std::nullopt;
+  }
+
+  std::string password;
+  password.resize(kMaxPasswordBytes + 2);
+  const ssize_t count = ::read(fd, password.data(), password.size());
+  const int read_error = errno;
+  ::close(fd);
+  if (count < 0) {
+    *error = "cannot read password file: " + std::string(strerror(read_error));
+    return std::nullopt;
+  }
+  password.resize(static_cast<size_t>(count));
+  if (!password.empty() && password.back() == '\n') {
+    password.pop_back();
+    if (!password.empty() && password.back() == '\r') {
+      password.pop_back();
     }
-    for (size_t i = 0; i < prefix.size(); ++i) {
-      if (std::toupper(static_cast<unsigned char>(command[i])) != prefix[i]) {
-        return false;
-      }
-    }
-    return true;
-  };
-  return (command.size() == 4 && starts_with("INFO")) || starts_with("CONFIG") || starts_with("CACHE STATS") ||
-         starts_with("DUMP INFO") || starts_with("DUMP STATUS");
+  }
+  if (!ValidatePassword(&password, error)) {
+    return std::nullopt;
+  }
+  return password;
 }
 
 #ifdef USE_READLINE
@@ -372,6 +351,7 @@ struct Config {
   bool interactive = true;
   int retry_count = 0;     // Number of retries (0 = no retry)
   int retry_interval = 3;  // Seconds between retries
+  std::optional<std::string> password;
 };
 
 class NvecdClient {
@@ -405,6 +385,13 @@ class NvecdClient {
         attempts++;
         continue;
       }
+      (void)nvecd::client::transport::ConfigureNoSigpipe(sock_);
+
+      constexpr int kCliTimeoutSeconds = 5;
+      struct timeval timeout_value = {};
+      timeout_value.tv_sec = kCliTimeoutSeconds;
+      (void)setsockopt(sock_, SOL_SOCKET, SO_RCVTIMEO, &timeout_value, sizeof(timeout_value));
+      (void)setsockopt(sock_, SOL_SOCKET, SO_SNDTIMEO, &timeout_value, sizeof(timeout_value));
 
       struct sockaddr_in server_addr = {};
       server_addr.sin_family = AF_INET;
@@ -462,12 +449,13 @@ class NvecdClient {
     return false;
   }
 
-  void Disconnect() {
+  void Disconnect() const {
     if (sock_ >= 0) {
       close(sock_);
       sock_ = -1;
     }
     response_buffer_.clear();
+    debug_mode_ = false;
   }
 
   [[nodiscard]] bool IsConnected() const { return sock_ >= 0; }
@@ -479,9 +467,10 @@ class NvecdClient {
 
     // Send command with \n
     std::string msg = command + "\n";
-    ssize_t sent = send(sock_, msg.c_str(), msg.length(), 0);
-    if (sent < 0) {
-      int saved_errno = errno;
+    int io_error = 0;
+    if (!nvecd::client::transport::SendAll(sock_, msg, &io_error)) {
+      const int saved_errno = io_error;
+      Disconnect();
       if (saved_errno == EPIPE || saved_errno == ECONNRESET) {
         return "(error) SERVER_DISCONNECTED: Connection lost while sending command. The server may have crashed or "
                "been shut down.";
@@ -495,16 +484,17 @@ class NvecdClient {
     // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
     char buffer[kReceiveBufferSize];
 
-    const bool requires_end_terminator = CommandRequiresEndTerminator(command);
+    const auto frame = nvecd::client::transport::FrameForCommand(command, debug_mode_);
     while (true) {
-      if (const auto response_length = CompleteResponseLength(response_buffer_, requires_end_terminator)) {
+      if (const auto response_length = nvecd::client::transport::CompleteResponseLength(response_buffer_, frame)) {
         response.assign(response_buffer_.data(), *response_length);
         response_buffer_.erase(0, *response_length);
         break;
       }
       // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
-      ssize_t received = recv(sock_, buffer, sizeof(buffer), 0);
+      const ssize_t received = nvecd::client::transport::ReceiveRetryingEintr(sock_, buffer, sizeof(buffer), &io_error);
       if (received <= 0) {
+        Disconnect();
         if (received == 0) {
           return "(error) SERVER_DISCONNECTED: Server closed the connection. This usually means:\n"
                  "  1. Server was shut down gracefully\n"
@@ -512,7 +502,7 @@ class NvecdClient {
                  "  3. Server restarted and dropped all connections\n"
                  "\nTry reconnecting to check if the server is still running.";
         }
-        int saved_errno = errno;
+        const int saved_errno = io_error;
         if (saved_errno == ECONNRESET) {
           return "(error) SERVER_DISCONNECTED: Connection reset by server. The server may have crashed.";
         }
@@ -524,6 +514,11 @@ class NvecdClient {
 
       // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
       response_buffer_.append(buffer, static_cast<size_t>(received));
+      constexpr size_t kMaxBufferedResponseBytes = 64U * 1024U * 1024U;
+      if (response_buffer_.size() > kMaxBufferedResponseBytes) {
+        Disconnect();
+        return "(error) Protocol response exceeds 64 MiB limit";
+      }
     }
 
     // Remove trailing newline
@@ -533,6 +528,15 @@ class NvecdClient {
     // Also remove \r if present
     if (!response.empty() && response.back() == '\r') {
       response.pop_back();
+    }
+
+    if (response.rfind("ERROR", 0) != 0 && response.rfind("-ERR", 0) != 0) {
+      const std::string upper = nvecd::client::transport::UpperCommand(command);
+      if (upper == "DEBUG ON") {
+        debug_mode_ = true;
+      } else if (upper == "DEBUG OFF") {
+        debug_mode_ = false;
+      }
     }
 
     return response;
@@ -651,6 +655,15 @@ class NvecdClient {
     return IsErrorResponse(response) ? 1 : 0;
   }
 
+  [[nodiscard]] bool Authenticate(const std::string& password) const {
+    const std::string response = SendCommand("AUTH " + password);
+    if (IsErrorResponse(response)) {
+      PrintResponse(response);
+      return false;
+    }
+    return true;
+  }
+
  private:
   /**
    * @brief Classify a server/transport response as an error.
@@ -755,8 +768,9 @@ class NvecdClient {
   }
 
   Config config_;
-  int sock_{-1};
+  mutable int sock_{-1};
   mutable std::string response_buffer_;
+  mutable bool debug_mode_{false};
 };
 
 void PrintUsage(const char* program_name) {
@@ -767,6 +781,8 @@ void PrintUsage(const char* program_name) {
   std::cout << "  -p PORT         Server port (default: 11017)" << '\n';
   std::cout << "  --retry N       Retry connection N times if refused (default: 0)" << '\n';
   std::cout << "  --wait-ready    Keep retrying until server is ready (max 100 attempts)" << '\n';
+  std::cout << "  --password-file FILE  Read AUTH password from a private file" << '\n';
+  std::cout << "  --password-env NAME   Read AUTH password from an environment variable" << '\n';
   std::cout << "  --help          Show this help" << '\n';
   std::cout << '\n';
   std::cout << "Examples:" << '\n';
@@ -837,6 +853,37 @@ int main(int argc, char* argv[]) {
       }
     } else if (arg == "--wait-ready") {
       config.retry_count = kMaxWaitReadyRetries;  // Max retries for --wait-ready (~5 minutes)
+    } else if (arg == "--password-file") {
+      if (i + 1 >= argc || config.password.has_value()) {
+        std::cerr << "Error: --password-file requires one exclusive secret source" << '\n';
+        return 1;
+      }
+      std::string error;
+      auto password = ReadPasswordFile(argv[++i],  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+                                       &error);
+      if (!password.has_value()) {
+        std::cerr << "Error: " << error << '\n';
+        return 1;
+      }
+      config.password = std::move(*password);
+    } else if (arg == "--password-env") {
+      if (i + 1 >= argc || config.password.has_value()) {
+        std::cerr << "Error: --password-env requires one exclusive secret source" << '\n';
+        return 1;
+      }
+      const char* variable_name = argv[++i];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+      const char* value = std::getenv(variable_name);
+      if (value == nullptr) {
+        std::cerr << "Error: environment variable is not set" << '\n';
+        return 1;
+      }
+      std::string password(value);
+      std::string error;
+      if (!ValidatePassword(&password, &error)) {
+        std::cerr << "Error: " << error << '\n';
+        return 1;
+      }
+      config.password = std::move(password);
     } else {
       // Assume remaining args are a command
       for (int j = i; j < argc; ++j) {
@@ -850,6 +897,9 @@ int main(int argc, char* argv[]) {
   // Create client and connect
   NvecdClient client(config);
   if (!client.Connect()) {
+    return 1;
+  }
+  if (config.password.has_value() && !client.Authenticate(*config.password)) {
     return 1;
   }
 

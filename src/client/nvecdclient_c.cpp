@@ -15,6 +15,7 @@
 
 #include "client/nvecdclient_c.h"
 
+#include <atomic>
 #include <cstring>
 #include <memory>
 #include <new>
@@ -24,6 +25,24 @@
 #include "client/nvecdclient.h"
 
 using namespace nvecd::client;
+
+#ifdef NVECD_ENABLE_TEST_HOOKS
+namespace nvecd::client::testing {
+namespace {
+std::atomic<bool> fail_next_c_allocation{false};
+}
+
+void FailNextCAllocationForTest() {
+  fail_next_c_allocation.store(true, std::memory_order_release);
+}
+
+void MaybeFailCAllocationForTest() {
+  if (fail_next_c_allocation.exchange(false, std::memory_order_acq_rel)) {
+    throw std::bad_alloc();
+  }
+}
+}  // namespace nvecd::client::testing
+#endif
 
 // Opaque handle structure
 struct NvecdClient_C {
@@ -121,15 +140,59 @@ static int build_sim_response(const SimResponse& src, NvecdSimResponse_C** out, 
   return 0;
 }
 
+// Keep implementation bodies separate from the exported C symbols. The
+// wrappers at the end of this file establish one exception barrier for every
+// entry point, including allocation-heavy std::string/std::vector paths.
+#define nvecdclient_create nvecdclient_create_impl
+#define nvecdclient_destroy nvecdclient_destroy_impl
+#define nvecdclient_connect nvecdclient_connect_impl
+#define nvecdclient_disconnect nvecdclient_disconnect_impl
+#define nvecdclient_is_connected nvecdclient_is_connected_impl
+#define nvecdclient_event nvecdclient_event_impl
+#define nvecdclient_vecset nvecdclient_vecset_impl
+#define nvecdclient_vecdel nvecdclient_vecdel_impl
+#define nvecdclient_metaset nvecdclient_metaset_impl
+#define nvecdclient_sim nvecdclient_sim_impl
+#define nvecdclient_sim_ex nvecdclient_sim_ex_impl
+#define nvecdclient_simv nvecdclient_simv_impl
+#define nvecdclient_simv_ex nvecdclient_simv_ex_impl
+#define nvecdclient_auth nvecdclient_auth_impl
+#define nvecdclient_info nvecdclient_info_impl
+#define nvecdclient_get_config nvecdclient_get_config_impl
+#define nvecdclient_save nvecdclient_save_impl
+#define nvecdclient_load nvecdclient_load_impl
+#define nvecdclient_verify nvecdclient_verify_impl
+#define nvecdclient_dump_info nvecdclient_dump_info_impl
+#define nvecdclient_dump_status nvecdclient_dump_status_impl
+#define nvecdclient_cache_stats nvecdclient_cache_stats_impl
+#define nvecdclient_cache_clear nvecdclient_cache_clear_impl
+#define nvecdclient_cache_enable nvecdclient_cache_enable_impl
+#define nvecdclient_cache_disable nvecdclient_cache_disable_impl
+#define nvecdclient_debug_on nvecdclient_debug_on_impl
+#define nvecdclient_debug_off nvecdclient_debug_off_impl
+#define nvecdclient_get_last_error nvecdclient_get_last_error_impl
+#define nvecdclient_free_sim_response nvecdclient_free_sim_response_impl
+#define nvecdclient_free_server_info nvecdclient_free_server_info_impl
+#define nvecdclient_free_string nvecdclient_free_string_impl
+
+int nvecdclient_sim_ex(NvecdClient_C* client, const char* id, uint32_t top_k, const char* mode,
+                       const NvecdSearchOptions_C* options, NvecdSimResponse_C** result);
+int nvecdclient_simv_ex(NvecdClient_C* client, const float* vector, size_t dimension, uint32_t top_k, const char* mode,
+                        const NvecdSearchOptions_C* options, NvecdSimResponse_C** result);
+
 NvecdClient_C* nvecdclient_create(const NvecdClientConfig_C* config) {
   if (config == nullptr) {
     return nullptr;
   }
+#ifdef NVECD_ENABLE_TEST_HOOKS
+  nvecd::client::testing::MaybeFailCAllocationForTest();
+#endif
 
   auto* client_c = new (std::nothrow) NvecdClient_C();
   if (client_c == nullptr) {
     return nullptr;
   }
+  std::unique_ptr<NvecdClient_C> client_holder(client_c);
 
   ClientConfig cpp_config;
   cpp_config.host = (config->host != nullptr) ? config->host : "127.0.0.1";
@@ -139,7 +202,7 @@ NvecdClient_C* nvecdclient_create(const NvecdClientConfig_C* config) {
 
   client_c->client = std::make_unique<NvecdClient>(cpp_config);
 
-  return client_c;
+  return client_holder.release();
 }
 
 void nvecdclient_destroy(NvecdClient_C* client) {
@@ -541,6 +604,232 @@ void nvecdclient_free_server_info(NvecdServerInfo_C* info) {
 void nvecdclient_free_string(char* str) {
   free(str);
 }
+
+#undef nvecdclient_create
+#undef nvecdclient_destroy
+#undef nvecdclient_connect
+#undef nvecdclient_disconnect
+#undef nvecdclient_is_connected
+#undef nvecdclient_event
+#undef nvecdclient_vecset
+#undef nvecdclient_vecdel
+#undef nvecdclient_metaset
+#undef nvecdclient_sim
+#undef nvecdclient_sim_ex
+#undef nvecdclient_simv
+#undef nvecdclient_simv_ex
+#undef nvecdclient_auth
+#undef nvecdclient_info
+#undef nvecdclient_get_config
+#undef nvecdclient_save
+#undef nvecdclient_load
+#undef nvecdclient_verify
+#undef nvecdclient_dump_info
+#undef nvecdclient_dump_status
+#undef nvecdclient_cache_stats
+#undef nvecdclient_cache_clear
+#undef nvecdclient_cache_enable
+#undef nvecdclient_cache_disable
+#undef nvecdclient_debug_on
+#undef nvecdclient_debug_off
+#undef nvecdclient_get_last_error
+#undef nvecdclient_free_sim_response
+#undef nvecdclient_free_server_info
+#undef nvecdclient_free_string
+
+static void record_c_api_exception(NvecdClient_C* client) noexcept {
+  if (client == nullptr) {
+    return;
+  }
+  try {
+    client->last_error = "Unhandled exception at C API boundary";
+  } catch (...) {
+  }
+}
+
+#define NVECD_C_INT_BARRIER(name, signature, arguments, client_arg) \
+  int name signature {                                              \
+    try {                                                           \
+      return name##_impl arguments;                                 \
+    } catch (...) {                                                 \
+      record_c_api_exception(client_arg);                           \
+      return -1;                                                    \
+    }                                                               \
+  }
+
+NvecdClient_C* nvecdclient_create(const NvecdClientConfig_C* config) {
+  try {
+    return nvecdclient_create_impl(config);
+  } catch (...) {
+    return nullptr;
+  }
+}
+
+void nvecdclient_destroy(NvecdClient_C* client) {
+  try {
+    nvecdclient_destroy_impl(client);
+  } catch (...) {
+  }
+}
+
+NVECD_C_INT_BARRIER(nvecdclient_connect, (NvecdClient_C * client), (client), client)
+
+void nvecdclient_disconnect(NvecdClient_C* client) {
+  try {
+    nvecdclient_disconnect_impl(client);
+  } catch (...) {
+    record_c_api_exception(client);
+  }
+}
+
+int nvecdclient_is_connected(const NvecdClient_C* client) {
+  try {
+    return nvecdclient_is_connected_impl(client);
+  } catch (...) {
+    return 0;
+  }
+}
+
+NVECD_C_INT_BARRIER(nvecdclient_event,
+                    (NvecdClient_C * client, const char* ctx, const char* type, const char* id, int score),
+                    (client, ctx, type, id, score), client)
+NVECD_C_INT_BARRIER(nvecdclient_vecset, (NvecdClient_C * client, const char* id, const float* vector, size_t dimension),
+                    (client, id, vector, dimension), client)
+NVECD_C_INT_BARRIER(nvecdclient_vecdel, (NvecdClient_C * client, const char* id), (client, id), client)
+NVECD_C_INT_BARRIER(nvecdclient_metaset, (NvecdClient_C * client, const char* id, const char* metadata),
+                    (client, id, metadata), client)
+
+int nvecdclient_sim(NvecdClient_C* client, const char* id, uint32_t top_k, const char* mode,
+                    NvecdSimResponse_C** result) {
+  if (result != nullptr) {
+    *result = nullptr;
+  }
+  try {
+    return nvecdclient_sim_impl(client, id, top_k, mode, result);
+  } catch (...) {
+    record_c_api_exception(client);
+    return -1;
+  }
+}
+
+int nvecdclient_sim_ex(NvecdClient_C* client, const char* id, uint32_t top_k, const char* mode,
+                       const NvecdSearchOptions_C* options, NvecdSimResponse_C** result) {
+  if (result != nullptr) {
+    *result = nullptr;
+  }
+  try {
+    return nvecdclient_sim_ex_impl(client, id, top_k, mode, options, result);
+  } catch (...) {
+    record_c_api_exception(client);
+    return -1;
+  }
+}
+
+int nvecdclient_simv(NvecdClient_C* client, const float* vector, size_t dimension, uint32_t top_k, const char* mode,
+                     NvecdSimResponse_C** result) {
+  if (result != nullptr) {
+    *result = nullptr;
+  }
+  try {
+    return nvecdclient_simv_impl(client, vector, dimension, top_k, mode, result);
+  } catch (...) {
+    record_c_api_exception(client);
+    return -1;
+  }
+}
+
+int nvecdclient_simv_ex(NvecdClient_C* client, const float* vector, size_t dimension, uint32_t top_k, const char* mode,
+                        const NvecdSearchOptions_C* options, NvecdSimResponse_C** result) {
+  if (result != nullptr) {
+    *result = nullptr;
+  }
+  try {
+    return nvecdclient_simv_ex_impl(client, vector, dimension, top_k, mode, options, result);
+  } catch (...) {
+    record_c_api_exception(client);
+    return -1;
+  }
+}
+
+NVECD_C_INT_BARRIER(nvecdclient_auth, (NvecdClient_C * client, const char* password), (client, password), client)
+
+int nvecdclient_info(NvecdClient_C* client, NvecdServerInfo_C** info) {
+  if (info != nullptr) {
+    *info = nullptr;
+  }
+  try {
+    return nvecdclient_info_impl(client, info);
+  } catch (...) {
+    record_c_api_exception(client);
+    return -1;
+  }
+}
+
+#define NVECD_C_STRING_OUT_BARRIER(name, signature, arguments, out_name) \
+  int name signature {                                                   \
+    if (out_name != nullptr) {                                           \
+      *out_name = nullptr;                                               \
+    }                                                                    \
+    try {                                                                \
+      return name##_impl arguments;                                      \
+    } catch (...) {                                                      \
+      record_c_api_exception(client);                                    \
+      return -1;                                                         \
+    }                                                                    \
+  }
+
+NVECD_C_STRING_OUT_BARRIER(nvecdclient_get_config, (NvecdClient_C * client, char** config_str), (client, config_str),
+                           config_str)
+NVECD_C_STRING_OUT_BARRIER(nvecdclient_save, (NvecdClient_C * client, const char* filepath, char** saved_path),
+                           (client, filepath, saved_path), saved_path)
+NVECD_C_STRING_OUT_BARRIER(nvecdclient_load, (NvecdClient_C * client, const char* filepath, char** loaded_path),
+                           (client, filepath, loaded_path), loaded_path)
+NVECD_C_STRING_OUT_BARRIER(nvecdclient_verify, (NvecdClient_C * client, const char* filepath, char** result_str),
+                           (client, filepath, result_str), result_str)
+NVECD_C_STRING_OUT_BARRIER(nvecdclient_dump_info, (NvecdClient_C * client, const char* filepath, char** info_str),
+                           (client, filepath, info_str), info_str)
+NVECD_C_STRING_OUT_BARRIER(nvecdclient_dump_status, (NvecdClient_C * client, char** status_str), (client, status_str),
+                           status_str)
+NVECD_C_STRING_OUT_BARRIER(nvecdclient_cache_stats, (NvecdClient_C * client, char** stats_str), (client, stats_str),
+                           stats_str)
+
+NVECD_C_INT_BARRIER(nvecdclient_cache_clear, (NvecdClient_C * client), (client), client)
+NVECD_C_INT_BARRIER(nvecdclient_cache_enable, (NvecdClient_C * client), (client), client)
+NVECD_C_INT_BARRIER(nvecdclient_cache_disable, (NvecdClient_C * client), (client), client)
+NVECD_C_INT_BARRIER(nvecdclient_debug_on, (NvecdClient_C * client), (client), client)
+NVECD_C_INT_BARRIER(nvecdclient_debug_off, (NvecdClient_C * client), (client), client)
+
+const char* nvecdclient_get_last_error(const NvecdClient_C* client) {
+  try {
+    return nvecdclient_get_last_error_impl(client);
+  } catch (...) {
+    return "Unhandled exception at C API boundary";
+  }
+}
+
+void nvecdclient_free_sim_response(NvecdSimResponse_C* result) {
+  try {
+    nvecdclient_free_sim_response_impl(result);
+  } catch (...) {
+  }
+}
+
+void nvecdclient_free_server_info(NvecdServerInfo_C* info) {
+  try {
+    nvecdclient_free_server_info_impl(info);
+  } catch (...) {
+  }
+}
+
+void nvecdclient_free_string(char* str) {
+  try {
+    nvecdclient_free_string_impl(str);
+  } catch (...) {
+  }
+}
+
+#undef NVECD_C_INT_BARRIER
+#undef NVECD_C_STRING_OUT_BARRIER
 
 // NOLINTEND(readability-identifier-naming, cppcoreguidelines-owning-memory,
 // cppcoreguidelines-no-malloc, readability-implicit-bool-conversion)

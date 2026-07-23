@@ -8,8 +8,11 @@
 #include "client/nvecdclient_c.h"
 
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <chrono>
+#include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -18,6 +21,10 @@
 #include "server/nvecd_server.h"
 
 using namespace nvecd;
+
+namespace nvecd::client::testing {
+void FailNextCAllocationForTest();
+}
 
 namespace {
 
@@ -33,13 +40,15 @@ class NvecdClientCTest : public ::testing::Test {
     config_ = std::make_unique<config::Config>();
     config_->api.tcp.port = kTestPort;
     config_->api.http.enable = false;
-    config_->perf.thread_pool_size = 2;                   // NOLINT
-    config_->events.ctx_buffer_size = 100;                // NOLINT
-    config_->events.decay_interval_sec = 60;              // NOLINT
-    config_->events.decay_alpha = 0.9;                    // NOLINT
-    config_->vectors.default_dimension = 3;               // Small dimension for tests
-    config_->network.allow_cidrs = {"127.0.0.1/32"};      // Allow localhost
-    config_->snapshot.dir = "/tmp/nvecd_test_snapshots";  // Use temp dir for tests
+    config_->perf.thread_pool_size = 2;               // NOLINT
+    config_->events.ctx_buffer_size = 100;            // NOLINT
+    config_->events.decay_interval_sec = 60;          // NOLINT
+    config_->events.decay_alpha = 0.9;                // NOLINT
+    config_->vectors.default_dimension = 3;           // Small dimension for tests
+    config_->network.allow_cidrs = {"127.0.0.1/32"};  // Allow localhost
+    snapshot_dir_ = std::filesystem::temp_directory_path() / ("nvecd_client_c_test_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(snapshot_dir_);
+    config_->snapshot.dir = snapshot_dir_.string();  // Isolated from parallel CTest processes
 
     // Create and start server (server owns stores)
     server_ = std::make_unique<server::NvecdServer>(*config_);
@@ -56,10 +65,12 @@ class NvecdClientCTest : public ::testing::Test {
     if (server_) {
       server_->Stop();
     }
+    std::filesystem::remove_all(snapshot_dir_);
   }
 
   std::unique_ptr<config::Config> config_;
   std::unique_ptr<server::NvecdServer> server_;
+  std::filesystem::path snapshot_dir_;
   uint16_t port_ = 0;
 };
 
@@ -457,4 +468,25 @@ TEST_F(NvecdClientCTest, MemoryManagement) {
   nvecdclient_free_server_info(nullptr);
   nvecdclient_free_string(nullptr);
   // Should not crash
+}
+
+TEST(NvecdClientCFailureTest, FailureOutputsAreAlwaysInitialized) {
+  auto* sim_sentinel = reinterpret_cast<NvecdSimResponse_C*>(std::uintptr_t{1});
+  EXPECT_EQ(nvecdclient_sim(nullptr, "item", 1, "vectors", &sim_sentinel), -1);
+  EXPECT_EQ(sim_sentinel, nullptr);
+
+  auto* info_sentinel = reinterpret_cast<NvecdServerInfo_C*>(std::uintptr_t{1});
+  EXPECT_EQ(nvecdclient_info(nullptr, &info_sentinel), -1);
+  EXPECT_EQ(info_sentinel, nullptr);
+
+  auto* string_sentinel = reinterpret_cast<char*>(std::uintptr_t{1});
+  EXPECT_EQ(nvecdclient_get_config(nullptr, &string_sentinel), -1);
+  EXPECT_EQ(string_sentinel, nullptr);
+}
+
+TEST(NvecdClientCFailureTest, AllocationExceptionCannotEscapeCAbi) {
+  NvecdClientConfig_C config = {};
+  config.host = "127.0.0.1";
+  nvecd::client::testing::FailNextCAllocationForTest();
+  EXPECT_EQ(nvecdclient_create(&config), nullptr);
 }
