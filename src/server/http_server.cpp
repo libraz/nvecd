@@ -9,7 +9,10 @@
 
 #include "server/http_server.h"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <spdlog/spdlog.h>
+#include <sys/socket.h>
 
 #include <algorithm>
 #include <array>
@@ -20,10 +23,13 @@
 #include <shared_mutex>
 #include <sstream>
 #include <string_view>
+#include <unordered_map>
 
 #include "cache/cache_key.h"
 #include "cache/cache_key_generator.h"
 #include "cache/similarity_cache.h"
+#include "cache/similarity_cache_controller.h"
+#include "config/runtime_variable_manager.h"
 #include "events/co_occurrence_index.h"
 #include "events/event_store.h"
 #include "server/command_parser.h"
@@ -56,11 +62,86 @@ constexpr int kHttpUnauthorized = 401;
 constexpr int kHttpForbidden = 403;
 constexpr int kHttpTooManyRequests = 429;
 constexpr int kHttpNotFound = 404;
+constexpr int kHttpGone = 410;
 constexpr int kHttpInternalServerError = 500;
 constexpr int kHttpServiceUnavailable = 503;
 
-// Server startup delay (milliseconds)
-constexpr int kStartupDelayMs = 100;
+class AdmissionControlledHttpServer final : public httplib::Server {
+ public:
+  AdmissionControlledHttpServer(size_t max_connections, size_t max_connections_per_ip)
+      : max_connections_(max_connections), max_connections_per_ip_(max_connections_per_ip) {}
+
+ private:
+  std::string PeerAddress(socket_t socket) const {
+    sockaddr_storage address = {};
+    socklen_t length = sizeof(address);
+    if (::getpeername(socket, reinterpret_cast<sockaddr*>(&address), &length) != 0) {
+      return "<unknown>";
+    }
+    std::array<char, INET6_ADDRSTRLEN> text{};
+    const void* source = nullptr;
+    if (address.ss_family == AF_INET) {
+      source = &reinterpret_cast<const sockaddr_in*>(&address)->sin_addr;
+    } else if (address.ss_family == AF_INET6) {
+      source = &reinterpret_cast<const sockaddr_in6*>(&address)->sin6_addr;
+    }
+    if (source == nullptr || ::inet_ntop(address.ss_family, source, text.data(), text.size()) == nullptr) {
+      return "<unknown>";
+    }
+    return text.data();
+  }
+
+  bool Acquire(const std::string& peer) {
+    std::lock_guard<std::mutex> lock(admission_mutex_);
+    if (max_connections_ != 0 && active_connections_ >= max_connections_) {
+      return false;
+    }
+    const auto current = active_by_ip_.find(peer);
+    const size_t peer_count = current == active_by_ip_.end() ? 0 : current->second;
+    if (max_connections_per_ip_ != 0 && peer_count >= max_connections_per_ip_) {
+      return false;
+    }
+    ++active_connections_;
+    ++active_by_ip_[peer];
+    return true;
+  }
+
+  void Release(const std::string& peer) {
+    std::lock_guard<std::mutex> lock(admission_mutex_);
+    if (active_connections_ > 0) {
+      --active_connections_;
+    }
+    auto current = active_by_ip_.find(peer);
+    if (current != active_by_ip_.end() && --current->second == 0) {
+      active_by_ip_.erase(current);
+    }
+  }
+
+  bool process_and_close_socket(socket_t socket) override {
+    const std::string peer = PeerAddress(socket);
+    if (!Acquire(peer)) {
+      httplib::detail::shutdown_socket(socket);
+      httplib::detail::close_socket(socket);
+      return false;
+    }
+    const auto release = httplib::detail::scope_exit([this, &peer]() { Release(peer); });
+    const bool result = httplib::detail::process_server_socket(
+        svr_sock_, socket, keep_alive_max_count_, keep_alive_timeout_sec_, read_timeout_sec_, read_timeout_usec_,
+        write_timeout_sec_, write_timeout_usec_,
+        [this](httplib::Stream& stream, bool close_connection, bool& connection_closed) {
+          return process_request(stream, close_connection, connection_closed, nullptr);
+        });
+    httplib::detail::shutdown_socket(socket);
+    httplib::detail::close_socket(socket);
+    return result;
+  }
+
+  const size_t max_connections_;
+  const size_t max_connections_per_ip_;
+  std::mutex admission_mutex_;
+  size_t active_connections_ = 0;
+  std::unordered_map<std::string, size_t> active_by_ip_;
+};
 
 /**
  * @brief Decode a base64 string.
@@ -111,6 +192,11 @@ int ErrorCodeToHttpStatus(utils::ErrorCode code) {
     case utils::ErrorCode::kInvalidArgument:
     case utils::ErrorCode::kCommandInvalidArgument:
     case utils::ErrorCode::kCommandMissingArgument:
+    case utils::ErrorCode::kCommandInvalidTopK:
+    case utils::ErrorCode::kCommandInvalidVector:
+    case utils::ErrorCode::kCommandSyntaxError:
+    case utils::ErrorCode::kCommandParseError:
+    case utils::ErrorCode::kEventInvalidScore:
     case utils::ErrorCode::kVectorDimensionMismatch:
     case utils::ErrorCode::kVectorInvalidDimension:
       return kHttpBadRequest;
@@ -148,8 +234,35 @@ bool JsonNumberIsFinite(const json& value) {
   return std::isfinite(value.get<double>());
 }
 
+utils::Expected<std::vector<float>, utils::Error> ParseFiniteFloatVector(const json& value) {
+  if (!value.is_array()) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kInvalidArgument, "Field 'vector' must be an array of numbers"));
+  }
+  std::vector<float> result;
+  result.reserve(value.size());
+  for (const auto& element : value) {
+    if (!JsonNumberIsFinite(element)) {
+      return utils::MakeUnexpected(
+          utils::MakeError(utils::ErrorCode::kInvalidArgument, "Field 'vector' must contain only finite numbers"));
+    }
+    const float component = static_cast<float>(element.get<double>());
+    if (!std::isfinite(component)) {
+      return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kInvalidArgument,
+                                                    "Field 'vector' component exceeds the finite float range"));
+    }
+    result.push_back(component);
+  }
+  return result;
+}
+
 bool WritesBlocked(const HandlerContext* handler_context) {
-  return handler_context != nullptr && handler_context->read_only.load(std::memory_order_acquire);
+  return handler_context != nullptr && (handler_context->read_only.load(std::memory_order_acquire) ||
+                                        handler_context->loading.load(std::memory_order_acquire));
+}
+
+bool LoadInProgress(const HandlerContext* handler_context) {
+  return handler_context != nullptr && handler_context->loading.load(std::memory_order_acquire);
 }
 
 std::shared_lock<std::shared_mutex> AcquireSnapshotWriteGuard(const HandlerContext* handler_context) {
@@ -200,27 +313,26 @@ utils::Expected<vectors::Metadata, utils::Error> ParseMetadataJson(const json& v
   return metadata;
 }
 
-/**
- * @brief Append an already-applied write command to the WAL (best-effort).
- *
- * Mirrors the TCP dispatcher: the in-memory mutation has already succeeded, so a
- * failed log write is logged as a warning and swallowed rather than failing the
- * client request. No-op when the WAL is not wired (ctx->wal == nullptr).
- */
-void AppendCommandToWal(const HandlerContext* ctx, const Command& cmd) {
+utils::Expected<void, utils::Error> AppendCommandToWal(HandlerContext* ctx, const Command& cmd) {
   if (ctx == nullptr || ctx->wal == nullptr) {
-    return;
+    return {};
+  }
+  if (cmd.type == CommandType::kVecset && ctx->config != nullptr && !ctx->config->wal.include_vectors) {
+    return {};
   }
   std::vector<uint8_t> payload = EncodeCommand(cmd);
   auto appended = ctx->wal->Append(WalOpForCommand(cmd), payload.data(), payload.size());
   if (!appended) {
+    ctx->read_only.store(true, std::memory_order_release);
     nvecd::utils::StructuredLog()
         .Event("wal_append_failed")
         .Field("surface", "http")
         .Field("command", CommandTypeToString(cmd.type))
         .Field("error", appended.error().message())
         .Warn();
+    return utils::MakeUnexpected(appended.error());
   }
+  return {};
 }
 
 }  // namespace
@@ -243,7 +355,12 @@ HttpServer::HttpServer(HttpServerConfig config, HandlerContext* handler_context,
     rate_limiter_ = owned_rate_limiter_.get();
   }
 
-  server_ = std::make_unique<httplib::Server>();
+  server_ = std::make_unique<AdmissionControlledHttpServer>(config_.max_connections, config_.max_connections_per_ip);
+  const size_t worker_threads = std::max<size_t>(1, config_.worker_threads);
+  const size_t max_queued_connections = std::max<size_t>(1, config_.max_queued_connections);
+  server_->new_task_queue = [worker_threads, max_queued_connections] {
+    return new httplib::ThreadPool(worker_threads, max_queued_connections);
+  };
 
   // Set timeouts
   server_->set_read_timeout(config_.read_timeout_sec, 0);
@@ -366,8 +483,8 @@ void HttpServer::SetupCors() {
     if (has_origin) {
       res.set_header("Access-Control-Allow-Origin", allow_origin);
     }
-    res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    res.set_header("Access-Control-Allow-Headers", "Content-Type");
+    res.set_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+    res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization");
     res.status = kHttpNoContent;
   });
 
@@ -385,7 +502,8 @@ nvecd::utils::Expected<void, nvecd::utils::Error> HttpServer::Start() {
   using nvecd::utils::MakeError;
   using nvecd::utils::MakeUnexpected;
 
-  if (running_) {
+  std::lock_guard lifecycle_lock(lifecycle_mutex_);
+  if (running_ || (server_thread_ && server_thread_->joinable())) {
     auto error = MakeError(ErrorCode::kNetworkAlreadyRunning, "HTTP server already running");
     nvecd::utils::StructuredLog()
         .Event("server_error")
@@ -395,42 +513,31 @@ nvecd::utils::Expected<void, nvecd::utils::Error> HttpServer::Start() {
     return MakeUnexpected(error);
   }
 
-  // Set running flag before starting thread to avoid race condition
+  spdlog::info("Starting HTTP server on {}:{}", config_.bind, config_.port);
+  if (!server_->bind_to_port(config_.bind, config_.port)) {
+    auto error = MakeError(ErrorCode::kNetworkBindFailed,
+                           "Failed to bind to " + config_.bind + ":" + std::to_string(config_.port));
+    return MakeUnexpected(error);
+  }
+
   running_ = true;
-
-  // Store error from thread (if any)
-  std::string thread_error;
-  std::mutex error_mutex;
-
-  // Start server in separate thread
-  server_thread_ = std::make_unique<std::thread>([this, &thread_error, &error_mutex]() {
-    spdlog::info("Starting HTTP server on {}:{}", config_.bind, config_.port);
-
-    if (!server_->listen(config_.bind, config_.port)) {
-      std::lock_guard<std::mutex> lock(error_mutex);
-      thread_error = "Failed to bind to " + config_.bind + ":" + std::to_string(config_.port);
+  server_thread_ = std::make_unique<std::thread>([this]() {
+    const bool listened = server_->listen_after_bind();
+    running_.store(false, std::memory_order_release);
+    if (!listened) {
       nvecd::utils::StructuredLog()
           .Event("server_error")
           .Field("operation", "http_server_listen")
           .Field("bind", config_.bind)
           .Field("port", static_cast<uint64_t>(config_.port))
-          .Field("error", thread_error)
           .Error();
-      running_ = false;
-      return;
     }
   });
-
-  // Wait a bit for server to start
-  std::this_thread::sleep_for(std::chrono::milliseconds(kStartupDelayMs));
-
-  if (!running_) {
-    if (server_thread_ && server_thread_->joinable()) {
-      server_thread_->join();
-    }
-    std::lock_guard<std::mutex> lock(error_mutex);
-    auto error =
-        MakeError(ErrorCode::kNetworkBindFailed, thread_error.empty() ? "Failed to start HTTP server" : thread_error);
+  server_->wait_until_ready();
+  if (!server_->is_running()) {
+    server_thread_->join();
+    auto error = MakeError(ErrorCode::kNetworkListenFailed, "HTTP listener stopped during startup on " + config_.bind +
+                                                                ":" + std::to_string(config_.port));
     return MakeUnexpected(error);
   }
 
@@ -439,18 +546,20 @@ nvecd::utils::Expected<void, nvecd::utils::Error> HttpServer::Start() {
 }
 
 void HttpServer::Stop() {
-  if (!running_) {
+  std::lock_guard lifecycle_lock(lifecycle_mutex_);
+  const bool was_running = running_.exchange(false, std::memory_order_acq_rel);
+  const bool has_thread = server_thread_ && server_thread_->joinable();
+  if (!was_running && !has_thread) {
     return;
   }
 
   spdlog::info("Stopping HTTP server...");
-  running_ = false;
 
   if (server_) {
     server_->stop();
   }
 
-  if (server_thread_ && server_thread_->joinable()) {
+  if (has_thread) {
     server_thread_->join();
   }
 
@@ -817,9 +926,13 @@ void HttpServer::HandleEvent(const httplib::Request& req, httplib::Response& res
     return;
   }
 
+  if (WritesBlocked(handler_context_)) {
+    SendError(res, kHttpServiceUnavailable, "Server is read-only or loading");
+    return;
+  }
   auto snapshot_write_guard = AcquireSnapshotWriteGuard(handler_context_);
   if (WritesBlocked(handler_context_)) {
-    SendError(res, kHttpServiceUnavailable, "Server is read-only while a snapshot is in progress");
+    SendError(res, kHttpServiceUnavailable, "Server is read-only or loading");
     return;
   }
   auto write_serialization_guard = AcquireWriteSerializationGuard(handler_context_);
@@ -907,16 +1020,41 @@ void HttpServer::HandleEvent(const httplib::Request& req, httplib::Response& res
       SendError(res, kHttpInternalServerError, "Event store not initialized");
       return;
     }
-    auto result = handler_context_->event_store->AddEventAndGetPrior(ctx, id, score, event_type, timestamp);
-    if (!result) {
-      SendError(res, kHttpInternalServerError, result.error().message());
+    auto prepared = handler_context_->event_store->PrepareEvent(ctx, id, score, event_type, timestamp);
+    if (!prepared) {
+      SendError(res, kHttpBadRequest, prepared.error().message());
       return;
     }
 
-    // Deduped events caused no state change and must not be logged; replaying
-    // them would re-run dedup against a different buffer state. Apply the
-    // co-occurrence delta and persist only when the event was actually stored.
-    if (!result->deduped) {
+    if (prepared->deduped) {
+      auto duplicate =
+          handler_context_->event_store->AddEventAndGetPrior(ctx, id, score, event_type, prepared->event.timestamp);
+      if (!duplicate || !duplicate->deduped) {
+        handler_context_->read_only.store(true, std::memory_order_release);
+        SendError(res, kHttpServiceUnavailable, "Event dedup state changed during acceptance");
+        return;
+      }
+    } else {
+      Command wal_cmd;
+      wal_cmd.type = CommandType::kEvent;
+      wal_cmd.ctx = ctx;
+      wal_cmd.id = id;
+      wal_cmd.score = prepared->event.score;
+      wal_cmd.event_type = prepared->event.type;
+      wal_cmd.timestamp = prepared->event.timestamp;
+      auto appended = AppendCommandToWal(handler_context_, wal_cmd);
+      if (!appended) {
+        SendError(res, kHttpServiceUnavailable, appended.error().message());
+        return;
+      }
+
+      auto result = handler_context_->event_store->AddEventAndGetPrior(ctx, id, prepared->event.score,
+                                                                       prepared->event.type, prepared->event.timestamp);
+      if (!result || result->deduped) {
+        handler_context_->read_only.store(true, std::memory_order_release);
+        SendError(res, kHttpServiceUnavailable, "Event apply diverged after WAL acceptance");
+        return;
+      }
       if (handler_context_->co_index != nullptr) {
         events::CoOccurrenceIndex::IngestOptions options;
         if (handler_context_->config != nullptr) {
@@ -927,17 +1065,6 @@ void HttpServer::HandleEvent(const httplib::Request& req, httplib::Response& res
         }
         handler_context_->co_index->ApplyIngestedEvent(ctx, result->prior_events, result->stored_event, options);
       }
-
-      // Persist using the EFFECTIVE stored fields (EventStore may assign the
-      // timestamp) so replay reproduces identical temporal state.
-      Command wal_cmd;
-      wal_cmd.type = CommandType::kEvent;
-      wal_cmd.ctx = ctx;
-      wal_cmd.id = id;
-      wal_cmd.score = result->stored_event.score;
-      wal_cmd.event_type = result->stored_event.type;
-      wal_cmd.timestamp = result->stored_event.timestamp;
-      AppendCommandToWal(handler_context_, wal_cmd);
     }
 
     auto* cache_ptr = handler_context_->cache.load(std::memory_order_acquire);
@@ -964,9 +1091,13 @@ void HttpServer::HandleVecset(const httplib::Request& req, httplib::Response& re
     return;
   }
 
+  if (WritesBlocked(handler_context_)) {
+    SendError(res, kHttpServiceUnavailable, "Server is read-only or loading");
+    return;
+  }
   auto snapshot_write_guard = AcquireSnapshotWriteGuard(handler_context_);
   if (WritesBlocked(handler_context_)) {
-    SendError(res, kHttpServiceUnavailable, "Server is read-only while a snapshot is in progress");
+    SendError(res, kHttpServiceUnavailable, "Server is read-only or loading");
     return;
   }
   auto write_serialization_guard = AcquireWriteSerializationGuard(handler_context_);
@@ -997,21 +1128,13 @@ void HttpServer::HandleVecset(const httplib::Request& req, httplib::Response& re
       return;
     }
 
-    if (!body["vector"].is_array()) {
-      SendError(res, kHttpBadRequest, "Field 'vector' must be an array of numbers");
+    std::string id = body["id"];
+    auto vector_result = ParseFiniteFloatVector(body["vector"]);
+    if (!vector_result) {
+      SendError(res, kHttpBadRequest, vector_result.error().message());
       return;
     }
-
-    // Validate all vector elements are finite numbers
-    for (const auto& elem : body["vector"]) {
-      if (!JsonNumberIsFinite(elem)) {
-        SendError(res, kHttpBadRequest, "Field 'vector' must contain only finite numbers");
-        return;
-      }
-    }
-
-    std::string id = body["id"];
-    std::vector<float> vector = body["vector"].get<std::vector<float>>();
+    std::vector<float> vector = std::move(vector_result.value());
     if (vector.empty()) {
       SendError(res, kHttpBadRequest, "Field 'vector' must not be empty");
       return;
@@ -1041,26 +1164,49 @@ void HttpServer::HandleVecset(const httplib::Request& req, httplib::Response& re
       metadata = std::move(*metadata_result);
     }
 
-    // Add vector to vector store
-    if (handler_context_->vector_store) {
-      auto result = handler_context_->vector_store->SetVector(id, vector);
-      if (!result) {
-        SendError(res, kHttpInternalServerError, result.error().message());
+    if (handler_context_->vector_store == nullptr) {
+      SendError(res, kHttpInternalServerError, "Vector store not initialized");
+      return;
+    }
+    auto validation = handler_context_->vector_store->ValidateVector(id, vector);
+    if (!validation) {
+      SendError(res, kHttpBadRequest, validation.error().message());
+      return;
+    }
+
+    Command wal_command;
+    if (handler_context_->config == nullptr || handler_context_->config->wal.include_vectors) {
+      wal_command.type = CommandType::kVecset;
+      wal_command.id = id;
+      wal_command.vector = vector;
+      wal_command.dimension = static_cast<int>(vector.size());
+      if (has_metadata) {
+        wal_command.metadata = metadata;
+      }
+    } else if (has_metadata) {
+      wal_command.type = CommandType::kMetaset;
+      wal_command.id = id;
+      wal_command.metadata = metadata;
+    }
+    if (wal_command.type != CommandType::kUnknown) {
+      auto appended = AppendCommandToWal(handler_context_, wal_command);
+      if (!appended) {
+        SendError(res, kHttpServiceUnavailable, appended.error().message());
         return;
       }
-    } else {
-      SendError(res, kHttpInternalServerError, "Vector store not initialized");
+    }
+
+    auto result = handler_context_->vector_store->SetVector(id, vector);
+    if (!result) {
+      handler_context_->read_only.store(true, std::memory_order_release);
+      SendError(res, kHttpServiceUnavailable, result.error().message());
       return;
     }
 
     auto compact_idx = handler_context_->vector_store->GetCompactIndex(id);
     if (compact_idx.has_value()) {
       if (has_metadata && handler_context_->metadata_store != nullptr) {
-        // Copy metadata before moving it into the store so it can also be
-        // serialized into the WAL METASET record below.
-        vectors::Metadata wal_metadata = metadata;
-        handler_context_->metadata_store->Set(id, std::move(metadata));
-        metadata = std::move(wal_metadata);
+        handler_context_->metadata_store->Set(id, metadata);
       }
 
       if (handler_context_->similarity_engine != nullptr) {
@@ -1073,25 +1219,8 @@ void HttpServer::HandleVecset(const httplib::Request& req, httplib::Response& re
     // id, so bumping the generation is required for a warmed SIM/SIMV response
     // to observe an HTTP-created vector.
     handler_context_->vector_generation.fetch_add(1, std::memory_order_acq_rel);
-
-    // Persist the vector registration, then (if present) the metadata. The WAL
-    // records are independent ops so replay reconstructs both; the VECSET must
-    // precede the METASET because METASET requires the vector to exist.
-    {
-      Command wal_vecset;
-      wal_vecset.type = CommandType::kVecset;
-      wal_vecset.id = id;
-      wal_vecset.vector = vector;
-      wal_vecset.dimension = static_cast<int>(vector.size());
-      AppendCommandToWal(handler_context_, wal_vecset);
-
-      if (has_metadata && handler_context_->metadata_store != nullptr) {
-        Command wal_metaset;
-        wal_metaset.type = CommandType::kMetaset;
-        wal_metaset.id = id;
-        wal_metaset.metadata = metadata;
-        AppendCommandToWal(handler_context_, wal_metaset);
-      }
+    if (has_metadata) {
+      handler_context_->metadata_generation.fetch_add(1, std::memory_order_acq_rel);
     }
 
     auto* cache_ptr = handler_context_->cache.load(std::memory_order_acquire);
@@ -1122,9 +1251,13 @@ void HttpServer::HandleVecdel(const httplib::Request& req, httplib::Response& re
     return;
   }
 
+  if (WritesBlocked(handler_context_)) {
+    SendError(res, kHttpServiceUnavailable, "Server is read-only or loading");
+    return;
+  }
   auto snapshot_write_guard = AcquireSnapshotWriteGuard(handler_context_);
   if (WritesBlocked(handler_context_)) {
-    SendError(res, kHttpServiceUnavailable, "Server is read-only while a snapshot is in progress");
+    SendError(res, kHttpServiceUnavailable, "Server is read-only or loading");
     return;
   }
   auto write_serialization_guard = AcquireWriteSerializationGuard(handler_context_);
@@ -1146,8 +1279,21 @@ void HttpServer::HandleVecdel(const httplib::Request& req, httplib::Response& re
     }
 
     const auto compact_index = handler_context_->vector_store->GetCompactIndex(id);
-    if (!compact_index.has_value() || !handler_context_->vector_store->DeleteVector(id)) {
+    if (!compact_index.has_value()) {
       SendError(res, kHttpNotFound, "Vector not found: " + id);
+      return;
+    }
+    Command wal_vecdel;
+    wal_vecdel.type = CommandType::kVecdel;
+    wal_vecdel.id = id;
+    auto appended = AppendCommandToWal(handler_context_, wal_vecdel);
+    if (!appended) {
+      SendError(res, kHttpServiceUnavailable, appended.error().message());
+      return;
+    }
+    if (!handler_context_->vector_store->DeleteVector(id)) {
+      handler_context_->read_only.store(true, std::memory_order_release);
+      SendError(res, kHttpServiceUnavailable, "Vector disappeared after WAL acceptance");
       return;
     }
     handler_context_->vector_store->Defragment();
@@ -1160,11 +1306,7 @@ void HttpServer::HandleVecdel(const httplib::Request& req, httplib::Response& re
       handler_context_->similarity_engine->RebuildAnnFromStore();
     }
     handler_context_->vector_generation.fetch_add(1, std::memory_order_acq_rel);
-
-    Command wal_vecdel;
-    wal_vecdel.type = CommandType::kVecdel;
-    wal_vecdel.id = id;
-    AppendCommandToWal(handler_context_, wal_vecdel);
+    handler_context_->metadata_generation.fetch_add(1, std::memory_order_acq_rel);
 
     auto* cache_ptr = handler_context_->cache.load(std::memory_order_acquire);
     if (cache_ptr != nullptr) {
@@ -1187,9 +1329,13 @@ void HttpServer::HandleMetaset(const httplib::Request& req, httplib::Response& r
     return;
   }
 
+  if (WritesBlocked(handler_context_)) {
+    SendError(res, kHttpServiceUnavailable, "Server is read-only or loading");
+    return;
+  }
   auto snapshot_write_guard = AcquireSnapshotWriteGuard(handler_context_);
   if (WritesBlocked(handler_context_)) {
-    SendError(res, kHttpServiceUnavailable, "Server is read-only while a snapshot is in progress");
+    SendError(res, kHttpServiceUnavailable, "Server is read-only or loading");
     return;
   }
   auto write_serialization_guard = AcquireWriteSerializationGuard(handler_context_);
@@ -1243,17 +1389,17 @@ void HttpServer::HandleMetaset(const httplib::Request& req, httplib::Response& r
       return;
     }
 
-    vectors::Metadata wal_metadata = *metadata_result;
-    handler_context_->metadata_store->Set(id, std::move(*metadata_result));
-
-    // Persist the metadata assignment for crash recovery.
-    {
-      Command wal_metaset;
-      wal_metaset.type = CommandType::kMetaset;
-      wal_metaset.id = id;
-      wal_metaset.metadata = std::move(wal_metadata);
-      AppendCommandToWal(handler_context_, wal_metaset);
+    Command wal_metaset;
+    wal_metaset.type = CommandType::kMetaset;
+    wal_metaset.id = id;
+    wal_metaset.metadata = *metadata_result;
+    auto appended = AppendCommandToWal(handler_context_, wal_metaset);
+    if (!appended) {
+      SendError(res, kHttpServiceUnavailable, appended.error().message());
+      return;
     }
+    handler_context_->metadata_store->Set(id, std::move(*metadata_result));
+    handler_context_->metadata_generation.fetch_add(1, std::memory_order_acq_rel);
 
     // Metadata changes affect filtered results broadly: clear the cache, as TCP does.
     auto* cache_ptr = handler_context_->cache.load(std::memory_order_acquire);
@@ -1274,8 +1420,12 @@ void HttpServer::HandleMetaset(const httplib::Request& req, httplib::Response& r
 }
 
 void HttpServer::HandleSim(const httplib::Request& req, httplib::Response& res) {
-  // Check if server is loading
-  if (loading_ != nullptr && loading_->load()) {
+  if (LoadInProgress(handler_context_)) {
+    SendError(res, kHttpServiceUnavailable, "Server is loading, please try again later");
+    return;
+  }
+  auto snapshot_write_guard = AcquireSnapshotWriteGuard(handler_context_);
+  if (LoadInProgress(handler_context_)) {
     SendError(res, kHttpServiceUnavailable, "Server is loading, please try again later");
     return;
   }
@@ -1358,12 +1508,20 @@ void HttpServer::HandleSim(const httplib::Request& req, httplib::Response& res) 
     const bool cache_enabled = (cache_ptr != nullptr && cache_ptr->IsEnabled());
     auto search_type = filter_expr.empty() ? cache::SearchType::kItemSearch : cache::SearchType::kFilteredSearch;
     cache::CacheKey cache_key;
+    uint64_t captured_cooccurrence_generation = 0;
+    uint64_t captured_vector_generation = 0;
+    uint64_t captured_metadata_generation = 0;
+    uint64_t captured_dataset_generation = 0;
 
     if (cache_enabled) {
-      cache_key = cache::GenerateSimCacheKey(
-          {id, top_k, mode, adaptive,
-           handler_context_->co_index != nullptr ? handler_context_->co_index->GetGeneration() : 0,
-           handler_context_->vector_generation.load(std::memory_order_acquire), filter_expr});
+      captured_cooccurrence_generation =
+          handler_context_->co_index != nullptr ? handler_context_->co_index->GetGeneration() : 0;
+      captured_vector_generation = handler_context_->vector_generation.load(std::memory_order_acquire);
+      captured_metadata_generation = handler_context_->metadata_generation.load(std::memory_order_acquire);
+      captured_dataset_generation = handler_context_->dataset_generation.load(std::memory_order_acquire);
+      cache_key = cache::GenerateSimCacheKey({id, top_k, mode, adaptive, captured_cooccurrence_generation,
+                                              captured_vector_generation, filter_expr, captured_metadata_generation,
+                                              captured_dataset_generation});
 
       auto cached = cache_ptr->Lookup(cache_key, search_type);
       if (cached.has_value()) {
@@ -1395,25 +1553,7 @@ void HttpServer::HandleSim(const httplib::Request& req, httplib::Response& res) 
     // Call appropriate search method based on mode
     utils::Expected<std::vector<similarity::SimilarityResult>, utils::Error> result;
     if (mode == "events") {
-      // Events mode is metadata-unaware: over-fetch and filter afterwards so the
-      // response can still reach top_k, keeping vectorless-but-matching items
-      // eligible (cold-start use case). Mirrors the TCP dispatcher.
-      const bool filtering = !filter_expr.empty() && handler_context_->metadata_store != nullptr;
-      // Clamp the over-fetch to the configured maximum so it never trips the
-      // engine's own top_k upper-bound validation.
-      const int max_top_k =
-          handler_context_->config != nullptr ? static_cast<int>(handler_context_->config->similarity.max_top_k) : 0;
-      int fetch_k = top_k;
-      if (filtering) {
-        fetch_k = top_k * kEventsFilterOversampling;
-        if (max_top_k > 0 && fetch_k > max_top_k) {
-          fetch_k = max_top_k;
-        }
-      }
-      result = handler_context_->similarity_engine->SearchByIdEvents(id, fetch_k);
-      if (result && filtering) {
-        *result = ApplyEventsFilterTopK(*result, handler_context_->metadata_store, filter, top_k);
-      }
+      result = handler_context_->similarity_engine->SearchByIdEvents(id, top_k, filter);
     } else if (mode == "vectors") {
       result = handler_context_->similarity_engine->SearchByIdVectors(id, top_k, filter);
     } else {  // fusion
@@ -1424,7 +1564,7 @@ void HttpServer::HandleSim(const httplib::Request& req, httplib::Response& res) 
       if (result.error().code() == utils::ErrorCode::kVectorNotFound) {
         SendError(res, kHttpNotFound, result.error().message());
       } else {
-        SendError(res, kHttpInternalServerError, result.error().message());
+        SendError(res, ErrorCodeToHttpStatus(result.error().code()), result.error().message());
       }
       return;
     }
@@ -1436,17 +1576,23 @@ void HttpServer::HandleSim(const httplib::Request& req, httplib::Response& res) 
 
     // Cache store (mirrors the TCP path: cache full results, register items).
     if (cache_enabled) {
-      auto elapsed = std::chrono::steady_clock::now() - start;
-      double elapsed_ms = std::chrono::duration<double, std::milli>(elapsed).count();
-      cache_ptr->Insert(cache_key, *result, elapsed_ms, search_type);
-
-      std::vector<std::string> item_ids;
-      item_ids.reserve(result->size() + 1);
-      item_ids.push_back(id);
-      for (const auto& item : *result) {
-        item_ids.push_back(item.item_id);
+      auto generation_guard = AcquireWriteSerializationGuard(handler_context_);
+      if (cache_ptr == handler_context_->cache.load(std::memory_order_acquire) && cache_ptr->IsEnabled() &&
+          captured_cooccurrence_generation ==
+              (handler_context_->co_index != nullptr ? handler_context_->co_index->GetGeneration() : 0) &&
+          captured_vector_generation == handler_context_->vector_generation.load(std::memory_order_acquire) &&
+          captured_metadata_generation == handler_context_->metadata_generation.load(std::memory_order_acquire) &&
+          captured_dataset_generation == handler_context_->dataset_generation.load(std::memory_order_acquire)) {
+        auto elapsed = std::chrono::steady_clock::now() - start;
+        double elapsed_ms = std::chrono::duration<double, std::milli>(elapsed).count();
+        std::vector<std::string> item_ids;
+        item_ids.reserve(result->size() + 1);
+        item_ids.push_back(id);
+        for (const auto& item : *result) {
+          item_ids.push_back(item.item_id);
+        }
+        cache_ptr->InsertAndRegister(cache_key, *result, item_ids, elapsed_ms, search_type);
       }
-      cache_ptr->RegisterResultItems(cache_key, item_ids);
     }
 
     handler_context_->stats.sim_commands.fetch_add(1);
@@ -1479,8 +1625,12 @@ void HttpServer::HandleSim(const httplib::Request& req, httplib::Response& res) 
 }
 
 void HttpServer::HandleSimv(const httplib::Request& req, httplib::Response& res) {
-  // Check if server is loading
-  if (loading_ != nullptr && loading_->load()) {
+  if (LoadInProgress(handler_context_)) {
+    SendError(res, kHttpServiceUnavailable, "Server is loading, please try again later");
+    return;
+  }
+  auto snapshot_write_guard = AcquireSnapshotWriteGuard(handler_context_);
+  if (LoadInProgress(handler_context_)) {
     SendError(res, kHttpServiceUnavailable, "Server is loading, please try again later");
     return;
   }
@@ -1500,19 +1650,6 @@ void HttpServer::HandleSimv(const httplib::Request& req, httplib::Response& res)
       return;
     }
 
-    if (!body["vector"].is_array()) {
-      SendError(res, kHttpBadRequest, "Field 'vector' must be an array of numbers");
-      return;
-    }
-
-    // Validate all vector elements are finite numbers
-    for (const auto& elem : body["vector"]) {
-      if (!JsonNumberIsFinite(elem)) {
-        SendError(res, kHttpBadRequest, "Field 'vector' must contain only finite numbers");
-        return;
-      }
-    }
-
     if (body.contains("top_k") && !body["top_k"].is_number_integer()) {
       SendError(res, kHttpBadRequest, "Field 'top_k' must be an integer");
       return;
@@ -1521,7 +1658,12 @@ void HttpServer::HandleSimv(const httplib::Request& req, httplib::Response& res)
       SendError(res, kHttpBadRequest, "Field 'min_score' must be a finite number");
       return;
     }
-    std::vector<float> vector = body["vector"].get<std::vector<float>>();
+    auto vector_result = ParseFiniteFloatVector(body["vector"]);
+    if (!vector_result) {
+      SendError(res, kHttpBadRequest, vector_result.error().message());
+      return;
+    }
+    std::vector<float> vector = std::move(vector_result.value());
     int top_k = body.value("top_k", handler_context_->config->similarity.default_top_k);
     float min_score = body.value("min_score", 0.0F);
 
@@ -1552,10 +1694,16 @@ void HttpServer::HandleSimv(const httplib::Request& req, httplib::Response& res)
     const bool cache_enabled = (cache_ptr != nullptr && cache_ptr->IsEnabled());
     auto search_type = filter_expr.empty() ? cache::SearchType::kVectorSearch : cache::SearchType::kFilteredSearch;
     cache::CacheKey cache_key;
+    uint64_t captured_vector_generation = 0;
+    uint64_t captured_metadata_generation = 0;
+    uint64_t captured_dataset_generation = 0;
 
     if (cache_enabled) {
-      cache_key = cache::GenerateSimvCacheKey(
-          {vector, top_k, handler_context_->vector_generation.load(std::memory_order_acquire), filter_expr});
+      captured_vector_generation = handler_context_->vector_generation.load(std::memory_order_acquire);
+      captured_metadata_generation = handler_context_->metadata_generation.load(std::memory_order_acquire);
+      captured_dataset_generation = handler_context_->dataset_generation.load(std::memory_order_acquire);
+      cache_key = cache::GenerateSimvCacheKey({vector, top_k, captured_vector_generation, filter_expr,
+                                               captured_metadata_generation, captured_dataset_generation});
 
       auto cached = cache_ptr->Lookup(cache_key, search_type);
       if (cached.has_value()) {
@@ -1587,23 +1735,27 @@ void HttpServer::HandleSimv(const httplib::Request& req, httplib::Response& res)
     // Search by vector
     auto result = handler_context_->similarity_engine->SearchByVector(vector, top_k, filter);
     if (!result) {
-      SendError(res, kHttpInternalServerError, result.error().message());
+      SendError(res, ErrorCodeToHttpStatus(result.error().code()), result.error().message());
       return;
     }
     *result = ApplyMetadataFilter(*result, handler_context_->metadata_store, filter);
 
     // Cache store (mirrors the TCP path).
     if (cache_enabled) {
-      auto elapsed = std::chrono::steady_clock::now() - start;
-      double elapsed_ms = std::chrono::duration<double, std::milli>(elapsed).count();
-      cache_ptr->Insert(cache_key, *result, elapsed_ms, search_type);
-
-      std::vector<std::string> item_ids;
-      item_ids.reserve(result->size());
-      for (const auto& item : *result) {
-        item_ids.push_back(item.item_id);
+      auto generation_guard = AcquireWriteSerializationGuard(handler_context_);
+      if (cache_ptr == handler_context_->cache.load(std::memory_order_acquire) && cache_ptr->IsEnabled() &&
+          captured_vector_generation == handler_context_->vector_generation.load(std::memory_order_acquire) &&
+          captured_metadata_generation == handler_context_->metadata_generation.load(std::memory_order_acquire) &&
+          captured_dataset_generation == handler_context_->dataset_generation.load(std::memory_order_acquire)) {
+        auto elapsed = std::chrono::steady_clock::now() - start;
+        double elapsed_ms = std::chrono::duration<double, std::milli>(elapsed).count();
+        std::vector<std::string> item_ids;
+        item_ids.reserve(result->size());
+        for (const auto& item : *result) {
+          item_ids.push_back(item.item_id);
+        }
+        cache_ptr->InsertAndRegister(cache_key, *result, item_ids, elapsed_ms, search_type);
       }
-      cache_ptr->RegisterResultItems(cache_key, item_ids);
     }
 
     handler_context_->stats.sim_commands.fetch_add(1);
@@ -1862,20 +2014,11 @@ void HttpServer::HandleDumpInfo(const httplib::Request& req, httplib::Response& 
 //
 
 void HttpServer::HandleDebugOn(const httplib::Request& /*req*/, httplib::Response& res) {
-  // Note: HTTP is stateless, so we cannot enable per-connection debug mode
-  // This endpoint exists for API compatibility, but has limited functionality
-  json response;
-  response["status"] = "ok";
-  response["message"] = "Debug mode enabled (note: HTTP is stateless, use TCP for per-connection debug)";
-  SendJson(res, kHttpOk, response);
+  SendError(res, kHttpGone, "HTTP debug mode is not supported; use DEBUG ON on a persistent TCP connection");
 }
 
 void HttpServer::HandleDebugOff(const httplib::Request& /*req*/, httplib::Response& res) {
-  // Note: HTTP is stateless, so we cannot disable per-connection debug mode
-  json response;
-  response["status"] = "ok";
-  response["message"] = "Debug mode disabled (note: HTTP is stateless, use TCP for per-connection debug)";
-  SendJson(res, kHttpOk, response);
+  SendError(res, kHttpGone, "HTTP debug mode is not supported; use DEBUG OFF on a persistent TCP connection");
 }
 
 //
@@ -1988,17 +2131,16 @@ void HttpServer::HandleMetrics(const httplib::Request& /*req*/, httplib::Respons
 void HttpServer::HandleCacheStats(const httplib::Request& /*req*/, httplib::Response& res) {
   // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
-    auto* stats_cache =
-        (handler_context_ != nullptr) ? handler_context_->cache.load(std::memory_order_acquire) : nullptr;
-    if (stats_cache == nullptr) {
-      SendError(res, kHttpInternalServerError, "Cache not initialized");
+    auto* controller = (handler_context_ != nullptr) ? handler_context_->cache_controller : nullptr;
+    if (controller == nullptr) {
+      SendError(res, kHttpInternalServerError, "Cache controller not initialized");
       return;
     }
 
-    auto stats = stats_cache->GetStatistics();
+    auto stats = controller->Cache().GetStatistics();
 
     json response;
-    response["enabled"] = true;
+    response["enabled"] = controller->IsEnabled();
     response["total_queries"] = stats.total_queries;
     response["cache_hits"] = stats.cache_hits;
     response["cache_misses"] = stats.cache_misses;
@@ -2008,6 +2150,10 @@ void HttpServer::HandleCacheStats(const httplib::Request& /*req*/, httplib::Resp
     response["current_entries"] = stats.current_entries;
     response["current_memory_bytes"] = stats.current_memory_bytes;
     response["current_memory_mb"] = static_cast<double>(stats.current_memory_bytes) / (1024.0 * 1024.0);
+    response["min_query_cost_ms"] = controller->Cache().GetMinQueryCost();
+    response["ttl_seconds"] = controller->Cache().GetTtl();
+    response["compression_enabled"] = controller->Cache().CompressionEnabled();
+    response["eviction_batch_size"] = controller->Cache().EvictionBatchSize();
     response["evictions"] = stats.evictions;
     response["avg_hit_latency_ms"] = stats.AverageCacheHitLatency();
     response["avg_miss_latency_ms"] = stats.AverageCacheMissLatency();
@@ -2029,10 +2175,9 @@ void HttpServer::HandleCacheClear(const httplib::Request& req, httplib::Response
 
   // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
-    auto* clear_cache =
-        (handler_context_ != nullptr) ? handler_context_->cache.load(std::memory_order_acquire) : nullptr;
-    if (clear_cache == nullptr) {
-      SendError(res, kHttpInternalServerError, "Cache not initialized");
+    auto* controller = (handler_context_ != nullptr) ? handler_context_->cache_controller : nullptr;
+    if (controller == nullptr) {
+      SendError(res, kHttpInternalServerError, "Cache controller not initialized");
       return;
     }
 
@@ -2040,19 +2185,30 @@ void HttpServer::HandleCacheClear(const httplib::Request& req, httplib::Response
     std::string scope = "all";
     if (!req.body.empty()) {
       auto body = json::parse(req.body, nullptr, false);
-      if (!body.is_discarded()) {
-        scope = body.value("scope", "all");
+      if (body.is_discarded() || !body.is_object()) {
+        SendError(res, kHttpBadRequest, "Request body must be a valid JSON object");
+        return;
       }
-      // Ignore parse errors, use default scope
+      if (body.contains("scope")) {
+        if (!body["scope"].is_string()) {
+          SendError(res, kHttpBadRequest, "scope must be a string");
+          return;
+        }
+        scope = body["scope"].get<std::string>();
+      }
     }
 
     // Get stats before clearing
-    auto stats_before = clear_cache->GetStatistics();
+    auto stats_before = controller->Cache().GetStatistics();
     uint64_t entries_before = stats_before.current_entries;
 
     // Clear cache (currently only supports clearing all)
     if (scope == "all") {
-      clear_cache->Clear();
+      auto clear_result = controller->Clear();
+      if (!clear_result) {
+        SendError(res, kHttpInternalServerError, clear_result.error().message());
+        return;
+      }
     } else {
       SendError(res, kHttpBadRequest, "Invalid scope. Only 'all' is supported currently.");
       return;
@@ -2079,13 +2235,17 @@ void HttpServer::HandleCacheEnable(const httplib::Request& req, httplib::Respons
 
   // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
-    auto* cache_ptr = (handler_context_ != nullptr) ? handler_context_->cache.load(std::memory_order_acquire) : nullptr;
-    if (cache_ptr == nullptr) {
-      SendError(res, kHttpInternalServerError, "Cache not initialized");
+    auto* manager = (handler_context_ != nullptr) ? handler_context_->variable_manager : nullptr;
+    if (manager == nullptr) {
+      SendError(res, kHttpInternalServerError, "Runtime variable manager not initialized");
       return;
     }
 
-    cache_ptr->SetEnabled(true);
+    auto enable_result = manager->SetVariable("cache.enabled", "true");
+    if (!enable_result) {
+      SendError(res, kHttpInternalServerError, enable_result.error().message());
+      return;
+    }
 
     json response;
     response["status"] = "ok";
@@ -2106,13 +2266,17 @@ void HttpServer::HandleCacheDisable(const httplib::Request& req, httplib::Respon
 
   // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
-    auto* cache_ptr = (handler_context_ != nullptr) ? handler_context_->cache.load(std::memory_order_acquire) : nullptr;
-    if (cache_ptr == nullptr) {
-      SendError(res, kHttpInternalServerError, "Cache not initialized");
+    auto* manager = (handler_context_ != nullptr) ? handler_context_->variable_manager : nullptr;
+    if (manager == nullptr) {
+      SendError(res, kHttpInternalServerError, "Runtime variable manager not initialized");
       return;
     }
 
-    cache_ptr->SetEnabled(false);
+    auto disable_result = manager->SetVariable("cache.enabled", "false");
+    if (!disable_result) {
+      SendError(res, kHttpInternalServerError, disable_result.error().message());
+      return;
+    }
 
     json response;
     response["status"] = "ok";

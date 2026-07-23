@@ -102,6 +102,21 @@ class PerformanceE2ETest : public NvecdTestFixture {
   void SetUp() override { SetUpServer(3); }
   void TearDown() override { TearDownServer(); }
 
+  bool WaitForSnapshotComplete(TcpClient& client, int timeout_ms = 5000) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (std::chrono::steady_clock::now() < deadline) {
+      const std::string status = client.SendCommand("DUMP STATUS");
+      if (status.find("failed") != std::string::npos) {
+        return false;
+      }
+      if (status.find("idle") != std::string::npos || status.find("completed") != std::string::npos) {
+        return true;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return false;
+  }
+
   /**
    * @brief Bulk-add vectors via TCP
    */
@@ -419,14 +434,27 @@ TEST_F(PerformanceE2ETest, DISABLED_SnapshotIOPerformance) {
 
     std::string filename = "perf_" + std::to_string(scale) + ".dmp";
 
-    // Measure SAVE
-    double save_ms = MeasureMs([&]() { client.SendCommand("DUMP SAVE " + filename); });
+    // Measure the durable snapshot, not just asynchronous child admission.
+    std::string save_response;
+    bool snapshot_completed = false;
+    double save_ms = MeasureMs([&]() {
+      save_response = client.SendCommand("DUMP SAVE " + filename);
+      if (ContainsOK(save_response)) {
+        snapshot_completed = WaitForSnapshotComplete(client);
+      }
+    });
+    ASSERT_TRUE(ContainsOK(save_response)) << save_response;
+    ASSERT_TRUE(snapshot_completed) << "Snapshot did not complete: " << filename;
 
     // Measure VERIFY
-    double verify_ms = MeasureMs([&]() { client.SendCommand("DUMP VERIFY " + filename); });
+    std::string verify_response;
+    double verify_ms = MeasureMs([&]() { verify_response = client.SendCommand("DUMP VERIFY " + filename); });
+    ASSERT_TRUE(ContainsOK(verify_response)) << verify_response;
 
     // Measure INFO
-    double info_ms = MeasureMs([&]() { client.SendCommand("DUMP INFO " + filename); });
+    std::string info_response;
+    double info_ms = MeasureMs([&]() { info_response = client.SendCommand("DUMP INFO " + filename); });
+    ASSERT_TRUE(ContainsOK(info_response)) << info_response;
 
     std::cout << "  " << scale << " items:\n";
     std::cout << "    SAVE:   " << std::fixed << std::setprecision(1) << save_ms << " ms\n";

@@ -73,7 +73,7 @@ class RequestDispatcher {
    *
    * @param record WAL record produced by WriteAheadLog::Replay
    */
-  void ReplayRecord(const storage::WalRecord& record);
+  utils::Expected<void, utils::Error> ReplayRecord(const storage::WalRecord& record);
 
  private:
   // Handler methods

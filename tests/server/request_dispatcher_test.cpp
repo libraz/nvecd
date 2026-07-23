@@ -10,6 +10,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -72,6 +73,7 @@ class RequestDispatcherTest : public ::testing::Test {
                                              /*.dump_dir=*/"/tmp",
                                              /*.requirepass=*/""};
     ctx_->cache.store(cache_.get(), std::memory_order_release);
+    ctx_->write_serialization_gate = &write_serialization_gate_;
 
     dispatcher_ = std::make_unique<RequestDispatcher>(*ctx_);
   }
@@ -99,6 +101,7 @@ class RequestDispatcherTest : public ::testing::Test {
   ServerStats stats_;
   std::atomic<bool> loading_{false};
   std::atomic<bool> read_only_{false};
+  std::mutex write_serialization_gate_;
   std::unique_ptr<nvecd::config::Config> config_;
   std::unique_ptr<nvecd::events::EventStore> event_store_;
   std::unique_ptr<nvecd::events::CoOccurrenceIndex> co_index_;
@@ -112,6 +115,27 @@ class RequestDispatcherTest : public ::testing::Test {
   HandlerContext* ctx_ = nullptr;
   std::unique_ptr<RequestDispatcher> dispatcher_;
 };
+
+TEST_F(RequestDispatcherTest, ReplaysDurableCoOccurrenceMaintenance) {
+  co_index_->SetScore("item1", "item2", 100.0F);
+  nvecd::storage::WalRecord record;
+  record.op = nvecd::storage::WalOpType::kCoOccurrenceMaintenance;
+  const double alpha = 0.5;
+  record.payload.resize(sizeof(alpha) + sizeof(uint8_t));
+  std::memcpy(record.payload.data(), &alpha, sizeof(alpha));
+  record.payload[sizeof(alpha)] = 0;
+
+  auto replayed = dispatcher_->ReplayRecord(record);
+  ASSERT_TRUE(replayed.has_value()) << replayed.error().message();
+  EXPECT_FLOAT_EQ(co_index_->GetScore("item1", "item2"), 50.0F);
+}
+
+TEST_F(RequestDispatcherTest, RejectsMalformedCoOccurrenceMaintenanceWalRecord) {
+  nvecd::storage::WalRecord record;
+  record.op = nvecd::storage::WalOpType::kCoOccurrenceMaintenance;
+  record.payload = {0x00};
+  EXPECT_FALSE(dispatcher_->ReplayRecord(record).has_value());
+}
 
 // ============================================================================
 // Basic dispatch tests
@@ -136,6 +160,26 @@ TEST_F(RequestDispatcherTest, WalAppendFailureIsReturnedToClient) {
   auto response = Dispatch("VECSET durable_item 1 0 0\r\n");
   EXPECT_NE(response.find("ERROR"), std::string::npos);
   EXPECT_NE(response.find("WAL is not open"), std::string::npos);
+  EXPECT_FALSE(vector_store_->HasVector("durable_item"));
+  EXPECT_TRUE(read_only_.load(std::memory_order_acquire));
+}
+
+TEST_F(RequestDispatcherTest, WalFailureLeavesEveryMutationTypeUnchanged) {
+  ASSERT_TRUE(vector_store_->SetVector("existing", {1.0F, 0.0F, 0.0F}).has_value());
+  metadata_store_->Set("existing", {{"state", std::string("before")}});
+  nvecd::storage::WriteAheadLog closed_wal;
+  ctx_->wal = &closed_wal;
+
+  EXPECT_NE(Dispatch("EVENT ctx ADD new 10\r\n").find("ERROR"), std::string::npos);
+  read_only_.store(false, std::memory_order_release);
+  EXPECT_NE(Dispatch("METASET existing state:after\r\n").find("ERROR"), std::string::npos);
+  read_only_.store(false, std::memory_order_release);
+  EXPECT_NE(Dispatch("VECDEL existing\r\n").find("ERROR"), std::string::npos);
+
+  EXPECT_TRUE(event_store_->GetEvents("ctx").empty());
+  ASSERT_NE(metadata_store_->Get("existing"), nullptr);
+  EXPECT_EQ(std::get<std::string>(metadata_store_->Get("existing")->at("state")), "before");
+  EXPECT_TRUE(vector_store_->HasVector("existing"));
 }
 
 TEST_F(RequestDispatcherTest, WalCanExcludeVectorPayloads) {
@@ -229,6 +273,14 @@ TEST_F(RequestDispatcherTest, WriteIsRejectedWhileLockSnapshotIsInProgress) {
   read_only_.store(true);
   auto response = Dispatch("VECSET item 1 0\r\n");
   EXPECT_NE(response.find("READONLY"), std::string::npos);
+}
+
+TEST_F(RequestDispatcherTest, ReadsAndWritesAreRejectedWhileSnapshotLoadIsInProgress) {
+  loading_.store(true, std::memory_order_release);
+
+  EXPECT_NE(Dispatch("VECSET item 1 0\r\n").find("LOADING"), std::string::npos);
+  EXPECT_NE(Dispatch("SIM item 10 using=vectors\r\n").find("LOADING"), std::string::npos);
+  EXPECT_FALSE(vector_store_->HasVector("item"));
 }
 
 TEST_F(RequestDispatcherTest, SnapshotWriteGateClosesCheckThenMutateRace) {
@@ -377,6 +429,43 @@ TEST_F(RequestDispatcherTest, MetasetRequiresExistingVector) {
   EXPECT_NE(response.find("Vector not found"), std::string::npos);
 }
 
+TEST_F(RequestDispatcherTest, MutationsAdvanceVectorAndMetadataGenerations) {
+  const auto vector_before = ctx_->vector_generation.load();
+  const auto metadata_before = ctx_->metadata_generation.load();
+  ASSERT_NE(Dispatch("VECSET item 1 0\r\n").find("OK"), std::string::npos);
+  EXPECT_EQ(ctx_->vector_generation.load(), vector_before + 1);
+  EXPECT_EQ(ctx_->metadata_generation.load(), metadata_before);
+
+  ASSERT_NE(Dispatch("METASET item status:draft\r\n").find("OK"), std::string::npos);
+  EXPECT_EQ(ctx_->metadata_generation.load(), metadata_before + 1);
+
+  ASSERT_NE(Dispatch("VECDEL item\r\n").find("OK"), std::string::npos);
+  EXPECT_EQ(ctx_->vector_generation.load(), vector_before + 2);
+  EXPECT_EQ(ctx_->metadata_generation.load(), metadata_before + 2);
+}
+
+TEST_F(RequestDispatcherTest, MetadataCommitPreventsInflightFilteredResultReadmission) {
+  ASSERT_TRUE(vector_store_->SetVector("active", {1.0F, 0.0F}).has_value());
+  metadata_store_->Set("active", {{"status", std::string("active")}});
+  const auto queries_before = cache_->GetStatistics().total_queries;
+
+  std::unique_lock mutation_guard(write_serialization_gate_);
+  auto query = std::async(std::launch::async, [this] { return Dispatch("SIMV 10 filter=status:active 1 0\r\n"); });
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (cache_->GetStatistics().total_queries == queries_before && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+  ASSERT_GT(cache_->GetStatistics().total_queries, queries_before);
+
+  metadata_store_->Set("active", {{"status", std::string("draft")}});
+  ctx_->metadata_generation.fetch_add(1, std::memory_order_acq_rel);
+  cache_->Clear();
+  mutation_guard.unlock();
+
+  EXPECT_NE(query.get().find("OK"), std::string::npos);
+  EXPECT_EQ(cache_->GetStatistics().current_entries, 0U);
+}
+
 TEST_F(RequestDispatcherTest, SimvFilterUsesMetadataStore) {
   ASSERT_NE(Dispatch("VECSET active 1 0\r\n").find("OK"), std::string::npos);
   ASSERT_NE(Dispatch("VECSET draft 0.9 0.1\r\n").find("OK"), std::string::npos);
@@ -477,6 +566,23 @@ TEST_F(RequestDispatcherTest, EventsFilterKeepsVectorlessMatchesAndReachesTopK) 
   EXPECT_EQ(response.find("drop2"), std::string::npos);
 }
 
+TEST_F(RequestDispatcherTest, EventsFilterExpandsBeyondFixedOversamplingPrefix) {
+  for (int i = 0; i < 10; ++i) {
+    const std::string id = "drop" + std::to_string(i);
+    co_index_->SetScore("query", id, 1000.0F - static_cast<float>(i));
+    metadata_store_->Set(id, {{"status", std::string("draft")}});
+  }
+  co_index_->SetScore("query", "keep1", 10.0F);
+  co_index_->SetScore("query", "keep2", 9.0F);
+  metadata_store_->Set("keep1", {{"status", std::string("active")}});
+  metadata_store_->Set("keep2", {{"status", std::string("active")}});
+
+  auto response = Dispatch("SIM query 2 using=events filter=status:active\r\n");
+  EXPECT_NE(response.find("OK RESULTS 2"), std::string::npos);
+  EXPECT_NE(response.find("keep1"), std::string::npos);
+  EXPECT_NE(response.find("keep2"), std::string::npos);
+}
+
 // ============================================================================
 // Parse-time top_k validation wiring (#42)
 // ============================================================================
@@ -502,7 +608,7 @@ TEST_F(RequestDispatcherTest, DebugModeAppendsDebugBlockToSim) {
   auto before = Dispatch("SIM item1 5 using=vectors\r\n", conn_ctx);
   EXPECT_EQ(before.find("# DEBUG"), std::string::npos);
 
-  ASSERT_NE(Dispatch("DEBUG ON\r\n", conn_ctx).find("Debug mode enabled"), std::string::npos);
+  ASSERT_EQ(Dispatch("DEBUG ON\r\n", conn_ctx), "OK DEBUG_ON\r\n");
   EXPECT_TRUE(conn_ctx.debug_mode);
 
   auto after = Dispatch("SIM item1 5 using=vectors\r\n", conn_ctx);

@@ -13,11 +13,14 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 
+#include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <optional>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "cache/similarity_cache.h"
 #include "server/connection_io_handler.h"
@@ -36,7 +39,7 @@ constexpr int kShutdownCheckIntervalMs = 100;
 constexpr size_t kBytesPerMegabyte = 1024 * 1024;  // Bytes in a megabyte
 
 /**
- * @brief Find the newest snapshot in @p dir.
+ * @brief Find completed snapshots in @p dir, newest first.
  *
  * Startup recovery must replay the WAL relative to the exact snapshot the WAL
  * was last truncated against. Every snapshot that triggered a truncation wrote a
@@ -49,26 +52,33 @@ constexpr size_t kBytesPerMegabyte = 1024 * 1024;  // Bytes in a megabyte
  *
  * @param dir Snapshot directory to scan
  * @param require_checkpoint Whether a WAL checkpoint sidecar is mandatory
- * @return Path of the newest eligible snapshot, or std::nullopt if none
+ * @return Eligible paths sorted by modification time (then path) descending
  */
-std::optional<std::string> FindLatestSnapshot(const std::string& dir, bool require_checkpoint) {
+std::vector<std::string> FindSnapshotCandidates(const std::string& dir, bool require_checkpoint) {
   std::error_code ec;
   std::filesystem::path snapshot_dir(dir);
   if (!std::filesystem::is_directory(snapshot_dir, ec)) {
-    return std::nullopt;
+    return {};
   }
 
-  std::optional<std::string> newest_path;
-  std::filesystem::file_time_type newest_time{};
+  struct Candidate {
+    std::string path;
+    std::filesystem::file_time_type mtime;
+  };
+  std::vector<Candidate> candidates;
   for (const auto& entry : std::filesystem::directory_iterator(snapshot_dir, ec)) {
     if (ec) {
       break;
     }
-    if (!entry.is_regular_file(ec)) {
+    const auto status = std::filesystem::symlink_status(entry.path(), ec);
+    if (ec || !std::filesystem::is_regular_file(status)) {
       continue;
     }
-    // The checkpoint sidecar itself must not be treated as a snapshot.
-    if (entry.path().extension() == storage::kWalCheckpointSuffix) {
+    // Only a final snapshot suffix denotes a published recovery candidate.
+    // Writer temporary files contain an additional ".tmp.<random>" suffix;
+    // checkpoint sidecars and unrelated files are therefore excluded too.
+    const auto extension = entry.path().extension();
+    if (extension != ".nvec" && extension != ".dmp") {
       continue;
     }
     // With WAL enabled, only snapshots with a checkpoint sidecar are valid
@@ -79,16 +89,24 @@ std::optional<std::string> FindLatestSnapshot(const std::string& dir, bool requi
     if (require_checkpoint && !std::filesystem::exists(sidecar, ec)) {
       continue;
     }
-    auto mtime = std::filesystem::last_write_time(entry, ec);
+    const auto mtime = std::filesystem::last_write_time(entry, ec);
     if (ec) {
       continue;
     }
-    if (!newest_path.has_value() || mtime > newest_time) {
-      newest_path = entry.path().string();
-      newest_time = mtime;
-    }
+    candidates.push_back({entry.path().string(), mtime});
   }
-  return newest_path;
+  std::sort(candidates.begin(), candidates.end(), [](const Candidate& lhs, const Candidate& rhs) {
+    if (lhs.mtime != rhs.mtime) {
+      return lhs.mtime > rhs.mtime;
+    }
+    return lhs.path > rhs.path;
+  });
+  std::vector<std::string> paths;
+  paths.reserve(candidates.size());
+  for (auto& candidate : candidates) {
+    paths.push_back(std::move(candidate.path));
+  }
+  return paths;
 }
 }  // namespace
 
@@ -262,6 +280,11 @@ utils::Expected<void, utils::Error> NvecdServer::Start() {
     http_config.cors_allow_origin = config_.api.http.cors_allow_origin;
     http_config.allow_cidrs = config_.network.allow_cidrs;
     http_config.requirepass = config_.security.requirepass;
+    http_config.worker_threads = static_cast<size_t>(std::max(1, config_.perf.thread_pool_size));
+    http_config.max_connections = static_cast<size_t>(std::max(0, config_.perf.max_connections));
+    http_config.max_connections_per_ip = static_cast<size_t>(std::max(0, config_.perf.max_connections_per_ip));
+    const int queued_connections = std::max(1, config_.perf.max_connections - config_.perf.thread_pool_size);
+    http_config.max_queued_connections = static_cast<size_t>(queued_connections);
     // Apply the same per-request query-length budget to HTTP and TCP.
     if (config_.perf.max_query_length > 0) {
       http_config.max_payload_bytes = static_cast<size_t>(config_.perf.max_query_length);
@@ -402,17 +425,16 @@ utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
   spdlog::info("SimilarityEngine initialized (fusion: alpha={}, beta={})", config_.similarity.fusion_alpha,
                config_.similarity.fusion_beta);
 
-  // Create SimilarityCache (if enabled)
-  if (config_.cache.enabled) {
-    cache_ = std::make_unique<cache::SimilarityCache>(config_.cache.max_memory_bytes, config_.cache.min_query_cost_ms,
-                                                      config_.cache.ttl_seconds);
-    spdlog::info("SimilarityCache initialized (max_memory={}MB, min_cost={}ms, ttl={}s)",
-                 config_.cache.max_memory_bytes / kBytesPerMegabyte, config_.cache.min_query_cost_ms,
-                 config_.cache.ttl_seconds);
-  } else {
-    cache_ = nullptr;
-    spdlog::info("SimilarityCache disabled");
-  }
+  // The controller owns a cache instance for the full server lifetime. A
+  // disabled cache is retained but unpublished, so runtime re-enable is always
+  // effective and keeps one source of truth across all control surfaces.
+  cache_controller_ = std::make_unique<cache::SimilarityCacheController>(
+      config_.cache.max_memory_bytes, config_.cache.min_query_cost_ms, config_.cache.ttl_seconds,
+      config_.cache.compression_enabled, static_cast<size_t>(config_.cache.eviction_batch_size), config_.cache.enabled,
+      &handler_ctx_.cache);
+  spdlog::info("SimilarityCache initialized (enabled={}, max_memory={}MB, min_cost={}ms, ttl={}s)",
+               config_.cache.enabled, config_.cache.max_memory_bytes / kBytesPerMegabyte,
+               config_.cache.min_query_cost_ms, config_.cache.ttl_seconds);
 
   // Create RuntimeVariableManager
   auto variable_mgr_result = config::RuntimeVariableManager::Create(config_);
@@ -422,26 +444,7 @@ utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
   }
   variable_manager_ = std::move(*variable_mgr_result);
 
-  // Register cache toggle callback
-  variable_manager_->SetCacheToggleCallback([this](bool enabled) -> utils::Expected<void, utils::Error> {
-    if (enabled && !cache_) {
-      // Create cache if it doesn't exist
-      cache_ = std::make_unique<cache::SimilarityCache>(config_.cache.max_memory_bytes, config_.cache.min_query_cost_ms,
-                                                        config_.cache.ttl_seconds);
-      handler_ctx_.cache.store(cache_.get(), std::memory_order_release);
-      spdlog::info("Cache enabled at runtime");
-    } else if (!enabled && cache_) {
-      // Disable cache (set pointer to null but keep cache for later re-enable)
-      handler_ctx_.cache.store(nullptr, std::memory_order_release);
-      spdlog::info("Cache disabled at runtime");
-    }
-    return {};
-  });
-
-  // Set SimilarityCache pointer if cache is enabled
-  if (cache_) {
-    variable_manager_->SetSimilarityCache(cache_.get());
-  }
+  variable_manager_->SetCacheController(cache_controller_.get());
 
   spdlog::info("RuntimeVariableManager initialized");
 
@@ -451,7 +454,7 @@ utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
   handler_ctx_.vector_store = vector_store_.get();
   handler_ctx_.metadata_store = metadata_store_.get();
   handler_ctx_.similarity_engine = similarity_engine_.get();
-  handler_ctx_.cache.store(cache_.get(), std::memory_order_release);
+  handler_ctx_.cache_controller = cache_controller_.get();
   handler_ctx_.variable_manager = variable_manager_.get();
   handler_ctx_.dump_dir = config_.snapshot.dir;
   handler_ctx_.requirepass = config_.security.requirepass;
@@ -492,34 +495,77 @@ utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
   // The fork-snapshot writer is also given the WAL pointer so it can write the
   // checkpoint sidecar and truncate the WAL once a background snapshot lands.
   auto load_snapshot = [this](const std::string& snapshot_path) -> utils::Expected<void, utils::Error> {
+    events::CoOccurrenceIndex::Config co_config;
+    co_config.max_neighbors_per_item = config_.events.max_neighbors_per_item;
+    co_config.min_support = static_cast<float>(config_.events.min_support);
+    events::EventStore staged_event_store(config_.events);
+    events::CoOccurrenceIndex staged_co_index(co_config);
+    vectors::VectorStore staged_vector_store(config_.vectors);
+    vectors::MetadataStore staged_metadata_store;
     config::Config loaded_config;
     storage::snapshot_format::IntegrityError integrity_error;
-    auto load =
-        storage::snapshot_v1::ReadSnapshotV1(snapshot_path, loaded_config, *event_store_, *co_index_, *vector_store_,
-                                             nullptr, nullptr, &integrity_error, metadata_store_.get());
+    auto load = storage::snapshot_v1::ReadSnapshotV1(snapshot_path, loaded_config, staged_event_store, staged_co_index,
+                                                     staged_vector_store, nullptr, nullptr, &integrity_error,
+                                                     &staged_metadata_store);
     if (!load) {
       std::string msg = load.error().message();
       if (!integrity_error.message.empty()) {
         msg += " (" + integrity_error.message + ")";
       }
-      spdlog::error("Failed to load snapshot {} during recovery: {}", snapshot_path, msg);
+      spdlog::warn("Skipping invalid snapshot {} during recovery: {}", snapshot_path, msg);
       return utils::MakeUnexpected(load.error());
+    }
+    event_store_->SwapState(staged_event_store);
+    co_index_->SwapState(staged_co_index);
+    vector_store_->SwapState(staged_vector_store);
+    metadata_store_->SwapState(staged_metadata_store);
+    handler_ctx_.vector_generation.fetch_add(1, std::memory_order_acq_rel);
+    handler_ctx_.metadata_generation.fetch_add(1, std::memory_order_acq_rel);
+    handler_ctx_.dataset_generation.fetch_add(1, std::memory_order_acq_rel);
+    if (cache_controller_ != nullptr) {
+      (void)cache_controller_->Clear();
     }
     spdlog::info("Recovery loaded snapshot: {}", snapshot_path);
     return {};
   };
 
+  struct RecoverySnapshot {
+    std::string path;
+    uint64_t checkpoint = 0;
+  };
+  auto load_newest_valid_snapshot = [&](bool require_checkpoint) -> utils::Expected<RecoverySnapshot, utils::Error> {
+    std::optional<utils::Error> last_error;
+    for (const auto& candidate : FindSnapshotCandidates(config_.snapshot.dir, require_checkpoint)) {
+      uint64_t checkpoint = 0;
+      if (require_checkpoint) {
+        auto checkpoint_result = storage::ReadWalCheckpoint(candidate);
+        if (!checkpoint_result) {
+          spdlog::warn("Skipping snapshot with invalid WAL checkpoint {}: {}", candidate,
+                       checkpoint_result.error().message());
+          last_error = checkpoint_result.error();
+          continue;
+        }
+        checkpoint = *checkpoint_result;
+      }
+      auto loaded = load_snapshot(candidate);
+      if (loaded) {
+        return RecoverySnapshot{candidate, checkpoint};
+      }
+      last_error = loaded.error();
+    }
+    if (last_error.has_value()) {
+      return utils::MakeUnexpected(*last_error);
+    }
+    return RecoverySnapshot{};
+  };
+
   if (config_.wal.enabled) {
     // 1. Load the latest checkpointed snapshot, if one exists.
-    std::string loaded_snapshot_path;
-    auto latest = FindLatestSnapshot(config_.snapshot.dir, /*require_checkpoint=*/true);
-    if (latest.has_value()) {
-      auto load = load_snapshot(*latest);
-      if (!load) {
-        return utils::MakeUnexpected(load.error());
-      }
-      loaded_snapshot_path = *latest;
+    auto loaded_snapshot = load_newest_valid_snapshot(/*require_checkpoint=*/true);
+    if (!loaded_snapshot) {
+      return utils::MakeUnexpected(loaded_snapshot.error());
     }
+    const std::string loaded_snapshot_path = loaded_snapshot->path;
 
     // 2. Open the WAL (recovers CurrentSequence from existing files).
     storage::WriteAheadLog::Config wal_config;
@@ -538,12 +584,13 @@ utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
     }
 
     // 3. Replay only records beyond the loaded snapshot's checkpoint.
-    const uint64_t checkpoint = loaded_snapshot_path.empty() ? 0 : storage::ReadWalCheckpoint(loaded_snapshot_path);
+    const uint64_t checkpoint = loaded_snapshot->checkpoint;
     const uint64_t from = (checkpoint == 0) ? 0 : checkpoint + 1;
 
     // Replay BEFORE publishing handler_ctx_.wal so replayed records are not
     // re-appended.
-    auto replayed = wal_.Replay(from, [this](const storage::WalRecord& record) { dispatcher_->ReplayRecord(record); });
+    auto replayed =
+        wal_.Replay(from, [this](const storage::WalRecord& record) { return dispatcher_->ReplayRecord(record); });
     if (!replayed) {
       spdlog::error("WAL replay failed from sequence {}: {}", from, replayed.error().message());
       return utils::MakeUnexpected(replayed.error());
@@ -559,12 +606,9 @@ utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
     // WAL-off is the default configuration. Its snapshots have no .walseq
     // sidecar, so recover the latest snapshot directly instead of starting
     // every restart from an empty in-memory store.
-    auto latest = FindLatestSnapshot(config_.snapshot.dir, /*require_checkpoint=*/false);
-    if (latest.has_value()) {
-      auto load = load_snapshot(*latest);
-      if (!load) {
-        return utils::MakeUnexpected(load.error());
-      }
+    auto loaded_snapshot = load_newest_valid_snapshot(/*require_checkpoint=*/false);
+    if (!loaded_snapshot) {
+      return utils::MakeUnexpected(loaded_snapshot.error());
     }
   }
 
@@ -587,7 +631,47 @@ utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
 
   // Create and start DecayScheduler (if co-occurrence decay is enabled)
   decay_scheduler_ = std::make_unique<DecayScheduler>(
-      co_index_.get(), static_cast<int>(config_.events.decay_interval_sec), config_.events.decay_alpha);
+      co_index_.get(), static_cast<int>(config_.events.decay_interval_sec), config_.events.decay_alpha,
+      [this](double alpha, bool prune) -> utils::Expected<void, utils::Error> {
+        std::shared_lock snapshot_guard(snapshot_write_gate_);
+        std::lock_guard write_guard(write_serialization_gate_);
+        if (read_only_.load(std::memory_order_acquire)) {
+          return utils::MakeUnexpected(
+              utils::MakeError(utils::ErrorCode::kEventDecayFailed, "Server is read-only; decay maintenance skipped"));
+        }
+
+        if (handler_ctx_.wal != nullptr) {
+          std::vector<uint8_t> payload(sizeof(alpha) + sizeof(uint8_t));
+          std::memcpy(payload.data(), &alpha, sizeof(alpha));
+          payload[sizeof(alpha)] = prune ? 1 : 0;
+          auto appended =
+              handler_ctx_.wal->Append(storage::WalOpType::kCoOccurrenceMaintenance, payload.data(), payload.size());
+          if (!appended) {
+            read_only_.store(true, std::memory_order_release);
+            return utils::MakeUnexpected(appended.error());
+          }
+        }
+
+        co_index_->ApplyDecay(alpha);
+        if (prune) {
+          co_index_->Prune();
+        }
+
+        // Without a WAL, publish the post-maintenance state as a completed
+        // snapshot before admitting another write. Startup will select it by
+        // normal snapshot ordering, so decay/prune does not resurrect.
+        if (handler_ctx_.wal == nullptr) {
+          const auto maintenance_path = (std::filesystem::path(config_.snapshot.dir) / "maintenance.nvec").string();
+          auto persisted =
+              storage::snapshot_v1::WriteSnapshotV1(maintenance_path, config_, *event_store_, *co_index_,
+                                                    *vector_store_, nullptr, nullptr, metadata_store_.get());
+          if (!persisted) {
+            read_only_.store(true, std::memory_order_release);
+            return utils::MakeUnexpected(persisted.error());
+          }
+        }
+        return {};
+      });
   decay_scheduler_->Start();
 
   // Create RateLimiter if enabled

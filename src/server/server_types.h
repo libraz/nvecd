@@ -37,6 +37,7 @@ class SimilarityEngine;
 
 namespace cache {
 class SimilarityCache;
+class SimilarityCacheController;
 }  // namespace cache
 
 namespace config {
@@ -201,6 +202,12 @@ struct HandlerContext {
   /// surfaces observe the same key space.
   std::atomic<uint64_t> vector_generation{0};
 
+  /// Metadata generation used by filtered SIM/SIMV cache identities.
+  std::atomic<uint64_t> metadata_generation{0};
+
+  /// Whole-dataset publication generation, advanced by transactional LOAD.
+  std::atomic<uint64_t> dataset_generation{0};
+
   /// Optional server-wide barrier for lock-mode snapshots. Core write handlers
   /// hold this shared for their full mutation/WAL sequence; a snapshot holds it
   /// exclusively after publishing read_only, so no write can cross the
@@ -211,6 +218,9 @@ struct HandlerContext {
   /// across VECSET/METASET from concurrent TCP and HTTP clients: a METASET
   /// that observed a vector cannot be replayed before that vector's record.
   std::mutex* write_serialization_gate = nullptr;
+
+  /// Single source of truth for cache ownership, publication, and tuning.
+  cache::SimilarityCacheController* cache_controller = nullptr;
 
   // NOLINTEND(cppcoreguidelines-avoid-const-or-ref-data-members)
 };

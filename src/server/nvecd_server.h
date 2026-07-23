@@ -12,6 +12,7 @@
 #include <memory>
 #include <string>
 
+#include "cache/similarity_cache_controller.h"
 #include "config/config.h"
 #include "config/runtime_variable_manager.h"
 #include "events/co_occurrence_index.h"
@@ -166,7 +167,7 @@ class NvecdServer {
   std::unique_ptr<vectors::VectorStore> vector_store_;
   std::unique_ptr<vectors::MetadataStore> metadata_store_;
   std::unique_ptr<similarity::SimilarityEngine> similarity_engine_;
-  std::unique_ptr<cache::SimilarityCache> cache_;
+  std::unique_ptr<cache::SimilarityCacheController> cache_controller_;
   std::unique_ptr<config::RuntimeVariableManager> variable_manager_;
 
   // Handler context (must be declared before dispatcher_ to ensure proper initialization order)

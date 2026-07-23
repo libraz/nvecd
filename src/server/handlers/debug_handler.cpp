@@ -11,12 +11,12 @@ namespace nvecd::server::handlers {
 
 utils::Expected<std::string, utils::Error> HandleDebugOn(ConnectionContext& ctx) {
   ctx.debug_mode = true;
-  return std::string("OK Debug mode enabled\r\n");
+  return std::string("OK DEBUG_ON\r\n");
 }
 
 utils::Expected<std::string, utils::Error> HandleDebugOff(ConnectionContext& ctx) {
   ctx.debug_mode = false;
-  return std::string("OK Debug mode disabled\r\n");
+  return std::string("OK DEBUG_OFF\r\n");
 }
 
 std::string FormatSimDebugBlock(const std::string& mode, double query_time_ms, int candidate_count, int result_count) {
@@ -26,7 +26,8 @@ std::string FormatSimDebugBlock(const std::string& mode, double query_time_ms, i
   // a timing figure and the candidate/result counts for the query.
   const auto query_time_us = static_cast<long long>(query_time_ms * 1000.0);
   std::ostringstream oss;
-  oss << "# DEBUG\r\n";
+  // The field count makes the appended block self-framing for stateful clients.
+  oss << "# DEBUG 4\r\n";
   oss << "mode: " << mode << "\r\n";
   oss << "query_time_us: " << query_time_us << "\r\n";
   oss << "candidates: " << candidate_count << "\r\n";

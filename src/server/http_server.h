@@ -19,6 +19,7 @@
 
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <nlohmann/json.hpp>
 #include <string>
 #include <thread>
@@ -48,6 +49,10 @@ struct HttpServerConfig {
   /// Maximum accepted HTTP request body size in bytes. Requests with a larger
   /// payload are rejected by httplib before reaching a handler. Defaults to 8MB.
   size_t max_payload_bytes = 8UL * 1024UL * 1024UL;
+  size_t worker_threads = 8;
+  size_t max_queued_connections = 128;
+  size_t max_connections = 256;         ///< 0 means unlimited.
+  size_t max_connections_per_ip = 100;  ///< 0 means unlimited.
 };
 
 /**
@@ -129,6 +134,7 @@ class HttpServer {
 
   std::unique_ptr<httplib::Server> server_;
   std::unique_ptr<std::thread> server_thread_;
+  std::mutex lifecycle_mutex_;
 
   const config::Config* full_config_;
 

@@ -12,22 +12,30 @@
 
 #include "server/http_server.h"
 
+#include <arpa/inet.h>
 #include <gtest/gtest.h>
 #include <httplib.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <chrono>
+#include <future>
+#include <mutex>
 #include <nlohmann/json.hpp>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "cache/similarity_cache.h"
+#include "cache/similarity_cache_controller.h"
 #include "config/config.h"
+#include "config/runtime_variable_manager.h"
 #include "events/co_occurrence_index.h"
 #include "events/event_store.h"
 #include "server/server_types.h"
 #include "similarity/similarity_engine.h"
+#include "storage/wal.h"
 #include "vectors/metadata_store.h"
 #include "vectors/vector_store.h"
 
@@ -47,6 +55,7 @@ class HttpServerTest : public ::testing::Test {
     config_->similarity.default_top_k = 10;
     config_->similarity.fusion_alpha = 0.6f;
     config_->similarity.fusion_beta = 0.4f;
+    config_->cache.enabled = true;
 
     // Initialize components
     event_store_ = std::make_unique<events::EventStore>(config_->events);
@@ -56,7 +65,13 @@ class HttpServerTest : public ::testing::Test {
     similarity_engine_ =
         std::make_unique<similarity::SimilarityEngine>(event_store_.get(), co_index_.get(), vector_store_.get(),
                                                        config_->similarity, config_->vectors, metadata_store_.get());
-    cache_ = std::make_unique<cache::SimilarityCache>(10 * 1024 * 1024, 0.1);
+    auto manager_result = config::RuntimeVariableManager::Create(*config_);
+    ASSERT_TRUE(manager_result);
+    variable_manager_ = std::move(*manager_result);
+    cache_controller_ = std::make_unique<cache::SimilarityCacheController>(10 * 1024 * 1024, 0.1, 0, true, 1, true,
+                                                                           &handler_ctx_.cache);
+    cache_ = &cache_controller_->Cache();
+    variable_manager_->SetCacheController(cache_controller_.get());
 
     // Setup handler context (pointers only, references already set in initializer)
     handler_ctx_.event_store = event_store_.get();
@@ -64,14 +79,17 @@ class HttpServerTest : public ::testing::Test {
     handler_ctx_.vector_store = vector_store_.get();
     handler_ctx_.metadata_store = metadata_store_.get();
     handler_ctx_.similarity_engine = similarity_engine_.get();
-    handler_ctx_.cache = cache_.get();
+    handler_ctx_.cache_controller = cache_controller_.get();
+    handler_ctx_.variable_manager = variable_manager_.get();
     handler_ctx_.config = config_.get();
+    handler_ctx_.write_serialization_gate = &write_serialization_gate_;
 
     // Create HTTP server
     server::HttpServerConfig http_config;
     http_config.bind = "127.0.0.1";
     http_config.port = 18081;  // Use different port for testing
     http_config.allow_cidrs = {"127.0.0.0/8"};
+    ConfigureHttpServer(&http_config);
 
     http_server_ = std::make_unique<server::HttpServer>(http_config, &handler_ctx_, config_.get(), &loading_, &stats_);
 
@@ -91,7 +109,10 @@ class HttpServerTest : public ::testing::Test {
     if (http_server_) {
       http_server_->Stop();
     }
+    cache_controller_.reset();
   }
+
+  virtual void ConfigureHttpServer(server::HttpServerConfig* /* config */) {}
 
   std::unique_ptr<config::Config> config_;
   std::unique_ptr<events::EventStore> event_store_;
@@ -99,11 +120,14 @@ class HttpServerTest : public ::testing::Test {
   std::unique_ptr<vectors::VectorStore> vector_store_;
   std::unique_ptr<vectors::MetadataStore> metadata_store_;
   std::unique_ptr<similarity::SimilarityEngine> similarity_engine_;
-  std::unique_ptr<cache::SimilarityCache> cache_;
+  cache::SimilarityCache* cache_ = nullptr;
+  std::unique_ptr<cache::SimilarityCacheController> cache_controller_;
+  std::unique_ptr<config::RuntimeVariableManager> variable_manager_;
 
   server::ServerStats stats_;
   std::atomic<bool> loading_{false};
   std::atomic<bool> read_only_{false};
+  std::mutex write_serialization_gate_;
   server::HandlerContext handler_ctx_{
       .event_store = nullptr,
       .co_index = nullptr,
@@ -155,6 +179,35 @@ TEST_F(HttpServerTest, HealthReadyWhileLoading) {
   EXPECT_EQ(body["loading"], true);
 
   loading_.store(false);
+}
+
+TEST_F(HttpServerTest, MutationIsRejectedWhileLoading) {
+  loading_.store(true, std::memory_order_release);
+
+  json body;
+  body["id"] = "blocked";
+  body["vector"] = {1.0, 0.0, 0.0, 0.0};
+  auto res = client_->Post("/vecset", body.dump(), "application/json");
+
+  ASSERT_TRUE(res);
+  EXPECT_EQ(res->status, 503);
+  EXPECT_FALSE(vector_store_->HasVector("blocked"));
+  loading_.store(false, std::memory_order_release);
+}
+
+TEST_F(HttpServerTest, WalAppendFailureReturns503WithoutMutation) {
+  storage::WriteAheadLog closed_wal;
+  handler_ctx_.wal = &closed_wal;
+  json body;
+  body["id"] = "not-accepted";
+  body["vector"] = {1.0, 0.0, 0.0, 0.0};
+
+  auto res = client_->Post("/vecset", body.dump(), "application/json");
+
+  ASSERT_TRUE(res);
+  EXPECT_EQ(res->status, 503);
+  EXPECT_FALSE(vector_store_->HasVector("not-accepted"));
+  EXPECT_TRUE(read_only_.load(std::memory_order_acquire));
 }
 
 TEST_F(HttpServerTest, HealthDetail) {
@@ -219,6 +272,16 @@ TEST_F(HttpServerTest, Config) {
   EXPECT_TRUE(body.contains("events"));
   EXPECT_TRUE(body.contains("vectors"));
   EXPECT_TRUE(body.contains("similarity"));
+}
+
+TEST_F(HttpServerTest, StatelessDebugEndpointsAreExplicitlyUnsupported) {
+  auto enabled = client_->Post("/debug/on", "", "application/json");
+  ASSERT_TRUE(enabled);
+  EXPECT_EQ(enabled->status, 410);
+
+  auto disabled = client_->Post("/debug/off", "", "application/json");
+  ASSERT_TRUE(disabled);
+  EXPECT_EQ(disabled->status, 410);
 }
 
 // Metrics test
@@ -458,6 +521,24 @@ TEST_F(HttpServerTest, SimAndSimvRejectWrongOptionalFieldTypesWithBadRequest) {
   auto simv_response = client_->Post("/simv", simv_body.dump(), "application/json");
   ASSERT_TRUE(simv_response);
   EXPECT_EQ(simv_response->status, 400);
+
+  json invalid_top_k = {{"vector", json::array({1.0, 0.0, 0.0, 0.0})}, {"top_k", -1}};
+  auto invalid_top_k_response = client_->Post("/simv", invalid_top_k.dump(), "application/json");
+  ASSERT_TRUE(invalid_top_k_response);
+  EXPECT_EQ(invalid_top_k_response->status, 400);
+}
+
+TEST_F(HttpServerTest, BindFailureIsReportedSynchronouslyAndStopStillJoinsSafely) {
+  server::HttpServerConfig duplicate_config;
+  duplicate_config.bind = "invalid-bind-address";
+  duplicate_config.port = 18089;
+  duplicate_config.allow_cidrs = {"127.0.0.0/8"};
+  server::HttpServer duplicate(duplicate_config, &handler_ctx_, config_.get(), &loading_, &stats_);
+
+  auto started = duplicate.Start();
+  EXPECT_FALSE(started.has_value());
+  duplicate.Stop();
+  EXPECT_FALSE(duplicate.IsRunning());
 }
 
 // Cache management tests
@@ -497,6 +578,45 @@ TEST_F(HttpServerTest, CacheClearInvalidScope) {
   auto res = client_->Post("/cache/clear", req_body.dump(), "application/json");
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 400);
+}
+
+TEST_F(HttpServerTest, CacheClearRejectsMalformedOrWrongTypedBodyWithoutClearing) {
+  const auto entries_before = cache_->GetStatistics().current_entries;
+
+  auto malformed = client_->Post("/cache/clear", "{", "application/json");
+  ASSERT_TRUE(malformed);
+  EXPECT_EQ(malformed->status, 400);
+  EXPECT_EQ(cache_->GetStatistics().current_entries, entries_before);
+
+  auto wrong_type = client_->Post("/cache/clear", R"({"scope":42})", "application/json");
+  ASSERT_TRUE(wrong_type);
+  EXPECT_EQ(wrong_type->status, 400);
+  EXPECT_EQ(cache_->GetStatistics().current_entries, entries_before);
+}
+
+TEST_F(HttpServerTest, CacheControlSurfacesShareEffectiveStateAndTuning) {
+  auto disabled = client_->Post("/cache/disable", "{}", "application/json");
+  ASSERT_TRUE(disabled);
+  ASSERT_EQ(disabled->status, 200);
+  EXPECT_EQ(handler_ctx_.cache.load(), nullptr);
+  EXPECT_EQ(*variable_manager_->GetVariable("cache.enabled"), "false");
+
+  ASSERT_TRUE(variable_manager_->SetVariable("cache.ttl_seconds", "19"));
+  ASSERT_TRUE(variable_manager_->SetVariable("cache.min_query_cost_ms", "2.5"));
+
+  auto enabled = client_->Post("/cache/enable", "{}", "application/json");
+  ASSERT_TRUE(enabled);
+  ASSERT_EQ(enabled->status, 200);
+  EXPECT_EQ(handler_ctx_.cache.load(), cache_);
+  EXPECT_EQ(*variable_manager_->GetVariable("cache.enabled"), "true");
+
+  auto stats_response = client_->Get("/cache/stats");
+  ASSERT_TRUE(stats_response);
+  ASSERT_EQ(stats_response->status, 200);
+  const auto stats = json::parse(stats_response->body);
+  EXPECT_TRUE(stats["enabled"].get<bool>());
+  EXPECT_EQ(stats["ttl_seconds"], 19);
+  EXPECT_DOUBLE_EQ(stats["min_query_cost_ms"].get<double>(), 2.5);
 }
 
 // Default SIM mode is fusion when the request omits "mode"
@@ -645,6 +765,41 @@ TEST_F(HttpServerTest, VecsetInvalidatesWarmSimvCacheViaVectorGeneration) {
                           [](const json& item) { return item["id"] == "new_match"; }));
 }
 
+TEST_F(HttpServerTest, MetadataCommitPreventsInflightFilteredResultReadmission) {
+  cache_->SetMinQueryCost(0.0);
+  json vector;
+  vector["id"] = "active";
+  vector["vector"] = {1.0F, 0.0F, 0.0F, 0.0F};
+  vector["metadata"] = {{"status", "active"}};
+  ASSERT_EQ(client_->Post("/vecset", vector.dump(), "application/json")->status, 200);
+
+  json query_body;
+  query_body["vector"] = {1.0F, 0.0F, 0.0F, 0.0F};
+  query_body["top_k"] = 10;
+  query_body["filter"] = "status:active";
+  const auto queries_before = cache_->GetStatistics().total_queries;
+
+  std::unique_lock mutation_guard(write_serialization_gate_);
+  auto query = std::async(std::launch::async, [body = query_body.dump()] {
+    httplib::Client client("http://127.0.0.1:18081");
+    auto response = client.Post("/simv", body, "application/json");
+    return response ? response->status : -1;
+  });
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (cache_->GetStatistics().total_queries == queries_before && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+  ASSERT_GT(cache_->GetStatistics().total_queries, queries_before);
+
+  metadata_store_->Set("active", {{"status", std::string("draft")}});
+  handler_ctx_.metadata_generation.fetch_add(1, std::memory_order_acq_rel);
+  cache_->Clear();
+  mutation_guard.unlock();
+
+  EXPECT_EQ(query.get(), 200);
+  EXPECT_EQ(cache_->GetStatistics().current_entries, 0U);
+}
+
 // DUMP SAVE failure returns a non-2xx with a real error (not 200 ok)
 TEST_F(HttpServerTest, DumpSaveFailureReturnsError) {
   // dump_dir points at a non-existent directory, so the save must fail.
@@ -767,6 +922,12 @@ TEST_F(HttpServerTest, EventsModeFilterKeepsVectorlessMatches) {
   metadata_store_->Set("drop1", {{"status", std::string("draft")}});
   metadata_store_->Set("keep2", {{"status", std::string("active")}});
   metadata_store_->Set("drop2", {{"status", std::string("draft")}});
+  // Put more than the old fixed 3x prefix ahead of both matches.
+  for (int i = 0; i < 10; ++i) {
+    const std::string id = "high_drop" + std::to_string(i);
+    co_index_->SetScore("query", id, 10000.0F - static_cast<float>(i));
+    metadata_store_->Set(id, {{"status", std::string("draft")}});
+  }
 
   json req_body;
   req_body["id"] = "query";
@@ -802,6 +963,19 @@ TEST_F(HttpServerTest, VecsetDimensionMismatchRejectedEarly) {
   auto res = client_->Post("/vecset", vec2.dump(), "application/json");
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 400);
+}
+
+TEST_F(HttpServerTest, FiniteDoubleOutsideFloatRangeIsRejectedWithoutMutation) {
+  json vecset = {{"id", "huge"}, {"vector", json::array({1e300, 0.0, 0.0, 0.0})}};
+  auto vecset_response = client_->Post("/vecset", vecset.dump(), "application/json");
+  ASSERT_TRUE(vecset_response);
+  EXPECT_EQ(vecset_response->status, 400);
+  EXPECT_FALSE(vector_store_->HasVector("huge"));
+
+  json simv = {{"vector", json::array({1e300, 0.0, 0.0, 0.0})}, {"top_k", 1}};
+  auto simv_response = client_->Post("/simv", simv.dump(), "application/json");
+  ASSERT_TRUE(simv_response);
+  EXPECT_EQ(simv_response->status, 400);
 }
 
 TEST_F(HttpServerTest, WriteEndpointsRejectDuringLockSnapshot) {
@@ -978,6 +1152,50 @@ TEST_F(HttpServerRateLimitTest, AppliesConfiguredLimitToHttpRequests) {
   EXPECT_EQ(limited->status, 429);
 }
 
+class HttpServerAdmissionTest : public HttpServerTest {
+ protected:
+  void ConfigureHttpServer(server::HttpServerConfig* config) override {
+    config->worker_threads = 2;
+    config->max_queued_connections = 2;
+    config->max_connections = 2;
+    config->max_connections_per_ip = 1;
+    config->read_timeout_sec = 2;
+  }
+};
+
+TEST_F(HttpServerAdmissionTest, RejectsSecondSlowConnectionFromSameIpBeforeParsing) {
+  auto connect_socket = []() {
+    const int socket_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (socket_fd < 0) {
+      return socket_fd;
+    }
+    sockaddr_in address = {};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(18081);
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (::connect(socket_fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
+      ::close(socket_fd);
+      return -1;
+    }
+    return socket_fd;
+  };
+
+  const int first = connect_socket();
+  ASSERT_GE(first, 0);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  const int second = connect_socket();
+  ASSERT_GE(second, 0);
+
+  timeval timeout = {};
+  timeout.tv_sec = 1;
+  ASSERT_EQ(::setsockopt(second, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)), 0);
+  char byte = 0;
+  EXPECT_LE(::recv(second, &byte, 1, 0), 0);
+
+  ::close(second);
+  ::close(first);
+}
+
 // CORS behavior: when enabled but no origin is configured, the
 // Access-Control-Allow-Origin header must be omitted (not emitted as "null").
 class HttpServerCorsTest : public ::testing::Test {
@@ -1064,6 +1282,18 @@ TEST_F(HttpServerCorsTest, ConfiguredOriginEmitsAcaoHeader) {
   EXPECT_EQ(res->status, 200);
   ASSERT_TRUE(res->has_header("Access-Control-Allow-Origin"));
   EXPECT_EQ(res->get_header_value("Access-Control-Allow-Origin"), "https://example.com");
+}
+
+TEST_F(HttpServerCorsTest, PreflightAllowsAuthenticatedDeleteRoutes) {
+  StartServer(18085, "https://example.com");
+  httplib::Headers headers = {{"Origin", "https://example.com"},
+                              {"Access-Control-Request-Method", "DELETE"},
+                              {"Access-Control-Request-Headers", "Authorization, Content-Type"}};
+  auto res = client_->Options("/vecset", headers);
+  ASSERT_TRUE(res);
+  EXPECT_EQ(res->status, 204);
+  EXPECT_NE(res->get_header_value("Access-Control-Allow-Methods").find("DELETE"), std::string::npos);
+  EXPECT_NE(res->get_header_value("Access-Control-Allow-Headers").find("Authorization"), std::string::npos);
 }
 
 }  // namespace
