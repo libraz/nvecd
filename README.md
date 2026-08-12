@@ -178,7 +178,7 @@ Configurable via `events.negative_signals` and `events.negative_weight`.
 | Cold-start handling | Automatic | Manual | Manual | N/A |
 | Distributed search | No | Yes | Yes | No |
 | Managed cloud service | No | Yes | Yes | No |
-| ANN indexing (HNSW, IVF) | HNSW + IVF | Yes | Yes | Yes |
+| ANN indexing (HNSW, IVF) | HNSW + IVF ([recall curve](docs/en/configuration.md#what-the-tuning-knobs-buy)) | Yes | Yes | Yes |
 | Metadata filtering | Yes (post-filter) | Yes | Yes | No |
 
 ## Architecture

@@ -142,6 +142,56 @@ similarity:
 `ivf_enabled` remains a legacy compatibility option; prefer
 `index_type: ivf` for new configurations.
 
+##### What the tuning knobs buy
+
+An approximate index is only meaningful as a trade: any of them can be made
+faster by returning worse answers. The table below pairs recall against
+latency at each setting so the trade is visible rather than implied.
+
+Measured on 50,000 vectors drawn around 200 latent centroids — the shape
+embeddings actually have — with an exhaustive scan over the same vectors as
+ground truth, `top_k=10`, 200 queries per point. Reproduce with:
+
+```bash
+cmake --build build --target ann_recall_benchmark
+./build/bin/ann_recall_benchmark --gtest_also_run_disabled_tests
+```
+
+HNSW, `hnsw_m: 16`, `hnsw_ef_construction: 200`:
+
+| `hnsw_ef_search` | recall@10 (dim 128) | vs exact scan | recall@10 (dim 768) | vs exact scan |
+|---|---|---|---|---|
+| 10 | 0.995 | 84x | 0.985 | 290x |
+| 16 | 0.999 | 66x | 0.992 | 234x |
+| 32 | 1.000 | 44x | 1.000 | 181x |
+| 64 | 1.000 | 30x | 1.000 | 139x |
+
+IVF, `ivf_nlist: 256`:
+
+| `ivf_nprobe` | recall@10 (dim 128) | vs exact scan | recall@10 (dim 768) | vs exact scan |
+|---|---|---|---|---|
+| 1 | 0.938 | 111x | 0.963 | 267x |
+| 2 | 0.993 | 96x | 0.996 | 167x |
+| 4 | 1.000 | 61x | 1.000 | 105x |
+| 8 | 1.000 | 37x | 1.000 | 56x |
+
+The defaults (`hnsw_ef_search: 50`, `ivf_nprobe: 8`) sit past the point where
+recall has already reached 1.0 on this data, so they are conservative rather
+than tuned for throughput. Lowering them is the first thing to try if query
+latency matters more than the last fraction of recall.
+
+::: warning Recall depends on how your vectors are distributed
+These figures come from data with cluster structure. Vectors spread evenly
+across the space — random directions with no grouping — are the worst case
+for every approximate index, and recall there is far lower at the same
+settings: HNSW reaches only 0.39 at `ef_search: 64` and needs `512` to pass
+0.93, by which point it is no faster than scanning everything.
+
+If your embeddings have little structure, an approximate index will not help.
+Measure with the benchmark above against your own vectors before switching
+`index_type` away from `flat`.
+:::
+
 ---
 
 ### Snapshot Persistence Configuration

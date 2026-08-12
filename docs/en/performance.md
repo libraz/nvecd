@@ -18,10 +18,10 @@ Nvecd automatically detects and uses the best SIMD instructions available on you
 
 **Performance Impact:**
 
-| Operation | Scalar | NEON (ARM64) | AVX2 (x86_64) |
-|-----------|--------|--------------|---------------|
-| Dot product (768-dim) | Baseline | **3-4x faster** | **6-8x faster** |
-| Cosine similarity | Baseline | **2.5-3x faster** | **5-6x faster** |
+NEON is roughly 5-6x faster than scalar on the kernel operations, and AVX2 is
+projected at 10-12x. Per-operation timings are measured in
+[Benchmarks](./benchmarks.md#simd-performance) and are not restated here, so there
+is one place to correct when they change.
 
 **Verification:**
 
@@ -73,7 +73,7 @@ time_saved_ms: 15420.50
 **Key Metrics:**
 - `hit_rate`: 0.85 = 85% of queries served from cache
 - `time_saved_ms`: Total latency saved by cache hits
-- `avg_hit_latency_ms`: Cache lookup time (~0.05ms)
+- `avg_hit_latency_ms`: Cache lookup time — a measured hit is 208ns, so this stays far below search latency
 
 ### 3. Automatic Cache Invalidation
 
@@ -431,13 +431,13 @@ If `total_queries > 0` but `cache_hits = 0`, queries may be too fast to cache.
 
 Nvecd provides high-performance vector search through:
 
-1. **SIMD acceleration** (3-8× faster vector operations)
-2. **Smart caching** (50-100× faster for repeated queries)
+1. **SIMD acceleration** (NEON is 5-6× faster than scalar at dim=128, 3-4× at dim=768)
+2. **Smart caching** (~400× faster for repeated queries at 10K, ~4,300× at 100K)
 3. **Efficient data structures** (compressed events, optimized layouts)
 
 For typical workloads with 10K-100K vectors:
-- **Cold queries**: 2-25ms
-- **Cached queries**: 0.05ms (50 microseconds)
+- **Cold queries**: 0.09-0.90ms
+- **Cached queries**: 0.21us (208 nanoseconds)
 - **Cache hit rate**: 70-90% with proper tuning
 
 Follow the optimization tips in this guide to achieve sub-millisecond query latency in production.

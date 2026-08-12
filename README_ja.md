@@ -178,7 +178,7 @@ nvecd-cli -p 11017 EVENT user1 DEL item_a
 | コールドスタート対応 | 自動 | 手動 | 手動 | N/A |
 | 分散検索 | No | Yes | Yes | No |
 | マネージドクラウド | No | Yes | Yes | No |
-| ANNインデックス (HNSW, IVF, PQ) | HNSW + IVF | Yes | Yes | Yes |
+| ANNインデックス (HNSW, IVF) | HNSW + IVF（[recall 曲線](docs/ja/configuration.md#チューニングパラメータで何が得られるか)） | Yes | Yes | Yes |
 | メタデータフィルタリング | Yes (ポストフィルタ) | Yes | Yes | No |
 
 ## Nvecd が適しているケース
