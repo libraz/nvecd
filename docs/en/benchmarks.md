@@ -126,6 +126,8 @@ Cache overhead is negligible compared to search latency.
 
 Reservoir sampling (Algorithm R) provides uniform random coverage. For recommendation workloads where approximate results are acceptable, `sample_size=10000` offers a good speed/quality tradeoff.
 
+> **These rows are extrapolated, not measured.** The measured dataset above tops out at 100K vectors. The 1M latencies are projected from that point on the assumption that the SIMD scan stays linear in the number of vectors scanned, which the pipeline breakdown supports but does not prove at that scale. Treat them as an order-of-magnitude estimate and measure on your own data before sizing against them.
+
 ### When to Use Exact Search
 
 Set `sample_size: 0` in configuration when:

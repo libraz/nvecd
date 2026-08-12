@@ -721,7 +721,7 @@ For detailed measured benchmarks, see [Benchmarks](benchmarks.md).
 | SIM       | **0.90ms**  | 0.00021ms      | ~1,100 QPS        |
 | SIMV      | **0.91ms**  | 0.00021ms      | ~1,100 QPS        |
 
-At 1M vectors with default sampling (10K): **~0.10ms** per query, **~80K QPS** on 8 threads.
+At 1M vectors with default sampling (10K), the [projected](benchmarks.md#approximate-search-sampling) figures are **~0.10ms** per query and **~80K QPS** on 8 threads. Measurements stop at 100K vectors; these are extrapolated from there.
 
 ### Optimization Tips
 
