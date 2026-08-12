@@ -58,7 +58,7 @@ The easiest way to build nvecd is using the provided Makefile:
 
 ```bash
 # Clone repository
-git clone https://github.com/yourusername/nvecd.git
+git clone https://github.com/libraz/nvecd.git
 cd nvecd
 
 # Build (automatically configures CMake and builds in parallel)

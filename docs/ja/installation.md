@@ -58,7 +58,7 @@ nvecd をビルドする最も簡単な方法は、提供されている Makefil
 
 ```bash
 # リポジトリのクローン
-git clone https://github.com/yourusername/nvecd.git
+git clone https://github.com/libraz/nvecd.git
 cd nvecd
 
 # ビルド (CMake を自動設定し、並列ビルドを実行)
