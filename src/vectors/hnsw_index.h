@@ -8,7 +8,8 @@
  *
  * Key properties:
  * - O(log N) search complexity
- * - High recall (>0.95 at typical settings)
+ * - Recall@10 of 0.99 at ef_search=10 and 1.00 by ef_search=64, measured on
+ *   50k clustered vectors; see tests/benchmark/ann_recall_benchmark.cpp
  * - Supports incremental insertion and logical deletion
  *
  * Thread-safety:
@@ -152,17 +153,24 @@ class HnswIndex : public AnnIndex {
                                                       uint32_t layer, uint32_t ef) const;
 
   /**
-   * @brief Select neighbors using simple heuristic
+   * @brief Select neighbors using the diversity heuristic
    *
-   * From a candidate set, select up to max_count neighbors.
-   * Uses the "simple" selection (closest neighbors).
+   * From a candidate set, select up to max_count neighbors, keeping a
+   * candidate only when it lies closer to the inserted point than to any
+   * neighbor already selected (Malkov & Yashunin, Algorithm 4). This
+   * preserves the long-range edges a nearest-M selection would discard.
    *
-   * @param candidates (distance, node_id) pairs
+   * @param candidates (similarity, node_id) pairs, best first
    * @param max_count Maximum number of neighbors to select
    * @return Selected neighbor node IDs
    */
   std::vector<uint32_t> SelectNeighbors(const std::vector<std::pair<float, uint32_t>>& candidates,
                                         uint32_t max_count) const;
+
+  /**
+   * @brief Similarity between two indexed nodes
+   */
+  float NodeToNodeSimilarity(uint32_t lhs, uint32_t rhs) const;
 
   /**
    * @brief Get the vector data for an internal node

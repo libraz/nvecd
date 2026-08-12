@@ -227,16 +227,63 @@ std::vector<std::pair<float, uint32_t>> HnswIndex::SearchLayer(const float* quer
   return result;
 }
 
+float HnswIndex::NodeToNodeSimilarity(uint32_t lhs, uint32_t rhs) const {
+  const float* lhs_vec = GetNodeVector(lhs);
+  const float* rhs_vec = GetNodeVector(rhs);
+  if (use_cosine_prenorm_) {
+    return CosineSimilarityPreNorm(lhs_vec, rhs_vec, dimension_, vector_norms_[lhs], vector_norms_[rhs]);
+  }
+  return distance_func_(lhs_vec, rhs_vec, dimension_);
+}
+
 std::vector<uint32_t> HnswIndex::SelectNeighbors(const std::vector<std::pair<float, uint32_t>>& candidates,
                                                  uint32_t max_count) const {
-  // Simple selection: take the closest max_count neighbors
-  // Candidates are sorted by distance descending (highest similarity first)
+  // Neighbour selection heuristic from Malkov & Yashunin, Algorithm 4.
+  //
+  // Taking the M nearest candidates outright looks correct and is not: in a
+  // dense region every link then points back into the same cluster, the graph
+  // loses the long edges that let a search cross between regions, and queries
+  // settle into local minima. The symptom is recall that only climbs once
+  // ef_search grows large enough to brute-force past the graph.
+  //
+  // A candidate is kept only when it sits closer to the inserted point than to
+  // anything already selected, which keeps the retained edges pointing in
+  // different directions.
   std::vector<uint32_t> selected;
-  uint32_t count = std::min(max_count, static_cast<uint32_t>(candidates.size()));
-  selected.reserve(count);
+  if (candidates.empty() || max_count == 0) {
+    return selected;
+  }
+  selected.reserve(std::min(max_count, static_cast<uint32_t>(candidates.size())));
 
-  for (uint32_t i = 0; i < count; ++i) {
-    selected.push_back(candidates[i].second);
+  // Candidates arrive sorted by similarity to the inserted point, best first.
+  for (const auto& [sim_to_query, cand_id] : candidates) {
+    if (selected.size() >= max_count) {
+      break;
+    }
+    bool keep = true;
+    for (uint32_t sel_id : selected) {
+      if (NodeToNodeSimilarity(cand_id, sel_id) > sim_to_query) {
+        keep = false;
+        break;
+      }
+    }
+    if (keep) {
+      selected.push_back(cand_id);
+    }
+  }
+
+  // The heuristic can return fewer than max_count. Top the list up with the
+  // best rejected candidates so a node still spends its whole connection
+  // budget rather than ending up sparsely linked.
+  if (selected.size() < max_count) {
+    for (const auto& [sim_to_query, cand_id] : candidates) {
+      if (selected.size() >= max_count) {
+        break;
+      }
+      if (std::find(selected.begin(), selected.end(), cand_id) == selected.end()) {
+        selected.push_back(cand_id);
+      }
+    }
   }
   return selected;
 }

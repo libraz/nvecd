@@ -281,6 +281,108 @@ TEST_F(HnswIndexTest, RecallAtK10) {
   EXPECT_GE(avg_recall, 0.80F) << "Average recall@" << kTopK << " = " << avg_recall << " (expected >= 0.80)";
 }
 
+// Recall on data that has structure.
+//
+// Uniformly random vectors are near-orthogonal, so every candidate looks
+// equally good and a graph missing its long-range edges still scores well —
+// which is why a uniform corpus cannot tell a healthy index from a broken
+// one. Clustered vectors can: a graph whose links all point into the same
+// local neighbourhood traps the search in one cluster, and recall then sits
+// at a ceiling that raising ef_search does not lift.
+TEST(HnswIndexClusteredRecallTest, RecallOnClusteredDataDoesNotPlateau) {
+  constexpr uint32_t kDim = 64;
+  constexpr uint32_t kCount = 5000;
+  constexpr uint32_t kClusters = 100;
+  constexpr uint32_t kTopK = 10;
+  constexpr uint32_t kQueries = 50;
+  constexpr float kSpread = 0.25F;
+
+  std::mt19937 rng(4242);
+  const float sigma = kSpread / std::sqrt(static_cast<float>(kDim));
+
+  auto random_unit = [&rng](uint32_t dim) {
+    std::normal_distribution<float> dist(0.0F, 1.0F);
+    std::vector<float> vec(dim);
+    float norm = 0.0F;
+    for (auto& val : vec) {
+      val = dist(rng);
+      norm += val * val;
+    }
+    norm = std::sqrt(norm);
+    for (auto& val : vec) {
+      val /= norm;
+    }
+    return vec;
+  };
+
+  auto perturb = [&rng, sigma](const std::vector<float>& base) {
+    std::normal_distribution<float> jitter(0.0F, sigma);
+    std::vector<float> vec(base.size());
+    float norm = 0.0F;
+    for (size_t i = 0; i < base.size(); ++i) {
+      vec[i] = base[i] + jitter(rng);
+      norm += vec[i] * vec[i];
+    }
+    norm = std::sqrt(norm);
+    for (auto& val : vec) {
+      val /= norm;
+    }
+    return vec;
+  };
+
+  std::vector<std::vector<float>> centroids;
+  centroids.reserve(kClusters);
+  for (uint32_t c = 0; c < kClusters; ++c) {
+    centroids.push_back(random_unit(kDim));
+  }
+
+  HnswIndex::Config config;
+  config.m = 16;
+  config.ef_construction = 200;
+  config.ef_search = 32;
+  HnswIndex index(kDim, CosineDistanceRaw, config);
+
+  std::uniform_int_distribution<uint32_t> pick_cluster(0, kClusters - 1);
+  std::vector<std::vector<float>> vecs;
+  vecs.reserve(kCount);
+  for (uint32_t i = 0; i < kCount; ++i) {
+    vecs.push_back(perturb(centroids[pick_cluster(rng)]));
+    index.Add(i, vecs[i].data());
+  }
+
+  std::uniform_int_distribution<uint32_t> pick_vector(0, kCount - 1);
+  float total_recall = 0.0F;
+  for (uint32_t q = 0; q < kQueries; ++q) {
+    const std::vector<float> query = perturb(vecs[pick_vector(rng)]);
+
+    std::vector<std::pair<float, uint32_t>> exact;
+    exact.reserve(kCount);
+    for (uint32_t i = 0; i < kCount; ++i) {
+      exact.push_back({CosineDistanceRaw(query.data(), vecs[i].data(), kDim), i});
+    }
+    std::partial_sort(exact.begin(), exact.begin() + kTopK, exact.end(),
+                      [](const auto& lhs, const auto& rhs) { return lhs.first > rhs.first; });
+
+    std::unordered_set<uint32_t> truth;
+    for (uint32_t i = 0; i < kTopK; ++i) {
+      truth.insert(exact[i].second);
+    }
+
+    uint32_t hits = 0;
+    for (const auto& [idx, score] : index.Search(query.data(), kTopK)) {
+      if (truth.count(idx) > 0) {
+        ++hits;
+      }
+    }
+    total_recall += static_cast<float>(hits) / static_cast<float>(kTopK);
+  }
+
+  const float avg_recall = total_recall / static_cast<float>(kQueries);
+  EXPECT_GE(avg_recall, 0.95F) << "Average recall@" << kTopK << " on clustered data = " << avg_recall
+                               << " (expected >= 0.95). A ceiling well below 1.0 that ef_search cannot lift "
+                                  "means neighbour selection is discarding the graph's long-range edges.";
+}
+
 // ============================================================================
 // Rebuild
 // ============================================================================
