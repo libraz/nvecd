@@ -38,7 +38,7 @@ Check server logs on startup:
 
 Nvecd uses an intelligent cache system that:
 - Caches expensive query results (configurable threshold)
-- Compresses results with LZ4 (75% memory reduction)
+- Compresses results with LZ4 (approximately 50-70% memory reduction)
 - Automatically invalidates stale entries
 
 **Configuration:**
@@ -145,14 +145,18 @@ Monitor with `CACHE STATS` and adjust based on hit rate.
 
 **Smaller dimensions = Faster queries**
 
-| Dimension | Typical Use | Query Time* |
-|-----------|-------------|-------------|
-| 128 | Fast lookups, moderate quality | ~0.5ms |
-| 384 | Balanced (sentence transformers) | ~1.5ms |
-| 768 | High quality (BERT embeddings) | ~3ms |
-| 1536 | Very high quality (OpenAI) | ~6ms |
+| Dimension | Typical Use | Relative scan cost* |
+|-----------|-------------|---------------------|
+| 128 | Fast lookups, moderate quality | 1x |
+| 384 | Balanced (sentence transformers) | ~3x |
+| 768 | High quality (BERT embeddings) | ~6x |
+| 1536 | Very high quality (OpenAI) | ~12x |
 
-\* Approximate query time for 10K vectors with AVX2
+\* The brute-force scan is O(n × d), so query time scales roughly linearly with
+dimension. Only dim=128 has measured figures — 0.092ms at 10K vectors and
+0.90ms at 100K, both on NEON, in [Benchmarks](benchmarks.md#search-latency).
+The other rows are derived from that scaling rather than measured, and no
+dimension has been measured on AVX2.
 
 **Recommendation:**
 - Start with 384-dimensional embeddings (good quality/speed trade-off)
