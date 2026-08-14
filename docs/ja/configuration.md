@@ -152,6 +152,12 @@ cmake --build build --target ann_recall_benchmark
 ./build/bin/ann_recall_benchmark --gtest_also_run_disabled_tests
 ```
 
+ハードウェア・SIMD構成・ビルドフラグは[計測環境](benchmarks.md#計測環境)と同じで、
+Apple M5 Max（arm64）の NEON、Release（`-O3 -march=native`）、Apple Clang です。
+「全探索比」は上記200クエリの p50 を、同一ベクトル集合に対する全探索の p50 で
+割った値です。ベンチマークは p99 も出力しますが、ここには載せていません。コーパスは
+固定シードから生成するため、同じビルドで再実行すれば同じ recall が得られます。
+
 HNSW（`hnsw_m: 16`、`hnsw_ef_construction: 200`）:
 
 | `hnsw_ef_search` | recall@10（128次元） | 全探索比 | recall@10（768次元） | 全探索比 |

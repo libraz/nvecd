@@ -157,6 +157,14 @@ cmake --build build --target ann_recall_benchmark
 ./build/bin/ann_recall_benchmark --gtest_also_run_disabled_tests
 ```
 
+Hardware, SIMD configuration and build flags are the same as the
+[Benchmark Environment](benchmarks.md#benchmark-environment): Apple M5 Max
+(arm64) with NEON, Release (`-O3 -march=native`), Apple Clang. Each
+`vs exact scan` figure is the p50 of those 200 queries divided by the p50 of
+the exhaustive scan over the same vectors; the benchmark also prints p99, which
+is not reproduced here. The corpus is generated from a fixed seed, so a rerun on
+the same build reproduces the same recall figures.
+
 HNSW, `hnsw_m: 16`, `hnsw_ef_construction: 200`:
 
 | `hnsw_ef_search` | recall@10 (dim 128) | vs exact scan | recall@10 (dim 768) | vs exact scan |
