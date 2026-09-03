@@ -13,6 +13,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -22,6 +23,7 @@
 #include "server/thread_pool.h"
 #include "utils/error.h"
 #include "utils/expected.h"
+#include "utils/fd_guard.h"
 #include "utils/network_utils.h"
 #include "utils/path_utils.h"
 #include "utils/structured_log.h"
@@ -162,9 +164,11 @@ nvecd::utils::Expected<void, nvecd::utils::Error> ConnectionAcceptor::Start() {
                                       "Failed to inspect Unix socket path: " + std::string(strerror(saved_errno))));
     }
 
-    // Create unix socket
-    server_fd_ = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (server_fd_ < 0) {
+    // Create unix socket. The descriptor stays local until the listener is
+    // fully set up: publishing it to server_fd_ is what makes it visible to the
+    // accept thread, and no setup failure path should expose a half-built one.
+    const int sfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sfd < 0) {
       ::close(unix_socket_parent_fd_);
       unix_socket_parent_fd_ = -1;
       return MakeUnexpected(MakeError(ErrorCode::kNetworkSocketCreationFailed,
@@ -176,9 +180,8 @@ nvecd::utils::Expected<void, nvecd::utils::Error> ConnectionAcceptor::Start() {
     bind_addr.sun_family = AF_UNIX;
     std::strncpy(bind_addr.sun_path, unix_socket_path_.c_str(), sizeof(bind_addr.sun_path) - 1);
 
-    if (bind(server_fd_, ToSockaddrUn(&bind_addr), sizeof(bind_addr)) < 0) {
-      close(server_fd_);
-      server_fd_ = -1;
+    if (bind(sfd, ToSockaddrUn(&bind_addr), sizeof(bind_addr)) < 0) {
+      close(sfd);
       ::close(unix_socket_parent_fd_);
       unix_socket_parent_fd_ = -1;
       return MakeUnexpected(
@@ -188,8 +191,7 @@ nvecd::utils::Expected<void, nvecd::utils::Error> ConnectionAcceptor::Start() {
     struct stat bound_info {};
     if (::fstatat(unix_socket_parent_fd_, unix_socket_filename_.c_str(), &bound_info, AT_SYMLINK_NOFOLLOW) != 0 ||
         !S_ISSOCK(bound_info.st_mode) || bound_info.st_uid != ::geteuid()) {
-      close(server_fd_);
-      server_fd_ = -1;
+      close(sfd);
       (void)::unlinkat(unix_socket_parent_fd_, unix_socket_filename_.c_str(), 0);
       ::close(unix_socket_parent_fd_);
       unix_socket_parent_fd_ = -1;
@@ -212,17 +214,15 @@ nvecd::utils::Expected<void, nvecd::utils::Error> ConnectionAcceptor::Start() {
     if (::fstatat(unix_socket_parent_fd_, unix_socket_filename_.c_str(), &chmod_info, AT_SYMLINK_NOFOLLOW) != 0 ||
         chmod_info.st_dev != unix_socket_device_ || chmod_info.st_ino != unix_socket_inode_ ||
         !S_ISSOCK(chmod_info.st_mode)) {
-      close(server_fd_);
-      server_fd_ = -1;
+      close(sfd);
       ::close(unix_socket_parent_fd_);
       unix_socket_parent_fd_ = -1;
       return MakeUnexpected(MakeError(ErrorCode::kNetworkBindFailed, "Unix socket changed during chmod"));
     }
 
     // Listen
-    if (listen(server_fd_, config_.max_connections) < 0) {
-      close(server_fd_);
-      server_fd_ = -1;
+    if (listen(sfd, config_.max_connections) < 0) {
+      close(sfd);
       (void)::unlinkat(unix_socket_parent_fd_, unix_socket_filename_.c_str(), 0);
       ::close(unix_socket_parent_fd_);
       unix_socket_parent_fd_ = -1;
@@ -235,15 +235,16 @@ nvecd::utils::Expected<void, nvecd::utils::Error> ConnectionAcceptor::Start() {
     // Start accept thread
     should_stop_.store(false);
     running_ = true;
+    server_fd_.store(sfd, std::memory_order_release);
     accept_thread_ = std::make_unique<std::thread>(&ConnectionAcceptor::AcceptLoop, this);
 
     nvecd::utils::StructuredLog().Event("unix_socket_listening").Field("path", unix_socket_path_).Info();
     return {};  // Early return -- skip TCP code below
   }
 
-  // Create socket
-  server_fd_ = socket(AF_INET, SOCK_STREAM, 0);
-  if (server_fd_ < 0) {
+  // Create socket. Kept local until the listener is ready; see the UDS branch.
+  const int sfd = socket(AF_INET, SOCK_STREAM, 0);
+  if (sfd < 0) {
     auto error =
         MakeError(ErrorCode::kNetworkSocketCreationFailed, "Failed to create socket: " + std::string(strerror(errno)));
     nvecd::utils::StructuredLog()
@@ -255,9 +256,8 @@ nvecd::utils::Expected<void, nvecd::utils::Error> ConnectionAcceptor::Start() {
   }
 
   // Set socket options
-  if (!SetSocketOptions(server_fd_)) {
-    close(server_fd_);
-    server_fd_ = -1;
+  if (!SetSocketOptions(sfd)) {
+    close(sfd);
     auto error = MakeError(ErrorCode::kNetworkSocketCreationFailed, "Failed to set socket options");
     nvecd::utils::StructuredLog()
         .Event("server_error")
@@ -279,8 +279,7 @@ nvecd::utils::Expected<void, nvecd::utils::Error> ConnectionAcceptor::Start() {
     bind_addr.s_addr = INADDR_ANY;
   } else {
     if (inet_pton(AF_INET, config_.host.c_str(), &bind_addr) != 1) {
-      close(server_fd_);
-      server_fd_ = -1;
+      close(sfd);
       auto error = MakeError(ErrorCode::kNetworkInvalidBindAddress, "Invalid bind address: " + config_.host);
       nvecd::utils::StructuredLog()
           .Event("server_error")
@@ -293,11 +292,18 @@ nvecd::utils::Expected<void, nvecd::utils::Error> ConnectionAcceptor::Start() {
   }
   address.sin_addr = bind_addr;
 
-  if (bind(server_fd_, ToSockaddr(&address), sizeof(address)) < 0) {
-    close(server_fd_);
-    server_fd_ = -1;
-    auto error = MakeError(ErrorCode::kNetworkBindFailed, "Failed to bind to port " + std::to_string(config_.port) +
-                                                              ": " + std::string(strerror(errno)));
+  if (bind(sfd, ToSockaddr(&address), sizeof(address)) < 0) {
+    // Capture errno before close(), which may overwrite it. EADDRINUSE means
+    // another process already holds the address; report that as its own
+    // condition, because an operator who started a second instance needs to be
+    // told which one it is rather than that a bind failed.
+    const int bind_errno = errno;
+    close(sfd);
+    const bool address_in_use = bind_errno == EADDRINUSE;
+    auto error =
+        MakeError(address_in_use ? ErrorCode::kNetworkAddressInUse : ErrorCode::kNetworkBindFailed,
+                  "Failed to bind to port " + std::to_string(config_.port) + ": " + std::string(strerror(bind_errno)) +
+                      (address_in_use ? " (another server is listening on this address)" : ""));
     nvecd::utils::StructuredLog()
         .Event("server_error")
         .Field("operation", "socket_bind")
@@ -310,7 +316,7 @@ nvecd::utils::Expected<void, nvecd::utils::Error> ConnectionAcceptor::Start() {
   // Get actual port if port 0 was specified
   if (config_.port == 0) {
     socklen_t addr_len = sizeof(address);
-    if (getsockname(server_fd_, ToSockaddr(&address), &addr_len) == 0) {
+    if (getsockname(sfd, ToSockaddr(&address), &addr_len) == 0) {
       actual_port_ = ntohs(address.sin_port);
     }
   } else {
@@ -318,9 +324,8 @@ nvecd::utils::Expected<void, nvecd::utils::Error> ConnectionAcceptor::Start() {
   }
 
   // Listen
-  if (listen(server_fd_, config_.max_connections) < 0) {
-    close(server_fd_);
-    server_fd_ = -1;
+  if (listen(sfd, config_.max_connections) < 0) {
+    close(sfd);
     auto error = MakeError(ErrorCode::kNetworkListenFailed, "Failed to listen: " + std::string(strerror(errno)));
     nvecd::utils::StructuredLog()
         .Event("server_error")
@@ -332,6 +337,7 @@ nvecd::utils::Expected<void, nvecd::utils::Error> ConnectionAcceptor::Start() {
 
   should_stop_ = false;
   running_ = true;
+  server_fd_.store(sfd, std::memory_order_release);
 
   // Start accept thread
   accept_thread_ = std::make_unique<std::thread>(&ConnectionAcceptor::AcceptLoop, this);
@@ -349,11 +355,14 @@ void ConnectionAcceptor::Stop() {
   should_stop_ = true;
   running_ = false;
 
-  // Close server socket to unblock accept()
-  if (server_fd_ >= 0) {
-    shutdown(server_fd_, SHUT_RDWR);
-    close(server_fd_);
-    server_fd_ = -1;
+  // Close the listening socket to unblock accept(). Swapping the descriptor out
+  // atomically means the accept thread either sees the old value (and its
+  // accept() fails) or sees -1 and leaves the loop; it can never pick up the
+  // number after the kernel has handed it to something else.
+  const int sfd = server_fd_.exchange(-1, std::memory_order_acq_rel);
+  if (sfd >= 0) {
+    shutdown(sfd, SHUT_RDWR);
+    close(sfd);
   }
 
   // Wait for accept thread to finish
@@ -384,15 +393,16 @@ void ConnectionAcceptor::Stop() {
     unix_socket_inode_ = 0;
   }
 
-  // In reactor mode, IoReactor owns the client fds and releases accounting
-  // through RemoveConnection(). Closing here would race its event loop.
+  // Accepted client fds are never closed here. In reactor mode each one belongs
+  // to a ReactorConnection; otherwise it belongs to the worker task running its
+  // handler. Both release their accounting through RemoveConnection(). Only
+  // shutdown() is issued, so a handler blocked on recv() wakes up and returns
+  // the fd to its owner for closing.
   if (!reactor_handler_) {
     std::lock_guard<std::mutex> lock(fds_mutex_);
     for (int socket_fd : active_fds_) {
       shutdown(socket_fd, SHUT_RDWR);
-      close(socket_fd);
     }
-    active_fds_.clear();
   }
 
   spdlog::info("ConnectionAcceptor stopped");
@@ -410,18 +420,24 @@ void ConnectionAcceptor::AcceptLoop() {
   spdlog::info("Accept loop started");
 
   while (!should_stop_) {
+    // Re-read the listener each round: Stop() swaps it to -1 before closing it.
+    const int listen_fd = server_fd_.load(std::memory_order_acquire);
+    if (listen_fd < 0) {
+      break;
+    }
+
     int client_fd = -1;
     std::string client_ip;
 
     if (IsUnixSocket()) {
       struct sockaddr_un client_addr_un {};
       socklen_t client_len_un = sizeof(client_addr_un);
-      client_fd = accept(server_fd_, ToSockaddrUn(&client_addr_un), &client_len_un);
+      client_fd = accept(listen_fd, ToSockaddrUn(&client_addr_un), &client_len_un);
       client_ip = "unix";  // UDS connections have no IP
     } else {
       struct sockaddr_in client_addr = {};
       socklen_t client_len = sizeof(client_addr);
-      client_fd = accept(server_fd_, ToSockaddr(&client_addr), &client_len);
+      client_fd = accept(listen_fd, ToSockaddr(&client_addr), &client_len);
 
       // Convert client IP to string for ACL checks
       // C-style array required by POSIX inet_ntop API
@@ -460,6 +476,12 @@ void ConnectionAcceptor::AcceptLoop() {
       continue;
     }
 
+    // From here on the accept loop is the descriptor's owner. Every rejection
+    // path below simply leaves the loop body; the guard closes the socket
+    // exactly once. Ownership is given up only where it is handed to the
+    // reactor or to a worker task, and only after that transfer succeeded.
+    nvecd::utils::FDGuard client_guard(client_fd);
+
     SetClientSocketOptions(client_fd);
 
     // SECURITY: Check connection limit BEFORE any processing to prevent resource exhaustion
@@ -472,7 +494,6 @@ void ConnectionAcceptor::AcceptLoop() {
             .Field("active_connections", static_cast<uint64_t>(active_fds_.size()))
             .Field("max_connections", static_cast<uint64_t>(config_.max_connections))
             .Warn();
-        close(client_fd);
         continue;
       }
     }
@@ -485,7 +506,6 @@ void ConnectionAcceptor::AcceptLoop() {
             .Field("type", "connection_rejected_acl")
             .Field("client_ip", client_ip.empty() ? "<unknown>" : client_ip)
             .Warn();
-        close(client_fd);
         continue;
       }
     }
@@ -502,7 +522,6 @@ void ConnectionAcceptor::AcceptLoop() {
             .Field("connections", static_cast<uint64_t>(it->second))
             .Field("limit", static_cast<uint64_t>(config_.max_connections_per_ip))
             .Warn();
-        close(client_fd);
         continue;
       }
     }
@@ -537,29 +556,30 @@ void ConnectionAcceptor::AcceptLoop() {
     // map insertion plus one poller call, and must not consume a worker for an
     // idle socket's lifetime.
     if (reactor_handler_) {
-      if (!reactor_handler_(client_fd)) {
-        close(client_fd);
+      if (reactor_handler_(client_fd)) {
+        // The reactor connection is now the sole closer.
+        client_guard.Release();
+      } else {
         RemoveConnection(client_fd);
       }
     } else if (thread_pool_ != nullptr && connection_handler_) {
+      // The task takes over close responsibility; its own guard closes the fd
+      // once the handler returns, however the handler exits.
       bool submitted = thread_pool_->Submit([this, client_fd]() {
+        nvecd::utils::FDGuard owned(client_fd);
         connection_handler_(client_fd);
         RemoveConnection(client_fd);
-        // The acceptor owns the accepted fd's lifecycle; the connection handler
-        // and I/O handler never close it. Close here so a completed connection
-        // releases its fd (otherwise every served connection leaks one fd,
-        // eventually exhausting RLIMIT_NOFILE and denying all service).
-        close(client_fd);
       });
 
-      if (!submitted) {
+      if (submitted) {
+        client_guard.Release();
+      } else {
         // Queue is full - reject connection to prevent FD leak
         nvecd::utils::StructuredLog()
             .Event("server_warning")
             .Field("type", "thread_pool_queue_full")
             .Field("client_fd", static_cast<uint64_t>(client_fd))
             .Warn();
-        close(client_fd);
         RemoveConnection(client_fd);
       }
     } else {
@@ -568,7 +588,6 @@ void ConnectionAcceptor::AcceptLoop() {
           .Field("type", "no_connection_handler")
           .Field("error", "No connection handler or thread pool configured")
           .Error();
-      close(client_fd);
       RemoveConnection(client_fd);
     }
   }

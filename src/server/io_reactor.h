@@ -14,6 +14,7 @@
 #include <thread>
 #include <unordered_map>
 
+#include "server/connection_io_handler.h"
 #include "server/reactor/event_multiplexer.h"
 #include "utils/error.h"
 #include "utils/expected.h"
@@ -66,7 +67,25 @@ class IoReactor {
   void Stop();
   bool IsRunning() const { return running_.load(std::memory_order_acquire); }
 
-  utils::Expected<void, utils::Error> Register(std::shared_ptr<ReactorConnection> connection);
+  /**
+   * @brief Adopt a freshly accepted socket into the event loop.
+   *
+   * The descriptor is passed as a raw number and is only wrapped in a
+   * ReactorConnection once every failure check has passed, so ownership moves
+   * exactly when this call succeeds. On failure @p fd is untouched and the
+   * caller stays its sole closer; on success the returned connection is the
+   * sole closer and the caller must not close @p fd.
+   *
+   * @param fd Accepted client socket.
+   * @param thread_pool Pool used to drain requests off the event loop.
+   * @param io_config Per-connection framing and buffer limits.
+   * @param processor Request callback invoked on a pool worker.
+   * @return The registered connection, or the reason registration failed.
+   */
+  [[nodiscard]] utils::Expected<std::shared_ptr<ReactorConnection>, utils::Error> Register(int fd,
+                                                                                           ThreadPool* thread_pool,
+                                                                                           const IOConfig& io_config,
+                                                                                           RequestProcessor processor);
   void Unregister(int fd, const ReactorConnection* expected_owner = nullptr);
   void ArmWrite(int fd);
   void DisarmWrite(int fd);

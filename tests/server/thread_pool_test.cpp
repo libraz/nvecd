@@ -210,28 +210,43 @@ TEST_F(ThreadPoolTest, ShutdownRejectsTasks) {
   EXPECT_EQ(counter, 1);
 }
 
-TEST_F(ThreadPoolTest, ShutdownTimeoutReturnsForUncooperativeRunningTask) {
+TEST_F(ThreadPoolTest, ShutdownTimeoutDiscardsQueuedTasksButStillJoinsTheRunningOne) {
   ThreadPool pool(1);
   std::atomic<bool> started{false};
   std::atomic<bool> allow_exit{false};
+  std::atomic<bool> running_task_finished{false};
+  std::atomic<int> queued_task_runs{0};
 
-  ASSERT_TRUE(pool.Submit([&started, &allow_exit]() {
+  ASSERT_TRUE(pool.Submit([&started, &allow_exit, &running_task_finished]() {
     started = true;
     while (!allow_exit.load()) {
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
+    running_task_finished = true;
   }));
   while (!started.load()) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_TRUE(pool.Submit([&queued_task_runs]() { queued_task_runs.fetch_add(1); }));
+  }
 
-  const auto start = std::chrono::steady_clock::now();
-  pool.Shutdown(false, 25);
-  const auto elapsed = std::chrono::steady_clock::now() - start;
+  // Release the running task well after the shutdown deadline so the discard of
+  // the queued work is observed first.
+  std::thread releaser([&allow_exit]() {
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    allow_exit = true;
+  });
 
-  EXPECT_LT(elapsed, std::chrono::milliseconds(250));
-  allow_exit = true;
-  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  pool.Shutdown(25);
+
+  // Shutdown never returns while a worker is still executing: tasks may
+  // reference state the caller destroys the moment this call returns.
+  EXPECT_TRUE(running_task_finished.load());
+  // Work that had not started yet is dropped rather than extending the wait.
+  EXPECT_EQ(queued_task_runs.load(), 0);
+
+  releaser.join();
 }
 
 TEST_F(ThreadPoolTest, DestructorWaitsForTasks) {

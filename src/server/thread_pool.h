@@ -37,7 +37,7 @@ class ThreadPool {
   explicit ThreadPool(size_t num_threads = 0, size_t queue_size = 0);
 
   /**
-   * @brief Destructor - waits for all tasks to complete
+   * @brief Destructor - runs every queued task and joins all workers
    */
   ~ThreadPool();
 
@@ -70,14 +70,18 @@ class ThreadPool {
   bool IsShutdown() const;
 
   /**
-   * @brief Shutdown pool and wait for running tasks up to the requested limit
-   * @param graceful If true, run pending tasks before stopping. If false, abandon pending tasks.
-   * @param timeout_ms Maximum time to wait for pending and running tasks (0 = no timeout).
-   *        On timeout, pending tasks are discarded and workers are detached.
-   *        Running tasks are not force-cancelled; they retain only shared worker
-   *        state and can finish safely after this object is destroyed.
+   * @brief Shutdown pool and join every worker
+   *
+   * Workers are always joined, so no worker thread outlives this call. Tasks
+   * may hold references to state that the caller destroys right after
+   * shutdown; detaching would let such a task run against freed memory.
+   *
+   * @param timeout_ms Maximum time to wait for the queue to drain (0 = wait for
+   *        the whole queue). On timeout, tasks that have not started are
+   *        discarded; a task already running is still waited for, because it
+   *        cannot be cancelled.
    */
-  void Shutdown(bool graceful = true, uint32_t timeout_ms = 0);
+  void Shutdown(uint32_t timeout_ms = 0);
 
  private:
   struct State {

@@ -69,43 +69,28 @@ bool ThreadPool::IsShutdown() const {
   return state_->shutdown.load();
 }
 
-void ThreadPool::Shutdown(bool graceful, uint32_t timeout_ms) {
+void ThreadPool::Shutdown(uint32_t timeout_ms) {
   std::scoped_lock lifecycle_lock(shutdown_mutex_);
 
-  size_t discarded_tasks = 0;
-
   {
+    // Publish under the queue lock so a worker that just evaluated its wait
+    // predicate cannot miss the notification below.
     std::scoped_lock lock(state_->queue_mutex);
-    if (!state_->shutdown.exchange(true)) {
-      // If not graceful, clear pending tasks.
-      if (!graceful && !state_->tasks.empty()) {
-        discarded_tasks = state_->tasks.size();
-        while (!state_->tasks.empty()) {
-          state_->tasks.pop();
-        }
-      }
-    }
-
-    if (discarded_tasks > 0) {
-      nvecd::utils::StructuredLog()
-          .Event("server_warning")
-          .Field("operation", "thread_pool_shutdown")
-          .Field("type", "non_graceful_shutdown")
-          .Field("pending_tasks", static_cast<uint64_t>(discarded_tasks))
-          .Warn();
-    }
+    state_->shutdown.store(true);
   }
 
   // Wake up all workers
   state_->condition.notify_all();
 
-  bool completed = true;
   if (timeout_ms > 0) {
     std::unique_lock<std::mutex> lock(state_->queue_mutex);
-    completed = state_->idle_condition.wait_for(lock, std::chrono::milliseconds(timeout_ms), [this] {
+    const bool drained = state_->idle_condition.wait_for(lock, std::chrono::milliseconds(timeout_ms), [this] {
       return state_->tasks.empty() && state_->active_workers.load() == 0;
     });
-    if (!completed) {
+    if (!drained) {
+      // Discard work that has not started so the join below cannot be extended
+      // indefinitely by the backlog. A task already running is still waited
+      // for: it may reference state the caller destroys once Shutdown returns.
       const size_t queued = state_->tasks.size();
       while (!state_->tasks.empty()) {
         state_->tasks.pop();
@@ -117,27 +102,20 @@ void ThreadPool::Shutdown(bool graceful, uint32_t timeout_ms) {
           .Event("server_warning")
           .Field("operation", "thread_pool_shutdown")
           .Field("type", "timeout_reached")
-          .Field("remaining_tasks", static_cast<uint64_t>(queued))
+          .Field("discarded_tasks", static_cast<uint64_t>(queued))
           .Field("active_workers", static_cast<uint64_t>(state_->active_workers.load()))
           .Warn();
-
-      // Workers own State via their entry-point argument, so detaching after a
-      // bounded shutdown cannot leave them accessing destroyed pool members.
-      for (auto& worker : workers_) {
-        if (worker.joinable()) {
-          worker.detach();
-        }
-      }
-      return;
     }
   }
 
+  // Joining is the only exit. Detaching would let a worker keep running against
+  // state the caller frees immediately after this returns.
   for (auto& worker : workers_) {
     if (worker.joinable()) {
       worker.join();
     }
   }
-  spdlog::info("Thread pool shut down{}", graceful ? " gracefully" : " (non-graceful)");
+  spdlog::info("Thread pool shut down");
 }
 
 void ThreadPool::WorkerThread(std::shared_ptr<State> state) {

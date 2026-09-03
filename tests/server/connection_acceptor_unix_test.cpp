@@ -107,7 +107,7 @@ TEST_F(ConnectionAcceptorUnixTest, StartAndStopUnixSocket) {
   auto config = MakeUdsConfig();
   nvecd::server::ConnectionAcceptor acceptor(config, &pool);
 
-  acceptor.SetConnectionHandler([](int client_fd) { close(client_fd); });
+  acceptor.SetConnectionHandler([](int) {});
 
   auto result = acceptor.Start();
   ASSERT_TRUE(result.has_value()) << "Start failed: " << result.error().message();
@@ -131,7 +131,7 @@ TEST_F(ConnectionAcceptorUnixTest, IsUnixSocket_True) {
   auto config = MakeUdsConfig();
   nvecd::server::ConnectionAcceptor acceptor(config, &pool);
 
-  acceptor.SetConnectionHandler([](int client_fd) { close(client_fd); });
+  acceptor.SetConnectionHandler([](int) {});
 
   auto result = acceptor.Start();
   ASSERT_TRUE(result.has_value()) << "Start failed: " << result.error().message();
@@ -150,7 +150,7 @@ TEST_F(ConnectionAcceptorUnixTest, IsUnixSocket_False) {
   auto config = MakeTcpConfig();
   nvecd::server::ConnectionAcceptor acceptor(config, &pool);
 
-  acceptor.SetConnectionHandler([](int client_fd) { close(client_fd); });
+  acceptor.SetConnectionHandler([](int) {});
 
   auto result = acceptor.Start();
   ASSERT_TRUE(result.has_value()) << "Start failed: " << result.error().message();
@@ -175,7 +175,7 @@ TEST_F(ConnectionAcceptorUnixTest, RegularFileAtSocketPathIsPreservedAndRejected
   auto config = MakeUdsConfig();
   nvecd::server::ConnectionAcceptor acceptor(config, &pool);
 
-  acceptor.SetConnectionHandler([](int client_fd) { close(client_fd); });
+  acceptor.SetConnectionHandler([](int) {});
 
   auto result = acceptor.Start();
   EXPECT_FALSE(result.has_value());
@@ -195,7 +195,7 @@ TEST_F(ConnectionAcceptorUnixTest, OwnedStaleSocketIsRemovedByIdentity) {
   nvecd::server::ThreadPool pool(2);
   auto config = MakeUdsConfig();
   nvecd::server::ConnectionAcceptor acceptor(config, &pool);
-  acceptor.SetConnectionHandler([](int client_fd) { close(client_fd); });
+  acceptor.SetConnectionHandler([](int) {});
 
   auto result = acceptor.Start();
   ASSERT_TRUE(result.has_value()) << result.error().message();
@@ -209,7 +209,7 @@ TEST_F(ConnectionAcceptorUnixTest, StopPreservesReplacementAtSocketPath) {
   nvecd::server::ThreadPool pool(2);
   auto config = MakeUdsConfig();
   nvecd::server::ConnectionAcceptor acceptor(config, &pool);
-  acceptor.SetConnectionHandler([](int client_fd) { close(client_fd); });
+  acceptor.SetConnectionHandler([](int) {});
   ASSERT_TRUE(acceptor.Start());
 
   ASSERT_EQ(::unlink(socket_path_.c_str()), 0);
@@ -239,7 +239,7 @@ TEST_F(ConnectionAcceptorUnixTest, PathTooLongError) {
   config.max_connections = 10;  // NOLINT(cppcoreguidelines-avoid-magic-numbers)
 
   nvecd::server::ConnectionAcceptor acceptor(config, &pool);
-  acceptor.SetConnectionHandler([](int client_fd) { close(client_fd); });
+  acceptor.SetConnectionHandler([](int) {});
 
   auto result = acceptor.Start();
   EXPECT_FALSE(result.has_value()) << "Start should fail for path exceeding sun_path limit";
@@ -254,7 +254,7 @@ TEST_F(ConnectionAcceptorUnixTest, SocketFileRemovedOnStop) {
   auto config = MakeUdsConfig();
   nvecd::server::ConnectionAcceptor acceptor(config, &pool);
 
-  acceptor.SetConnectionHandler([](int client_fd) { close(client_fd); });
+  acceptor.SetConnectionHandler([](int) {});
 
   auto result = acceptor.Start();
   ASSERT_TRUE(result.has_value()) << "Start failed: " << result.error().message();
@@ -336,7 +336,7 @@ TEST_F(ConnectionAcceptorUnixTest, SocketPermissions) {
   auto config = MakeUdsConfig();
   nvecd::server::ConnectionAcceptor acceptor(config, &pool);
 
-  acceptor.SetConnectionHandler([](int client_fd) { close(client_fd); });
+  acceptor.SetConnectionHandler([](int) {});
 
   auto result = acceptor.Start();
   ASSERT_TRUE(result.has_value()) << "Start failed: " << result.error().message();

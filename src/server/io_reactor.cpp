@@ -69,21 +69,28 @@ void IoReactor::Stop() {
   spdlog::info("I/O reactor stopped");
 }
 
-utils::Expected<void, utils::Error> IoReactor::Register(std::shared_ptr<ReactorConnection> connection) {
+utils::Expected<std::shared_ptr<ReactorConnection>, utils::Error> IoReactor::Register(int fd, ThreadPool* thread_pool,
+                                                                                      const IOConfig& io_config,
+                                                                                      RequestProcessor processor) {
   // Serialize registration with Stop() all the way through poller publication.
   // Without this, a late Register could insert an fd after Stop() snapshotted
   // the map, leaving it alive beyond the server lifecycle.
   std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
-  if (!connection || !running_.load(std::memory_order_acquire)) {
+  if (fd < 0) {
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kInvalidArgument, "invalid client fd"));
+  }
+  if (!running_.load(std::memory_order_acquire)) {
     return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCancelled, "reactor is not running"));
   }
-  const int fd = connection->Fd();
   const int flags = ::fcntl(fd, F_GETFL, 0);
   if (flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
     return utils::MakeUnexpected(
         utils::MakeError(utils::ErrorCode::kIOError, "failed to set client socket non-blocking"));
   }
 
+  // Every step that can fail runs before the descriptor is handed to a
+  // ReactorConnection. Once the connection exists it is the only closer, so
+  // there is no failure path left that could close the fd a second time.
   reactor::RegistrationToken token = 0;
   {
     std::lock_guard<std::mutex> lock(connections_mutex_);
@@ -94,17 +101,21 @@ utils::Expected<void, utils::Error> IoReactor::Register(std::shared_ptr<ReactorC
     token = next_token_++;
     if (token == 0)
       token = next_token_++;
-    connections_.emplace(fd, Entry{std::move(connection), token, reactor::event::kReadable});
+  }
+  if (auto result = multiplexer_->Add(fd, reactor::event::kReadable, token); !result) {
+    return utils::MakeUnexpected(result.error());
+  }
+
+  // The poller may report the fd before the map entry below is published; the
+  // event loop then finds no connection and skips the event. Readiness is
+  // level-triggered, so the next poll reports it again.
+  auto connection = ReactorConnection::Create(utils::FDGuard(fd), this, thread_pool, io_config, std::move(processor));
+  {
+    std::lock_guard<std::mutex> lock(connections_mutex_);
+    connections_.emplace(fd, Entry{connection, token, reactor::event::kReadable});
     tokens_.emplace(token, fd);
   }
-  auto result = multiplexer_->Add(fd, reactor::event::kReadable, token);
-  if (!result) {
-    std::lock_guard<std::mutex> lock(connections_mutex_);
-    connections_.erase(fd);
-    tokens_.erase(token);
-    return result;
-  }
-  return {};
+  return connection;
 }
 
 void IoReactor::Unregister(int fd, const ReactorConnection* expected_owner) {

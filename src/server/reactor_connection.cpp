@@ -26,21 +26,26 @@ constexpr int kSendFlags = 0;
 #endif
 }  // namespace
 
-std::shared_ptr<ReactorConnection> ReactorConnection::Create(int fd, IoReactor* reactor, ThreadPool* thread_pool,
-                                                             IOConfig config, RequestProcessor processor) {
+std::shared_ptr<ReactorConnection> ReactorConnection::Create(utils::FDGuard fd, IoReactor* reactor,
+                                                             ThreadPool* thread_pool, IOConfig config,
+                                                             RequestProcessor processor) {
   return std::shared_ptr<ReactorConnection>(
-      new ReactorConnection(fd, reactor, thread_pool, config, std::move(processor)));
+      new ReactorConnection(std::move(fd), reactor, thread_pool, config, std::move(processor)));
 }
 
-ReactorConnection::ReactorConnection(int fd, IoReactor* reactor, ThreadPool* thread_pool, IOConfig config,
+ReactorConnection::ReactorConnection(utils::FDGuard fd, IoReactor* reactor, ThreadPool* thread_pool, IOConfig config,
                                      RequestProcessor processor)
-    : fd_(fd), reactor_(reactor), thread_pool_(thread_pool), config_(config), processor_(std::move(processor)) {
+    : fd_(std::move(fd)),
+      reactor_(reactor),
+      thread_pool_(thread_pool),
+      config_(config),
+      processor_(std::move(processor)) {
   if (reactor_ != nullptr)
     memory_budget_ = reactor_->MemoryBudget();
-  context_.client_fd = fd;
+  context_.client_fd = Fd();
   sockaddr_storage peer{};
   socklen_t peer_len = sizeof(peer);
-  if (::getpeername(fd, reinterpret_cast<sockaddr*>(&peer), &peer_len) == 0) {
+  if (::getpeername(Fd(), reinterpret_cast<sockaddr*>(&peer), &peer_len) == 0) {
     if (peer.ss_family == AF_INET) {
       const auto* ipv4 = reinterpret_cast<const sockaddr_in*>(&peer);
       char address[INET_ADDRSTRLEN]{};
@@ -61,8 +66,7 @@ ReactorConnection::~ReactorConnection() {
     std::lock_guard<std::mutex> write_lock(write_mutex_);
     memory_budget_->Release(accumulated_.size() + request_bytes_ + response_bytes_);
   }
-  if (!closed_.exchange(true, std::memory_order_acq_rel) && fd_ >= 0)
-    ::close(fd_);
+  // fd_ closes itself: the guard is the single owner of the client socket.
 }
 
 std::chrono::steady_clock::time_point ReactorConnection::LastActive() const {
@@ -74,8 +78,6 @@ std::chrono::steady_clock::time_point ReactorConnection::CreatedAt() const {
 }
 
 bool ReactorConnection::OnReadable() {
-  if (closed_.load(std::memory_order_acquire))
-    return false;
   last_active_.store(std::chrono::steady_clock::now(), std::memory_order_relaxed);
 
   std::array<char, kReadChunkBytes> chunk{};
@@ -83,7 +85,7 @@ bool ReactorConnection::OnReadable() {
   bool pause_read = false;
   size_t read_bytes = 0;
   while (!read_eof_.load(std::memory_order_acquire)) {
-    const ssize_t read = ::recv(fd_, chunk.data(), chunk.size(), 0);
+    const ssize_t read = ::recv(Fd(), chunk.data(), chunk.size(), 0);
     if (read > 0) {
       read_bytes += static_cast<size_t>(read);
       bool overflow = false;
@@ -128,13 +130,13 @@ bool ReactorConnection::OnReadable() {
         }
       }
       if (overflow) {
-        spdlog::warn("Reactor request buffer limit reached on fd {}", fd_);
+        spdlog::warn("Reactor request buffer limit reached on fd {}", Fd());
         (void)EnqueueResponse("ERROR Request too large");
         CloseAfterFlush();
         return true;
       }
       if (pause_read) {
-        reactor_->SetReadEnabled(fd_, false);
+        reactor_->SetReadEnabled(Fd(), false);
         break;
       }
       // Level-triggered readiness will report this fd again while the peer
@@ -146,7 +148,7 @@ bool ReactorConnection::OnReadable() {
     }
     if (read == 0) {
       read_eof_.store(true, std::memory_order_release);
-      reactor_->DisarmRead(fd_);
+      reactor_->DisarmRead(Fd());
       break;
     }
     if (errno == EINTR)
@@ -174,7 +176,7 @@ bool ReactorConnection::OnWritable() {
     while (!responses_.empty()) {
       std::string& response = responses_.front();
       const ssize_t sent =
-          ::send(fd_, response.data() + response_offset_, response.size() - response_offset_, kSendFlags);
+          ::send(Fd(), response.data() + response_offset_, response.size() - response_offset_, kSendFlags);
       if (sent > 0) {
         response_offset_ += static_cast<size_t>(sent);
         response_bytes_ -= static_cast<size_t>(sent);
@@ -195,7 +197,7 @@ bool ReactorConnection::OnWritable() {
     drained = true;
   }
   if (drained)
-    reactor_->DisarmWrite(fd_);
+    reactor_->DisarmWrite(Fd());
   return !close_after_flush_.load(std::memory_order_acquire);
 }
 
@@ -237,7 +239,7 @@ void ReactorConnection::DrainRequests() {
       }
     }
     if (resume_read)
-      reactor_->SetReadEnabled(fd_, true);
+      reactor_->SetReadEnabled(Fd(), true);
     if (!EnqueueResponse(processor_(request, context_))) {
       CloseAfterFlush();
       break;
@@ -246,7 +248,7 @@ void ReactorConnection::DrainRequests() {
   if (read_eof_.load(std::memory_order_acquire) && !HasPendingRequests()) {
     CloseAfterFlush();
     if (!HasPendingOutput())
-      reactor_->Unregister(fd_, this);
+      reactor_->Unregister(Fd(), this);
   }
 }
 
@@ -256,13 +258,13 @@ bool ReactorConnection::EnqueueResponse(const std::string& response) {
     std::lock_guard<std::mutex> lock(write_mutex_);
     if (response_bytes_ + framed.size() > kMaxWriteQueueBytes ||
         (memory_budget_ != nullptr && !memory_budget_->TryAcquire(framed.size()))) {
-      spdlog::warn("Reactor write buffer limit reached on fd {}", fd_);
+      spdlog::warn("Reactor write buffer limit reached on fd {}", Fd());
       return false;
     }
     response_bytes_ += framed.size();
     responses_.push_back(std::move(framed));
   }
-  reactor_->ArmWrite(fd_);
+  reactor_->ArmWrite(Fd());
   return true;
 }
 
@@ -278,8 +280,8 @@ bool ReactorConnection::HasPendingRequests() const {
 
 void ReactorConnection::CloseAfterFlush() {
   close_after_flush_.store(true, std::memory_order_release);
-  reactor_->DisarmRead(fd_);
-  reactor_->ArmWrite(fd_);
+  reactor_->DisarmRead(Fd());
+  reactor_->ArmWrite(Fd());
 }
 
 std::string ReactorConnection::NormalizeResponse(const std::string& response) {

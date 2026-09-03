@@ -14,6 +14,7 @@
 
 #include "server/connection_io_handler.h"
 #include "server/server_types.h"
+#include "utils/fd_guard.h"
 
 namespace nvecd::server {
 
@@ -21,15 +22,29 @@ class IoReactor;
 class ReactorMemoryBudget;
 class ThreadPool;
 
+/**
+ * @brief Per-client reactor state and the sole owner of the client socket.
+ *
+ * The client descriptor is held in a move-only utils::FDGuard, so close(2)
+ * responsibility is expressed by the type: constructing a connection requires
+ * handing the descriptor over, and the destructor is the only closer. Code that
+ * still holds the raw descriptor number (for example the accept loop) must not
+ * close it once a connection has been built from it.
+ */
 class ReactorConnection : public std::enable_shared_from_this<ReactorConnection> {
  public:
-  static std::shared_ptr<ReactorConnection> Create(int fd, IoReactor* reactor, ThreadPool* thread_pool, IOConfig config,
-                                                   RequestProcessor processor);
+  /**
+   * @brief Build a connection, taking ownership of @p fd.
+   * @param fd Accepted client socket; close responsibility moves into the connection.
+   */
+  static std::shared_ptr<ReactorConnection> Create(utils::FDGuard fd, IoReactor* reactor, ThreadPool* thread_pool,
+                                                   IOConfig config, RequestProcessor processor);
   ~ReactorConnection();
   ReactorConnection(const ReactorConnection&) = delete;
   ReactorConnection& operator=(const ReactorConnection&) = delete;
 
-  int Fd() const { return fd_; }
+  /// Borrow the descriptor number for syscalls. Ownership stays with this object.
+  int Fd() const { return fd_.Get(); }
   bool OnReadable();
   bool OnWritable();
   bool OnError();
@@ -38,7 +53,8 @@ class ReactorConnection : public std::enable_shared_from_this<ReactorConnection>
   bool HasReceivedFrame() const { return received_frame_.load(std::memory_order_acquire); }
 
  private:
-  ReactorConnection(int fd, IoReactor* reactor, ThreadPool* thread_pool, IOConfig config, RequestProcessor processor);
+  ReactorConnection(utils::FDGuard fd, IoReactor* reactor, ThreadPool* thread_pool, IOConfig config,
+                    RequestProcessor processor);
   bool ScheduleDrain();
   void DrainRequests();
   bool EnqueueResponse(const std::string& response);
@@ -52,7 +68,7 @@ class ReactorConnection : public std::enable_shared_from_this<ReactorConnection>
   static constexpr size_t kPendingFramesLowWatermark = 512;
   static constexpr size_t kMaxWriteQueueBytes = 16 * 1024 * 1024;
 
-  int fd_;
+  utils::FDGuard fd_;
   IoReactor* reactor_;
   ThreadPool* thread_pool_;
   IOConfig config_;
@@ -73,7 +89,6 @@ class ReactorConnection : public std::enable_shared_from_this<ReactorConnection>
   size_t response_offset_ = 0;
   size_t response_bytes_ = 0;
   std::atomic<bool> close_after_flush_{false};
-  std::atomic<bool> closed_{false};
   std::atomic<std::chrono::steady_clock::time_point> last_active_;
   std::atomic<std::chrono::steady_clock::time_point> created_at_;
   std::shared_ptr<ReactorMemoryBudget> memory_budget_;

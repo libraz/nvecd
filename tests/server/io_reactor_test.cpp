@@ -5,6 +5,7 @@
 
 #include "server/io_reactor.h"
 
+#include <fcntl.h>
 #include <gtest/gtest.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -63,10 +64,8 @@ TEST(IoReactorTest, FramesPartialAndPipelinedRequestsWithoutBlockingTheLoop) {
 
   int sockets[2];
   ASSERT_EQ(MakeSocketPair(sockets), 0);
-  auto connection =
-      ReactorConnection::Create(sockets[0], &reactor, &pool, TestIoConfig(),
-                                [](const std::string& request, ConnectionContext&) { return "OK " + request; });
-  ASSERT_TRUE(reactor.Register(connection));
+  ASSERT_TRUE(reactor.Register(sockets[0], &pool, TestIoConfig(),
+                               [](const std::string& request, ConnectionContext&) { return "OK " + request; }));
 
   ASSERT_EQ(::write(sockets[1], "HEL", 3), 3);
   EXPECT_EQ(ReadAvailable(sockets[1], 50), "");
@@ -80,7 +79,6 @@ TEST(IoReactorTest, FramesPartialAndPipelinedRequestsWithoutBlockingTheLoop) {
 
   reactor.Stop();
   pool.Shutdown();
-  connection.reset();
   ::close(sockets[1]);
 }
 
@@ -89,16 +87,13 @@ TEST(IoReactorTest, IdleConnectionsDoNotConsumeWorkersBeforeLateRequest) {
   IoReactor reactor({10, 0});
   ASSERT_TRUE(reactor.Start());
 
-  std::vector<std::shared_ptr<ReactorConnection>> connections;
   std::vector<int> clients;
   constexpr int kIdleClients = 32;
   for (int i = 0; i < kIdleClients; ++i) {
     int sockets[2];
     ASSERT_EQ(MakeSocketPair(sockets), 0);
-    auto connection = ReactorConnection::Create(sockets[0], &reactor, &pool, TestIoConfig(),
-                                                [](const std::string&, ConnectionContext&) { return "OK"; });
-    ASSERT_TRUE(reactor.Register(connection));
-    connections.push_back(std::move(connection));
+    ASSERT_TRUE(reactor.Register(sockets[0], &pool, TestIoConfig(),
+                                 [](const std::string&, ConnectionContext&) { return "OK"; }));
     clients.push_back(sockets[1]);
   }
   EXPECT_EQ(pool.GetQueueSize(), 0U);
@@ -109,7 +104,6 @@ TEST(IoReactorTest, IdleConnectionsDoNotConsumeWorkersBeforeLateRequest) {
 
   reactor.Stop();
   pool.Shutdown();
-  connections.clear();
   for (int fd : clients)
     ::close(fd);
 }
@@ -126,9 +120,8 @@ TEST(IoReactorTest, InitialReadDeadlineClosesSlowlorisPartialRequest) {
 
   int sockets[2];
   ASSERT_EQ(MakeSocketPair(sockets), 0);
-  auto connection = ReactorConnection::Create(sockets[0], &reactor, &pool, TestIoConfig(),
-                                              [](const std::string&, ConnectionContext&) { return "OK"; });
-  ASSERT_TRUE(reactor.Register(connection));
+  ASSERT_TRUE(
+      reactor.Register(sockets[0], &pool, TestIoConfig(), [](const std::string&, ConnectionContext&) { return "OK"; }));
   ASSERT_EQ(::write(sockets[1], "PARTIAL", 7), 7);
 
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
@@ -139,7 +132,39 @@ TEST(IoReactorTest, InitialReadDeadlineClosesSlowlorisPartialRequest) {
 
   reactor.Stop();
   pool.Shutdown();
-  connection.reset();
+  ::close(sockets[1]);
+}
+
+TEST(IoReactorTest, FailedRegistrationLeavesTheDescriptorWithTheCaller) {
+  ThreadPool pool(1);
+  IoReactor reactor({10, 0});
+
+  int sockets[2];
+  ASSERT_EQ(MakeSocketPair(sockets), 0);
+
+  // Registering before Start() fails; the fd must survive so that the accept
+  // loop, which is still its owner, can close it exactly once.
+  auto before_start =
+      reactor.Register(sockets[0], &pool, TestIoConfig(), [](const std::string&, ConnectionContext&) { return "OK"; });
+  ASSERT_FALSE(before_start.has_value());
+  EXPECT_EQ(::fcntl(sockets[0], F_GETFD), 0) << "failed Register must not close the caller's fd";
+
+  ASSERT_TRUE(reactor.Start());
+  auto registered =
+      reactor.Register(sockets[0], &pool, TestIoConfig(), [](const std::string&, ConnectionContext&) { return "OK"; });
+  ASSERT_TRUE(registered.has_value());
+
+  // A second registration of the same fd fails after the reactor already owns
+  // it; the rejection must not close the descriptor the first one owns.
+  auto duplicate =
+      reactor.Register(sockets[0], &pool, TestIoConfig(), [](const std::string&, ConnectionContext&) { return "OK"; });
+  ASSERT_FALSE(duplicate.has_value());
+  EXPECT_EQ(::fcntl(sockets[0], F_GETFD), 0) << "duplicate Register must not close the registered fd";
+
+  reactor.Stop();
+  pool.Shutdown();
+  registered->reset();
+  EXPECT_EQ(::fcntl(sockets[0], F_GETFD), -1) << "the connection must close the fd when it is destroyed";
   ::close(sockets[1]);
 }
 

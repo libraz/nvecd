@@ -49,8 +49,9 @@ class ConnectionAcceptor {
   /**
    * @brief Connection handler callback type
    *
-   * This callback is invoked for each accepted connection.
-   * The handler should process the connection and close the file descriptor.
+   * Invoked on a pool worker for each accepted connection. The acceptor keeps
+   * ownership of the descriptor and closes it once the handler returns, so the
+   * handler must not close it.
    */
   using ConnectionHandler = std::function<void(int client_fd)>;
 
@@ -81,7 +82,9 @@ class ConnectionAcceptor {
   /**
    * @brief Stop accepting connections
    *
-   * Stops the accept loop and closes all active connections.
+   * Closes the listening socket and joins the accept thread. Accepted client
+   * descriptors are shut down but never closed here: each one is owned either
+   * by the reactor connection or by the worker task that is handling it.
    */
   void Stop();
 
@@ -136,7 +139,10 @@ class ConnectionAcceptor {
   ConnectionHandler connection_handler_;
   ReactorHandler reactor_handler_;
 
-  int server_fd_ = -1;
+  /// Listening socket. Atomic because Stop() swaps it out and closes it while
+  /// the accept thread is reading it; the thread must never pass a stale (and
+  /// possibly already reused) descriptor number to accept().
+  std::atomic<int> server_fd_{-1};
   uint16_t actual_port_ = 0;
   std::atomic<bool> running_{false};
   std::atomic<bool> should_stop_{false};
