@@ -76,25 +76,6 @@ class AdmissionControlledHttpServer final : public httplib::Server {
       : max_connections_(max_connections), max_connections_per_ip_(max_connections_per_ip) {}
 
  private:
-  std::string PeerAddress(socket_t socket) const {
-    sockaddr_storage address = {};
-    socklen_t length = sizeof(address);
-    if (::getpeername(socket, reinterpret_cast<sockaddr*>(&address), &length) != 0) {
-      return "<unknown>";
-    }
-    std::array<char, INET6_ADDRSTRLEN> text{};
-    const void* source = nullptr;
-    if (address.ss_family == AF_INET) {
-      source = &reinterpret_cast<const sockaddr_in*>(&address)->sin_addr;
-    } else if (address.ss_family == AF_INET6) {
-      source = &reinterpret_cast<const sockaddr_in6*>(&address)->sin6_addr;
-    }
-    if (source == nullptr || ::inet_ntop(address.ss_family, source, text.data(), text.size()) == nullptr) {
-      return "<unknown>";
-    }
-    return text.data();
-  }
-
   bool Acquire(const std::string& peer) {
     std::lock_guard<std::mutex> lock(admission_mutex_);
     if (max_connections_ != 0 && active_connections_ >= max_connections_) {
@@ -121,22 +102,40 @@ class AdmissionControlledHttpServer final : public httplib::Server {
     }
   }
 
+  // Mirrors the base implementation, with admission control in front of it. The
+  // peer address is resolved once and used both to key the per-IP limit and to
+  // populate the request, so the limit counts the same peer the handlers see.
   bool process_and_close_socket(socket_t socket) override {
-    const std::string peer = PeerAddress(socket);
-    if (!Acquire(peer)) {
+    std::string remote_addr;
+    int remote_port = 0;
+    httplib::detail::get_remote_ip_and_port(socket, remote_addr, remote_port);
+
+    if (!Acquire(remote_addr)) {
+      // A refused connection is closed outright rather than drained: there is
+      // no response to flush, and draining would hold the slot the limit just
+      // declined to grant.
       httplib::detail::shutdown_socket(socket);
       httplib::detail::close_socket(socket);
       return false;
     }
-    const auto release = httplib::detail::scope_exit([this, &peer]() { Release(peer); });
-    const bool result = httplib::detail::process_server_socket(
-        svr_sock_, socket, keep_alive_max_count_, keep_alive_timeout_sec_, read_timeout_sec_, read_timeout_usec_,
-        write_timeout_sec_, write_timeout_usec_,
-        [this](httplib::Stream& stream, bool close_connection, bool& connection_closed) {
-          return process_request(stream, close_connection, connection_closed, nullptr);
-        });
-    httplib::detail::shutdown_socket(socket);
-    httplib::detail::close_socket(socket);
+    const auto release = httplib::detail::scope_exit([this, &remote_addr]() { Release(remote_addr); });
+
+    std::string local_addr;
+    int local_port = 0;
+    httplib::detail::get_local_ip_and_port(socket, local_addr, local_port);
+
+    bool websocket_upgraded = false;
+    const bool result = serve_guarded([&]() {
+      return httplib::detail::process_server_socket(
+          svr_sock_, socket, keep_alive_max_count_, keep_alive_timeout_sec_, read_timeout_sec_, read_timeout_usec_,
+          write_timeout_sec_, write_timeout_usec_,
+          [&](httplib::Stream& stream, bool close_connection, bool& connection_closed) {
+            return process_request(stream, remote_addr, remote_port, local_addr, local_port, close_connection,
+                                   connection_closed, nullptr, &websocket_upgraded);
+          });
+    });
+
+    httplib::detail::drain_and_close_socket(socket);
     return result;
   }
 
