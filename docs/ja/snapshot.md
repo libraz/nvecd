@@ -70,29 +70,36 @@ DUMP SAVE [filepath]
 ```
 
 **パラメータ:**
-- `[filepath]` (オプション): スナップショットファイルの保存先パス。省略すると、タイムスタンプ付きファイル名が自動生成されます。
+- `[filepath]` (オプション): スナップショットの書き込み先。省略すると `snapshot.default_filename` の名前が使われます。
 
 **例:**
 ```
--- 手動スナップショット
+-- パスを明示する場合
 DUMP SAVE /var/lib/nvecd/snapshots/backup.nvec
 
--- 自動生成ファイル名
+-- 設定した既定名を使う場合
 DUMP SAVE
 ```
 
 **レスポンス:**
 ```
-OK Snapshot saved: /var/lib/nvecd/snapshots/backup.nvec
-event_store_contexts: 100
-vector_store_vectors: 2000
-co_occurrence_pairs: 1500
-size: 1048576 bytes
+DUMP SAVE /var/lib/nvecd/snapshots/backup.nvec
+→ OK DUMP_SAVED /var/lib/nvecd/snapshots/backup.nvec
 ```
 
-**自動生成ファイル名形式**: `dump_YYYYMMDD_HHMMSS.nvec`
+**ファイル名の解決:** 引数なしの `DUMP SAVE` は、スナップショットディレクトリ内の
+`snapshot.default_filename` に書き込みます。名前は固定なので、**繰り返し実行すると
+同じファイルを上書きします**。履歴は蓄積されません。履歴を残すのは自動スナップショット
+の役割です（`auto_*.nvec` が `snapshot.retain` に従って保持されます）。
+`snapshot.default_filename` が空のときにかぎり、タイムスタンプ付きの
+`snapshot_YYYYMMDD_HHMMSS.dmp` 形式にフォールバックします。
 
-**注意:** `snapshot.mode` が `fork`（デフォルト）の場合、DUMP SAVE は `fork()` を使用してバックグラウンドスナップショットを開始します。コマンドは即座に返却され、子プロセスがスナップショットを書き込みます。進捗状況は `DUMP STATUS` で確認できます。
+**パスの検証:** 設定された名前は信頼されず、検証されます。クライアントが指定したパスと
+同じ検証を通るため、絶対パスや `..` を含む `default_filename` は、スナップショット
+ディレクトリを基準に解決されるのではなく保存時に拒否されます。この場合 `DUMP SAVE` は
+予期しない場所へ書き込む代わりにエラーを返します。
+
+**注意:** `snapshot.mode` が `fork`（デフォルト）の場合、DUMP SAVE は `fork()` を使用してバックグラウンドスナップショットを開始し、`OK DUMP_SAVE_STARTED` を返します。コマンドは即座に返却され、子プロセスがスナップショットを書き込みます。進捗状況は `DUMP STATUS` で確認できます。`snapshot.mode: lock` の場合はコマンドがブロックし、`OK DUMP_SAVED` はスナップショット・sidecar・WAL チェックポイントのすべてが完了したことを意味します。
 
 ---
 
@@ -115,16 +122,23 @@ DUMP LOAD /var/lib/nvecd/snapshots/backup.nvec
 
 **レスポンス:**
 ```
-OK Snapshot loaded: 5000 events, 2000 vectors
-event_store_contexts: 100
-vector_store_vectors: 2000
-co_occurrence_pairs: 1500
+DUMP LOAD /var/lib/nvecd/snapshots/backup.nvec
+→ OK DUMP_LOADED /var/lib/nvecd/snapshots/backup.nvec
 ```
 
 **重要な注意事項:**
 - スナップショットの読み込みは現在のすべてのデータを**置き換えます**
 - 読み込み中、サーバーは読み取り専用モードになります
 - 既存の接続はすべて読み込み中にエラーを受け取ります
+- 読み込みは**不正な共起エッジに対してフェイルクローズ**です。自己辺や非有限スコアを
+  含むスナップショットは、不正なエッジだけを捨てて読み込むのではなく、ファイル全体が
+  拒否されます。読み飛ばすと、ファイルは読み込めたように見えるのに復元されたインデックスが
+  書き出されたものと異なる状態になります。またそのようなエッジは prune 時にマップを破壊し、
+  以降のあらゆるソートの順序を壊します。
+- したがって、**そのようなエッジを既に含む旧ビルドで書かれたスナップショットは読み込めなく
+  なります**。これは意図した挙動です。起動時の復旧はより古いスナップショットと WAL に
+  フォールバックします。手動の `DUMP LOAD` は該当するエッジを示すエラーを返すため、
+  そのようなエッジを持たない情報源からファイルを作り直す必要があります。
 
 ---
 
@@ -147,17 +161,13 @@ DUMP VERIFY /var/lib/nvecd/snapshots/backup.nvec
 
 **レスポンス（成功）:**
 ```
-OK Snapshot is valid (CRC32: 0x12345678)
-status: valid
-crc: verified
-size: verified
+DUMP VERIFY /var/lib/nvecd/snapshots/backup.nvec
+→ OK DUMP_VERIFIED /var/lib/nvecd/snapshots/backup.nvec
 ```
 
 **レスポンス（失敗）:**
 ```
-(error) CRC mismatch: file may be corrupted
-expected: 0x12345678
-actual: 0x87654321
+→ ERROR Snapshot verification failed for /var/lib/nvecd/snapshots/backup.nvec: CRC mismatch
 ```
 
 ---
@@ -203,8 +213,9 @@ DUMP STATUS
 
 **レスポンス:**
 ```
-OK STATUS
+OK DUMP_STATUS
 status: idle
+END
 ```
 
 **ステータス値:**
@@ -213,24 +224,26 @@ status: idle
 | `idle` | スナップショットは進行中ではない |
 | `in_progress` | fork 子プロセスがスナップショットを書き込み中 |
 | `completed` | 直近のスナップショットが正常に保存された |
-| `failed` | 直近のスナップショットが失敗（error_message を確認） |
+| `failed` | 直近のスナップショットが失敗（`error` フィールドに理由が入る） |
 
 **進行中のレスポンス:**
 ```
-OK STATUS
+OK DUMP_STATUS
 status: in_progress
-child_pid: 12345
 filepath: /var/lib/nvecd/snapshots/dump_20250325_120000.nvec
+pid: 12345
 start_time: 1711360800
+END
 ```
 
 **完了時のレスポンス:**
 ```
-OK STATUS
+OK DUMP_STATUS
 status: completed
 filepath: /var/lib/nvecd/snapshots/dump_20250325_120000.nvec
 start_time: 1711360800
 end_time: 1711360802
+END
 ```
 
 ---
@@ -305,8 +318,8 @@ snapshot:
 ### 自動スナップショットの動作
 
 - スケジュールに従って自動的にスナップショットを作成
-- ファイル名: `auto_YYYYMMDD_HHMMSS.snapshot`
-- 古いスナップショットは自動的にクリーンアップ（最新の `retain` 個を保持）
+- ファイル名: `auto_YYYYMMDD_HHMMSS.nvec`
+- クリーンアップは最新の `retain` 個の `auto_*.nvec` を残して他を削除します。`retain: 0` はクリーンアップを無効化し、すべてのファイルを残します
 - 手動スナップショットはクリーンアップの**影響を受けません**
 
 ---
@@ -378,21 +391,21 @@ Nvecd はパストラバーサル攻撃を防止します：
 
 ### スナップショット保存失敗
 
-**エラー**: `(error) Cannot save snapshot: read-only mode`
+**エラー**: `ERROR Cannot save snapshot: read-only mode`
 - **原因**: サーバーが読み取り専用モード（読み込み中）
 - **解決方法**: 読み込み完了を待つ
 
-**エラー**: `(error) Permission denied`
+**エラー**: `ERROR Permission denied`
 - **原因**: `snapshot.dir` への書き込み権限がない
 - **解決方法**: ディレクトリのパーミッションと所有権を確認
 
 ### スナップショット読み込み失敗
 
-**エラー**: `(error) CRC mismatch: file may be corrupted`
+**エラー**: `ERROR CRC mismatch: file may be corrupted`
 - **原因**: ファイル破損または不完全な書き込み
 - **解決方法**: 別のスナップショットファイルを使用
 
-**エラー**: `(error) Version mismatch: expected 1, got 2`
+**エラー**: `ERROR Version mismatch: expected 1, got 2`
 - **原因**: より新しい Nvecd バージョンで作成されたスナップショット
 - **解決方法**: 互換性のあるバージョンに Nvecd をアップグレード
 

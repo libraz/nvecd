@@ -9,7 +9,7 @@ libnvecdclient は nvecd サーバーに接続してクエリを実行するた�
 - すべての nvecd プロトコルコマンドに完全対応
 - RAII と型安全性を備えたモダンな C++17 API
 - 他言語との統合が容易な C API（Python、Node.js など）
-- スレッドセーフな接続管理
+- 1 つのハンドルを複数スレッドで共有可能。コマンドは内部で直列化
 - CMake package target（`nvecd::client`）付き共有ライブラリ
 
 ## ビルド
@@ -88,6 +88,8 @@ cmake -S . -B build && cmake --build build
 
 ### イベントトラッキング
 
+`Event` のシグネチャは `Event(ctx, type, id, score)` で、`type` は `"ADD"`、`"SET"`、`"DEL"` のいずれかです（`DEL` では score は無視されます）。
+
 ```cpp
 // ユーザー行動を追跡
 client.Event("user_alice", "ADD", "product123", 100);  // スコア: 0-100
@@ -142,14 +144,34 @@ if (info) {
 
 ### スナップショット管理
 
+既定の `snapshot.mode: fork` では、サーバーは書き込みを行う子プロセスが生成された時点で
+応答します。したがって `Save()` が成功してもファイルが読める状態とは限りません。
+読み込み・コピー・アップロードの前に `SaveResult::completed` を確認し、
+`DumpStatus()` をポーリングしてください。
+
 ```cpp
 // スナップショット保存
-if (auto result = client.Save("snapshot.dmp"); !result) {
+auto result = client.Save("snapshot.nvec");
+if (!result) {
     std::cerr << "保存失敗: " << result.error().message() << std::endl;
+} else if (!result->completed) {
+    // fork モード: バックグラウンドの書き込みが開始されただけで、
+    // result->filepath はまだ利用できない。完了までポーリングする。
+    while (true) {
+        auto status = client.DumpStatus();
+        if (!status) {
+            std::cerr << "状態取得失敗: " << status.error().message() << std::endl;
+            break;
+        }
+        if (status->find("status: in_progress") == std::string::npos) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
 }
 
 // スナップショット読み込み
-if (auto result = client.Load("snapshot.dmp"); !result) {
+if (auto result = client.Load("snapshot.nvec"); !result) {
     std::cerr << "読み込み失敗: " << result.error().message() << std::endl;
 }
 ```
@@ -407,21 +429,36 @@ console.log(results);
 ### C++ API クラス
 
 #### ClientConfig
-- `host` - サーバーホスト名（デフォルト: "127.0.0.1"）
+- `host` - サーバーのホスト名または IPv4 アドレス（デフォルト: "127.0.0.1"）
 - `port` - サーバーポート（デフォルト: 11017）
 - `timeout_ms` - 接続タイムアウト（デフォルト: 5000）
 - `recv_buffer_size` - 受信バッファサイズ（デフォルト: 65536）
 
 #### SimResponse
-- `results` - SimilarityResult のベクター（id, score のペア）
+- `results` - SimResultItem のベクター（`id`、`score`）
+- `mode` - 使用された検索モード
+
+#### SearchOptions
+`Sim`/`Simv` の任意パラメータ:
+- `filter` - メタデータフィルタ式（例: `"category:books"`）
+- `min_score` - `std::optional<float>` の最小スコア閾値
+- `adaptive` - `std::optional<bool>` の adaptive fusion 切り替え（SIM の fusion のみ）
 
 #### ServerInfo
+フィールド名はサーバーの `INFO` コマンドが出力するキーと一致します:
 - `version` - サーバーバージョン文字列
 - `uptime_seconds` - サーバー稼働時間（秒）
 - `total_commands_processed` - 処理されたコマンド総数
+- `failed_commands` - エラーを返したコマンド数
+- `total_connections` - 受け付けた接続数
+- `active_connections` - 現在開いている接続数
+- `event_count` - 格納されているイベント総数
+- `vector_count` - 格納されているベクトル総数
+- `id_count` - 共起 ID の異なり数
+- `ctx_count` - イベントコンテキストの異なり数
 
 #### Error
-- `message` - エラーメッセージ文字列
+- `message()` - エラーメッセージ文字列
 
 ### C++ API メソッド
 
@@ -431,16 +468,28 @@ console.log(results);
 - `bool IsConnected()` - 接続状態を確認
 
 #### nvecd コマンド
-- `Expected<void, Error> Event(ctx, type, id, score)` - イベント追跡（`type`: `ADD`/`SET`/`DEL`）
+- `Expected<void, Error> Event(ctx, type, id, score)` - イベント追跡（`type`: "ADD"/"SET"/"DEL"）
 - `Expected<void, Error> Vecset(id, vector)` - ベクトル登録
-- `Expected<SimResponse, Error> Sim(id, top_k, mode)` - ID で検索
-- `Expected<SimResponse, Error> Simv(vector, top_k, mode)` - ベクトルで検索
+- `Expected<void, Error> Vecdel(id)` - ベクトルとそのメタデータを削除
+- `Expected<void, Error> Metaset(id, metadata)` - フィルタ検索用のメタデータを付与
+- `Expected<SimResponse, Error> Sim(id, top_k, mode, options)` - ID で検索
+- `Expected<SimResponse, Error> Simv(vector, top_k, mode, options)` - ベクトルで検索
 
 #### 管理コマンド
+- `Expected<void, Error> Auth(password)` - 接続を認証
 - `Expected<ServerInfo, Error> Info()` - サーバー情報取得
 - `Expected<std::string, Error> GetConfig()` - 設定取得
-- `Expected<std::string, Error> Save(filepath)` - スナップショット保存
+- `Expected<SaveResult, Error> Save(filepath)` - スナップショット保存。`SaveResult` は
+  `{ std::string filepath; bool completed; }` で、fork モードのバックグラウンド書き込みが
+  開始された場合 `completed` は false
 - `Expected<std::string, Error> Load(filepath)` - スナップショット読み込み
+- `Expected<std::string, Error> Verify(filepath)` - スナップショットの整合性検証
+- `Expected<std::string, Error> DumpInfo(filepath)` - スナップショットのメタデータ
+- `Expected<std::string, Error> DumpStatus()` - バックグラウンドスナップショットの状態
+- `Expected<std::string, Error> CacheStats()` - キャッシュ統計
+- `Expected<void, Error> CacheClear()` - キャッシュをクリア
+- `Expected<void, Error> CacheEnable()` - キャッシュを有効化
+- `Expected<void, Error> CacheDisable()` - キャッシュを無効化
 - `Expected<void, Error> EnableDebug()` - デバッグモード有効化
 - `Expected<void, Error> DisableDebug()` - デバッグモード無効化
 
@@ -451,16 +500,48 @@ console.log(results);
 主要な関数：
 - `nvecdclient_create()` - クライアント作成
 - `nvecdclient_connect()` - サーバーに接続
-- `nvecdclient_event()` - イベント追跡
+- `nvecdclient_auth()` - 接続を認証
+- `nvecdclient_event()` - イベント追跡（`ctx, type, id, score`）
 - `nvecdclient_vecset()` - ベクトル登録
-- `nvecdclient_sim()` - ID で検索
-- `nvecdclient_simv()` - ベクトルで検索
+- `nvecdclient_vecdel()` - ベクトルとそのメタデータを削除
+- `nvecdclient_metaset()` - メタデータを付与
+- `nvecdclient_sim()` / `nvecdclient_sim_ex()` - ID で検索（`_ex` 形式は `NvecdSearchOptions_C` を取る）
+- `nvecdclient_simv()` / `nvecdclient_simv_ex()` - ベクトルで検索
 - `nvecdclient_info()` - サーバー情報取得
+- `nvecdclient_cache_stats()` / `_clear()` / `_enable()` / `_disable()` - キャッシュ管理
+- `nvecdclient_dump_status()` - バックグラウンドスナップショットの状態
 - `nvecdclient_free_*()` - 結果構造体を解放
+
+**C API の戻り値**: 各関数は成功時に `0`、エラー時に負の値を返しますが、1 つだけ例外が
+あります。`nvecdclient_save()` は、スナップショットが完成して読み込み可能なとき `0`、
+バックグラウンドの書き込みが開始されファイルがまだ利用できないとき `1`、エラー時に `-1`
+を返します。`saved_path` はどちらの成功コードでも書き込まれます。`1` を失敗として扱うのも
+「保存済み」として扱うのも誤りです。ファイルを読む前に `nvecdclient_dump_status()` を
+書き込み完了までポーリングしてください。
+
+**C API のメモリ所有権**: `char**` の出力引数で文字列を返す関数
+（`nvecdclient_get_config`、`nvecdclient_dump_status`、`nvecdclient_cache_stats` など）は
+所有権を呼び出し側に移すため、呼び出し側が `nvecdclient_free_string()` で解放する必要があります。
+`NvecdSimResponse_C` は `nvecdclient_free_sim_response()` で、`NvecdServerInfo_C` は
+`nvecdclient_free_server_info()` で解放します。`nvecdclient_get_last_error()` が返す文字列は
+クライアントが所有しているため、解放しては**いけません**。
 
 ## スレッドセーフティ
 
-NvecdClient クラスは単一の TCP 接続を管理しており、**スレッドセーフではありません**。マルチスレッドアプリケーションでは、スレッドごとにクライアントインスタンスを作成するか、適切な同期を使用してください。
+**1 つのハンドルを複数スレッドから同時に使用できます。** クライアントインスタンス 1 つが
+サーバー接続 1 本を保持し、その共有はサポートされています。スレッドごとに接続を用意する
+必要はありません。
+
+- 同一ハンドルに対するコマンドは**内部で直列化されます**。並列には実行されないため、
+  遅いコマンドは後ろに並んだコマンドを待たせます。ハンドルの共有は、スレッドごとの接続
+  コストを避けるためのものであって、スループットを上げるためのものではありません。
+- C ABI のエラースロットは同期されており、破損したエラーメッセージや解放済みの
+  エラーメッセージを読むことはありません。
+- `nvecdclient_get_last_error()` が返すポインタは呼び出したスレッドに属し、**その**
+  スレッドが再度この関数を呼ぶまで有効です。他のスレッドが無効化することはありません。
+  それより長く保持する必要がある場合は文字列をコピーしてください。
+- **生成と破棄は同期されません。** `nvecdclient_destroy()` の実行中に処理中の呼び出しが
+  あってはなりません。
 
 ## エラーハンドリング
 

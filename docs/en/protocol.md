@@ -26,7 +26,7 @@ nc -U /var/run/nvecd.sock
 - **Transport**: Text-based line protocol (UTF-8)
 - **Request**: `COMMAND args...\r\n` (accepts both `\r\n` and `\n`)
 - **Response**: `OK data...\r\n` or `ERROR message\r\n`
-- **Max request size**: 16MB (configurable)
+- **Max request size**: `performance.max_query_length` bytes (default 1 MiB, up to 16 MiB)
 
 ### Response Format
 
@@ -34,13 +34,16 @@ nc -U /var/run/nvecd.sock
 ```
 OK [data]\r\n
 ```
-or Redis-style: `+OK [data]\r\n`
+
+A command that returns nothing but an acknowledgement echoes its own name, for
+example `OK VECSET`. `AUTH` is the single exception and answers `+OK\r\n`.
 
 **Error**:
 ```
 ERROR <message>\r\n
 ```
-or Redis-style: `-ERR <message>\r\n` or `(error) <message>\r\n`
+
+This is the only error shape on the wire; no Redis-style variant is emitted.
 
 ---
 
@@ -80,27 +83,27 @@ EVENT <ctx> DEL <id>
 ```bash
 # Stream event (click tracking)
 EVENT user123 ADD view:item456 95
-→ OK
+→ OK EVENT
 
 # State event (like ON)
 EVENT user123 SET like:item456 100
-→ OK
+→ OK EVENT
 
 # State event (like OFF)
 EVENT user123 SET like:item456 0
-→ OK
+→ OK EVENT
 
 # Weighted bookmark (high priority)
 EVENT user123 SET bookmark:item789 100
-→ OK
+→ OK EVENT
 
 # Change bookmark priority (medium)
 EVENT user123 SET bookmark:item789 50
-→ OK
+→ OK EVENT
 
 # Delete bookmark
 EVENT user123 DEL bookmark:item789
-→ OK
+→ OK EVENT
 ```
 
 **Event Type Behavior**:
@@ -117,28 +120,28 @@ EVENT user123 DEL bookmark:item789
 # SET is idempotent for same value
 EVENT user1 SET like:item1 100
 EVENT user1 SET like:item1 100  # Duplicate, ignored
-→ OK (both succeed, second is deduped)
+→ OK EVENT (both succeed, second is deduped)
 
 # SET allows state transitions
 EVENT user1 SET bookmark:item1 100  # High priority
 EVENT user1 SET bookmark:item1 50   # Medium priority (stored)
 EVENT user1 SET bookmark:item1 50   # Duplicate (ignored)
-→ OK
+→ OK EVENT
 
 # DEL is idempotent
 EVENT user1 DEL like:item1
 EVENT user1 DEL like:item1  # Already deleted, ignored
-→ OK
+→ OK EVENT
 ```
 
 **Error Responses**:
-- `(error) Invalid EVENT type: <type> (must be ADD, SET, or DEL)`
-- `(error) EVENT ADD requires 4 arguments: <ctx> ADD <id> <score>`
-- `(error) EVENT SET requires 4 arguments: <ctx> SET <id> <score>`
-- `(error) EVENT DEL requires 3 arguments: <ctx> DEL <id>`
-- `(error) Invalid score: must be integer`
-- `(error) Context cannot be empty`
-- `(error) ID cannot be empty`
+- `ERROR Invalid EVENT type: <type> (must be ADD, SET, or DEL)`
+- `ERROR EVENT ADD requires 4 arguments: <ctx> ADD <id> <score>`
+- `ERROR EVENT SET requires 4 arguments: <ctx> SET <id> <score>`
+- `ERROR EVENT DEL requires 3 arguments: <ctx> DEL <id>`
+- `ERROR Invalid score: must be integer`
+- `ERROR Context cannot be empty`
+- `ERROR ID cannot be empty`
 
 **Notes**:
 - Events are stored in a ring buffer per context (size: `events.ctx_buffer_size`)
@@ -166,19 +169,19 @@ VECSET <id> <f1> <f2> ... <fN>
 **Example**:
 ```
 VECSET item456 0.1 0.5 0.8
-→ OK
+→ OK VECSET
 ```
 
 **Example with 768-dimensional vector**:
 ```
 VECSET item789 0.11 0.98 -0.22 0.44 ... (768 values)
-→ OK
+→ OK VECSET
 ```
 
 **Error Responses**:
-- `(error) Dimension mismatch: expected 768, got 512`
-- `(error) Invalid vector format`
-- `(error) Invalid argument count`
+- `ERROR Dimension mismatch: expected 768, got 512`
+- `ERROR Invalid vector format`
+- `ERROR Invalid argument count`
 
 **Notes**:
 - Dimension is auto-detected from the number of values
@@ -186,6 +189,34 @@ VECSET item789 0.11 0.98 -0.22 0.44 ... (768 values)
 - Vectors are automatically normalized based on `vectors.distance_metric` setting
 
 ---
+
+### VECDEL — Delete vector
+
+Remove an item's vector, its metadata, and its cached results.
+
+**Syntax**:
+```
+VECDEL <id>
+```
+
+**Parameters**:
+- `<id>`: Item identifier (string)
+
+**Example**:
+```
+VECDEL item456
+→ OK VECDEL
+```
+
+**Error Responses**:
+- `ERROR VECDEL requires 1 argument: <id>`
+- `ERROR Vector not found: item456`
+
+**Notes**:
+- Requires authentication when `security.requirepass` is set
+- Metadata registered with `METASET` is removed together with the vector
+- The active ANN index is rebuilt, so a delete is more expensive than a write
+- Co-occurrence edges recorded by `EVENT` are not affected
 
 ### METASET — Register item metadata
 
@@ -286,9 +317,9 @@ item202 0.8567
 ```
 
 **Error Responses**:
-- `(error) Item not found: item456`
-- `(error) Invalid mode: must be events, vectors, or fusion`
-- `(error) Invalid top_k: must be > 0 and <= 1000`
+- `ERROR Item not found: item456`
+- `ERROR Invalid mode: must be events, vectors, or fusion`
+- `ERROR Invalid top_k: must be > 0 and <= 1000`
 
 **Notes**:
 - Fusion mode combines vector similarity (weight: `similarity.fusion_alpha`) with co-occurrence scores (weight: `similarity.fusion_beta`)
@@ -336,9 +367,9 @@ item789 0.9800
 ```
 
 **Error Responses**:
-- `(error) Dimension mismatch: expected 768, got 512`
-- `(error) Invalid vector format`
-- `(error) Invalid top_k`
+- `ERROR Dimension mismatch: expected 768, got 512`
+- `ERROR Invalid vector format`
+- `ERROR Invalid top_k`
 
 **Notes**:
 - Dimension is auto-detected from the number of values
@@ -364,11 +395,11 @@ AUTH <password>
 **Example**:
 ```bash
 AUTH mysecretpassword
-→ OK
+→ +OK
 
 # Without auth, write commands are rejected:
 VECSET item1 0.1 0.2 0.3
-→ (error) NOAUTH Authentication required
+→ ERROR NOAUTH Authentication required
 ```
 
 **Notes**:
@@ -442,11 +473,16 @@ Show configuration documentation.
 ```
 CONFIG HELP events
 → +OK
-events:
-  ctx_buffer_size: Ring buffer size per context (default: 50)
-  decay_interval_sec: Decay interval in seconds (default: 3600)
-  decay_alpha: Decay factor 0.0-1.0 (default: 0.99)
+Available paths under 'events':
+  ctx_buffer_size  - Number of events to track per context (ring buffer size)
+  decay_alpha      - Decay factor
+  ...
+END
 ```
+
+`CONFIG HELP`, `CONFIG SHOW` and `CONFIG VERIFY` answer `+OK` followed by a
+multi-line body and the terminator `END`. Read until `END` rather than until the
+first blank line.
 
 #### CONFIG SHOW
 
@@ -456,18 +492,35 @@ Display current configuration (passwords masked).
 ```
 CONFIG SHOW events.ctx_buffer_size
 → +OK
-events:
-  ctx_buffer_size: 50
+50
+END
 ```
 
 #### CONFIG VERIFY
 
 Validate configuration file (usable before server start).
 
+`CONFIG VERIFY` requires a filepath and reports a summary of the parsed file:
+
 **Response**:
 ```
-+OK Configuration is valid
+CONFIG VERIFY /etc/nvecd/config.yaml
+→ +OK
+Configuration is valid
+  Vectors:
+    dimension: 768
+    distance_metric: cosine
+  Events:
+    ctx_buffer_size: 50
+    decay_interval_sec: 3600
+  API:
+    tcp: 127.0.0.1:11017
+END
 ```
+
+**Error Responses**:
+- `ERROR CONFIG VERIFY requires a filepath`
+- `ERROR Configuration validation failed: <reason>`
 
 ---
 
@@ -485,34 +538,61 @@ Single binary `.dmp` format, MygramDB-compatible.
 
 #### DUMP SAVE
 
-Save complete snapshot to disk.
+Save a complete snapshot to disk. The response depends on `snapshot.mode`.
 
-**Example**:
+**Example (`snapshot.mode: lock`)**:
 ```
-DUMP SAVE /data/nvecd.dmp
-→ +OK Snapshot saved: /data/nvecd.dmp (512.3 MB) in 2.35s
+DUMP SAVE /data/nvecd.nvec
+→ OK DUMP_SAVED /data/nvecd.nvec
 ```
 
-**Without filepath (auto-generated name)**:
+`OK DUMP_SAVED` means the whole durability handshake completed: the snapshot was
+written, its sidecar was made durable, and the WAL was checkpointed and
+truncated. A failure at any of those steps is reported as an error rather than
+logged under an OK response, so the acknowledgement never outruns the data.
+
+**Example (`snapshot.mode: fork`)**:
+```
+DUMP SAVE /data/nvecd.nvec
+→ OK DUMP_SAVE_STARTED /data/nvecd.nvec
+```
+
+Fork mode acknowledges that the background child started, not that it finished.
+Poll `DUMP STATUS` for the outcome.
+
+**Without filepath**:
 ```
 DUMP SAVE
-→ +OK Snapshot saved: /var/lib/nvecd/snapshots/auto_20251118_143000.dmp (512.3 MB) in 2.35s
+→ OK DUMP_SAVED /var/lib/nvecd/snapshots/nvecd.snapshot
 ```
+
+An argument-less save writes to `snapshot.default_filename`, resolved inside the
+snapshot directory under the same path validation as a client-supplied name. If
+that setting is empty, the name falls back to `snapshot_YYYYMMDD_HHMMSS.dmp`.
+
+**Error Responses**:
+- `ERROR Another snapshot save is already in progress`
+- `ERROR Cannot save snapshot while a snapshot load is in progress`
+- `ERROR Failed to save snapshot to /data/nvecd.nvec: <reason>`
 
 #### DUMP LOAD
 
-Load snapshot from disk (server becomes read-only during load).
+Load a snapshot from disk (the server becomes read-only during the load).
 
 **Example**:
 ```
-DUMP LOAD /data/nvecd.dmp
-→ +OK Snapshot loaded: /data/nvecd.dmp (5000 events, 2000 vectors) in 1.23s
+DUMP LOAD /data/nvecd.nvec
+→ OK DUMP_LOADED /data/nvecd.nvec
 ```
 
+A load makes the loaded snapshot the durable recovery base and discards the
+pre-load WAL tail, so a later restart does not replay the mutations the operator
+rolled back.
+
 **Error Responses**:
-- `(error) File not found: /data/nvecd.dmp`
-- `(error) CRC mismatch: file may be corrupted`
-- `(error) Unsupported snapshot version`
+- `ERROR File not found: /data/nvecd.nvec`
+- `ERROR CRC mismatch: file may be corrupted`
+- `ERROR Unsupported snapshot version`
 
 #### DUMP VERIFY
 
@@ -520,27 +600,28 @@ Verify snapshot integrity without loading.
 
 **Example**:
 ```
-DUMP VERIFY /data/nvecd.dmp
-→ +OK Snapshot is valid (CRC32: 0x12345678)
+DUMP VERIFY /data/nvecd.nvec
+→ OK DUMP_VERIFIED /data/nvecd.nvec
 ```
+
+**Error Responses**:
+- `ERROR Snapshot verification failed for /data/nvecd.nvec: <reason>`
 
 #### DUMP INFO
 
-Show snapshot metadata (version, size, CRC32, record counts).
+Show snapshot metadata.
 
 **Example**:
 ```
-DUMP INFO /data/nvecd.dmp
-→ +OK INFO
+DUMP INFO /data/nvecd.nvec
+→ OK DUMP_INFO /data/nvecd.nvec
 version: 1
+stores: 3
 flags: 0
-timestamp: 2025-11-18T14:30:00Z
-event_store_count: 5000
-co_occurrence_count: 1500
-vector_store_count: 2000
-file_size_bytes: 536870912
-file_size_human: 512.00 MB
-crc32: 0x12345678
+file_size: 536870912
+timestamp: 1705564800
+has_statistics: true
+END
 ```
 
 #### DUMP STATUS
@@ -554,23 +635,29 @@ DUMP STATUS
 
 **Response**:
 ```
-OK STATUS
+OK DUMP_STATUS
 status: idle|in_progress|completed|failed
-child_pid: <pid>
 filepath: <path>
+pid: <pid>
 start_time: <timestamp>
 end_time: <timestamp>
-error_message: <message>
+error: <message>
+END
 ```
+
+Which fields follow `status:` depends on the status itself: `idle` carries none,
+`in_progress` adds `filepath`, `pid` and `start_time`, `completed` adds
+`end_time` instead of `pid`, and `failed` adds `error` as well. Read until `END`.
 
 **Example**:
 ```bash
 DUMP STATUS
-→ OK STATUS
+→ OK DUMP_STATUS
 status: completed
 filepath: /var/lib/nvecd/snapshots/dump_20250325_120000.nvec
 start_time: 1711360800
 end_time: 1711360802
+END
 ```
 
 **Notes**:
@@ -609,7 +696,7 @@ Disable debug logging for this connection.
 **Example**:
 ```
 DEBUG OFF
-→ OK Debug mode disabled
+→ OK DEBUG_OFF
 ```
 
 **Debug output example** (when DEBUG ON):
@@ -619,7 +706,7 @@ SIM item456 10 using=fusion
 item789 0.9245
 item101 0.8932
 item202 0.8567
-# DEBUG
+# DEBUG 4
 mode: fusion
 query_time_us: 850
 candidates: 15
@@ -627,7 +714,8 @@ results: 3
 ```
 
 The debug block is appended after the normal SIM/SIMV results for connections with
-DEBUG mode enabled. Fields:
+DEBUG mode enabled. The `# DEBUG` header carries the number of fields that
+follow, so a stateful client can frame the block without parsing it. Fields:
 - `mode`: search mode (`events`, `vectors`, `fusion`, or `vector` for SIMV)
 - `query_time_us`: total query execution time in microseconds
 - `candidates`: number of candidates produced before `min_score` filtering
@@ -766,23 +854,17 @@ cache:
 All errors follow a consistent format:
 
 ```
-(error) <error_message>
-```
-
-or Redis-style:
-
-```
--ERR <error_message>
+ERROR <error_message>
 ```
 
 **Common error examples**:
-- `(error) Unknown command: FOO`
-- `(error) Invalid argument count`
-- `(error) Item not found: item123`
-- `(error) Dimension mismatch: expected 768, got 512`
-- `(error) Invalid score: must be 0-100`
-- `(error) File not found: /data/dump.dmp`
-- `(error) CRC mismatch: file may be corrupted`
+- `ERROR Unknown command: FOO`
+- `ERROR Invalid argument count`
+- `ERROR Item not found: item123`
+- `ERROR Dimension mismatch: expected 768, got 512`
+- `ERROR Invalid score: must be 0-100`
+- `ERROR File not found: /data/dump.dmp`
+- `ERROR CRC mismatch: file may be corrupted`
 
 ---
 

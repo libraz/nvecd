@@ -34,7 +34,7 @@ Provide the password via the `Authorization` request header, using either scheme
 - `Authorization: Basic base64(<user>:<password>)` — the username is ignored; only
   the password is compared (matching TCP `AUTH`).
 
-Gated endpoints: `POST /event`, `POST /vecset`, `POST /metaset`,
+Gated endpoints: `POST /event`, `POST /vecset`, `DELETE /vecset`, `POST /metaset`,
 `POST /cache/clear`, `POST /cache/enable`, `POST /cache/disable`,
 `POST /dump/save`, `POST /dump/load`, `POST /dump/verify`, `POST /dump/info`, and
 `GET /dump/status`.
@@ -142,6 +142,45 @@ Content-Type: application/json
 ```json
 {
   "error": "Dimension mismatch: expected 768, got 512"
+}
+```
+
+### DELETE /vecset
+
+Remove an item's vector, its metadata, and its cached results.
+
+This endpoint requires authentication when `security.requirepass` is set.
+
+**Request:**
+
+```http
+DELETE /vecset HTTP/1.1
+Content-Type: application/json
+
+{
+  "id": "product123"
+}
+```
+
+**Request Body Parameters:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `id` | string | Yes | Item ID |
+
+**Response (200 OK):**
+
+```json
+{
+  "status": "ok"
+}
+```
+
+**Error Response (404 Not Found):**
+
+```json
+{
+  "error": "Vector not found: product123"
 }
 ```
 
@@ -382,7 +421,7 @@ GET /info HTTP/1.1
 | **Server** | `server` | Server name (nvecd) |
 | | `version` | Server version |
 | | `uptime_seconds` | Server uptime in seconds |
-| | `total_requests` | Total requests processed |
+| | `total_requests` | Alias of `total_commands_processed`; both report the same counter |
 | | `total_commands_processed` | Total commands processed |
 | | `failed_commands` | Number of commands that returned an error |
 | **Memory** | `used_memory_bytes` | Total tracked store memory (bytes) |

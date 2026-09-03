@@ -157,12 +157,16 @@ make
 
 #### Enable Code Coverage
 
+Coverage is a CMake target rather than a Makefile target, and it needs `lcov`
+and `genhtml` on the PATH. It is defined only when `ENABLE_COVERAGE=ON` was
+passed at configure time.
+
 ```bash
 cmake -B build -DENABLE_COVERAGE=ON
 cmake --build build --parallel
 
-# Run tests with coverage
-make coverage
+# Run the tests and render the report
+cmake --build build --target coverage
 
 # View coverage report
 open build/coverage/html/index.html
@@ -186,9 +190,21 @@ sudo make install
 
 This will install:
 
-- **Binary**: `/usr/local/bin/nvecd`
-- **Config sample**: `/usr/local/etc/nvecd/config.yaml.example`
+- **Server binary**: `/usr/local/bin/nvecd`
+- **CLI binary**: `/usr/local/bin/nvecd-cli`
+- **Client library**: `/usr/local/lib/libnvecdclient.dylib` on macOS, `libnvecdclient.so` on Linux
+- **Client headers**: `/usr/local/include/nvecd/` (`nvecdclient.h`, `nvecdclient_c.h`, and `utils/error.h`, `utils/expected.h`)
+- **CMake package**: `/usr/local/lib/cmake/nvecd/`, exporting the `nvecd::client` target
+- **Config sample**: `/usr/local/etc/nvecd/config.yaml`
+- **Config schema**: `/usr/local/etc/nvecd/config-schema.json`
 - **Documentation**: `/usr/local/share/doc/nvecd/`
+
+A CMake project consumes the installed client with:
+
+```cmake
+find_package(nvecd CONFIG REQUIRED)
+target_link_libraries(my_app PRIVATE nvecd::client)
+```
 
 ### Custom Installation Location
 

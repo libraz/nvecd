@@ -70,29 +70,37 @@ DUMP SAVE [filepath]
 ```
 
 **Parameters:**
-- `[filepath]` (optional): Path where the snapshot file will be saved. If omitted, a timestamped filename is automatically generated.
+- `[filepath]` (optional): Where to write the snapshot. If omitted, the name comes from `snapshot.default_filename`.
 
 **Examples:**
 ```
--- Manual snapshot
+-- Explicit path
 DUMP SAVE /var/lib/nvecd/snapshots/backup.nvec
 
--- Auto-generated filename
+-- Configured default name
 DUMP SAVE
 ```
 
 **Response:**
 ```
-OK Snapshot saved: /var/lib/nvecd/snapshots/backup.nvec
-event_store_contexts: 100
-vector_store_vectors: 2000
-co_occurrence_pairs: 1500
-size: 1048576 bytes
+DUMP SAVE /var/lib/nvecd/snapshots/backup.nvec
+→ OK DUMP_SAVED /var/lib/nvecd/snapshots/backup.nvec
 ```
 
-**Auto-generated filename format**: `dump_YYYYMMDD_HHMMSS.nvec`
+**Filename resolution:** an argument-less `DUMP SAVE` writes to
+`snapshot.default_filename` inside the snapshot directory — a fixed name, so
+**repeating the command overwrites the same file**. It does not accumulate
+history; that is the auto-snapshot path's job (`auto_*.nvec` kept according to
+`snapshot.retain`). Only when `snapshot.default_filename` is empty does the name
+fall back to the timestamped form `snapshot_YYYYMMDD_HHMMSS.dmp`.
 
-**Note:** When `snapshot.mode` is `fork` (default), DUMP SAVE starts a background snapshot via `fork()`. The command returns immediately while the child process writes the snapshot. Use `DUMP STATUS` to check progress.
+**Path validation:** the configured name is validated, not trusted. It goes
+through the same dump-path check a client-supplied path gets, so a
+`default_filename` that is absolute or contains `..` is refused at save time
+rather than resolved against the snapshot directory. `DUMP SAVE` then returns an
+error instead of writing somewhere unexpected.
+
+**Note:** When `snapshot.mode` is `fork` (default), DUMP SAVE starts a background snapshot via `fork()` and answers `OK DUMP_SAVE_STARTED`. The command returns immediately while the child process writes the snapshot. Use `DUMP STATUS` to check progress. Under `snapshot.mode: lock` the command blocks and `OK DUMP_SAVED` means the snapshot, its sidecar and the WAL checkpoint all completed.
 
 ---
 
@@ -115,16 +123,24 @@ DUMP LOAD /var/lib/nvecd/snapshots/backup.nvec
 
 **Response:**
 ```
-OK Snapshot loaded: 5000 events, 2000 vectors
-event_store_contexts: 100
-vector_store_vectors: 2000
-co_occurrence_pairs: 1500
+DUMP LOAD /var/lib/nvecd/snapshots/backup.nvec
+→ OK DUMP_LOADED /var/lib/nvecd/snapshots/backup.nvec
 ```
 
 **Important Notes:**
 - Loading a snapshot **replaces** all current data
 - The server will be in read-only mode during load
 - All existing connections receive an error during load
+- A load is **fail-closed on invalid co-occurrence edges**: a snapshot carrying
+  a self-edge or a non-finite score is refused whole rather than loaded with the
+  bad edge dropped. Skipping it would let the file appear to load while the
+  restored index differed from the one that was written, and such an edge
+  corrupts the map during pruning and breaks the ordering of every later sort.
+- Consequently **a snapshot written by an older build that already contains such
+  an edge is no longer loadable.** This is intended. Startup recovery falls back
+  to an older snapshot plus the WAL; a manual `DUMP LOAD` returns an error
+  naming the offending edge, and the file has to be rebuilt from a source that
+  never held one.
 
 ---
 
@@ -147,17 +163,13 @@ DUMP VERIFY /var/lib/nvecd/snapshots/backup.nvec
 
 **Response (Success):**
 ```
-OK Snapshot is valid (CRC32: 0x12345678)
-status: valid
-crc: verified
-size: verified
+DUMP VERIFY /var/lib/nvecd/snapshots/backup.nvec
+→ OK DUMP_VERIFIED /var/lib/nvecd/snapshots/backup.nvec
 ```
 
 **Response (Failure):**
 ```
-(error) CRC mismatch: file may be corrupted
-expected: 0x12345678
-actual: 0x87654321
+→ ERROR Snapshot verification failed for /var/lib/nvecd/snapshots/backup.nvec: CRC mismatch
 ```
 
 ---
@@ -203,8 +215,9 @@ DUMP STATUS
 
 **Response:**
 ```
-OK STATUS
+OK DUMP_STATUS
 status: idle
+END
 ```
 
 **Status Values:**
@@ -213,24 +226,26 @@ status: idle
 | `idle` | No snapshot in progress |
 | `in_progress` | Fork child is writing snapshot |
 | `completed` | Last snapshot saved successfully |
-| `failed` | Last snapshot failed (check error_message) |
+| `failed` | Last snapshot failed (the `error` field carries the reason) |
 
 **In-Progress Response:**
 ```
-OK STATUS
+OK DUMP_STATUS
 status: in_progress
-child_pid: 12345
 filepath: /var/lib/nvecd/snapshots/dump_20250325_120000.nvec
+pid: 12345
 start_time: 1711360800
+END
 ```
 
 **Completed Response:**
 ```
-OK STATUS
+OK DUMP_STATUS
 status: completed
 filepath: /var/lib/nvecd/snapshots/dump_20250325_120000.nvec
 start_time: 1711360800
 end_time: 1711360802
+END
 ```
 
 ---
@@ -305,8 +320,8 @@ snapshot:
 ### Auto-snapshot Behavior
 
 - Automatic snapshots are created on schedule
-- Filenames: `auto_YYYYMMDD_HHMMSS.snapshot`
-- Old snapshots are automatically cleaned up (keeps last `retain` snapshots)
+- Filenames: `auto_YYYYMMDD_HHMMSS.nvec`
+- Cleanup keeps the `retain` newest `auto_*.nvec` files and removes the rest; `retain: 0` disables cleanup and keeps every file
 - Manual snapshots are **not** affected by cleanup
 
 ---
@@ -378,21 +393,21 @@ Nvecd prevents path traversal attacks:
 
 ### Snapshot Save Fails
 
-**Error**: `(error) Cannot save snapshot: read-only mode`
+**Error**: `ERROR Cannot save snapshot: read-only mode`
 - **Cause**: Server is in read-only mode (loading in progress)
 - **Solution**: Wait for load to complete
 
-**Error**: `(error) Permission denied`
+**Error**: `ERROR Permission denied`
 - **Cause**: No write permission for `snapshot.dir`
 - **Solution**: Check directory permissions and ownership
 
 ### Snapshot Load Fails
 
-**Error**: `(error) CRC mismatch: file may be corrupted`
+**Error**: `ERROR CRC mismatch: file may be corrupted`
 - **Cause**: File corruption or incomplete write
 - **Solution**: Use a different snapshot file
 
-**Error**: `(error) Version mismatch: expected 1, got 2`
+**Error**: `ERROR Version mismatch: expected 1, got 2`
 - **Cause**: Snapshot created by newer Nvecd version
 - **Solution**: Upgrade Nvecd to compatible version
 

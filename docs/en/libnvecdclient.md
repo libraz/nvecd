@@ -9,7 +9,7 @@ libnvecdclient is a C/C++ client library for connecting to and querying nvecd se
 - Full support for all nvecd protocol commands
 - Modern C++17 API with RAII and type safety
 - C API for easy integration with other languages (Python, Node.js, etc.)
-- Thread-safe connection management
+- One handle shareable across threads, with commands serialized internally
 - Shared library build with a CMake package target (`nvecd::client`)
 
 ## Building
@@ -149,14 +149,34 @@ if (info) {
 
 ### Snapshot Management
 
+Under the default `snapshot.mode: fork` the server answers as soon as the
+writing child exists, so a successful `Save()` does not mean the file is
+readable. Check `SaveResult::completed` and poll `DumpStatus()` before loading,
+copying or uploading it.
+
 ```cpp
 // Save snapshot
-if (auto result = client.Save("snapshot.dmp"); !result) {
+auto result = client.Save("snapshot.nvec");
+if (!result) {
     std::cerr << "Save failed: " << result.error().message() << std::endl;
+} else if (!result->completed) {
+    // fork mode: a background writer was started and result->filepath is not
+    // ready yet. Poll until the writer finishes.
+    while (true) {
+        auto status = client.DumpStatus();
+        if (!status) {
+            std::cerr << "Status failed: " << status.error().message() << std::endl;
+            break;
+        }
+        if (status->find("status: in_progress") == std::string::npos) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
 }
 
 // Load snapshot
-if (auto result = client.Load("snapshot.dmp"); !result) {
+if (auto result = client.Load("snapshot.nvec"); !result) {
     std::cerr << "Load failed: " << result.error().message() << std::endl;
 }
 ```
@@ -412,7 +432,7 @@ console.log(results);
 ### C++ API Classes
 
 #### ClientConfig
-- `host` - Server hostname (default: "127.0.0.1")
+- `host` - Server hostname or IPv4 address (default: "127.0.0.1")
 - `port` - Server port (default: 11017)
 - `timeout_ms` - Connection timeout (default: 5000)
 - `recv_buffer_size` - Receive buffer size (default: 65536)
@@ -453,6 +473,7 @@ Field names mirror the keys emitted by the server's `INFO` command:
 #### nvecd Commands
 - `Expected<void, Error> Event(ctx, type, id, score)` - Track event (`type`: "ADD"/"SET"/"DEL")
 - `Expected<void, Error> Vecset(id, vector)` - Register vector
+- `Expected<void, Error> Vecdel(id)` - Delete a vector and its metadata
 - `Expected<void, Error> Metaset(id, metadata)` - Attach metadata for filtered search
 - `Expected<SimResponse, Error> Sim(id, top_k, mode, options)` - Search by ID
 - `Expected<SimResponse, Error> Simv(vector, top_k, mode, options)` - Search by vector
@@ -461,7 +482,9 @@ Field names mirror the keys emitted by the server's `INFO` command:
 - `Expected<void, Error> Auth(password)` - Authenticate the connection
 - `Expected<ServerInfo, Error> Info()` - Get server info
 - `Expected<std::string, Error> GetConfig()` - Get configuration
-- `Expected<std::string, Error> Save(filepath)` - Save snapshot
+- `Expected<SaveResult, Error> Save(filepath)` - Save snapshot; `SaveResult` is
+  `{ std::string filepath; bool completed; }` and `completed` is false when a
+  fork-mode background writer was started
 - `Expected<std::string, Error> Load(filepath)` - Load snapshot
 - `Expected<std::string, Error> Verify(filepath)` - Verify snapshot integrity
 - `Expected<std::string, Error> DumpInfo(filepath)` - Snapshot metadata
@@ -483,6 +506,7 @@ Key functions:
 - `nvecdclient_auth()` - Authenticate the connection
 - `nvecdclient_event()` - Track event (`ctx, type, id, score`)
 - `nvecdclient_vecset()` - Register vector
+- `nvecdclient_vecdel()` - Delete a vector and its metadata
 - `nvecdclient_metaset()` - Attach metadata
 - `nvecdclient_sim()` / `nvecdclient_sim_ex()` - Search by ID (the `_ex` form takes `NvecdSearchOptions_C`)
 - `nvecdclient_simv()` / `nvecdclient_simv_ex()` - Search by vector
@@ -490,6 +514,13 @@ Key functions:
 - `nvecdclient_cache_stats()` / `_clear()` / `_enable()` / `_disable()` - Cache management
 - `nvecdclient_dump_status()` - Background snapshot status
 - `nvecdclient_free_*()` - Free result structures
+
+**C API return codes:** every function returns `0` on success and a negative
+value on error, with one exception. `nvecdclient_save()` returns `0` when the
+snapshot is complete and loadable, `1` when a background writer was started and
+the file is not ready yet, and `-1` on error. `saved_path` is written for both
+success codes. Treating `1` as failure, or as "saved", both mislead: poll
+`nvecdclient_dump_status()` until the writer finishes before reading the file.
 
 **C API memory ownership:** functions returning a string via a `char**` out-parameter
 (e.g. `nvecdclient_get_config`, `nvecdclient_dump_status`, `nvecdclient_cache_stats`)
@@ -500,7 +531,20 @@ transfer ownership to the caller, who must free it with `nvecdclient_free_string
 
 ## Thread Safety
 
-The NvecdClient class manages a single TCP connection and is **not thread-safe**. For multi-threaded applications, create one client instance per thread or use proper synchronization.
+**A handle may be used from several threads at once.** One client instance
+holds one server connection, and sharing it is supported: you do not need a
+connection per thread.
+
+- Commands on one handle are **serialized internally** — they do not run in
+  parallel, so a slow command delays the ones queued behind it. Share a handle
+  to avoid paying for a connection per thread, not to gain throughput.
+- The C ABI's error slot is synchronized, so no call can observe a torn or
+  freed error message.
+- The pointer from `nvecdclient_get_last_error()` belongs to the calling thread
+  and stays valid until **that** thread calls it again. Other threads never
+  invalidate it. Copy the string if it has to outlive that.
+- **Creation and destruction are not synchronized.** No call may be in flight
+  when `nvecdclient_destroy()` runs.
 
 ## Error Handling
 

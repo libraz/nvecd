@@ -116,24 +116,38 @@ SIM movie123 10 using=fusion
 
 ---
 
-## Similarity Modes
+## Search Modes
 
-### Dot Product (`dot`)
+`SIM` takes one of three modes through `using=`: `events`, `vectors` or `fusion`.
+Any other value is rejected. `SIMV` always searches by the query vector you
+supply and takes no mode.
 
-Raw dot product between vectors. Use when vectors are already normalized or when magnitude matters.
+The arithmetic behind a vector comparison — dot product, cosine or L2 — is not a
+query mode. It is chosen once for the whole store by `vectors.distance_metric`
+in `config.yaml` and is fixed while the server runs:
+
+```yaml
+vectors:
+  distance_metric: cosine  # cosine, dot or l2
+```
+
+### Vector Similarity (`vectors`)
+
+Ranks purely by the distance between vectors, ignoring recorded events. Use for
+semantic search over embeddings.
 
 ```bash
-SIM item1 10 using=dot
+SIM item1 10 using=vectors
 SIMV 10 0.1 0.2 0.3 0.4 0.5
 ```
 
-### Cosine Similarity (`cosine`)
+### Co-occurrence (`events`)
 
-Normalized similarity (range: -1.0 to 1.0). Use for general semantic similarity regardless of vector magnitude.
+Ranks purely by co-occurrence built from events, ignoring vectors. Use when
+behaviour matters more than content, or for items whose vectors are missing.
 
 ```bash
-SIM item1 10 using=cosine
-SIMV 10 0.1 0.2 0.3 0.4 0.5
+SIM item1 10 using=events
 ```
 
 ### Fusion Search (`fusion`) - Recommended
@@ -363,4 +377,4 @@ performance:
 - See [Protocol Reference](protocol.md) for all available commands
 - See [Configuration Guide](configuration.md) for tuning options
 - See [Performance Guide](performance.md) for optimization tips
-- See [HTTP API Reference](http-api.md) for REST API usage (when available)
+- See [HTTP API Reference](http-api.md) for REST API usage

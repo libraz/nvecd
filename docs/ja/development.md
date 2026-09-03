@@ -116,24 +116,35 @@ SIM movie123 10 using=fusion
 
 ---
 
-## 類似度モード
+## 検索モード
 
-### 内積 (`dot`)
+`SIM` は `using=` で 3 つのモードのいずれかを取ります: `events`、`vectors`、`fusion` です。
+これ以外の値は拒否されます。`SIMV` は常に指定されたクエリベクトルで検索するため、モードを取りません。
 
-ベクトル間の生の内積です。ベクトルがすでに正規化されている場合や、大きさが重要な場合に使用します。
+ベクトル比較の演算そのもの（内積・コサイン・L2）はクエリのモードではありません。
+`config.yaml` の `vectors.distance_metric` によってストア全体で 1 つだけ選ばれ、
+サーバーの稼働中は固定されます:
+
+```yaml
+vectors:
+  distance_metric: cosine  # cosine, dot or l2
+```
+
+### ベクトル類似度 (`vectors`)
+
+記録済みのイベントを無視し、ベクトル間の距離だけで順位付けします。埋め込みに対する意味的検索に使用します。
 
 ```bash
-SIM item1 10 using=dot
+SIM item1 10 using=vectors
 SIMV 10 0.1 0.2 0.3 0.4 0.5 0.6
 ```
 
-### コサイン類似度 (`cosine`)
+### 共起 (`events`)
 
-正規化された類似度（範囲: -1.0 ～ 1.0）。ベクトルの大きさに関係なく、一般的な意味的類似性に使用します。
+ベクトルを無視し、イベントから構築した共起だけで順位付けします。内容よりも行動が重要な場合や、ベクトルが未登録のアイテムに使用します。
 
 ```bash
-SIM item1 10 using=cosine
-SIMV 10 0.1 0.2 0.3 0.4 0.5 0.6
+SIM item1 10 using=events
 ```
 
 ### フュージョン検索 (`fusion`) - 推奨
@@ -363,4 +374,4 @@ performance:
 - すべての利用可能なコマンドについては [プロトコルリファレンス](protocol.md) を参照
 - チューニングオプションについては [設定ガイド](configuration.md) を参照
 - 最適化のヒントについては [パフォーマンスガイド](performance.md) を参照
-- REST API 使用法については [HTTP API リファレンス](http-api.md) を参照（利用可能時）
+- REST API 使用法については [HTTP API リファレンス](http-api.md) を参照

@@ -157,12 +157,16 @@ make
 
 #### コードカバレッジの有効化
 
+カバレッジは Makefile のターゲットではなく CMake のターゲットで、PATH 上に
+`lcov` と `genhtml` が必要です。configure 時に `ENABLE_COVERAGE=ON` を渡した
+場合にのみ定義されます。
+
 ```bash
 cmake -B build -DENABLE_COVERAGE=ON
 cmake --build build --parallel
 
-# カバレッジ付きでテストを実行
-make coverage
+# テストを実行してレポートを生成
+cmake --build build --target coverage
 
 # カバレッジレポートの表示
 open build/coverage/html/index.html
@@ -186,9 +190,21 @@ sudo make install
 
 これにより以下がインストールされます:
 
-- **バイナリ**: `/usr/local/bin/nvecd`
-- **設定サンプル**: `/usr/local/etc/nvecd/config.yaml.example`
+- **サーバーバイナリ**: `/usr/local/bin/nvecd`
+- **CLI バイナリ**: `/usr/local/bin/nvecd-cli`
+- **クライアントライブラリ**: macOS では `/usr/local/lib/libnvecdclient.dylib`、Linux では `libnvecdclient.so`
+- **クライアントヘッダー**: `/usr/local/include/nvecd/`（`nvecdclient.h`、`nvecdclient_c.h`、および `utils/error.h`、`utils/expected.h`）
+- **CMake パッケージ**: `/usr/local/lib/cmake/nvecd/`（`nvecd::client` ターゲットをエクスポート）
+- **設定サンプル**: `/usr/local/etc/nvecd/config.yaml`
+- **設定スキーマ**: `/usr/local/etc/nvecd/config-schema.json`
 - **ドキュメント**: `/usr/local/share/doc/nvecd/`
+
+CMake プロジェクトからインストール済みのクライアントを利用するには:
+
+```cmake
+find_package(nvecd CONFIG REQUIRED)
+target_link_libraries(my_app PRIVATE nvecd::client)
+```
 
 ### カスタムインストール場所
 

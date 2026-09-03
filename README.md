@@ -119,7 +119,7 @@ Cache hit: **0.21us** (4.8M ops/sec). See [Benchmarks](docs/en/benchmarks.md) fo
 - **Client Library** - C++ and C client libraries for language bindings
 - **Metadata Filtering** - Attribute-based post-filtering for SIM/SIMV queries (`filter=key:value`)
 - **Score Thresholding** - Minimum score cutoff (`min_score=0.5`) to filter low-confidence results
-- **Write-Ahead Log** - Optional CRC32-verified operation log (`wal.enabled`); on restart, writes since the last snapshot are recovered by replaying the WAL
+- **Write-Ahead Log** - Optional CRC32-verified operation log (`wal.enabled`); on restart, writes since the last snapshot are recovered by replaying the WAL. Vector payloads are replayed only while `wal.include_vectors` stays enabled
 - **ANN Indexing** - Select HNSW or IVF through `similarity.index_type`
 - **Co-occurrence Pruning** - Configurable max neighbors and minimum support thresholds
 
@@ -166,20 +166,20 @@ nvecd-cli -p 11017 EVENT user1 DEL item_a
 
 Configurable via `events.negative_signals` and `events.negative_weight`.
 
-### Feature Matrix — Similar Projects
+### Feature Matrix — How Nvecd Differs
 
-| | Nvecd | Qdrant | Milvus | Faiss |
-|--|--|--|--|--|
-| Vector search | Yes | Yes | Yes | Yes |
-| Behavioral co-occurrence | Engine-level | App-level | App-level | No |
-| Adaptive fusion | Built-in | No | No | No |
-| Temporal co-occurrence | Built-in | No | No | No |
-| Negative signal suppression | Built-in | No | No | No |
-| Cold-start handling | Automatic | Manual | Manual | N/A |
-| Distributed search | No | Yes | Yes | No |
-| Managed cloud service | No | Yes | Yes | No |
-| ANN indexing (HNSW, IVF) | HNSW + IVF ([recall curve](docs/en/configuration.md#what-the-tuning-knobs-buy)) | Yes | Yes | Yes |
-| Metadata filtering | Yes (post-filter) | Yes | Yes | No |
+| | Nvecd | General-purpose vector database | Embedded ANN library |
+|--|--|--|--|
+| Vector search | Yes | Yes | Yes |
+| Behavioral co-occurrence | Engine-level | App-level | No |
+| Adaptive fusion | Built-in | No | No |
+| Temporal co-occurrence | Built-in | No | No |
+| Negative signal suppression | Built-in | No | No |
+| Cold-start handling | Automatic | Manual | N/A |
+| Distributed search | No | Typically yes | No |
+| Managed cloud service | No | Commonly offered | No |
+| ANN indexing (HNSW, IVF) | HNSW + IVF ([recall curve](docs/en/configuration.md#what-the-tuning-knobs-buy)) | Yes | Yes |
+| Metadata filtering | Yes (post-filter) | Yes | No |
 
 ## Architecture
 

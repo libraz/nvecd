@@ -26,7 +26,7 @@ nc -U /var/run/nvecd.sock
 - **トランスポート**: テキストベースの行プロトコル（UTF-8）
 - **リクエスト**: `COMMAND args...\r\n`（`\r\n` と `\n` の両方を受け付けます）
 - **レスポンス**: `OK data...\r\n` または `ERROR message\r\n`
-- **最大リクエストサイズ**: 16MB（設定変更可能）
+- **最大リクエストサイズ**: `performance.max_query_length` バイト（既定 1 MiB、上限 16 MiB）
 
 ### レスポンス形式
 
@@ -34,13 +34,16 @@ nc -U /var/run/nvecd.sock
 ```
 OK [data]\r\n
 ```
-または Redis スタイル: `+OK [data]\r\n`
+
+応答が受理の合図だけであるコマンドは、自身のコマンド名を返します（例: `OK VECSET`）。
+唯一の例外は `AUTH` で、`+OK\r\n` を返します。
 
 **エラー**:
 ```
 ERROR <message>\r\n
 ```
-または Redis スタイル: `-ERR <message>\r\n` または `(error) <message>\r\n`
+
+ワイヤ上のエラー形式はこれだけです。Redis スタイルの変種は出力されません。
 
 ---
 
@@ -80,27 +83,27 @@ EVENT <ctx> DEL <id>
 ```bash
 # ストリーム型イベント（クリック追跡）
 EVENT user123 ADD view:item456 95
-→ OK
+→ OK EVENT
 
 # 状態型イベント（いいね ON）
 EVENT user123 SET like:item456 100
-→ OK
+→ OK EVENT
 
 # 状態型イベント（いいね OFF）
 EVENT user123 SET like:item456 0
-→ OK
+→ OK EVENT
 
 # 重み付きブックマーク（重要度: 高）
 EVENT user123 SET bookmark:item789 100
-→ OK
+→ OK EVENT
 
 # ブックマーク重要度変更（中）
 EVENT user123 SET bookmark:item789 50
-→ OK
+→ OK EVENT
 
 # ブックマーク削除
 EVENT user123 DEL bookmark:item789
-→ OK
+→ OK EVENT
 ```
 
 **イベントタイプの動作**:
@@ -123,22 +126,22 @@ EVENT user1 SET like:item1 100  # 重複、無視される
 EVENT user1 SET bookmark:item1 100  # 重要度: 高
 EVENT user1 SET bookmark:item1 50   # 重要度: 中（格納）
 EVENT user1 SET bookmark:item1 50   # 重複（無視）
-→ OK
+→ OK EVENT
 
 # DEL は冪等
 EVENT user1 DEL like:item1
 EVENT user1 DEL like:item1  # 既に削除済み、無視される
-→ OK
+→ OK EVENT
 ```
 
 **エラーレスポンス**:
-- `(error) Invalid EVENT type: <type> (must be ADD, SET, or DEL)`
-- `(error) EVENT ADD requires 4 arguments: <ctx> ADD <id> <score>`
-- `(error) EVENT SET requires 4 arguments: <ctx> SET <id> <score>`
-- `(error) EVENT DEL requires 3 arguments: <ctx> DEL <id>`
-- `(error) Invalid score: must be integer`
-- `(error) Context cannot be empty`
-- `(error) ID cannot be empty`
+- `ERROR Invalid EVENT type: <type> (must be ADD, SET, or DEL)`
+- `ERROR EVENT ADD requires 4 arguments: <ctx> ADD <id> <score>`
+- `ERROR EVENT SET requires 4 arguments: <ctx> SET <id> <score>`
+- `ERROR EVENT DEL requires 3 arguments: <ctx> DEL <id>`
+- `ERROR Invalid score: must be integer`
+- `ERROR Context cannot be empty`
+- `ERROR ID cannot be empty`
 
 **注意事項**:
 - イベントはコンテキストごとのリングバッファに格納されます（サイズ: `events.ctx_buffer_size`）
@@ -166,19 +169,19 @@ VECSET <id> <f1> <f2> ... <fN>
 **例**:
 ```
 VECSET item456 0.1 0.5 0.8
-→ OK
+→ OK VECSET
 ```
 
 **768 次元ベクトルの例**:
 ```
 VECSET item789 0.11 0.98 -0.22 0.44 ... (768 個の値)
-→ OK
+→ OK VECSET
 ```
 
 **エラーレスポンス**:
-- `(error) Dimension mismatch: expected 768, got 512`
-- `(error) Invalid vector format`
-- `(error) Invalid argument count`
+- `ERROR Dimension mismatch: expected 768, got 512`
+- `ERROR Invalid vector format`
+- `ERROR Invalid argument count`
 
 **注意事項**:
 - 次元数は値の数から自動検出されます
@@ -186,6 +189,34 @@ VECSET item789 0.11 0.98 -0.22 0.44 ... (768 個の値)
 - ベクトルは `vectors.distance_metric` の設定に基づいて自動的に正規化されます
 
 ---
+
+### VECDEL — ベクトルの削除
+
+アイテムのベクトル、そのメタデータ、キャッシュ済みの結果を削除します。
+
+**構文**:
+```
+VECDEL <id>
+```
+
+**パラメータ**:
+- `<id>`: アイテム識別子（文字列）
+
+**例**:
+```
+VECDEL item456
+→ OK VECDEL
+```
+
+**エラーレスポンス**:
+- `ERROR VECDEL requires 1 argument: <id>`
+- `ERROR Vector not found: item456`
+
+**注意**:
+- `security.requirepass` が設定されている場合は認証が必要です
+- `METASET` で登録したメタデータもベクトルと一緒に削除されます
+- 有効な ANN インデックスが再構築されるため、削除は書き込みより高コストです
+- `EVENT` が記録した共起エッジは影響を受けません
 
 ### METASET — アイテムメタデータの登録
 
@@ -286,9 +317,9 @@ item202 0.8567
 ```
 
 **エラーレスポンス**:
-- `(error) Item not found: item456`
-- `(error) Invalid mode: must be events, vectors, or fusion`
-- `(error) Invalid top_k: must be > 0 and <= 1000`
+- `ERROR Item not found: item456`
+- `ERROR Invalid mode: must be events, vectors, or fusion`
+- `ERROR Invalid top_k: must be > 0 and <= 1000`
 
 **注意事項**:
 - fusion モードはベクトル類似度（重み: `similarity.fusion_alpha`）と共起スコア（重み: `similarity.fusion_beta`）を組み合わせます
@@ -336,9 +367,9 @@ item789 0.9800
 ```
 
 **エラーレスポンス**:
-- `(error) Dimension mismatch: expected 768, got 512`
-- `(error) Invalid vector format`
-- `(error) Invalid top_k`
+- `ERROR Dimension mismatch: expected 768, got 512`
+- `ERROR Invalid vector format`
+- `ERROR Invalid top_k`
 
 **注意事項**:
 - 次元数は値の数から自動検出されます
@@ -364,11 +395,11 @@ AUTH <password>
 **例**:
 ```bash
 AUTH mysecretpassword
-→ OK
+→ +OK
 
 # 認証なしの場合、書き込みコマンドは拒否されます:
 VECSET item1 0.1 0.2 0.3
-→ (error) NOAUTH Authentication required
+→ ERROR NOAUTH Authentication required
 ```
 
 **注意事項**:
@@ -442,11 +473,15 @@ CONFIG VERIFY
 ```
 CONFIG HELP events
 → +OK
-events:
-  ctx_buffer_size: Ring buffer size per context (default: 50)
-  decay_interval_sec: Decay interval in seconds (default: 3600)
-  decay_alpha: Decay factor 0.0-1.0 (default: 0.99)
+Available paths under 'events':
+  ctx_buffer_size  - Number of events to track per context (ring buffer size)
+  decay_alpha      - Decay factor
+  ...
+END
 ```
+
+`CONFIG HELP`、`CONFIG SHOW`、`CONFIG VERIFY` は `+OK` に続けて複数行の本文を返し、
+最後に終端トークン `END` を出力します。最初の空行までではなく `END` まで読んでください。
 
 #### CONFIG SHOW
 
@@ -456,18 +491,35 @@ events:
 ```
 CONFIG SHOW events.ctx_buffer_size
 → +OK
-events:
-  ctx_buffer_size: 50
+50
+END
 ```
 
 #### CONFIG VERIFY
 
 設定ファイルを検証します（サーバー起動前にも使用可能）。
 
+`CONFIG VERIFY` はファイルパスを必須とし、解析した内容の要約を返します。
+
 **レスポンス**:
 ```
-+OK Configuration is valid
+CONFIG VERIFY /etc/nvecd/config.yaml
+→ +OK
+Configuration is valid
+  Vectors:
+    dimension: 768
+    distance_metric: cosine
+  Events:
+    ctx_buffer_size: 50
+    decay_interval_sec: 3600
+  API:
+    tcp: 127.0.0.1:11017
+END
 ```
+
+**エラーレスポンス**:
+- `ERROR CONFIG VERIFY requires a filepath`
+- `ERROR Configuration validation failed: <reason>`
 
 ---
 
@@ -485,19 +537,42 @@ DUMP INFO [<filepath>]
 
 #### DUMP SAVE
 
-完全なスナップショットをディスクに保存します。
+完全なスナップショットをディスクに保存します。レスポンスは `snapshot.mode` によって変わります。
 
-**例**:
+**例（`snapshot.mode: lock`）**:
 ```
-DUMP SAVE /data/nvecd.dmp
-→ +OK Snapshot saved: /data/nvecd.dmp (512.3 MB) in 2.35s
+DUMP SAVE /data/nvecd.nvec
+→ OK DUMP_SAVED /data/nvecd.nvec
 ```
 
-**ファイルパスを省略した場合（自動生成名）**:
+`OK DUMP_SAVED` は耐久性ハンドシェイクが最後まで完了したことを意味します。すなわち、
+スナップショットが書き出され、その sidecar が永続化され、WAL がチェックポイントされて
+切り詰められた状態です。いずれかの段階が失敗した場合は、OK レスポンスの下にログ行を
+残すのではなくエラーとして報告されるため、受理の返答がデータを追い越すことはありません。
+
+**例（`snapshot.mode: fork`）**:
+```
+DUMP SAVE /data/nvecd.nvec
+→ OK DUMP_SAVE_STARTED /data/nvecd.nvec
+```
+
+fork モードが返すのはバックグラウンドの子プロセスが開始したという合図であって、完了の
+合図ではありません。結果は `DUMP STATUS` で確認してください。
+
+**ファイルパスを省略した場合**:
 ```
 DUMP SAVE
-→ +OK Snapshot saved: /var/lib/nvecd/snapshots/auto_20251118_143000.dmp (512.3 MB) in 2.35s
+→ OK DUMP_SAVED /var/lib/nvecd/snapshots/nvecd.snapshot
 ```
+
+引数なしの保存は `snapshot.default_filename` に書き込みます。クライアントが指定した名前と
+同じパス検証を通し、スナップショットディレクトリ内に解決されます。この設定が空の場合は
+`snapshot_YYYYMMDD_HHMMSS.dmp` 形式の名前にフォールバックします。
+
+**エラーレスポンス**:
+- `ERROR Another snapshot save is already in progress`
+- `ERROR Cannot save snapshot while a snapshot load is in progress`
+- `ERROR Failed to save snapshot to /data/nvecd.nvec: <reason>`
 
 #### DUMP LOAD
 
@@ -505,14 +580,17 @@ DUMP SAVE
 
 **例**:
 ```
-DUMP LOAD /data/nvecd.dmp
-→ +OK Snapshot loaded: /data/nvecd.dmp (5000 events, 2000 vectors) in 1.23s
+DUMP LOAD /data/nvecd.nvec
+→ OK DUMP_LOADED /data/nvecd.nvec
 ```
 
+読み込みは、そのスナップショットを永続的な復旧基点にし、読み込み前の WAL 末尾を破棄します。
+これにより、オペレーターが巻き戻した変更を後の再起動が再生してしまうことはありません。
+
 **エラーレスポンス**:
-- `(error) File not found: /data/nvecd.dmp`
-- `(error) CRC mismatch: file may be corrupted`
-- `(error) Unsupported snapshot version`
+- `ERROR File not found: /data/nvecd.nvec`
+- `ERROR CRC mismatch: file may be corrupted`
+- `ERROR Unsupported snapshot version`
 
 #### DUMP VERIFY
 
@@ -520,27 +598,28 @@ DUMP LOAD /data/nvecd.dmp
 
 **例**:
 ```
-DUMP VERIFY /data/nvecd.dmp
-→ +OK Snapshot is valid (CRC32: 0x12345678)
+DUMP VERIFY /data/nvecd.nvec
+→ OK DUMP_VERIFIED /data/nvecd.nvec
 ```
+
+**エラーレスポンス**:
+- `ERROR Snapshot verification failed for /data/nvecd.nvec: <reason>`
 
 #### DUMP INFO
 
-スナップショットのメタデータ（バージョン、サイズ、CRC32、レコード数）を表示します。
+スナップショットのメタデータを表示します。
 
 **例**:
 ```
-DUMP INFO /data/nvecd.dmp
-→ +OK INFO
+DUMP INFO /data/nvecd.nvec
+→ OK DUMP_INFO /data/nvecd.nvec
 version: 1
+stores: 3
 flags: 0
-timestamp: 2025-11-18T14:30:00Z
-event_store_count: 5000
-co_occurrence_count: 1500
-vector_store_count: 2000
-file_size_bytes: 536870912
-file_size_human: 512.00 MB
-crc32: 0x12345678
+file_size: 536870912
+timestamp: 1705564800
+has_statistics: true
+END
 ```
 
 #### DUMP STATUS
@@ -554,23 +633,29 @@ DUMP STATUS
 
 **レスポンス**:
 ```
-OK STATUS
+OK DUMP_STATUS
 status: idle|in_progress|completed|failed
-child_pid: <pid>
 filepath: <path>
+pid: <pid>
 start_time: <timestamp>
 end_time: <timestamp>
-error_message: <message>
+error: <message>
+END
 ```
+
+`status:` に続くフィールドはステータスによって変わります。`idle` は何も伴わず、
+`in_progress` は `filepath`、`pid`、`start_time` を、`completed` は `pid` の代わりに
+`end_time` を、`failed` はさらに `error` を伴います。`END` まで読んでください。
 
 **例**:
 ```bash
 DUMP STATUS
-→ OK STATUS
+→ OK DUMP_STATUS
 status: completed
 filepath: /var/lib/nvecd/snapshots/dump_20250325_120000.nvec
 start_time: 1711360800
 end_time: 1711360802
+END
 ```
 
 **注意事項**:
@@ -609,7 +694,7 @@ DEBUG ON
 **例**:
 ```
 DEBUG OFF
-→ OK Debug mode disabled
+→ OK DEBUG_OFF
 ```
 
 **デバッグ出力例**（DEBUG ON 時）:
@@ -620,15 +705,20 @@ item789 0.9245
 item101 0.8932
 item202 0.8567
 
-# DEBUG
-query_time_us: 850
-event_search_time_us: 320
-vector_search_time_us: 410
-fusion_time_us: 120
+# DEBUG 4
 mode: fusion
-event_candidates: 15
-vector_candidates: 12
+query_time_us: 850
+candidates: 15
+results: 3
 ```
+
+デバッグブロックは、DEBUG モードが有効な接続に対して通常の SIM/SIMV の結果の後ろに
+付加されます。`# DEBUG` ヘッダーは後続のフィールド数を持つため、ステートフルな
+クライアントは中身を解釈せずにブロックを切り出せます。フィールド:
+- `mode`: 検索モード（`events`、`vectors`、`fusion`、SIMV では `vector`）
+- `query_time_us`: クエリ実行時間の合計（マイクロ秒）
+- `candidates`: `min_score` による絞り込み前の候補数
+- `results`: クライアントに返した結果数
 
 ---
 
@@ -763,23 +853,17 @@ cache:
 すべてのエラーは一貫した形式に従います：
 
 ```
-(error) <error_message>
-```
-
-または Redis スタイル：
-
-```
--ERR <error_message>
+ERROR <error_message>
 ```
 
 **一般的なエラー例**:
-- `(error) Unknown command: FOO`
-- `(error) Invalid argument count`
-- `(error) Item not found: item123`
-- `(error) Dimension mismatch: expected 768, got 512`
-- `(error) Invalid score: must be 0-100`
-- `(error) File not found: /data/dump.dmp`
-- `(error) CRC mismatch: file may be corrupted`
+- `ERROR Unknown command: FOO`
+- `ERROR Invalid argument count`
+- `ERROR Item not found: item123`
+- `ERROR Dimension mismatch: expected 768, got 512`
+- `ERROR Invalid score: must be 0-100`
+- `ERROR File not found: /data/dump.dmp`
+- `ERROR CRC mismatch: file may be corrupted`
 
 ---
 

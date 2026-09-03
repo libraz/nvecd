@@ -119,8 +119,8 @@ Apple M5 Max (NEON) で計測、dim=128、cosine、top_k=10:
 - **クライアントライブラリ** - 言語バインディング用のC++/Cクライアントライブラリ
 - **メタデータフィルタリング** - SIM/SIMV クエリの属性ベースポストフィルタ (`filter=key:value`)
 - **スコア閾値フィルタ** - 低信頼度の結果を除外する最小スコア (`min_score=0.5`)
-- **Write-Ahead Log** - CRC32 検証付き操作ログによるクラッシュリカバリ
-- **階層型ベクトルストア** - デルタバッファとバックグラウンドマージによる二層アーキテクチャ
+- **Write-Ahead Log** - CRC32 検証付きの操作ログ (`wal.enabled`)。再起動時、直近のスナップショット以降の書き込みは WAL の再生によって復元されます。ベクトル本体が再生されるのは `wal.include_vectors` が有効なあいだだけです
+- **ANN インデックス** - `similarity.index_type` で HNSW または IVF を選択
 - **共起プルーニング** - 最大隣接数と最小サポート閾値の設定
 
 ## Nvecd の差別化ポイント
@@ -166,20 +166,20 @@ nvecd-cli -p 11017 EVENT user1 DEL item_a
 
 `events.negative_signals` と `events.negative_weight` で設定可能。
 
-### 機能比較 — 類似プロジェクト
+### 機能比較 — Nvecd の位置づけ
 
-| | Nvecd | Qdrant | Milvus | Faiss |
-|--|--|--|--|--|
-| ベクトル検索 | Yes | Yes | Yes | Yes |
-| 行動共起 | エンジンレベル | アプリ層 | アプリ層 | No |
-| 適応型フュージョン | 組み込み | No | No | No |
-| テンポラル共起 | 組み込み | No | No | No |
-| ネガティブシグナル | 組み込み | No | No | No |
-| コールドスタート対応 | 自動 | 手動 | 手動 | N/A |
-| 分散検索 | No | Yes | Yes | No |
-| マネージドクラウド | No | Yes | Yes | No |
-| ANNインデックス (HNSW, IVF) | HNSW + IVF（[recall 曲線](docs/ja/configuration.md#チューニングパラメータで何が得られるか)） | Yes | Yes | Yes |
-| メタデータフィルタリング | Yes (ポストフィルタ) | Yes | Yes | No |
+| | Nvecd | 汎用ベクトルデータベース | 組み込み ANN ライブラリ |
+|--|--|--|--|
+| ベクトル検索 | Yes | Yes | Yes |
+| 行動共起 | エンジンレベル | アプリ層 | No |
+| 適応型フュージョン | 組み込み | No | No |
+| テンポラル共起 | 組み込み | No | No |
+| ネガティブシグナル | 組み込み | No | No |
+| コールドスタート対応 | 自動 | 手動 | N/A |
+| 分散検索 | No | 一般的に Yes | No |
+| マネージドクラウド | No | 提供されることが多い | No |
+| ANNインデックス (HNSW, IVF) | HNSW + IVF（[recall 曲線](docs/ja/configuration.md#チューニングパラメータで何が得られるか)） | Yes | Yes |
+| メタデータフィルタリング | Yes (ポストフィルタ) | Yes | No |
 
 ## Nvecd が適しているケース
 
