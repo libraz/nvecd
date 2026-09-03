@@ -41,7 +41,25 @@ TEST_F(MetadataStoreTest, Delete) {
 }
 
 TEST_F(MetadataStoreTest, DeleteNonExistent) {
-  store_.Delete("missing");  // Should not crash
+  store_.Set("present", {{"status", std::string("active")}});
+  ASSERT_EQ(store_.Size(), 1U);
+
+  // Deleting an ID that was never set is a no-op: it must not insert an entry
+  // for that ID and must leave every other entry untouched.
+  store_.Delete("missing");
+
+  EXPECT_EQ(store_.Get("missing"), nullptr);
+  EXPECT_EQ(store_.Size(), 1U);
+  const auto* present = store_.Get("present");
+  ASSERT_NE(present, nullptr);
+  EXPECT_EQ(std::get<std::string>(present->at("status")), "active");
+
+  // A no-op delete must not make the ID visible to the no-condition filter
+  // either, which would leak a phantom item into unfiltered searches.
+  MetadataFilter empty_filter;
+  auto all = store_.Filter(empty_filter);
+  ASSERT_EQ(all.size(), 1U);
+  EXPECT_EQ(all[0], "present");
 }
 
 TEST_F(MetadataStoreTest, Update) {

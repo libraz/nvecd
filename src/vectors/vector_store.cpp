@@ -15,10 +15,6 @@
 
 namespace nvecd::vectors {
 
-namespace {
-constexpr size_t kMaxVectorDimension = 4096;
-}
-
 VectorStore::VectorStore(config::VectorsConfig config) : config_(std::move(config)) {}
 
 utils::Expected<void, utils::Error> VectorStore::ValidateVector(const std::string& vector_id,
@@ -34,9 +30,9 @@ utils::Expected<void, utils::Error> VectorStore::ValidateVector(const std::strin
     utils::LogVectorStoreError("set_vector", vector_id, static_cast<int>(vec.size()), error.message());
     return utils::MakeUnexpected(error);
   }
-  if (vec.size() > kMaxVectorDimension) {
+  if (vec.size() > kMaxDimension) {
     auto error = utils::MakeError(utils::ErrorCode::kVectorDimensionMismatch,
-                                  "Vector dimension exceeds maximum of " + std::to_string(kMaxVectorDimension));
+                                  "Vector dimension exceeds maximum of " + std::to_string(kMaxDimension));
     utils::LogVectorStoreError("set_vector", vector_id, static_cast<int>(vec.size()), error.message());
     return utils::MakeUnexpected(error);
   }
@@ -142,6 +138,34 @@ utils::Expected<void, utils::Error> VectorStore::SetVector(const std::string& ve
     generation_.fetch_add(1, std::memory_order_release);
   }
 
+  return {};
+}
+
+utils::Expected<void, utils::Error> VectorStore::RestoreDimension(size_t dimension) {
+  if (dimension == 0 || dimension > kMaxDimension) {
+    auto error = utils::MakeError(utils::ErrorCode::kVectorInvalidDimension,
+                                  "Restored dimension out of range: " + std::to_string(dimension));
+    utils::LogVectorStoreError("restore_dimension", "", static_cast<int>(dimension), error.message());
+    return utils::MakeUnexpected(error);
+  }
+
+  std::unique_lock lock(mutex_);
+  const size_t current_dim = dimension_.load(std::memory_order_relaxed);
+  if (current_dim == dimension) {
+    return {};
+  }
+  // Stored rows are laid out at the current dimension; adopting another one
+  // would reinterpret every existing row at the wrong stride.
+  if (!idx_to_id_.empty()) {
+    auto error = utils::MakeError(utils::ErrorCode::kVectorDimensionMismatch,
+                                  "Cannot restore dimension " + std::to_string(dimension) + " onto a store holding " +
+                                      std::to_string(current_dim) + "-dimensional vectors");
+    utils::LogVectorStoreError("restore_dimension", "", static_cast<int>(dimension), error.message());
+    return utils::MakeUnexpected(error);
+  }
+
+  dimension_.store(dimension, std::memory_order_release);
+  generation_.fetch_add(1, std::memory_order_release);
   return {};
 }
 
@@ -377,6 +401,12 @@ void VectorStore::Defragment() {
 }
 
 void VectorStore::DefragmentLocked() {
+  // Nothing to reclaim: compacting here would copy the whole matrix and force
+  // every consumer keyed by compact index to rebuild, for no change in layout.
+  if (tombstone_count_ == 0) {
+    return;
+  }
+
   size_t dim = dimension_.load(std::memory_order_relaxed);
   if (dim == 0 || active_count_ == 0) {
     matrix_.clear();

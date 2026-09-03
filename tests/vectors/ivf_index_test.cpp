@@ -10,9 +10,12 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <map>
 #include <numeric>
 #include <random>
+#include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "vectors/distance.h"
@@ -526,6 +529,33 @@ TEST_F(IvfIndexTest, SealEmptyBuffer) {
   EXPECT_EQ(index.GetIndexedCount(), count_before);
 }
 
+// The return value is what tells a caller whether the write buffer is drained.
+// Reporting success for a seal that put the entries back would leave them to be
+// rescanned by every query, with nothing scheduled to re-evaluate the condition
+// afterwards.
+TEST_F(IvfIndexTest, SealBufferReportsWhetherEntriesWerePublished) {
+  IvfIndex untrained(kDim);
+  EXPECT_TRUE(untrained.SealBuffer()) << "an empty buffer has nothing left unsealed";
+
+  for (size_t i = 0; i < 20; ++i) {
+    untrained.AppendToBuffer(i, vectors_[i].data());
+  }
+  EXPECT_FALSE(untrained.SealBuffer()) << "entries stay buffered until the index is trained";
+  EXPECT_EQ(untrained.GetBufferSize(), 20U);
+
+  IvfIndex::Config config;
+  config.nlist = 8;
+  config.nprobe = 4;
+  IvfIndex trained(kDim, config);
+  trained.Train(matrix_.data(), valid_indices_.data(), valid_indices_.size(), kDim, false);
+  for (size_t i = 0; i < 20; ++i) {
+    trained.AppendToBuffer(i, vectors_[i].data());
+  }
+  EXPECT_TRUE(trained.SealBuffer());
+  EXPECT_EQ(trained.GetBufferSize(), 0U);
+  EXPECT_EQ(trained.GetIndexedCount(), 20U);
+}
+
 TEST_F(IvfIndexTest, TwoTierSearchMergesResults) {
   IvfIndex::Config config;
   config.nlist = 8;
@@ -782,7 +812,8 @@ TEST(IvfMetricDivergenceTest, DotAndL2DifferFromCosine) {
       << "All metrics agreed on top-1; metric may be ignored";
 }
 
-// Bug #8: zero-norm vectors must not all collapse into cluster 0.
+// Zero-norm vectors have no nearest centroid under cosine and must be spread
+// deterministically instead of all collapsing into cluster 0.
 TEST(IvfZeroNormTest, ZeroNormVectorsDoNotAllCollapseToClusterZero) {
   constexpr uint32_t kDim = 8;
   constexpr size_t kNonZero = 100;
@@ -823,6 +854,378 @@ TEST(IvfZeroNormTest, ZeroNormVectorsDoNotAllCollapseToClusterZero) {
   EXPECT_GT(results.size(), 0U);
   // Top result should be the (non-zero) query itself.
   EXPECT_EQ(results[0].second, 0U);
+}
+
+// ============================================================================
+// Cluster-count derivation
+// ============================================================================
+
+// Centroid seeding draws one distinct training sample per cluster. An nlist
+// above the internal training-sample cap is reachable from a schema-valid
+// configuration and used to index past the seeding permutation, then use that
+// garbage as a matrix row offset. Only the seeding path is exercised here
+// (max_iterations 0, no assignment), which is where the out-of-range read was.
+TEST(IvfClusterCountTest, NlistAboveTrainingSampleCapIsClamped) {
+  constexpr uint32_t kDim = 4;
+  constexpr size_t kCount = IvfIndex::kMaxTrainingSamples + 1000;
+
+  std::mt19937 rng(9);
+  std::vector<std::vector<float>> vecs;
+  vecs.reserve(kCount);
+  for (size_t i = 0; i < kCount; ++i) {
+    vecs.push_back(RandomVector(kDim, rng));
+  }
+  std::vector<float> matrix = BuildMatrix(vecs);
+  std::vector<size_t> indices(kCount);
+  std::iota(indices.begin(), indices.end(), size_t{0});
+
+  IvfIndex::Config config;
+  config.nlist = 12000;
+  config.nprobe = 1;
+  config.max_iterations = 0;
+  IvfIndex index(kDim, config);
+
+  index.Train(matrix.data(), indices.data(), kCount, kDim, /*assign_vectors=*/false);
+
+  EXPECT_TRUE(index.IsTrained());
+  EXPECT_GT(index.GetClusterCount(), 0U);
+  EXPECT_LE(index.GetClusterCount(), IvfIndex::kMaxTrainingSamples);
+}
+
+// Resetting the trained state must not discard an explicit cluster count: the
+// restore path only fires for the auto sentinel, so clearing it here silently
+// replaced the operator's setting with auto-scaling for the rest of the run.
+TEST(IvfClusterCountTest, ResetTrainedKeepsConfiguredNlist) {
+  constexpr uint32_t kDim = 8;
+  constexpr size_t kCount = 200;
+  constexpr uint32_t kNlist = 16;
+
+  std::mt19937 rng(11);
+  std::vector<std::vector<float>> vecs;
+  for (size_t i = 0; i < kCount; ++i) {
+    vecs.push_back(RandomVector(kDim, rng));
+  }
+  std::vector<float> matrix = BuildMatrix(vecs);
+  std::vector<size_t> indices(kCount);
+  std::iota(indices.begin(), indices.end(), size_t{0});
+
+  IvfIndex::Config config;
+  config.nlist = kNlist;
+  config.max_iterations = 2;
+  IvfIndex index(kDim, config);
+
+  index.Train(matrix.data(), indices.data(), kCount, kDim);
+  ASSERT_EQ(index.GetClusterCount(), kNlist);
+
+  index.ResetTrained();
+  index.Train(matrix.data(), indices.data(), kCount, kDim);
+
+  EXPECT_EQ(index.GetClusterCount(), kNlist);
+}
+
+// The auto sentinel must keep rescaling with the corpus after a reset.
+TEST(IvfClusterCountTest, AutoNlistRescalesAfterReset) {
+  constexpr uint32_t kDim = 8;
+  constexpr size_t kSmall = 100;
+  constexpr size_t kLarge = 400;
+
+  std::mt19937 rng(13);
+  std::vector<std::vector<float>> vecs;
+  for (size_t i = 0; i < kLarge; ++i) {
+    vecs.push_back(RandomVector(kDim, rng));
+  }
+  std::vector<float> matrix = BuildMatrix(vecs);
+  std::vector<size_t> indices(kLarge);
+  std::iota(indices.begin(), indices.end(), size_t{0});
+
+  IvfIndex::Config config;
+  config.nlist = 0;  // auto
+  config.max_iterations = 2;
+  IvfIndex index(kDim, config);
+
+  index.Train(matrix.data(), indices.data(), kSmall, kDim);
+  ASSERT_EQ(index.GetClusterCount(), 10U);  // sqrt(100)
+
+  index.ResetTrained();
+  index.Train(matrix.data(), indices.data(), kLarge, kDim);
+
+  EXPECT_EQ(index.GetClusterCount(), 20U);  // sqrt(400)
+}
+
+// ============================================================================
+// Dimension rebinding
+// ============================================================================
+
+// Reset binds a new stride and therefore has to drop everything laid out at the
+// old one, including buffered entries that a later search would otherwise scan
+// at the wrong offset.
+TEST(IvfResetTest, ResetRebindsDimensionAndClearsTransientTiers) {
+  constexpr uint32_t kOldDim = 4;
+  constexpr uint32_t kNewDim = 8;
+
+  IvfIndex::Config config;
+  config.nlist = 2;
+  IvfIndex index(kOldDim, config);
+  ASSERT_EQ(index.GetDimension(), kOldDim);
+
+  std::vector<float> vec(kOldDim, 1.0F);
+  index.AppendToBuffer(0, vec.data());
+  ASSERT_EQ(index.GetBufferSize(), 1U);
+
+  index.Reset(kNewDim);
+
+  EXPECT_EQ(index.GetDimension(), kNewDim);
+  EXPECT_EQ(index.GetBufferSize(), 0U);
+  EXPECT_FALSE(index.IsTrained());
+}
+
+// ============================================================================
+// Write-buffer slot bookkeeping
+// ============================================================================
+
+// The tiers keep a compact_index -> slot map so that appending, removing and
+// sealing cost the same whether the buffer holds ten entries or a hundred
+// thousand. A map that drifts from the arrays it indexes is invisible until it
+// overwrites the wrong row, so the tests below re-derive the expected contents
+// from a deliberately naive model after every mutation.
+namespace {
+
+/// Reference model of the write-buffer semantics, written the way the index
+/// worked before the slot maps: linear scans, no bookkeeping to get wrong. It
+/// is defined in this translation unit only, so production code cannot call it
+/// and cannot pass the comparison by sharing an implementation with it.
+class BufferReference {
+ public:
+  void Append(size_t compact_index, float value) {
+    for (auto& entry : buffer_) {
+      if (entry.first == compact_index) {
+        entry.second = value;
+        return;
+      }
+    }
+    buffer_.emplace_back(compact_index, value);
+  }
+
+  void Remove(size_t compact_index) {
+    RemoveFromTier(compact_index, buffer_);
+    RemoveFromTier(compact_index, sealing_);
+  }
+
+  /// Seal on an untrained index: entries move to the sealing tier and come back
+  /// unless a newer buffered embedding already claimed the same index.
+  void SealUntrained() {
+    if (buffer_.empty() || !sealing_.empty()) {
+      return;
+    }
+    sealing_.swap(buffer_);
+    for (const auto& entry : sealing_) {
+      bool superseded = false;
+      for (const auto& buffered : buffer_) {
+        if (buffered.first == entry.first) {
+          superseded = true;
+          break;
+        }
+      }
+      if (!superseded) {
+        buffer_.push_back(entry);
+      }
+    }
+    sealing_.clear();
+  }
+
+  size_t Size() const { return buffer_.size() + sealing_.size(); }
+  size_t SealingSize() const { return sealing_.size(); }
+
+  /// Contents as a search over the tiers would report them: a buffered entry
+  /// shadows a sealing entry with the same compact index.
+  std::map<size_t, float> Projection() const {
+    std::map<size_t, float> projection;
+    for (const auto& entry : sealing_) {
+      projection[entry.first] = entry.second;
+    }
+    for (const auto& entry : buffer_) {
+      projection[entry.first] = entry.second;
+    }
+    return projection;
+  }
+
+ private:
+  static void RemoveFromTier(size_t compact_index, std::vector<std::pair<size_t, float>>& tier) {
+    for (size_t i = 0; i < tier.size();) {
+      if (tier[i].first != compact_index) {
+        ++i;
+        continue;
+      }
+      tier[i] = tier.back();
+      tier.pop_back();
+    }
+  }
+
+  std::vector<std::pair<size_t, float>> buffer_;
+  std::vector<std::pair<size_t, float>> sealing_;
+};
+
+/// Vector whose every component is @p value, so a dot product against an
+/// all-ones query of the same dimension recovers the value the entry was
+/// written with. That makes a stale slot visible as a wrong embedding rather
+/// than only as a wrong count.
+std::vector<float> ValueVector(uint32_t dim, float value) {
+  return std::vector<float>(dim, value);
+}
+
+/// Read the tier contents back out of the index through its search path.
+std::map<size_t, float> ReadTiers(const IvfIndex& index, uint32_t dim) {
+  const std::vector<float> query(dim, 1.0F);
+  const float query_norm = L2Norm(query);
+  auto results = index.SearchBuffer(query.data(), query_norm, dim, 4096);
+  std::map<size_t, float> projection;
+  for (const auto& [score, compact_index] : results) {
+    projection[compact_index] = score / static_cast<float>(dim);
+  }
+  return projection;
+}
+
+}  // namespace
+
+TEST(IvfBufferBookkeepingTest, TierContentsMatchLinearScanReferenceAfterEveryMutation) {
+  constexpr uint32_t kDim = 4;
+
+  IvfIndex::Config config;
+  config.metric = IvfMetric::kDot;  // Score recovers the written value exactly.
+  IvfIndex index(kDim, config);
+  BufferReference reference;
+
+  size_t step = 0;
+  const auto check = [&](const char* what) {
+    SCOPED_TRACE(std::string("step ") + std::to_string(step) + ": " + what);
+    EXPECT_EQ(index.GetBufferSize(), reference.Size());
+    EXPECT_EQ(index.GetSealingSize(), reference.SealingSize());
+    const auto actual = ReadTiers(index, kDim);
+    const auto expected = reference.Projection();
+    EXPECT_EQ(actual, expected);
+    // A duplicate entry would be hidden by the search-time dedup but not by the
+    // raw tier count, so compare the two.
+    EXPECT_EQ(actual.size(), index.GetBufferSize());
+    ++step;
+  };
+
+  const auto append = [&](size_t compact_index, float value) {
+    auto vec = ValueVector(kDim, value);
+    index.AppendToBuffer(compact_index, vec.data());
+    reference.Append(compact_index, value);
+  };
+  const auto remove = [&](size_t compact_index) {
+    index.RemoveVector(compact_index);
+    reference.Remove(compact_index);
+  };
+  const auto seal = [&]() {
+    index.SealBuffer();
+    reference.SealUntrained();
+  };
+
+  for (size_t i = 0; i < 16; ++i) {
+    append(i, static_cast<float>(i + 1));
+    check("append new");
+  }
+
+  // Upsert: the same compact index written again keeps one entry.
+  for (size_t i : {size_t{3}, size_t{7}, size_t{11}}) {
+    append(i, static_cast<float>(i + 101));
+    check("append existing");
+  }
+
+  remove(0);  // first slot
+  check("remove first");
+  remove(15);  // last slot
+  check("remove last");
+  remove(8);  // interior slot, filled by the moved last entry
+  check("remove interior");
+  remove(42);  // never present
+  check("remove absent");
+
+  append(8, 208.0F);  // re-add a removed index
+  check("re-append removed");
+
+  seal();  // untrained: the tier round-trips through sealing and back
+  check("seal untrained");
+
+  append(5, 305.0F);
+  check("append existing after seal");
+  remove(3);
+  check("remove after seal");
+  append(20, 320.0F);
+  append(21, 321.0F);
+  check("append new after seal");
+
+  seal();
+  check("seal again");
+  remove(21);
+  check("remove after second seal");
+  append(21, 421.0F);
+  check("re-append after second seal");
+
+  EXPECT_GT(index.GetBufferSize(), 0U);
+}
+
+// After a trained seal the tiers are empty and hold no leftover bookkeeping, so
+// the same compact indices can be buffered again as fresh entries.
+TEST(IvfBufferBookkeepingTest, TrainedSealLeavesTiersReusable) {
+  constexpr uint32_t kDim = 4;
+  constexpr size_t kCount = 8;
+
+  std::mt19937 rng(77);
+  std::vector<std::vector<float>> vecs;
+  for (size_t i = 0; i < kCount; ++i) {
+    vecs.push_back(RandomVector(kDim, rng));
+  }
+  const auto matrix = BuildMatrix(vecs);
+  std::vector<size_t> indices(kCount);
+  std::iota(indices.begin(), indices.end(), size_t{0});
+
+  IvfIndex::Config config;
+  config.nlist = 2;
+  config.nprobe = 2;
+  IvfIndex index(kDim, config);
+  index.Train(matrix.data(), indices.data(), kCount, kDim, /*assign_vectors=*/false);
+  ASSERT_TRUE(index.IsTrained());
+
+  for (size_t i = 0; i < kCount; ++i) {
+    index.AppendToBuffer(i, vecs[i].data());
+  }
+  ASSERT_EQ(index.GetBufferSize(), kCount);
+
+  index.SealBuffer();
+  EXPECT_EQ(index.GetBufferSize(), 0U);
+  EXPECT_EQ(index.GetSealingSize(), 0U);
+  EXPECT_EQ(index.GetIndexedCount(), kCount);
+
+  // Re-buffering the same indices must produce new entries, not upserts against
+  // slots left behind by the seal.
+  for (size_t i = 0; i < kCount; ++i) {
+    index.AppendToBuffer(i, vecs[i].data());
+  }
+  EXPECT_EQ(index.GetBufferSize(), kCount);
+}
+
+// A search whose stride disagrees with the bound dimension has no correct
+// answer and must not scan the buffers at the caller's stride.
+TEST(IvfResetTest, SearchRejectsMismatchedDimension) {
+  constexpr uint32_t kDim = 8;
+
+  IvfIndex::Config config;
+  config.nlist = 2;
+  IvfIndex index(kDim, config);
+
+  std::vector<float> vec(kDim, 1.0F);
+  index.AppendToBuffer(0, vec.data());
+
+  std::vector<float> query(kDim, 1.0F);
+  const float query_norm = L2Norm(query);
+  auto matrix = query;
+  std::vector<float> norms{query_norm};
+
+  EXPECT_FALSE(index.Search(query.data(), query_norm, matrix.data(), norms.data(), 1, kDim, 3).empty());
+  EXPECT_TRUE(index.Search(query.data(), query_norm, matrix.data(), norms.data(), 1, kDim * 2, 3).empty());
 }
 
 }  // namespace

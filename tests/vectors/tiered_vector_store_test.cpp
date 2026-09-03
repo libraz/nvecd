@@ -433,6 +433,34 @@ TEST_F(TieredVectorStoreTest, AddDuplicateMovesFromMainToDelta) {
   EXPECT_EQ(store_->DeletedCount(), 1U);  // old main entry is tombstoned
 }
 
+// Replacing a main-tier id retires the same slot Delete retires, so the ANN
+// index stops treating it as live rather than spending search budget on a row
+// the tombstone filter then discards.
+TEST_F(TieredVectorStoreTest, ReplacingMainEntryRetiresItFromSearch) {
+  constexpr uint32_t kCount = 8;
+  for (uint32_t i = 0; i < kCount; ++i) {
+    store_->Add("v" + std::to_string(i), MakeAxisVector(kDim, i));
+  }
+  store_->MergeDeltaToMain();
+  ASSERT_TRUE(store_->IsInMain("v0"));
+
+  // Re-add v0 pointing along a different axis; the old main row must not be
+  // reachable through search any more.
+  store_->Add("v0", MakeAxisVector(kDim, kCount));
+
+  auto query = MakeAxisVector(kDim, 0);
+  auto results = store_->Search(query.data(), kCount);
+  size_t v0_hits = 0;
+  for (const auto& result : results) {
+    if (result.id == "v0") {
+      ++v0_hits;
+      EXPECT_LT(result.score, 0.5F) << "stale embedding still ranked for v0";
+    }
+  }
+  EXPECT_LE(v0_hits, 1U);
+  EXPECT_EQ(store_->TotalSize(), kCount);
+}
+
 TEST_F(TieredVectorStoreTest, DeleteFromMainCreatesTombstone) {
   store_->Add("v0", MakeAxisVector(kDim, 0));
   store_->MergeDeltaToMain();
@@ -631,13 +659,31 @@ TEST_F(TieredVectorStoreTest, UpdateSameIdRapidly) {
 // MergeScheduler
 // ============================================================================
 
+/// Poll until the predicate holds; report failure instead of blocking forever.
+template <typename Predicate>
+bool WaitFor(Predicate predicate, std::chrono::milliseconds timeout) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (predicate()) {
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  return predicate();
+}
+
+/// Shortest interval the scheduler config can express, to keep waits bounded.
+MergeScheduler::Config FastSchedulerConfig() {
+  MergeScheduler::Config config;
+  config.check_interval = std::chrono::seconds(1);
+  return config;
+}
+
 TEST(MergeSchedulerTest, StartAndStop) {
   TieredVectorStore::Config cfg = DefaultConfig();
   TieredVectorStore store(cfg);
 
-  MergeScheduler::Config sched_cfg;
-  sched_cfg.check_interval = std::chrono::seconds(1);
-  MergeScheduler scheduler(sched_cfg);
+  MergeScheduler scheduler(FastSchedulerConfig());
 
   scheduler.Start(&store);
   EXPECT_TRUE(scheduler.IsRunning());
@@ -648,53 +694,169 @@ TEST(MergeSchedulerTest, StartAndStop) {
 
 TEST(MergeSchedulerTest, AutoMergeOnThreshold) {
   constexpr uint32_t kDim = 4;
+  constexpr uint32_t kVectorCount = 6;
 
   TieredVectorStore::Config cfg = DefaultConfig();
   cfg.delta_merge_threshold = 5;
   TieredVectorStore store(cfg);
 
-  // Add vectors exceeding threshold
-  for (uint32_t i = 0; i < 6; ++i) {
+  for (uint32_t i = 0; i < kVectorCount; ++i) {
     store.Add("v" + std::to_string(i), MakeAxisVector(kDim, i % kDim));
   }
-  EXPECT_TRUE(store.NeedsMerge());
+  ASSERT_TRUE(store.NeedsMerge());
+  ASSERT_EQ(store.DeltaSize(), kVectorCount);
 
-  MergeScheduler::Config sched_cfg;
-  sched_cfg.check_interval = std::chrono::seconds(1);
-  MergeScheduler scheduler(sched_cfg);
+  MergeScheduler scheduler(FastSchedulerConfig());
   scheduler.Start(&store);
 
-  // Wait for scheduler to run at least once
-  std::this_thread::sleep_for(std::chrono::seconds(2));
-
+  // Wait on the state transition itself rather than on a fixed sleep. A sleep
+  // long enough to pass reliably is also long enough to pass when the
+  // scheduler never ran, so the timeout has to end in a failing assertion.
+  const bool merged = WaitFor([&store] { return store.DeltaSize() == 0; }, std::chrono::seconds(10));
   scheduler.Stop();
 
-  // After scheduler ran, delta should have been merged
+  ASSERT_TRUE(merged) << "waited for DeltaSize()==0; observed DeltaSize=" << store.DeltaSize()
+                      << " MainSize=" << store.MainSize() << " NeedsMerge=" << store.NeedsMerge();
   EXPECT_EQ(store.DeltaSize(), 0U);
-  EXPECT_EQ(store.MainSize(), 6U);
+  EXPECT_EQ(store.MainSize(), kVectorCount);
+  EXPECT_FALSE(store.NeedsMerge());
 }
 
 TEST(MergeSchedulerTest, DoubleStartIsHarmless) {
   TieredVectorStore::Config cfg = DefaultConfig();
   TieredVectorStore store(cfg);
 
-  MergeScheduler scheduler;
+  MergeScheduler scheduler(FastSchedulerConfig());
   scheduler.Start(&store);
   scheduler.Start(&store);  // Should not crash or create extra threads
   EXPECT_TRUE(scheduler.IsRunning());
   scheduler.Stop();
+  EXPECT_FALSE(scheduler.IsRunning());
 }
 
 TEST(MergeSchedulerTest, DestructorStopsThread) {
+  constexpr uint32_t kDim = 4;
+  constexpr uint32_t kVectorCount = 6;
+
   TieredVectorStore::Config cfg = DefaultConfig();
+  cfg.delta_merge_threshold = 5;
   TieredVectorStore store(cfg);
 
   {
-    MergeScheduler scheduler;
+    MergeScheduler scheduler(FastSchedulerConfig());
     scheduler.Start(&store);
     EXPECT_TRUE(scheduler.IsRunning());
   }
-  // Destructor should have joined the thread without crash
+
+  // A destructor that failed to join would leave a worker still watching the
+  // store, so a delta seeded past the threshold after destruction must survive.
+  for (uint32_t i = 0; i < kVectorCount; ++i) {
+    store.Add("v" + std::to_string(i), MakeAxisVector(kDim, i % kDim));
+  }
+  ASSERT_TRUE(store.NeedsMerge());
+  EXPECT_FALSE(WaitFor([&store] { return store.DeltaSize() == 0; }, std::chrono::seconds(3)))
+      << "a worker thread outlived the scheduler and merged the delta: DeltaSize=" << store.DeltaSize()
+      << " MainSize=" << store.MainSize();
+  EXPECT_EQ(store.DeltaSize(), kVectorCount);
+  EXPECT_EQ(store.MainSize(), 0U);
+}
+
+TEST(MergeSchedulerTest, SearchesStayConsistentWhileTheSchedulerMerges) {
+  constexpr uint32_t kDim = 8;
+  constexpr uint32_t kSeedCount = 40;
+  constexpr uint32_t kTopK = 5;
+  constexpr int kReaders = 4;
+  constexpr uint32_t kWriteRounds = 3;
+  constexpr uint32_t kWritesPerRound = 15;
+
+  TieredVectorStore::Config cfg = DefaultConfig();
+  cfg.delta_merge_threshold = 10;
+  TieredVectorStore store(cfg);
+
+  std::mt19937 rng(7);
+  std::unordered_set<std::string> known_ids;
+  for (uint32_t i = 0; i < kSeedCount; ++i) {
+    const std::string id = "seed" + std::to_string(i);
+    ASSERT_TRUE(store.Add(id, MakeRandomVector(kDim, rng)).has_value());
+    known_ids.insert(id);
+  }
+
+  MergeScheduler scheduler(FastSchedulerConfig());
+  scheduler.Start(&store);
+
+  // Search takes a shared lock and the merge takes the exclusive one, so every
+  // search observes one tier state, never a half-applied merge. Each of the
+  // properties below is what "one tier state" means for a result set: the
+  // store only grows during this test, so a full page is always available; an
+  // entry in flight from delta to main must appear once, not twice or zero
+  // times; and the merged ranking must stay ordered.
+  //
+  // Scope of this case: it detects a merge that loses, duplicates, or
+  // misorders entries while readers are running. It does not detect an absent
+  // lock as such -- a data race that happens to leave the observable result set
+  // intact passes here. Race detection for this path belongs to a
+  // ThreadSanitizer run, which this case does not replace.
+  std::atomic<bool> stop{false};
+  std::atomic<int> searches{0};
+  std::atomic<int> short_pages{0};
+  std::atomic<int> duplicate_ids{0};
+  std::atomic<int> unknown_ids{0};
+  std::atomic<int> unordered_scores{0};
+
+  std::vector<std::thread> readers;
+  readers.reserve(kReaders);
+  for (int reader = 0; reader < kReaders; ++reader) {
+    readers.emplace_back([&, reader] {
+      std::mt19937 local_rng(static_cast<uint32_t>(reader) + 1);
+      while (!stop.load(std::memory_order_acquire)) {
+        auto query = MakeRandomVector(kDim, local_rng);
+        auto results = store.Search(query.data(), kTopK);
+        searches.fetch_add(1, std::memory_order_relaxed);
+
+        if (results.size() != kTopK) {
+          short_pages.fetch_add(1, std::memory_order_relaxed);
+        }
+        std::unordered_set<std::string> seen;
+        for (size_t i = 0; i < results.size(); ++i) {
+          if (!seen.insert(results[i].id).second) {
+            duplicate_ids.fetch_add(1, std::memory_order_relaxed);
+          }
+          if (known_ids.count(results[i].id) == 0) {
+            unknown_ids.fetch_add(1, std::memory_order_relaxed);
+          }
+          if (i > 0 && results[i].score > results[i - 1].score) {
+            unordered_scores.fetch_add(1, std::memory_order_relaxed);
+          }
+        }
+      }
+    });
+  }
+
+  // Keep the delta above the merge threshold so the scheduler keeps working
+  // underneath the readers rather than idling after a single merge. New IDs
+  // are published to known_ids before the store so a reader can never see an
+  // ID that is not yet in the set.
+  for (uint32_t round = 0; round < kWriteRounds; ++round) {
+    for (uint32_t i = 0; i < kWritesPerRound; ++i) {
+      const std::string id = "round" + std::to_string(round) + "_" + std::to_string(i);
+      known_ids.insert(id);
+      store.Add(id, MakeRandomVector(kDim, rng));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+  }
+
+  stop.store(true, std::memory_order_release);
+  for (auto& reader : readers) {
+    reader.join();
+  }
+  scheduler.Stop();
+
+  EXPECT_GT(searches.load(), 0);
+  EXPECT_EQ(short_pages.load(), 0) << "a search returned fewer than top_k results from an always-growing store";
+  EXPECT_EQ(duplicate_ids.load(), 0) << "an entry in flight from delta to main was returned twice";
+  EXPECT_EQ(unknown_ids.load(), 0) << "a search returned an ID that was never stored";
+  EXPECT_EQ(unordered_scores.load(), 0) << "merged results were not ordered by descending score";
+  EXPECT_EQ(store.MainSize() + store.DeltaSize(), known_ids.size());
 }
 
 }  // namespace

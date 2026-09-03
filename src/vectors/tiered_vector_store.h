@@ -174,6 +174,10 @@ class TieredVectorStore {
   /// Remove entry from delta by swap-with-last (O(1) matrix operation)
   void RemoveFromDelta(uint32_t delta_idx);
 
+  /// Retire a main-tier slot: tombstone it and tell the ANN index, so the
+  /// tombstone set and the index's own liveness never disagree.
+  void RetireMainSlot(uint32_t compact_index);
+
   /// Rebuild the HNSW index on main_.matrix
   void RebuildMainIndex();
 

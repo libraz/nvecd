@@ -461,12 +461,18 @@ void HnswIndex::MarkDeleted(uint32_t compact_index) {
     return;
   }
   uint32_t internal_id = compact_to_internal_[compact_index];
-  if (internal_id == UINT32_MAX) {
+  // A mapping entry past the node array cannot be retired, and dereferencing it
+  // would read outside nodes_.
+  if (internal_id == UINT32_MAX || internal_id >= nodes_.size()) {
     return;
   }
   if (!nodes_[internal_id].deleted) {
     nodes_[internal_id].deleted = true;
-    active_count_--;
+    // active_count_ is unsigned: decrementing it at zero wraps to UINT32_MAX and
+    // turns the tombstone ratio in MaybeCompactLocked into a size_t underflow.
+    if (active_count_ > 0) {
+      --active_count_;
+    }
     MaybeCompactLocked();
   }
 }
@@ -474,7 +480,7 @@ void HnswIndex::MarkDeleted(uint32_t compact_index) {
 std::vector<std::pair<uint32_t, float>> HnswIndex::Search(const float* query, uint32_t top_k) const {
   std::shared_lock lock(mutex_);
 
-  if (entry_point_ == UINT32_MAX || active_count_ == 0) {
+  if (top_k == 0 || query == nullptr || entry_point_ == UINT32_MAX || active_count_ == 0) {
     return {};
   }
 
@@ -559,6 +565,11 @@ void HnswIndex::Rebuild(const float* all_vectors, uint32_t count, uint32_t dimen
   for (uint32_t i = 0; i < count; ++i) {
     AddLocked(i, all_vectors + static_cast<size_t>(i) * dimension);
   }
+}
+
+uint32_t HnswIndex::Dimension() const {
+  std::shared_lock lock(mutex_);
+  return dimension_;
 }
 
 uint32_t HnswIndex::Size() const {
@@ -720,6 +731,12 @@ utils::Expected<void, utils::Error> HnswIndex::Deserialize(std::istream& in) {
       }
     }
   }
+
+  // The persisted active count is untrusted input. Derive it from the deleted
+  // flags that Search actually consults, so a header that disagrees with them
+  // cannot leave MarkDeleted decrementing a counter that is already at zero.
+  active_count_ = static_cast<uint32_t>(
+      std::count_if(nodes_.begin(), nodes_.end(), [](const Node& node) { return !node.deleted; }));
 
   // compact_to_internal mapping
   uint32_t map_size = 0;

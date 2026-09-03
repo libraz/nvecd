@@ -46,7 +46,7 @@ utils::Expected<void, utils::Error> TieredVectorStore::Add(const std::string& id
   auto loc_it = id_location_.find(id);
   if (loc_it != id_location_.end()) {
     if (loc_it->second.store == StoreLocation::kMain) {
-      main_.deleted.insert(loc_it->second.compact_index);
+      RetireMainSlot(loc_it->second.compact_index);
     } else {
       RemoveFromDelta(loc_it->second.compact_index);
     }
@@ -73,10 +73,7 @@ utils::Expected<void, utils::Error> TieredVectorStore::Delete(const std::string&
   }
 
   if (loc_it->second.store == StoreLocation::kMain) {
-    main_.deleted.insert(loc_it->second.compact_index);
-    if (main_.index) {
-      main_.index->MarkDeleted(loc_it->second.compact_index);
-    }
+    RetireMainSlot(loc_it->second.compact_index);
   } else {
     RemoveFromDelta(loc_it->second.compact_index);
   }
@@ -386,6 +383,16 @@ void TieredVectorStore::RemoveFromDelta(uint32_t delta_idx) {
   delta_.ids.pop_back();
   delta_.norms.pop_back();
   delta_.matrix.resize(delta_.ids.size() * dimension_);
+}
+
+void TieredVectorStore::RetireMainSlot(uint32_t compact_index) {
+  main_.deleted.insert(compact_index);
+  if (main_.index) {
+    // Without this the index keeps the slot live: it still spends search budget
+    // on a row the tombstone filter then discards, and its own active count
+    // disagrees with main_.deleted.
+    main_.index->MarkDeleted(compact_index);
+  }
 }
 
 void TieredVectorStore::RebuildMainIndex() {

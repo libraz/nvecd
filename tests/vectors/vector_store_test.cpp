@@ -910,5 +910,55 @@ TEST(VectorStoreTest, ConcurrentDeleteAndRead) {
   EXPECT_EQ(ids.size(), remaining);
 }
 
+// ============================================================================
+// Dimension restore entry point
+// ============================================================================
+
+// A corpus that was emptied before being persisted carries a dimension but no
+// vectors. Restoring only the vectors leaves the store accepting the next write
+// at any size, which drops the guard against a mismatched embedding model.
+TEST(VectorStoreTest, RestoreDimensionSetsDimensionOnEmptyStore) {
+  auto config = MakeConfig();
+  VectorStore store(config);
+  ASSERT_EQ(store.GetDimension(), 0);
+
+  ASSERT_TRUE(store.RestoreDimension(384).has_value());
+  EXPECT_EQ(store.GetDimension(), 384);
+
+  // The restored dimension is enforced like one learned from a live write.
+  EXPECT_FALSE(store.SetVector("item1", std::vector<float>(8, 1.0F)).has_value());
+  EXPECT_TRUE(store.SetVector("item1", std::vector<float>(384, 1.0F)).has_value());
+}
+
+TEST(VectorStoreTest, RestoreDimensionRejectsOutOfRangeValues) {
+  auto config = MakeConfig();
+  VectorStore store(config);
+
+  auto zero = store.RestoreDimension(0);
+  ASSERT_FALSE(zero.has_value());
+  EXPECT_EQ(zero.error().code(), utils::ErrorCode::kVectorInvalidDimension);
+
+  auto too_large = store.RestoreDimension(VectorStore::kMaxDimension + 1);
+  ASSERT_FALSE(too_large.has_value());
+  EXPECT_EQ(too_large.error().code(), utils::ErrorCode::kVectorInvalidDimension);
+
+  EXPECT_EQ(store.GetDimension(), 0);
+}
+
+TEST(VectorStoreTest, RestoreDimensionRejectsConflictWithStoredVectors) {
+  auto config = MakeConfig();
+  VectorStore store(config);
+  ASSERT_TRUE(store.SetVector("item1", std::vector<float>(4, 1.0F)).has_value());
+
+  auto conflicting = store.RestoreDimension(8);
+  ASSERT_FALSE(conflicting.has_value());
+  EXPECT_EQ(conflicting.error().code(), utils::ErrorCode::kVectorDimensionMismatch);
+  EXPECT_EQ(store.GetDimension(), 4);
+
+  // Restoring the dimension the store already holds is a no-op.
+  EXPECT_TRUE(store.RestoreDimension(4).has_value());
+  EXPECT_EQ(store.GetDimension(), 4);
+}
+
 }  // namespace
 }  // namespace nvecd::vectors

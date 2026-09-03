@@ -6,7 +6,7 @@
  * Vectors are partitioned into Voronoi cells using K-means clustering,
  * and queries search only the nearest nprobe cells instead of all vectors.
  *
- * Uses a two-tier architecture (Milvus-style):
+ * Uses a two-tier architecture:
  * - Write buffer: flat, append-only buffer for recent vectors (brute-force searched)
  * - Sealed IVF index: trained clusters with inverted lists (IVF searched)
  * Search merges results from both tiers and returns top-k.
@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <shared_mutex>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -91,6 +92,10 @@ class IvfIndex {
  public:
   /// Maximum auto-nlist to cap training cost for large datasets
   static constexpr uint32_t kMaxAutoNlist = 1024;
+
+  /// Upper bound on the sample K-means trains from. The effective nlist is
+  /// clamped to the sample count, since seeding takes one sample per cluster.
+  static constexpr size_t kMaxTrainingSamples = 10000;
 
   /**
    * @brief IVF index configuration
@@ -201,8 +206,33 @@ class IvfIndex {
 
   /**
    * @brief Reset trained state to allow re-training with more data
+   *
+   * Keeps the operator-configured nlist. Clearing it here would silently
+   * replace an explicit `similarity.ivf_nlist` with auto-scaling, because the
+   * restore path only fires for the auto sentinel.
    */
   void ResetTrained();
+
+  /**
+   * @brief Empty the index and bind it to a vector dimension
+   *
+   * Drops the trained layout and both transient tiers, then adopts
+   * @p dimension. This is the state a rebuild starts from: buffered entries are
+   * keyed by compact index and laid out at the previous stride, so carrying
+   * them across a rebuild would score stale rows at the wrong offset once the
+   * store renumbers or resizes. Binding the dimension here is also what keeps a
+   * provisionally-constructed index from writing at the configured default
+   * stride while the store holds vectors of another size.
+   *
+   * @param dimension New vector dimension
+   */
+  void Reset(uint32_t dimension);
+
+  /**
+   * @brief Get the vector dimension the index is bound to
+   * @return Current dimension
+   */
+  uint32_t GetDimension() const;
 
   /**
    * @brief Set the number of probes at query time
@@ -262,8 +292,15 @@ class IvfIndex {
    * Briefly takes buffer_mutex_ to detach pending entries. Cluster assignment
    * runs without mutex_ held, so concurrent IVF searches continue; mutex_ is
    * acquired exclusively only to append the precomputed assignments.
+   *
+   * @return True when nothing is left unsealed on return. False means the
+   *         entries are still in the write buffer: the index is not trained
+   *         yet, a concurrent training/reset replaced the layout they were
+   *         assigned against, or another seal is already in flight. A caller
+   *         that treats false as "drained" leaves the buffer to be rescanned by
+   *         every subsequent query, so it must seal again instead.
    */
-  void SealBuffer();
+  bool SealBuffer();
 
   /**
    * @brief Search the write buffer with brute-force scan
@@ -320,9 +357,31 @@ class IvfIndex {
    */
   float Similarity(const float* a, float norm_a, const float* b, float norm_b, uint32_t dim) const;
 
+  /**
+   * @brief Score a search candidate against the query
+   *
+   * Same as Similarity except that a cosine-undefined (zero-norm) pair scores
+   * 0.0 instead of -infinity, which is what the brute-force and HNSW kernels
+   * return. Ranking a zero-norm vector rather than dropping it keeps the set of
+   * items a query can return independent of the configured index type. Cluster
+   * assignment keeps the -infinity sentinel because it has to recognise "no
+   * meaningful centroid" and spread such vectors deliberately.
+   *
+   * @param a First vector
+   * @param norm_a Pre-computed L2 norm of @p a (used by cosine only)
+   * @param b Second vector
+   * @param norm_b Pre-computed L2 norm of @p b (used by cosine only)
+   * @param dim Vector dimension
+   * @return Similarity score usable for top-k selection
+   */
+  float ScoreCandidate(const float* a, float norm_a, const float* b, float norm_b, uint32_t dim) const;
+
   Config config_;
+  /// Operator-configured nlist (0 = auto-scale). config_.nlist holds the
+  /// effective value derived from it for the current training run.
+  uint32_t configured_nlist_;
   /// Vector dimension. Atomic because AppendToBuffer (buffer_mutex_ only) reads
-  /// it concurrently with Train (mutex_ only) writing it; see bug #7.
+  /// it concurrently with Train (mutex_ only) writing it.
   std::atomic<uint32_t> dimension_;
   bool trained_ = false;
 
@@ -359,6 +418,15 @@ class IvfIndex {
   /// until the IVF commit publishes them, so sealing never creates a gap.
   std::vector<size_t> sealing_indices_;
   std::vector<float> sealing_vectors_;
+
+  /// compact_index -> slot in the tier beside it. Every tier lookup (the
+  /// upsert-dedup on append, the removal, and the two membership tests a seal
+  /// performs) goes through these, so no operation costs more as the buffer
+  /// fills: a linear scan made one append proportional to the entries already
+  /// pending, which is work done under an exclusive lock. Each tier's map holds
+  /// exactly one entry per index in the tier, and its indices are unique.
+  std::unordered_map<size_t, size_t> buffer_slots_;
+  std::unordered_map<size_t, size_t> sealing_slots_;
 
   /// Separate reader-writer lock for write buffer (independent of mutex_)
   mutable std::shared_mutex buffer_mutex_;

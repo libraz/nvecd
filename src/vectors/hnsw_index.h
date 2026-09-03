@@ -79,6 +79,7 @@ class HnswIndex : public AnnIndex {
   void MarkDeleted(uint32_t compact_index) override;
   std::vector<std::pair<uint32_t, float>> Search(const float* query, uint32_t top_k) const override;
   void Rebuild(const float* all_vectors, uint32_t count, uint32_t dimension) override;
+  uint32_t Dimension() const override;
   uint32_t Size() const override;
   utils::Expected<void, utils::Error> Serialize(std::ostream& out) const override;
   utils::Expected<void, utils::Error> Deserialize(std::istream& in) override;

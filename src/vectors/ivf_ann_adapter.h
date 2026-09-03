@@ -43,7 +43,7 @@ class IvfAnnAdapter : public AnnIndex {
    */
   IvfAnnAdapter(std::unique_ptr<IvfIndex> ivf, VectorStore* vector_store, uint32_t dimension)
       : ivf_(std::move(ivf)), vector_store_(vector_store) {
-    (void)dimension;
+    ivf_->Reset(dimension);
   }
 
   void Add(uint32_t compact_index, const float* vector) override {
@@ -53,11 +53,19 @@ class IvfAnnAdapter : public AnnIndex {
   void MarkDeleted(uint32_t compact_index) override { ivf_->RemoveVector(static_cast<size_t>(compact_index)); }
 
   std::vector<std::pair<uint32_t, float>> Search(const float* query, uint32_t top_k) const override {
+    if (top_k == 0 || query == nullptr) {
+      return {};
+    }
     auto snap = vector_store_->GetCompactSnapshot();
     if (snap.count == 0 || snap.matrix == nullptr) {
       return {};
     }
 
+    // Read the query at the dimension the index is bound to, never at the
+    // store's current one: the caller validated the query against the bound
+    // dimension, while a concurrent Clear/SetVector can move the store's. When
+    // the two disagree the index is not bound to this corpus, so there is no
+    // correct result and neither buffer may be strided.
     const auto dimension = static_cast<uint32_t>(snap.dim);
     float query_norm = simd::GetOptimalImpl().l2_norm(query, snap.dim);
 
@@ -75,8 +83,11 @@ class IvfAnnAdapter : public AnnIndex {
   void Rebuild(const float* all_vectors, uint32_t count, uint32_t dimension) override {
     // Adopt the caller's dimension so Search (query_norm / stride) matches the
     // real data dimension even when the index was provisionally constructed for
-    // a different configured default_dimension.
-    ivf_->ResetTrained();
+    // a different configured default_dimension. This has to happen before the
+    // empty-input return: that path is exactly how a still-empty index is
+    // rebound ahead of the first insert, and leaving the constructed dimension
+    // in place there makes AppendToBuffer read past the caller's vector.
+    ivf_->Reset(dimension);
     if (count == 0 || all_vectors == nullptr) {
       return;  // Dimension-only rebind: nothing to train yet.
     }
@@ -91,8 +102,11 @@ class IvfAnnAdapter : public AnnIndex {
 
   uint32_t Size() const override { return static_cast<uint32_t>(ivf_->GetIndexedCount() + ivf_->GetBufferSize()); }
 
+  uint32_t Dimension() const override { return ivf_->GetDimension(); }
+
   utils::Expected<void, utils::Error> Serialize(std::ostream& /*out*/) const override {
-    // IVF serialization is handled by snapshot_format directly
+    // The IVF layout is not persisted: it is retrained from the restored vector
+    // store on startup, so there is nothing to serialize here.
     return utils::MakeUnexpected(
         utils::MakeError(utils::ErrorCode::kNotImplemented, "IVF serialization via AnnIndex not supported"));
   }
@@ -113,7 +127,8 @@ class IvfAnnAdapter : public AnnIndex {
   bool NeedsSeal() const { return ivf_->NeedsSeal(); }
 
   /// @brief Seal the write buffer
-  void SealBuffer() { ivf_->SealBuffer(); }
+  /// @return True when nothing is left unsealed; see IvfIndex::SealBuffer
+  bool SealBuffer() { return ivf_->SealBuffer(); }
 
  private:
   std::unique_ptr<IvfIndex> ivf_;

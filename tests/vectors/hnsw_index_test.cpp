@@ -9,8 +9,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <random>
 #include <sstream>
+#include <string>
 #include <unordered_set>
 #include <vector>
 
@@ -227,6 +229,39 @@ TEST_F(HnswIndexTest, DeserializeRejectsOversizedDimensionBeforeAllocation) {
   auto result = index_->Deserialize(serialized);
   EXPECT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code(), utils::ErrorCode::kSnapshotLoadFailed);
+}
+
+// A persisted active count that disagrees with the per-node deleted flags used
+// to be adopted verbatim, and the next MarkDeleted then wrapped the unsigned
+// counter, which turns the tombstone ratio into a size_t underflow. The count
+// is derived from the flags the search path actually consults instead.
+TEST_F(HnswIndexTest, DeserializeRecomputesActiveCountFromDeletedFlags) {
+  constexpr uint32_t kCount = 4;
+  for (uint32_t i = 0; i < kCount; ++i) {
+    std::vector<float> vec(kDim, 0.0F);
+    vec[i % kDim] = 1.0F;
+    index_->Add(i, vec.data());
+  }
+
+  std::stringstream serialized;
+  ASSERT_TRUE(index_->Serialize(serialized).has_value());
+
+  // Header layout: magic, version, m, ef_construction, ef_search, dimension,
+  // node_count, entry_point, max_level, active_count.
+  std::string bytes = serialized.str();
+  constexpr size_t kActiveCountOffset = 9 * sizeof(uint32_t);
+  ASSERT_GT(bytes.size(), kActiveCountOffset + sizeof(uint32_t));
+  const uint32_t tampered_active_count = 0;
+  std::memcpy(bytes.data() + kActiveCountOffset, &tampered_active_count, sizeof(tampered_active_count));
+
+  HnswIndex restored(kDim, CosineDistanceRaw, HnswIndex::Config{});
+  std::stringstream input(bytes);
+  ASSERT_TRUE(restored.Deserialize(input).has_value());
+
+  EXPECT_EQ(restored.Size(), kCount);
+  restored.MarkDeleted(0);
+  EXPECT_EQ(restored.Size(), kCount - 1);
+  EXPECT_EQ(restored.GetTombstoneCount(), 1U);
 }
 
 // ============================================================================

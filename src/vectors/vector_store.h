@@ -77,6 +77,10 @@ struct VectorStoreStatistics {
  */
 class VectorStore {
  public:
+  /// Largest dimension the store accepts. Every entry point that admits a
+  /// dimension checks against this one constant.
+  static constexpr size_t kMaxDimension = 4096;
+
   /**
    * @brief Construct vector store with configuration
    * @param config Vector store configuration
@@ -99,6 +103,23 @@ class VectorStore {
    */
   utils::Expected<void, utils::Error> SetVector(const std::string& vector_id, const std::vector<float>& vec,
                                                 bool normalize = false);
+
+  /**
+   * @brief Adopt a persisted dimension for a store that holds no vectors
+   *
+   * Restore paths (snapshot load, crash recovery) have to re-establish the
+   * dimension even when the persisted corpus is empty, because a store whose
+   * dimension is unset accepts the next vector at any size and silently stops
+   * rejecting a mismatched embedding model. This is the only way to set the
+   * dimension without a vector payload, and it applies the same range check
+   * SetVector applies, so restoring cannot relax a rule the live path enforces.
+   *
+   * @param dimension Persisted vector dimension (1..kMaxDimension)
+   * @return Success, or kVectorInvalidDimension for an out-of-range value, or
+   *         kVectorDimensionMismatch when the store already holds vectors of a
+   *         different dimension
+   */
+  utils::Expected<void, utils::Error> RestoreDimension(size_t dimension);
 
   /**
    * @brief Retrieve a vector by ID
