@@ -951,9 +951,9 @@ TEST_F(TikTok1MScaleTest, DISABLED_TikTokLive10MWith500Viewers) {
     if (p99 < 100.0) {
       std::cout << "  PASS: p99=" << p99 << " ms - viable for real-time recommendations\n";
     } else if (p99 < 500.0) {
-      std::cout << "  WARNING: p99=" << p99 << " ms - marginal, consider ANN index (FAISS)\n";
+      std::cout << "  WARNING: p99=" << p99 << " ms - marginal, consider enabling an ANN index\n";
     } else {
-      std::cout << "  CRITICAL: p99=" << p99 << " ms - ANN index (FAISS) required for production\n";
+      std::cout << "  CRITICAL: p99=" << p99 << " ms - an ANN index is required for production\n";
     }
     std::cout << "  Estimated throughput at p50: " << std::setprecision(0) << (1000.0 / p50)
               << " queries/sec per thread\n";

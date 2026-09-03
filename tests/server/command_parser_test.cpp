@@ -171,10 +171,37 @@ TEST(CommandParserTest, ParseSim_TopKZeroRejected) {
   EXPECT_EQ(result.error().code(), ErrorCode::kCommandInvalidTopK);
 }
 
+TEST(CommandParserTest, ParseSim_TopKNegativeRejected) {
+  auto result = ParseCommand("SIM item123 -1");
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), ErrorCode::kCommandInvalidTopK);
+}
+
 TEST(CommandParserTest, ParseSimv_TopKExceedsMaxRejected) {
   auto result = ParseCommand("SIMV 200 0.1 0.2", /*max_top_k=*/100);
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code(), ErrorCode::kCommandInvalidTopK);
+}
+
+// SIMV carries the same top_k bounds as SIM. Both ends are pinned on this
+// command too, so the two commands cannot drift apart if either grows its own
+// argument handling.
+TEST(CommandParserTest, ParseSimv_TopKZeroRejected) {
+  auto result = ParseCommand("SIMV 0 0.1 0.2");
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), ErrorCode::kCommandInvalidTopK);
+}
+
+TEST(CommandParserTest, ParseSimv_TopKNegativeRejected) {
+  auto result = ParseCommand("SIMV -1 0.1 0.2");
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), ErrorCode::kCommandInvalidTopK);
+}
+
+TEST(CommandParserTest, ParseSimv_TopKWithinMaxAccepted) {
+  auto result = ParseCommand("SIMV 100 0.1 0.2", /*max_top_k=*/100);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->top_k, 100);
 }
 
 TEST(CommandParserTest, ParseSim_MissingArgs) {

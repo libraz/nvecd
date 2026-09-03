@@ -102,6 +102,13 @@ def _complete_response_length(data: bytes, command: str, debug_mode: bool = Fals
     return _complete_value_length(data)
 
 
+def _metadata_literal(value: Any) -> str:
+    """Render a Python value using the server's metadata value spelling."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
 class NvecdClient:
     """Persistent nvecd client with command-aware response framing."""
 
@@ -182,12 +189,40 @@ class NvecdClient:
         vec_str = " ".join(str(v) for v in vector)
         return self.tcp_command(f"VECSET {item} {vec_str}")
 
-    def sim(self, item: str, top_k: int = 10, mode: str = "fusion") -> str | None:
-        return self.tcp_command(f"SIM {item} {top_k} using={mode}")
+    def metaset(self, item: str, metadata: dict[str, Any] | str) -> str | None:
+        """Attach metadata to an existing vector item.
 
-    def simv(self, vector: list[float], top_k: int = 10) -> str | None:
+        Accepts either a ready-made ``key:value,key:value`` expression or a
+        mapping, which is rendered with the wire spelling the server expects
+        (lowercase ``true``/``false`` for booleans).
+        """
+        if isinstance(metadata, str):
+            pairs = metadata
+        else:
+            pairs = ",".join(f"{key}:{_metadata_literal(value)}" for key, value in metadata.items())
+        return self.tcp_command(f"METASET {item} {pairs}")
+
+    def sim(
+        self,
+        item: str,
+        top_k: int = 10,
+        mode: str = "fusion",
+        filter_expr: str | None = None,
+    ) -> str | None:
+        command = f"SIM {item} {top_k} using={mode}"
+        if filter_expr is not None:
+            command += f" filter={filter_expr}"
+        return self.tcp_command(command)
+
+    def simv(
+        self,
+        vector: list[float],
+        top_k: int = 10,
+        filter_expr: str | None = None,
+    ) -> str | None:
         vec_str = " ".join(str(v) for v in vector)
-        return self.tcp_command(f"SIMV {top_k} {vec_str}")
+        filter_part = f"filter={filter_expr} " if filter_expr is not None else ""
+        return self.tcp_command(f"SIMV {top_k} {filter_part}{vec_str}")
 
     def info(self) -> dict[str, Any]:
         resp = self.tcp_command("INFO")

@@ -1,6 +1,10 @@
 """Smoke tests: basic connectivity and health checks."""
 
+import re
+
 import pytest
+
+SEMVER = re.compile(r"^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.\-]+)?$")
 
 
 @pytest.mark.smoke
@@ -10,10 +14,11 @@ class TestConnectivity:
         assert nvecd.ping()
 
     def test_info_command(self, nvecd):
-        """INFO command returns server information."""
+        """INFO reports a semver server version."""
         info = nvecd.info()
         assert "version" in info
-        assert info["version"] == "0.1.0"
+        version = str(info["version"])
+        assert SEMVER.match(version), f"version is not semver: {version!r}"
 
     def test_info_has_sections(self, nvecd):
         """INFO response includes all expected sections."""

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import signal
 import socket
 import subprocess
@@ -16,7 +17,9 @@ from lib.wait import wait_until
 NVECD_HOST = "127.0.0.1"
 E2E_PASSWORD = "isolated-e2e-password"
 PROJECT_ROOT = Path(__file__).parent.parent
-NVECD_BINARY = PROJECT_ROOT / "build" / "bin" / "nvecd"
+# Defaults to the in-tree build/bin/nvecd; set NVECD_E2E_BINARY to run the suite
+# against a binary from a side-by-side build tree instead.
+NVECD_BINARY = Path(os.environ.get("NVECD_E2E_BINARY", PROJECT_ROOT / "build" / "bin" / "nvecd"))
 NVECD_CONFIG_TEMPLATE = Path(__file__).parent / "nvecd-test.yaml"
 
 
