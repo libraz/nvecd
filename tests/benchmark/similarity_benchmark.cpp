@@ -14,6 +14,7 @@
  * 5. End-to-end SearchByIdVectors
  * 6. End-to-end SearchByVector (SIMV)
  * 7. Cache hit vs miss latency
+ * 8. Cache mutation cost vs resident entry count (insert / invalidate)
  */
 
 #include <gtest/gtest.h>
@@ -504,6 +505,109 @@ TEST_F(SimilarityBenchmark, DISABLED_CacheHitVsMiss) {
   }
 
   std::cout << std::string(66, '-') << "\n";
+}
+
+// ---------------------------------------------------------------------------
+// 8. Cache mutation cost vs resident entry count
+// ---------------------------------------------------------------------------
+
+/// Entries sharing one reverse-index group id. InvalidateByItemId on a group id
+/// erases exactly this many entries, independent of how many are resident.
+constexpr size_t kCacheGroupSize = 5;
+
+/// Resident entry counts used by the mutation benchmark.
+constexpr size_t kMutationEntryCounts[] = {1000, 5000, 20000};
+
+/// Cache budget large enough that the mutation benchmark never evicts.
+constexpr size_t kMutationCacheMemory = 512UL * 1024 * 1024;
+
+/// Item ids registered for the entry at index `i`: its own id plus a group id.
+std::vector<std::string> CacheItemIdsFor(size_t index) {
+  return {"item_" + std::to_string(index), "group_" + std::to_string(index / kCacheGroupSize)};
+}
+
+/// Cache key used for the entry at index `i`.
+cache::CacheKey CacheKeyFor(size_t index) {
+  return cache::CacheKeyGenerator::Generate("SIM item_" + std::to_string(index) + " 10");
+}
+
+/// Fill `cache` with `entry_count` entries and their reverse-index references.
+void PopulateCache(cache::SimilarityCache& cache, size_t entry_count,
+                   const std::vector<similarity::SimilarityResult>& results) {
+  for (size_t i = 0; i < entry_count; ++i) {
+    cache.InsertAndRegister(CacheKeyFor(i), results, CacheItemIdsFor(i), 50.0, cache::SearchType::kItemSearch);
+  }
+}
+
+/// Print the header of a mutation-cost table.
+void PrintMutationHeader(const std::string& title) {
+  std::cout << "\n--- " << title << " ---\n";
+  std::cout << std::left << std::setw(16) << "Resident" << std::setw(18) << "Median (us)" << std::setw(18) << "Ops/sec"
+            << "\n"
+            << std::string(52, '-') << "\n";
+}
+
+/// Print one row of a mutation-cost table.
+void PrintMutationRow(size_t resident, double median_us) {
+  double ops_sec = (median_us > 0.0) ? 1'000'000.0 / median_us : 0.0;
+  std::cout << std::left << std::setw(16) << resident << std::fixed << std::setprecision(3) << std::setw(18)
+            << median_us << std::setprecision(0) << std::setw(18) << ops_sec << "\n";
+}
+
+TEST_F(SimilarityBenchmark, DISABLED_CacheMutationCost) {
+  PrintHeader("SimilarityCache mutation cost under the exclusive lock");
+
+  std::vector<similarity::SimilarityResult> dummy_results;
+  dummy_results.reserve(kTopK);
+  for (int i = 0; i < kTopK; ++i) {
+    dummy_results.emplace_back("item_" + std::to_string(i), 1.0F - static_cast<float>(i) * 0.05F);
+  }
+
+  PrintMutationHeader("InsertAndRegister (one new entry into an already-populated cache)");
+  for (size_t entry_count : kMutationEntryCounts) {
+    cache::SimilarityCache cache(kMutationCacheMemory, 0.0, 0);
+    PopulateCache(cache, entry_count, dummy_results);
+    ASSERT_EQ(cache.GetStatistics().current_entries, entry_count) << "cache evicted during population";
+
+    std::vector<double> samples;
+    samples.reserve(kIterations);
+    for (int iter = 0; iter < kIterations; ++iter) {
+      size_t index = entry_count + static_cast<size_t>(iter);
+      auto key = CacheKeyFor(index);
+      auto item_ids = CacheItemIdsFor(index);
+
+      auto start = std::chrono::high_resolution_clock::now();
+      bool inserted = cache.InsertAndRegister(key, dummy_results, item_ids, 50.0, cache::SearchType::kItemSearch);
+      auto end = std::chrono::high_resolution_clock::now();
+
+      ASSERT_TRUE(inserted);
+      samples.push_back(std::chrono::duration<double, std::micro>(end - start).count());
+    }
+    PrintMutationRow(entry_count, MedianUs(samples));
+  }
+
+  PrintMutationHeader("InvalidateByItemId (erases " + std::to_string(kCacheGroupSize) + " entries per call)");
+  for (size_t entry_count : kMutationEntryCounts) {
+    cache::SimilarityCache cache(kMutationCacheMemory, 0.0, 0);
+    PopulateCache(cache, entry_count, dummy_results);
+    ASSERT_EQ(cache.GetStatistics().current_entries, entry_count) << "cache evicted during population";
+
+    std::vector<double> samples;
+    samples.reserve(kIterations);
+    for (int iter = 0; iter < kIterations; ++iter) {
+      auto group_id = "group_" + std::to_string(iter);
+
+      auto start = std::chrono::high_resolution_clock::now();
+      size_t invalidated = cache.InvalidateByItemId(group_id);
+      auto end = std::chrono::high_resolution_clock::now();
+
+      ASSERT_EQ(invalidated, kCacheGroupSize);
+      samples.push_back(std::chrono::duration<double, std::micro>(end - start).count());
+    }
+    PrintMutationRow(entry_count, MedianUs(samples));
+  }
+
+  std::cout << std::string(52, '-') << "\n";
 }
 
 }  // namespace

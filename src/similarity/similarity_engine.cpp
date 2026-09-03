@@ -15,8 +15,8 @@
 
 #include "utils/error.h"
 #include "utils/structured_log.h"
+#include "vectors/ann_index_factory.h"
 #include "vectors/distance.h"
-#include "vectors/hnsw_index.h"
 #include "vectors/ivf_ann_adapter.h"
 #include "vectors/ivf_index.h"
 
@@ -33,60 +33,63 @@ SimilarityEngine::SimilarityEngine(events::EventStore* event_store, events::CoOc
       distance_func_(SelectDistanceFunction(vectors_config.distance_metric)),
       use_prenorm_(vectors_config.distance_metric.empty() || vectors_config.distance_metric == "cosine") {
   // Determine effective index type: support legacy ivf_enabled flag
-  std::string effective_type = config_.index_type;
-  if (effective_type == "flat" && config_.ivf_enabled) {
-    effective_type = "ivf";
+  if (config_.index_type == "flat" && config_.ivf_enabled) {
+    config_.index_type = "ivf";
   }
-  // Store back for consistent behavior
-  config_.index_type = effective_type;
+  // An unrecognised name keeps its configured spelling and falls back to
+  // brute-force search, as an explicitly flat configuration does.
+  index_type_ = vectors::AnnIndexTypeFromString(config_.index_type).value_or(vectors::AnnIndexType::kFlat);
 
-  if (effective_type == "hnsw") {
-    vectors::HnswIndex::Config hnsw_config;
-    hnsw_config.m = config_.hnsw_m;
-    hnsw_config.ef_construction = config_.hnsw_ef_construction;
-    hnsw_config.ef_search = config_.hnsw_ef_search;
-    hnsw_config.max_elements = config_.hnsw_max_elements;
+  vectors::AnnIndexOptions ann_options;
+  ann_options.dimension = static_cast<uint32_t>(vectors_config.default_dimension);
+  ann_options.distance_metric = vectors_config.distance_metric;
+  ann_options.hnsw.m = config_.hnsw_m;
+  ann_options.hnsw.ef_construction = config_.hnsw_ef_construction;
+  ann_options.hnsw.ef_search = config_.hnsw_ef_search;
+  ann_options.hnsw.max_elements = config_.hnsw_max_elements;
+  ann_options.ivf.nlist = config_.ivf_nlist;
+  ann_options.ivf.nprobe = config_.ivf_nprobe;
+  ann_options.ivf.train_threshold = config_.ivf_train_threshold;
+  ann_options.ivf.seal_threshold = config_.ivf_seal_threshold;
+  ann_options.vector_store = vector_store;
 
-    auto distance_func = vectors::GetDistanceFunc(vectors_config.distance_metric);
-    ann_index_ = std::make_unique<vectors::HnswIndex>(vectors_config.default_dimension, distance_func, hnsw_config);
+  // Every ANN implementation is built here, through the single construction
+  // point, so a new one cannot reach production without being routed through it.
+  ann_index_ = vectors::MakeAnnIndex(index_type_, ann_options);
 
-    utils::StructuredLog()
-        .Event("hnsw_index_created")
-        .Field("m", static_cast<int64_t>(config_.hnsw_m))
-        .Field("ef_construction", static_cast<int64_t>(config_.hnsw_ef_construction))
-        .Field("ef_search", static_cast<int64_t>(config_.hnsw_ef_search))
-        .Info();
-  } else if (effective_type == "ivf") {
-    vectors::IvfIndex::Config ivf_config;
-    ivf_config.nlist = config_.ivf_nlist;
-    ivf_config.nprobe = config_.ivf_nprobe;
-    ivf_config.train_threshold = config_.ivf_train_threshold;
-    ivf_config.seal_threshold = config_.ivf_seal_threshold;
-    // Use the same metric as flat/HNSW so IVF ranking stays consistent (C-2).
-    ivf_config.metric = vectors::IvfMetricFromString(vectors_config.distance_metric);
-
-    auto ivf = std::make_unique<vectors::IvfIndex>(vectors_config.default_dimension, ivf_config);
-    auto* raw = ivf.get();
-
-    ann_index_ =
-        std::make_unique<vectors::IvfAnnAdapter>(std::move(ivf), vector_store, vectors_config.default_dimension);
-    ivf_index_raw_ = raw;
-
-    utils::StructuredLog()
-        .Event("ivf_index_created")
-        .Field("nlist", static_cast<int64_t>(config_.ivf_nlist))
-        .Field("nprobe", static_cast<int64_t>(config_.ivf_nprobe))
-        .Field("train_threshold", static_cast<int64_t>(config_.ivf_train_threshold))
-        .Field("seal_threshold", static_cast<int64_t>(config_.ivf_seal_threshold))
-        .Info();
+  switch (index_type_) {
+    case vectors::AnnIndexType::kFlat:
+      break;  // brute-force search; no index object exists
+    case vectors::AnnIndexType::kHnsw:
+      utils::StructuredLog()
+          .Event("hnsw_index_created")
+          .Field("m", static_cast<int64_t>(config_.hnsw_m))
+          .Field("ef_construction", static_cast<int64_t>(config_.hnsw_ef_construction))
+          .Field("ef_search", static_cast<int64_t>(config_.hnsw_ef_search))
+          .Info();
+      break;
+    case vectors::AnnIndexType::kIvf:
+      utils::StructuredLog()
+          .Event("ivf_index_created")
+          .Field("nlist", static_cast<int64_t>(config_.ivf_nlist))
+          .Field("nprobe", static_cast<int64_t>(config_.ivf_nprobe))
+          .Field("train_threshold", static_cast<int64_t>(config_.ivf_train_threshold))
+          .Field("seal_threshold", static_cast<int64_t>(config_.ivf_seal_threshold))
+          .Info();
+      break;
+    case vectors::AnnIndexType::kCount:
+      break;
   }
-  // else: flat (no index), brute-force search
 
   // The ANN index above is provisionally sized to the configured
   // default_dimension. Record it so EnsureAnnDimension() can detect and correct
   // a mismatch against the dimension the VectorStore actually learns.
   if (ann_index_) {
     ann_dimension_ = static_cast<uint32_t>(vectors_config.default_dimension);
+  }
+
+  if (index_type_ == vectors::AnnIndexType::kIvf && ann_index_) {
+    ivf_maintenance_thread_ = std::make_unique<std::thread>([this] { IvfMaintenanceLoop(); });
   }
 }
 
@@ -113,6 +116,10 @@ void SimilarityEngine::RebuildAnnFromStore() {
   }
   JoinTrainThread();
   std::unique_lock publication_lock(ann_publication_mutex_);
+  // A rebuild drops the trained layout and both write tiers. Excluding a seal
+  // in flight keeps it from committing assignments made against the layout this
+  // call is about to replace.
+  std::lock_guard seal_lock(ivf_seal_mutex_);
   // Hold one store snapshot for both the index build and the generation
   // publication. A search can therefore observe either the old pair or the
   // complete new pair, never old ANN labels mapped through a new ID layout.
@@ -137,6 +144,7 @@ void SimilarityEngine::RebuildAnnFromStore() {
 }
 
 SimilarityEngine::~SimilarityEngine() {
+  StopIvfMaintenance();
   JoinTrainThread();
 }
 
@@ -247,7 +255,12 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
   // this shared lock is held; a mismatch falls back to a fresh flat snapshot.
   bool ann_mapping_stale = false;
   std::shared_lock publication_lock(ann_publication_mutex_);
-  if (ann_index_ && IsAnnIndexReady()) {
+  // query_copy was captured from a store snapshot that has already been
+  // released, so its width can disagree with the dimension the ANN kernels
+  // stride at. Fall back to the flat path in that case; it re-resolves the
+  // query inside the snapshot it scans, which is self-consistent by
+  // construction.
+  if (ann_index_ && IsAnnIndexReady() && query_copy.size() == ann_dimension_) {
     // When a metadata filter is active the post-filter can discard most ANN
     // candidates, so a single fetch_k under-fetches relative to a flat scan.
     // Grow fetch_k until top_k filtered results are gathered or the index is
@@ -574,7 +587,11 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
         utils::MakeError(utils::ErrorCode::kInvalidArgument, "Query vector components must be finite"));
   }
 
-  // Validate dimension
+  // Fast rejection for the common case. This reads the store's dimension
+  // outside the consistency window of the scan that follows, so it is an error
+  // message, not the guarantee: a store that is transiently empty reports 0 and
+  // lets any length through here. Both scan paths below re-establish dimension
+  // agreement against the data they actually dereference.
   size_t expected_dim = vector_store_->GetDimension();
   if (expected_dim > 0 && query_vector.size() != expected_dim) {
     auto error = utils::MakeError(utils::ErrorCode::kVectorDimensionMismatch,
@@ -603,7 +620,12 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
   // snapshot internally. Take a snapshot only to map result indices to IDs.
   bool ann_mapping_stale = false;
   std::shared_lock publication_lock(ann_publication_mutex_);
-  if (ann_index_ && IsAnnIndexReady()) {
+  // ann_dimension_ is the width the ANN kernels read the query at, and it is
+  // published under this same lock, so comparing against it here holds for the
+  // whole Search below. A disagreeing query never reaches an ANN kernel; it
+  // falls through to the brute-force path, which decides against the corpus it
+  // scans (the ANN index may simply be stale relative to the store).
+  if (ann_index_ && IsAnnIndexReady() && query_vector.size() == ann_dimension_) {
     // With an active metadata filter, the post-filter can discard most ANN
     // candidates. Grow fetch_k until top_k filtered results are gathered or the
     // index is exhausted, so ANN matches the flat scan's result count. Without a
@@ -665,6 +687,17 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
   auto snap = vector_store_->GetCompactSnapshot();
   if (snap.Empty()) {
     return std::vector<SimilarityResult>{};
+  }
+
+  // The scan strides the matrix at snap.dim and reads the query at the same
+  // width, so agreement is established here, from the snapshot being scanned
+  // and under the read lock it holds. A concurrent Clear/SetVector cannot move
+  // the dimension between this check and the dereferences below.
+  if (query_vector.size() != snap.dim) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kVectorDimensionMismatch, "Query vector dimension mismatch: expected " +
+                                                                         std::to_string(snap.dim) + ", got " +
+                                                                         std::to_string(query_vector.size())));
   }
 
   // Bounded min-heap: track top-k (score, index) pairs without string allocation
@@ -861,6 +894,9 @@ void SimilarityEngine::NotifyVectorAdded(size_t compact_index, const float* vect
 
   const uint64_t published_generation = ann_generation_.load(std::memory_order_relaxed);
   if (published_generation == std::numeric_limits<uint64_t>::max() || published_generation + 1 != snap.generation) {
+    // Rebuild resets the index, so it must not overlap a seal committing
+    // assignments made against the layout being replaced.
+    std::lock_guard seal_lock(ivf_seal_mutex_);
     ann_index_->Rebuild(snap.matrix, static_cast<uint32_t>(snap.count), static_cast<uint32_t>(snap.dim));
     ann_dimension_ = static_cast<uint32_t>(snap.dim);
     ann_dimension_bound_ = true;
@@ -870,17 +906,25 @@ void SimilarityEngine::NotifyVectorAdded(size_t compact_index, const float* vect
 
   const float* published_vector = snap.matrix + compact_index * snap.dim;
   bool start_ivf_training = false;
-  bool start_ivf_seal = false;
-  if (config_.index_type == "hnsw") {
-    // HNSW: direct incremental insertion
-    ann_index_->Add(static_cast<uint32_t>(compact_index), published_vector);
-  } else if (config_.index_type == "ivf") {
-    // IVF: append to write buffer (fast path)
-    auto* adapter = static_cast<vectors::IvfAnnAdapter*>(ann_index_.get());
-    adapter->GetIvfIndex()->AppendToBuffer(compact_index, published_vector);
+  bool buffered_for_ivf = false;
+  switch (index_type_) {
+    case vectors::AnnIndexType::kFlat:
+      break;
+    case vectors::AnnIndexType::kHnsw:
+      // HNSW: direct incremental insertion
+      ann_index_->Add(static_cast<uint32_t>(compact_index), published_vector);
+      break;
+    case vectors::AnnIndexType::kIvf: {
+      // IVF: append to write buffer (fast path)
+      auto* adapter = static_cast<vectors::IvfAnnAdapter*>(ann_index_.get());
+      adapter->GetIvfIndex()->AppendToBuffer(compact_index, published_vector);
 
-    start_ivf_training = !adapter->IsTrained();
-    start_ivf_seal = !start_ivf_training && adapter->NeedsSeal();
+      start_ivf_training = !adapter->IsTrained();
+      buffered_for_ivf = true;
+      break;
+    }
+    case vectors::AnnIndexType::kCount:
+      break;
   }
   ann_generation_.store(snap.generation, std::memory_order_release);
   snap.lock.unlock();
@@ -890,16 +934,13 @@ void SimilarityEngine::NotifyVectorAdded(size_t compact_index, const float* vect
   // the store/shared publication locks held by the incremental publish above.
   if (start_ivf_training) {
     MaybeTrainIvfIndex();
-  } else if (start_ivf_seal) {
-    auto* adapter = static_cast<vectors::IvfAnnAdapter*>(ann_index_.get());
-    bool expected = false;
-    if (ivf_training_.compare_exchange_strong(expected, true)) {
-      JoinTrainThread();
-      ivf_train_thread_ = std::make_unique<std::thread>([this, adapter]() {
-        adapter->SealBuffer();
-        ivf_training_.store(false);
-      });
-    }
+  }
+  // The write path only reports that the buffer moved. Whether that leaves
+  // anything to seal is decided by the maintenance thread, which also runs
+  // after the last write and so can drain a buffer that a write-path test
+  // would leave sitting there for the rest of the process's life.
+  if (buffered_for_ivf) {
+    RequestIvfSeal();
   }
 }
 
@@ -912,40 +953,65 @@ void SimilarityEngine::NotifyVectorRemoved(size_t compact_index) {
 }
 
 bool SimilarityEngine::IsIvfTrained() const {
-  if (config_.index_type == "ivf" && ann_index_) {
+  if (index_type_ == vectors::AnnIndexType::kIvf && ann_index_) {
     auto* adapter = static_cast<const vectors::IvfAnnAdapter*>(ann_index_.get());
     return adapter->IsTrained();
   }
   return false;
+}
+
+size_t SimilarityEngine::GetIvfIndexedCount() const {
+  if (index_type_ != vectors::AnnIndexType::kIvf || !ann_index_) {
+    return 0;
+  }
+  return static_cast<const vectors::IvfAnnAdapter*>(ann_index_.get())->GetIvfIndex()->GetIndexedCount();
+}
+
+size_t SimilarityEngine::GetIvfUnsealedCount() const {
+  if (index_type_ != vectors::AnnIndexType::kIvf || !ann_index_) {
+    return 0;
+  }
+  return static_cast<const vectors::IvfAnnAdapter*>(ann_index_.get())->GetIvfIndex()->GetBufferSize();
+}
+
+uint64_t SimilarityEngine::GetIvfSealCount() const {
+  if (index_type_ != vectors::AnnIndexType::kIvf || !ann_index_) {
+    return 0;
+  }
+  return ivf_seal_count_.load(std::memory_order_relaxed);
 }
 
 bool SimilarityEngine::IsAnnIndexReady() const {
   if (!ann_index_) {
     return false;
   }
-  if (config_.index_type == "hnsw") {
-    return ann_index_->Size() > 0;
-  }
-  if (config_.index_type == "ivf") {
-    auto* adapter = static_cast<const vectors::IvfAnnAdapter*>(ann_index_.get());
-    return adapter->IsTrained();
+  switch (index_type_) {
+    case vectors::AnnIndexType::kFlat:
+      return false;
+    case vectors::AnnIndexType::kHnsw:
+      return ann_index_->Size() > 0;
+    case vectors::AnnIndexType::kIvf:
+      return static_cast<const vectors::IvfAnnAdapter*>(ann_index_.get())->IsTrained();
+    case vectors::AnnIndexType::kCount:
+      break;
   }
   return false;
 }
 
 void SimilarityEngine::ForceIvfTrain() {
-  if (config_.index_type != "ivf" || !ann_index_) {
+  if (index_type_ != vectors::AnnIndexType::kIvf || !ann_index_) {
     return;
   }
-  auto* adapter = static_cast<vectors::IvfAnnAdapter*>(ann_index_.get());
-  if (adapter->IsTrained()) {
-    adapter->GetIvfIndex()->ResetTrained();
-  }
-  MaybeTrainIvfIndex();
+  // Training rebuilds the partition and drops the inverted lists with it, so
+  // everything the store holds has to be assigned against the new centroids.
+  // The incremental trainer assigns only the write buffer, which after a
+  // retrain of a populated index is empty: it would leave a trained index
+  // reporting readiness with nothing in it.
+  RebuildAnnFromStore();
 }
 
 void SimilarityEngine::MaybeTrainIvfIndex() {
-  if (config_.index_type != "ivf" || !ann_index_) {
+  if (index_type_ != vectors::AnnIndexType::kIvf || !ann_index_) {
     return;
   }
 
@@ -1053,14 +1119,15 @@ void SimilarityEngine::MaybeTrainIvfIndex() {
   // Launch training in a background thread.
   // After training, seal the write buffer to move buffered entries into IVF.
   ivf_train_thread_ = std::make_unique<std::thread>(
-      [this, ivf_index, adapter, sample_matrix, sample_indices = std::move(sample_indices), dim]() {
+      [this, ivf_index, sample_matrix, sample_indices = std::move(sample_indices), dim]() {
         // Phase 1: Train centroids on the sample (no vector assignment
         // since all data is already in the write buffer)
         ivf_index->Train(sample_matrix->data(), sample_indices.data(), sample_indices.size(), dim, false);
 
         // Phase 2: Seal the write buffer to assign buffered entries to
-        // the newly-trained IVF clusters
-        adapter->SealBuffer();
+        // the newly-trained IVF clusters. Routed through the engine's single
+        // seal path so it cannot overlap a maintenance seal and be dropped.
+        DrainIvfBuffer(/*only_when_over_threshold=*/false);
 
         utils::StructuredLog()
             .Event("ivf_training_complete_async")
@@ -1071,6 +1138,104 @@ void SimilarityEngine::MaybeTrainIvfIndex() {
 
         ivf_training_.store(false);
       });
+}
+
+// ============================================================================
+// IVF write-buffer maintenance
+// ============================================================================
+
+void SimilarityEngine::DrainIvfBuffer(bool only_when_over_threshold) {
+  if (index_type_ != vectors::AnnIndexType::kIvf || !ann_index_) {
+    return;
+  }
+  auto* ivf_index = static_cast<vectors::IvfAnnAdapter*>(ann_index_.get())->GetIvfIndex();
+
+  // Decide whether there is work before taking the seal lock. A rebuild waits
+  // on that lock while holding the publication lock exclusively, so an idle
+  // tick must not acquire it and then block behind a training run.
+  //
+  // Sealing assigns to existing centroids, so there is nothing to publish into
+  // until training has produced them. The buffered entries stay searchable
+  // meanwhile and are picked up by the seal that follows training.
+  if (!ivf_index->IsTrained()) {
+    return;
+  }
+  if (only_when_over_threshold && !ivf_index->NeedsSeal()) {
+    return;
+  }
+  if (ivf_index->GetBufferSize() == 0) {
+    return;
+  }
+
+  std::lock_guard seal_lock(ivf_seal_mutex_);
+  if (ivf_index->SealBuffer()) {
+    ivf_seal_count_.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    // The entries are back in the write buffer because the layout they were
+    // assigned against was replaced. Leave them; the next maintenance pass
+    // reassigns them against the current centroids. Nothing else re-evaluates
+    // this, so dropping the retry would strand them for good.
+    utils::StructuredLog()
+        .Event("ivf_seal_deferred")
+        .Field("buffered", static_cast<int64_t>(ivf_index->GetBufferSize()))
+        .Debug();
+  }
+}
+
+void SimilarityEngine::RequestIvfSeal() {
+  if (index_type_ != vectors::AnnIndexType::kIvf || !ann_index_) {
+    return;
+  }
+  ivf_write_pending_.store(true, std::memory_order_relaxed);
+
+  // Below the threshold a pass would find nothing to do, so let the maintenance
+  // thread reach it on its own tick instead of waking it once per write.
+  if (!static_cast<vectors::IvfAnnAdapter*>(ann_index_.get())->NeedsSeal()) {
+    return;
+  }
+  {
+    std::lock_guard lock(ivf_maintenance_mutex_);
+    ivf_seal_now_ = true;
+  }
+  ivf_maintenance_cv_.notify_one();
+}
+
+void SimilarityEngine::IvfMaintenanceLoop() {
+  std::unique_lock lock(ivf_maintenance_mutex_);
+  while (!ivf_maintenance_stop_) {
+    ivf_maintenance_cv_.wait_for(lock, kIvfMaintenanceInterval,
+                                 [this] { return ivf_maintenance_stop_ || ivf_seal_now_; });
+    if (ivf_maintenance_stop_) {
+      break;
+    }
+    ivf_seal_now_ = false;
+    lock.unlock();
+
+    // A write since the previous pass means ingestion is still running, so seal
+    // only once the buffer reaches the configured bound: that way ingestion
+    // pays for one assignment pass per ivf_seal_threshold vectors instead of
+    // one per vector. A pass with no write behind it means the stream went
+    // quiet, and from then on every query would rescan whatever is left, so it
+    // all gets published.
+    const bool stream_active = ivf_write_pending_.exchange(false, std::memory_order_relaxed);
+    DrainIvfBuffer(stream_active);
+    lock.lock();
+  }
+}
+
+void SimilarityEngine::StopIvfMaintenance() {
+  if (!ivf_maintenance_thread_) {
+    return;
+  }
+  {
+    std::lock_guard lock(ivf_maintenance_mutex_);
+    ivf_maintenance_stop_ = true;
+  }
+  ivf_maintenance_cv_.notify_all();
+  if (ivf_maintenance_thread_->joinable()) {
+    ivf_maintenance_thread_->join();
+  }
+  ivf_maintenance_thread_.reset();
 }
 
 }  // namespace nvecd::similarity

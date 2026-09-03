@@ -61,8 +61,11 @@ std::vector<float> MakeVector(std::mt19937& rng, uint32_t dim) {
   return vec;
 }
 
+/// Writes per writer thread for the index types whose publish path is cheap.
+constexpr int kDefaultIterations = 400;
+
 // Run a stress workload with the given index type and assert no crash.
-void RunStress(const std::string& index_type, bool exercise_dispatcher_path) {
+void RunStress(const std::string& index_type, bool exercise_dispatcher_path, int iterations = kDefaultIterations) {
   auto vectors_config = MakeVectorsConfig();
   auto similarity_config = MakeSimilarityConfig(index_type);
 
@@ -89,7 +92,6 @@ void RunStress(const std::string& index_type, bool exercise_dispatcher_path) {
 
   constexpr int kWriters = 4;
   constexpr int kReaders = 4;
-  constexpr int kIterations = 400;
   std::atomic<bool> stop{false};
   std::atomic<size_t> read_ops{0};
 
@@ -100,7 +102,7 @@ void RunStress(const std::string& index_type, bool exercise_dispatcher_path) {
     threads.emplace_back([&, w]() {
       std::mt19937 rng(static_cast<uint32_t>(100 + w));
       std::uniform_int_distribution<size_t> id_dist(0, kIdSpace - 1);
-      for (int iter = 0; iter < kIterations; ++iter) {
+      for (int iter = 0; iter < iterations; ++iter) {
         size_t id_num = id_dist(rng);
         std::string id = "item" + std::to_string(id_num);
         if ((iter & 3) == 0) {
@@ -161,8 +163,104 @@ TEST(VectorStoreConcurrencyStress, FlatBruteForce) {
   RunStress("flat", /*exercise_dispatcher_path=*/false);
 }
 
+TEST(VectorStoreConcurrencyStress, HnswIncrementalInsert) {
+  // A delete advances the store generation without publishing to the index, so
+  // the next add finds a generation gap and rebuilds the whole graph. With
+  // ef_construction neighbour selection over the shared ID space that costs
+  // orders of magnitude more per write than the flat or IVF publish, hence the
+  // shorter write run; the interleaving being exercised is the same.
+  RunStress("hnsw", /*exercise_dispatcher_path=*/true, /*iterations=*/24);
+}
+
 TEST(VectorStoreConcurrencyStress, IvfWithTraining) {
   RunStress("ivf", /*exercise_dispatcher_path=*/true);
+}
+
+/// Dimension used by the store while the mismatch race below is running.
+constexpr uint32_t kRaceStoredDim = 64;
+
+/// Query length that agrees with no stored vector, so no scan may score it.
+constexpr uint32_t kRaceQueryDim = 3;
+
+// Drive SearchByVector with a query that matches no stored vector while a writer
+// repeatedly empties and refills the store.
+//
+// Clear() resets the store's dimension to 0, which is what makes a dimension
+// check taken before the scan unsound: a query of any length passes while the
+// store is momentarily empty, and a concurrent refill re-establishes a dimension
+// the query does not have. The observable consequence is scoring a short query
+// against wide rows, so the assertion is that a mismatched query never yields a
+// result: it is either rejected or answered against an empty store.
+void RunDimensionMismatchRace(const std::string& index_type, int cycles) {
+  auto vectors_config = MakeVectorsConfig();
+  vectors_config.default_dimension = kRaceStoredDim;
+  auto similarity_config = MakeSimilarityConfig(index_type);
+
+  events::EventStore event_store(config::EventsConfig{});
+  events::CoOccurrenceIndex co_index;
+  vectors::VectorStore vector_store(vectors_config);
+  SimilarityEngine engine(&event_store, &co_index, &vector_store, similarity_config, vectors_config);
+
+  constexpr size_t kFillCount = 64;
+  std::atomic<bool> stop{false};
+  std::atomic<size_t> scored_results{0};
+  std::atomic<size_t> read_ops{0};
+
+  std::thread writer([&]() {
+    std::mt19937 rng(7);
+    for (int cycle = 0; cycle < cycles; ++cycle) {
+      vector_store.Clear();
+      for (size_t i = 0; i < kFillCount; ++i) {
+        auto vec = MakeVector(rng, kRaceStoredDim);
+        const std::string id = "item" + std::to_string(i);
+        if (vector_store.SetVector(id, vec).has_value()) {
+          auto idx = vector_store.GetCompactIndex(id);
+          if (idx.has_value()) {
+            engine.NotifyVectorAdded(idx.value(), vec.data());
+          }
+        }
+      }
+    }
+    stop.store(true, std::memory_order_relaxed);
+  });
+
+  std::vector<std::thread> readers;
+  constexpr int kReaders = 4;
+  for (int r = 0; r < kReaders; ++r) {
+    readers.emplace_back([&, r]() {
+      std::mt19937 rng(static_cast<uint32_t>(900 + r));
+      const std::vector<float> short_query = MakeVector(rng, kRaceQueryDim);
+      while (!stop.load(std::memory_order_relaxed)) {
+        auto result = engine.SearchByVector(short_query, 10, {});
+        if (result.has_value() && !result->empty()) {
+          scored_results.fetch_add(result->size(), std::memory_order_relaxed);
+        }
+        read_ops.fetch_add(1, std::memory_order_relaxed);
+      }
+    });
+  }
+
+  writer.join();
+  for (auto& reader : readers) {
+    reader.join();
+  }
+
+  EXPECT_GT(read_ops.load(), 0U);
+  EXPECT_EQ(scored_results.load(), 0U) << "a query of " << kRaceQueryDim << " components was scored against "
+                                       << kRaceStoredDim << "-dimensional vectors";
+}
+
+TEST(VectorStoreConcurrencyStress, FlatRejectsMismatchedQueryDuringRefill) {
+  RunDimensionMismatchRace("flat", /*cycles=*/300);
+}
+
+TEST(VectorStoreConcurrencyStress, HnswRejectsMismatchedQueryDuringRefill) {
+  // Each refill rebuilds the graph, so fewer cycles buy the same interleaving.
+  RunDimensionMismatchRace("hnsw", /*cycles=*/60);
+}
+
+TEST(VectorStoreConcurrencyStress, IvfRejectsMismatchedQueryDuringRefill) {
+  RunDimensionMismatchRace("ivf", /*cycles=*/300);
 }
 
 }  // namespace

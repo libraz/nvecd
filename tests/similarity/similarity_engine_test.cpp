@@ -8,8 +8,11 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <limits>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -354,6 +357,293 @@ TEST(SimilarityEngineAnnDeleteTest, StaleAnnGenerationFallsBackWithoutWrongIdSco
   for (const auto& result : *results) {
     EXPECT_NEAR(result.score, 0.0F, 0.0001F) << result.item_id;
   }
+}
+
+// ============================================================================
+// Index Type Selection
+// ============================================================================
+
+// `similarity.index_type` is parsed once and the index is built through the
+// single ANN construction point, so the configured name decides which
+// implementation the engine drives. Asserted through the engine's own surface:
+// a flat configuration has no index that can become ready, HNSW is ready as
+// soon as it holds vectors, and only IVF reports itself trained.
+class SimilarityEngineIndexSelectionTest : public ::testing::Test {
+ protected:
+  void BuildEngine(const config::SimilarityConfig& similarity_config) {
+    vectors_config_ = MakeVectorsConfig();
+    event_store_ = std::make_unique<events::EventStore>(MakeEventsConfig());
+    co_index_ = std::make_unique<events::CoOccurrenceIndex>();
+    vector_store_ = std::make_unique<vectors::VectorStore>(vectors_config_);
+    engine_ = std::make_unique<SimilarityEngine>(event_store_.get(), co_index_.get(), vector_store_.get(),
+                                                 similarity_config, vectors_config_);
+
+    ASSERT_TRUE(vector_store_->SetVector("first", {1.0F, 0.0F, 0.0F}).has_value());
+    ASSERT_TRUE(vector_store_->SetVector("second", {0.0F, 1.0F, 0.0F}).has_value());
+    engine_->RebuildAnnFromStore();
+  }
+
+  /// Search must return both stored items whichever implementation was selected.
+  void ExpectSearchCoversStore() {
+    auto results = engine_->SearchByVector({1.0F, 0.0F, 0.0F}, 10);
+    ASSERT_TRUE(results.has_value());
+    EXPECT_EQ(results->size(), 2U);
+  }
+
+  config::VectorsConfig vectors_config_;
+  std::unique_ptr<events::EventStore> event_store_;
+  std::unique_ptr<events::CoOccurrenceIndex> co_index_;
+  std::unique_ptr<vectors::VectorStore> vector_store_;
+  std::unique_ptr<SimilarityEngine> engine_;
+};
+
+TEST_F(SimilarityEngineIndexSelectionTest, FlatBuildsNoIndex) {
+  auto similarity_config = MakeSimilarityConfig();
+  similarity_config.index_type = "flat";
+  BuildEngine(similarity_config);
+
+  EXPECT_EQ(engine_->GetIndexType(), "flat");
+  EXPECT_FALSE(engine_->IsAnnIndexReady());
+  EXPECT_FALSE(engine_->IsIvfTrained());
+  ExpectSearchCoversStore();
+}
+
+TEST_F(SimilarityEngineIndexSelectionTest, HnswBuildsReadyIndex) {
+  auto similarity_config = MakeSimilarityConfig();
+  similarity_config.index_type = "hnsw";
+  similarity_config.hnsw_m = 8;
+  similarity_config.hnsw_ef_construction = 32;
+  similarity_config.hnsw_ef_search = 16;
+  BuildEngine(similarity_config);
+
+  EXPECT_EQ(engine_->GetIndexType(), "hnsw");
+  EXPECT_TRUE(engine_->IsAnnIndexReady());
+  EXPECT_FALSE(engine_->IsIvfTrained());
+  ExpectSearchCoversStore();
+}
+
+TEST_F(SimilarityEngineIndexSelectionTest, IvfBuildsTrainedIndex) {
+  auto similarity_config = MakeSimilarityConfig();
+  similarity_config.index_type = "ivf";
+  BuildEngine(similarity_config);
+
+  EXPECT_EQ(engine_->GetIndexType(), "ivf");
+  // A rebuild from the store clusters what it finds, so IVF is trained by the
+  // time the rebuild returns.
+  EXPECT_TRUE(engine_->IsIvfTrained());
+  EXPECT_TRUE(engine_->IsAnnIndexReady());
+  ExpectSearchCoversStore();
+}
+
+// The legacy ivf_enabled flag still promotes the default flat configuration.
+TEST_F(SimilarityEngineIndexSelectionTest, LegacyIvfEnabledPromotesFlatToIvf) {
+  auto similarity_config = MakeSimilarityConfig();
+  similarity_config.index_type = "flat";
+  similarity_config.ivf_enabled = true;
+  BuildEngine(similarity_config);
+
+  EXPECT_EQ(engine_->GetIndexType(), "ivf");
+  EXPECT_TRUE(engine_->IsIvfTrained());
+  ExpectSearchCoversStore();
+}
+
+// An unrecognised name keeps its configured spelling and falls back to
+// brute-force search rather than building an index of some other kind.
+TEST_F(SimilarityEngineIndexSelectionTest, UnknownNameFallsBackToBruteForce) {
+  auto similarity_config = MakeSimilarityConfig();
+  similarity_config.index_type = "no-such-index";
+  BuildEngine(similarity_config);
+
+  EXPECT_EQ(engine_->GetIndexType(), "no-such-index");
+  EXPECT_FALSE(engine_->IsAnnIndexReady());
+  EXPECT_FALSE(engine_->IsIvfTrained());
+  ExpectSearchCoversStore();
+}
+
+// ============================================================================
+// IVF write-buffer drain
+// ============================================================================
+
+// A trained IVF index answers a query by probing nprobe clusters *and*
+// scanning whatever is still in the write buffer. The buffer scan recomputes a
+// norm per candidate, so per item it costs more than the brute-force path IVF
+// is meant to replace: an index that leaves the corpus unsealed is slower than
+// no index at all while still reporting itself ready. What follows asserts on
+// the split between the two tiers rather than on latency, because the results
+// are correct either way and only the tier state distinguishes them.
+namespace {
+
+/// Vectors spread over a ring so clustering has structure to find, and
+/// deterministic so a failure reproduces.
+std::vector<float> IvfRow(size_t index, size_t dim) {
+  std::vector<float> row(dim, 0.0F);
+  const auto angle = static_cast<float>(index) * 0.017F;
+  for (size_t d = 0; d < dim; ++d) {
+    row[d] = std::cos(angle + static_cast<float>(d));
+  }
+  return row;
+}
+
+/// Owns an IVF-configured engine and drives it the way the dispatcher does.
+class IvfIngestHarness {
+ public:
+  static constexpr size_t kDim = 16;
+
+  IvfIngestHarness(uint32_t train_threshold, uint32_t seal_threshold) {
+    vectors_config_.default_dimension = kDim;
+    vectors_config_.distance_metric = "cosine";
+
+    similarity_config_ = MakeSimilarityConfig();
+    similarity_config_.index_type = "ivf";
+    similarity_config_.ivf_nlist = 16;
+    similarity_config_.ivf_train_threshold = train_threshold;
+    similarity_config_.ivf_seal_threshold = seal_threshold;
+
+    event_store_ = std::make_unique<events::EventStore>(MakeEventsConfig());
+    co_index_ = std::make_unique<events::CoOccurrenceIndex>();
+    vector_store_ = std::make_unique<vectors::VectorStore>(vectors_config_);
+    engine_ = std::make_unique<SimilarityEngine>(event_store_.get(), co_index_.get(), vector_store_.get(),
+                                                 similarity_config_, vectors_config_);
+  }
+
+  /// Store rows [first, first + count) and publish each to the index.
+  /// @return The largest unsealed count seen while a trained index was ingesting
+  size_t Ingest(size_t first, size_t count) {
+    size_t peak_unsealed = 0;
+    for (size_t i = first; i < first + count; ++i) {
+      const std::string id = "v" + std::to_string(i);
+      const std::vector<float> row = IvfRow(i, kDim);
+      EXPECT_TRUE(vector_store_->SetVector(id, row).has_value());
+      const auto compact_index = vector_store_->GetCompactIndex(id);
+      EXPECT_TRUE(compact_index.has_value());
+      engine_->NotifyVectorAdded(compact_index.value(), row.data());
+      if (engine_->IsIvfTrained()) {
+        peak_unsealed = std::max(peak_unsealed, engine_->GetIvfUnsealedCount());
+      }
+    }
+    return peak_unsealed;
+  }
+
+  /// Wait for the background trainer. False on timeout.
+  bool WaitUntilTrained() {
+    return WaitFor([this] { return engine_->IsIvfTrained(); });
+  }
+
+  /// Wait for the maintenance thread to publish everything. False on timeout.
+  bool WaitUntilDrained() {
+    return WaitFor([this] { return engine_->GetIvfUnsealedCount() == 0; });
+  }
+
+  SimilarityEngine& engine() { return *engine_; }
+
+ private:
+  template <typename Predicate>
+  static bool WaitFor(Predicate predicate) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (std::chrono::steady_clock::now() < deadline) {
+      if (predicate()) {
+        return true;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return predicate();
+  }
+
+  config::VectorsConfig vectors_config_;
+  config::SimilarityConfig similarity_config_;
+  std::unique_ptr<events::EventStore> event_store_;
+  std::unique_ptr<events::CoOccurrenceIndex> co_index_;
+  std::unique_ptr<vectors::VectorStore> vector_store_;
+  std::unique_ptr<SimilarityEngine> engine_;
+};
+
+}  // namespace
+
+// Whether anything is left unsealed is a condition that outlives the last
+// write, so it cannot be decided on the write path: training finishes after
+// ingestion has moved on, and no later write arrives to re-evaluate it. Here
+// the seal threshold is far above the corpus deliberately, so only a drain that
+// runs while the engine is idle can empty the buffer.
+TEST(SimilarityEngineIvfDrainTest, WriteBufferDrainsAfterWritesStop) {
+  constexpr size_t kVectors = 2000;
+  IvfIngestHarness harness(/*train_threshold=*/200, /*seal_threshold=*/100000);
+
+  harness.Ingest(0, kVectors);
+  ASSERT_TRUE(harness.WaitUntilTrained());
+  ASSERT_TRUE(harness.WaitUntilDrained()) << "unsealed=" << harness.engine().GetIvfUnsealedCount();
+
+  EXPECT_EQ(harness.engine().GetIvfUnsealedCount(), 0U);
+  EXPECT_EQ(harness.engine().GetIvfIndexedCount(), kVectors);
+}
+
+// Both threshold settings have to end with the corpus published, whether the
+// buffer was sealed repeatedly on the way or only once the stream went quiet.
+// A threshold far above the corpus is the case a threshold-only trigger gets
+// wrong: nothing crosses it, so nothing publishes unless an idle pass runs.
+//
+// How much sits unsealed *during* ingestion is deliberately not asserted here.
+// Seals run on a background thread, so any instantaneous figure is set by how
+// many writes land while one is in flight -- a rate, which a loaded machine
+// changes freely. A tolerance wide enough to absorb scheduling delay is also
+// wide enough to absorb the defect. The threshold predicate itself is pinned
+// deterministically one layer down, in IvfIndexTest.NeedsSealThreshold, and
+// the maintenance pass consumes exactly that predicate. The peaks below are
+// carried only as context for a failure.
+TEST(SimilarityEngineIvfDrainTest, BothSealThresholdsEndFullyPublished) {
+  constexpr size_t kWarmup = 500;
+  constexpr size_t kMeasured = 4000;
+  constexpr uint32_t kSmallThreshold = 128;
+
+  IvfIngestHarness bounded(/*train_threshold=*/200, /*seal_threshold=*/kSmallThreshold);
+  bounded.Ingest(0, kWarmup);
+  ASSERT_TRUE(bounded.WaitUntilTrained());
+  const size_t bounded_peak = bounded.Ingest(kWarmup, kMeasured);
+
+  IvfIngestHarness unbounded(/*train_threshold=*/200, /*seal_threshold=*/100000);
+  unbounded.Ingest(0, kWarmup);
+  ASSERT_TRUE(unbounded.WaitUntilTrained());
+  const size_t unbounded_peak = unbounded.Ingest(kWarmup, kMeasured);
+
+  // The remainder below the threshold is what a threshold-only trigger leaves
+  // behind for good: no further write arrives to re-evaluate it. The bound has
+  // to hold without depending on more writes showing up.
+  EXPECT_TRUE(bounded.WaitUntilDrained())
+      << "unsealed=" << bounded.engine().GetIvfUnsealedCount() << " peak during ingestion=" << bounded_peak;
+  EXPECT_TRUE(unbounded.WaitUntilDrained())
+      << "unsealed=" << unbounded.engine().GetIvfUnsealedCount() << " peak during ingestion=" << unbounded_peak;
+
+  // Publication happens by sealing, so a drain that reports an empty buffer
+  // without a seal behind it would mean the vectors went somewhere else.
+  EXPECT_GT(bounded.engine().GetIvfSealCount(), 0U);
+  EXPECT_GT(unbounded.engine().GetIvfSealCount(), 0U);
+  EXPECT_EQ(bounded.engine().GetIvfIndexedCount(), kWarmup + kMeasured);
+  EXPECT_EQ(unbounded.engine().GetIvfIndexedCount(), kWarmup + kMeasured);
+}
+
+// Training rebuilds the partition and discards the inverted lists with it, so a
+// retrain has to reassign the whole corpus. Reassigning only the write buffer
+// leaves a trained index that reports readiness while holding nothing, and
+// queries take the index branch and find an empty answer.
+TEST(SimilarityEngineIvfDrainTest, RetrainKeepsEveryVectorReachable) {
+  constexpr size_t kVectors = 1500;
+  IvfIngestHarness harness(/*train_threshold=*/200, /*seal_threshold=*/100000);
+
+  harness.Ingest(0, kVectors);
+  ASSERT_TRUE(harness.WaitUntilTrained());
+  ASSERT_TRUE(harness.WaitUntilDrained());
+  ASSERT_EQ(harness.engine().GetIvfIndexedCount(), kVectors);
+
+  harness.engine().ForceIvfTrain();
+  ASSERT_TRUE(harness.WaitUntilTrained());
+  ASSERT_TRUE(harness.WaitUntilDrained());
+
+  EXPECT_TRUE(harness.engine().IsAnnIndexReady());
+  EXPECT_EQ(harness.engine().GetIvfIndexedCount(), kVectors);
+  EXPECT_EQ(harness.engine().GetIvfUnsealedCount(), 0U);
+
+  auto results = harness.engine().SearchByVector(IvfRow(7, IvfIngestHarness::kDim), 10);
+  ASSERT_TRUE(results.has_value());
+  EXPECT_FALSE(results->empty());
 }
 
 // ============================================================================

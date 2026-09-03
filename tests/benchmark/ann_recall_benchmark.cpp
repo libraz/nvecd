@@ -33,19 +33,29 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
 #include <iterator>
 #include <numeric>
+#include <queue>
 #include <random>
+#include <string>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
+#include "config/config.h"
+#include "events/co_occurrence_index.h"
+#include "events/event_store.h"
+#include "similarity/similarity_engine.h"
 #include "vectors/distance.h"
+#include "vectors/distance_simd.h"
 #include "vectors/hnsw_index.h"
 #include "vectors/ivf_index.h"
+#include "vectors/vector_store.h"
 
 namespace nvecd::benchmark {
 namespace {
@@ -206,18 +216,56 @@ std::vector<float> BuildQuery(uint32_t dim, std::mt19937& rng, Corpus corpus, co
   return vec;
 }
 
-/// Exhaustive top-k over the corpus — the exact answer recall is scored against.
-std::vector<uint32_t> ExactTopK(const float* query, const float* matrix, uint32_t count, uint32_t dim, uint32_t top_k) {
-  std::vector<std::pair<float, uint32_t>> scored(count);
+/// L2 norms of every corpus row, as VectorStore keeps them.
+std::vector<float> ComputeNorms(const std::vector<float>& matrix, uint32_t count, uint32_t dim) {
+  std::vector<float> norms(count);
   for (uint32_t i = 0; i < count; ++i) {
-    scored[i] = {vectors::CosineDistanceRaw(query, matrix + static_cast<size_t>(i) * dim, dim), i};
+    norms[i] = vectors::simd::GetOptimalImpl().l2_norm(matrix.data() + static_cast<size_t>(i) * dim, dim);
   }
-  const uint32_t k = std::min(top_k, count);
-  std::partial_sort(scored.begin(), scored.begin() + k, scored.end(),
-                    [](const auto& lhs, const auto& rhs) { return lhs.first > rhs.first; });
-  std::vector<uint32_t> ids(k);
-  for (uint32_t i = 0; i < k; ++i) {
-    ids[i] = scored[i].second;
+  return norms;
+}
+
+/// Exhaustive top-k over the corpus — the exact answer recall is scored against,
+/// and the cost the approximate indices are reported as a multiple of.
+///
+/// Written to the same cost model as SimilarityEngine's brute-force path,
+/// because that is the alternative a user actually has: pre-computed norms
+/// instead of recomputing both per candidate, a bounded min-heap instead of
+/// sorting the whole corpus, and the same prefetch distance. A baseline that
+/// leaves those out inflates every speedup ratio measured against it, by more
+/// at higher dimensions.
+std::vector<uint32_t> ExactTopK(const float* query, float query_norm, const float* matrix, const float* norms,
+                                uint32_t count, uint32_t dim, uint32_t top_k) {
+  constexpr size_t kPrefetchAhead = 4;
+  using ScoreIdx = std::pair<float, uint32_t>;
+  auto cmp = [](const ScoreIdx& lhs, const ScoreIdx& rhs) { return lhs.first > rhs.first; };
+  std::priority_queue<ScoreIdx, std::vector<ScoreIdx>, decltype(cmp)> min_heap(cmp);
+
+  for (uint32_t i = 0; i < count; ++i) {
+    if (i + kPrefetchAhead < count) {
+      __builtin_prefetch(matrix + static_cast<size_t>(i + kPrefetchAhead) * dim, 0, 0);
+    }
+    const float score =
+        vectors::CosineSimilarityPreNorm(query, matrix + static_cast<size_t>(i) * dim, dim, query_norm, norms[i]);
+    if (min_heap.size() < top_k) {
+      min_heap.push({score, i});
+    } else if (score > min_heap.top().first) {
+      min_heap.pop();
+      min_heap.push({score, i});
+    }
+  }
+
+  std::vector<ScoreIdx> scored;
+  scored.reserve(min_heap.size());
+  while (!min_heap.empty()) {
+    scored.push_back(min_heap.top());
+    min_heap.pop();
+  }
+  std::sort(scored.begin(), scored.end(), cmp);
+  std::vector<uint32_t> ids;
+  ids.reserve(scored.size());
+  for (const auto& [score, id] : scored) {
+    ids.push_back(id);
   }
   return ids;
 }
@@ -246,11 +294,46 @@ double Percentile(std::vector<double> samples, double q) {
   return samples[rank == 0 ? 0 : rank - 1];
 }
 
-void PrintCurveHeader(const char* knob) {
+/// Exact answers for a query set, and what producing them cost.
+struct ExactBaseline {
+  std::vector<std::vector<uint32_t>> truth;
+  double p50 = 0.0;
+};
+
+ExactBaseline MeasureExactBaseline(const std::vector<std::vector<float>>& queries, const std::vector<float>& matrix,
+                                   const std::vector<float>& norms, uint32_t count, uint32_t dim) {
+  ExactBaseline baseline;
+  baseline.truth.reserve(queries.size());
+  std::vector<double> times;
+  times.reserve(queries.size());
+  for (const auto& query : queries) {
+    const auto start = std::chrono::steady_clock::now();
+    const float query_norm = vectors::simd::GetOptimalImpl().l2_norm(query.data(), dim);
+    baseline.truth.push_back(ExactTopK(query.data(), query_norm, matrix.data(), norms.data(), count, dim, kTopK));
+    const auto end = std::chrono::steady_clock::now();
+    times.push_back(std::chrono::duration<double, std::micro>(end - start).count());
+  }
+  baseline.p50 = Percentile(times, 0.50);
+  return baseline;
+}
+
+/// @param knob Name of the swept parameter
+/// @param baseline Label for the measurement the speedup column divides by
+void PrintCurveHeader(const char* knob, const char* baseline) {
   std::cout << "\n  " << std::left << std::setw(10) << knob << std::right << std::setw(12) << "recall@10"
-            << std::setw(14) << "p50 (us)" << std::setw(14) << "p99 (us)" << std::setw(16) << "vs exact scan"
-            << "\n  " << std::string(10, '-') << std::string(12, '-') << std::string(14, '-') << std::string(14, '-')
+            << std::setw(14) << "p50 (us)" << std::setw(14) << "p99 (us)" << std::setw(16) << baseline << "\n  "
+            << std::string(10, '-') << std::string(12, '-') << std::string(14, '-') << std::string(14, '-')
             << std::string(16, '-') << "\n";
+}
+
+/// Vector ID for corpus row @p index, as the engine path stores it.
+std::string RowId(uint32_t index) {
+  return "v" + std::to_string(index);
+}
+
+/// Recover the corpus row a result ID refers to.
+uint32_t RowIndex(const std::string& id) {
+  return static_cast<uint32_t>(std::stoul(id.substr(1)));
 }
 
 void PrintCurveRow(uint32_t knob, double recall, double p50, double p99, double exact_p50) {
@@ -279,17 +362,10 @@ TEST(AnnRecallBenchmark, DISABLED_HnswRecallVsEfSearch) {
       }
 
       // Exact answers, and the cost of producing them.
-      std::vector<std::vector<uint32_t>> truth;
-      truth.reserve(kQueryCount);
-      std::vector<double> exact_times;
-      exact_times.reserve(kQueryCount);
-      for (const auto& query : queries) {
-        const auto start = std::chrono::steady_clock::now();
-        truth.push_back(ExactTopK(query.data(), matrix.data(), kVectorCount, dim, kTopK));
-        const auto end = std::chrono::steady_clock::now();
-        exact_times.push_back(std::chrono::duration<double, std::micro>(end - start).count());
-      }
-      const double exact_p50 = Percentile(exact_times, 0.50);
+      const std::vector<float> norms = ComputeNorms(matrix, kVectorCount, dim);
+      const ExactBaseline exact = MeasureExactBaseline(queries, matrix, norms, kVectorCount, dim);
+      const std::vector<std::vector<uint32_t>>& truth = exact.truth;
+      const double exact_p50 = exact.p50;
 
       vectors::HnswIndex::Config config;
       config.m = 16;
@@ -310,7 +386,7 @@ TEST(AnnRecallBenchmark, DISABLED_HnswRecallVsEfSearch) {
                 << " ms"
                 << "   memory: " << (index.MemoryUsage() / (1024 * 1024)) << " MB"
                 << "   exact scan p50: " << std::setprecision(1) << exact_p50 << " us\n";
-      PrintCurveHeader("ef_search");
+      PrintCurveHeader("ef_search", "vs exact scan");
 
       for (uint32_t ef : kEfSearchSweep) {
         index.SetEfSearch(ef);
@@ -355,15 +431,7 @@ TEST(AnnRecallBenchmark, DISABLED_IvfRecallVsNprobe) {
       std::mt19937 rng(kSeed);
       const std::vector<float> matrix = BuildCorpus(kVectorCount, dim, rng, corpus);
 
-      std::vector<float> norms(kVectorCount);
-      for (uint32_t i = 0; i < kVectorCount; ++i) {
-        const float* v = matrix.data() + static_cast<size_t>(i) * dim;
-        float sum = 0.0F;
-        for (uint32_t d = 0; d < dim; ++d) {
-          sum += v[d] * v[d];
-        }
-        norms[i] = std::sqrt(sum);
-      }
+      const std::vector<float> norms = ComputeNorms(matrix, kVectorCount, dim);
 
       std::vector<std::vector<float>> queries;
       queries.reserve(kQueryCount);
@@ -371,17 +439,9 @@ TEST(AnnRecallBenchmark, DISABLED_IvfRecallVsNprobe) {
         queries.push_back(BuildQuery(dim, rng, corpus, matrix, kVectorCount));
       }
 
-      std::vector<std::vector<uint32_t>> truth;
-      truth.reserve(kQueryCount);
-      std::vector<double> exact_times;
-      exact_times.reserve(kQueryCount);
-      for (const auto& query : queries) {
-        const auto start = std::chrono::steady_clock::now();
-        truth.push_back(ExactTopK(query.data(), matrix.data(), kVectorCount, dim, kTopK));
-        const auto end = std::chrono::steady_clock::now();
-        exact_times.push_back(std::chrono::duration<double, std::micro>(end - start).count());
-      }
-      const double exact_p50 = Percentile(exact_times, 0.50);
+      const ExactBaseline exact = MeasureExactBaseline(queries, matrix, norms, kVectorCount, dim);
+      const std::vector<std::vector<uint32_t>>& truth = exact.truth;
+      const double exact_p50 = exact.p50;
 
       vectors::IvfIndex::Config config;
       config.nlist = 256;
@@ -401,7 +461,7 @@ TEST(AnnRecallBenchmark, DISABLED_IvfRecallVsNprobe) {
                 << "\n    train: " << std::fixed << std::setprecision(1) << build_ms << " ms"
                 << "   clusters: " << index.GetClusterCount() << "   indexed: " << index.GetIndexedCount()
                 << "   exact scan p50: " << std::setprecision(1) << exact_p50 << " us\n";
-      PrintCurveHeader("nprobe");
+      PrintCurveHeader("nprobe", "vs exact scan");
 
       for (uint32_t nprobe : kNprobeSweep) {
         if (nprobe > config.nlist) {
@@ -435,6 +495,164 @@ TEST(AnnRecallBenchmark, DISABLED_IvfRecallVsNprobe) {
                                      << ") fell below the published curve";
           }
         }
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// IVF: recall through the path the server actually runs
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// nprobe values the documented IVF table lists, and therefore the ones the
+/// engine path has to reproduce.
+constexpr uint32_t kEnginePathNprobe[] = {1, 2, 4, 8};
+
+/// How long to wait for the background trainer before giving up.
+constexpr std::chrono::seconds kTrainDeadline{300};
+
+/// Store the corpus and publish each row, exactly as the request dispatcher does.
+void IngestCorpus(vectors::VectorStore& store, similarity::SimilarityEngine& engine, const std::vector<float>& matrix,
+                  uint32_t count, uint32_t dim) {
+  std::vector<float> row(dim);
+  for (uint32_t i = 0; i < count; ++i) {
+    const float* src = matrix.data() + static_cast<size_t>(i) * dim;
+    row.assign(src, src + dim);
+    const std::string id = RowId(i);
+    ASSERT_TRUE(store.SetVector(id, row).has_value());
+    const auto compact_index = store.GetCompactIndex(id);
+    ASSERT_TRUE(compact_index.has_value());
+    engine.NotifyVectorAdded(compact_index.value(), row.data());
+  }
+}
+
+/// p50 of SearchByVector over the query set, in microseconds.
+double MeasureEnginePathP50(similarity::SimilarityEngine& engine, const std::vector<std::vector<float>>& queries) {
+  std::vector<double> times;
+  times.reserve(queries.size());
+  for (const auto& query : queries) {
+    const auto start = std::chrono::steady_clock::now();
+    auto results = engine.SearchByVector(query, static_cast<int>(kTopK), {});
+    const auto end = std::chrono::steady_clock::now();
+    times.push_back(std::chrono::duration<double, std::micro>(end - start).count());
+    EXPECT_TRUE(results.has_value());
+  }
+  return Percentile(times, 0.50);
+}
+
+}  // namespace
+
+// The sweep above trains on the whole corpus in one Train(assign_vectors=true)
+// call, which no server ever does. A running server ingests one vector at a
+// time through SetVector + NotifyVectorAdded, trains asynchronously on a sample
+// once ivf_train_threshold is crossed, and publishes buffered vectors into the
+// inverted lists from a background maintenance pass. This test drives that path
+// with the shipped default thresholds so the published recall is checked
+// against what the server produces, not against a layout built by the benchmark
+// itself.
+//
+// Two baselines are printed and they measure different things. The component
+// one is the standalone exhaustive scan used above; the engine one is
+// SimilarityEngine configured with index_type flat over the same corpus, which
+// is the alternative a user is actually choosing between. Speedups on this
+// curve are reported against the engine baseline for that reason — a ratio
+// against a scan no shipped code path runs is not one anybody can observe.
+TEST(AnnRecallBenchmark, DISABLED_IvfRecallThroughEnginePath) {
+  for (uint32_t dim : kDimensions) {
+    std::mt19937 rng(kSeed);
+    const std::vector<float> matrix = BuildCorpus(kVectorCount, dim, rng, Corpus::kClustered);
+
+    std::vector<std::vector<float>> queries;
+    queries.reserve(kQueryCount);
+    for (uint32_t q = 0; q < kQueryCount; ++q) {
+      queries.push_back(BuildQuery(dim, rng, Corpus::kClustered, matrix, kVectorCount));
+    }
+
+    const std::vector<float> norms = ComputeNorms(matrix, kVectorCount, dim);
+    const ExactBaseline exact = MeasureExactBaseline(queries, matrix, norms, kVectorCount, dim);
+    const std::vector<std::vector<uint32_t>>& truth = exact.truth;
+
+    config::VectorsConfig vectors_config;
+    vectors_config.default_dimension = dim;
+    vectors_config.distance_metric = "cosine";
+
+    config::SimilarityConfig base_config;
+    base_config.index_type = "ivf";
+    base_config.sample_size = 0;  // Exact fallback, so the index is the only approximation.
+    base_config.ivf_nlist = 256;
+
+    // The engine's own brute-force path over the same corpus.
+    double flat_p50 = 0.0;
+    {
+      config::SimilarityConfig flat_config = base_config;
+      flat_config.index_type = "flat";
+      events::EventStore event_store{config::EventsConfig{}};
+      events::CoOccurrenceIndex co_index;
+      vectors::VectorStore store(vectors_config);
+      similarity::SimilarityEngine engine(&event_store, &co_index, &store, flat_config, vectors_config);
+      IngestCorpus(store, engine, matrix, kVectorCount, dim);
+      flat_p50 = MeasureEnginePathP50(engine, queries);
+    }
+
+    std::cout << "\n=== IVF via SimilarityEngine  corpus=" << CorpusName(Corpus::kClustered) << "  dim=" << dim
+              << "  vectors=" << kVectorCount << "  nlist=" << base_config.ivf_nlist << "  top_k=" << kTopK
+              << "  queries=" << kQueryCount << "\n    ivf_train_threshold=" << base_config.ivf_train_threshold
+              << "  ivf_seal_threshold=" << base_config.ivf_seal_threshold
+              << "\n    component exact scan p50: " << std::fixed << std::setprecision(1) << exact.p50
+              << " us   engine flat p50: " << std::setprecision(1) << flat_p50 << " us\n";
+    PrintCurveHeader("nprobe", "vs engine flat");
+
+    for (uint32_t nprobe : kEnginePathNprobe) {
+      config::SimilarityConfig similarity_config = base_config;
+      similarity_config.ivf_nprobe = nprobe;
+
+      events::EventStore event_store{config::EventsConfig{}};
+      events::CoOccurrenceIndex co_index;
+      vectors::VectorStore store(vectors_config);
+      similarity::SimilarityEngine engine(&event_store, &co_index, &store, similarity_config, vectors_config);
+
+      IngestCorpus(store, engine, matrix, kVectorCount, dim);
+
+      // Training runs on a background thread, and the vectors buffered while it
+      // ran are published by the maintenance pass that follows. Querying before
+      // both land measures a buffer scan, not the inverted lists.
+      const auto deadline = std::chrono::steady_clock::now() + kTrainDeadline;
+      while ((!engine.IsIvfTrained() || engine.GetIvfUnsealedCount() > 0) &&
+             std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      }
+      ASSERT_TRUE(engine.IsIvfTrained()) << "IVF training did not complete at dim " << dim;
+      ASSERT_TRUE(engine.IsAnnIndexReady());
+      ASSERT_EQ(engine.GetIvfUnsealedCount(), 0U)
+          << "vectors left unsealed at dim " << dim << "; every query would rescan them";
+      ASSERT_EQ(engine.GetIvfIndexedCount(), kVectorCount);
+
+      double recall_sum = 0.0;
+      std::vector<double> times;
+      times.reserve(kQueryCount);
+      for (uint32_t q = 0; q < kQueryCount; ++q) {
+        const auto start = std::chrono::steady_clock::now();
+        auto results = engine.SearchByVector(queries[q], static_cast<int>(kTopK), {});
+        const auto end = std::chrono::steady_clock::now();
+        times.push_back(std::chrono::duration<double, std::micro>(end - start).count());
+
+        ASSERT_TRUE(results.has_value()) << results.error().to_string();
+        std::vector<uint32_t> ids;
+        ids.reserve(results->size());
+        for (const auto& result : *results) {
+          ids.push_back(RowIndex(result.item_id));
+        }
+        recall_sum += RecallAt(ids, truth[q]);
+      }
+      const double recall = recall_sum / kQueryCount;
+      PrintCurveRow(nprobe, recall, Percentile(times, 0.50), Percentile(times, 0.99), flat_p50);
+
+      const double floor = FloorFor(kIvfFloors, std::size(kIvfFloors), nprobe);
+      if (floor >= 0.0) {
+        EXPECT_GE(recall, floor) << "IVF recall@" << kTopK << " at nprobe=" << nprobe << " (dim " << dim
+                                 << ") fell below the published curve when measured through the engine";
       }
     }
   }

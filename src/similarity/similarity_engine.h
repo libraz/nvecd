@@ -12,8 +12,11 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <string>
@@ -167,10 +170,45 @@ class SimilarityEngine {
   bool IsIvfTrained() const;
 
   /**
+   * @brief Number of vectors published into the IVF inverted lists
+   *
+   * These are the vectors a query reaches through the cluster probes. Reported
+   * alongside GetIvfUnsealedCount() so the split between the two tiers is
+   * observable: an index whose vectors sit in the write buffer answers queries
+   * by scanning that buffer, which costs more per item than the brute-force
+   * path it is meant to replace.
+   *
+   * @return Indexed count, or 0 when the index type is not IVF
+   */
+  size_t GetIvfIndexedCount() const;
+
+  /**
+   * @brief Number of vectors still in the IVF write buffer
+   * @return Unsealed count, or 0 when the index type is not IVF
+   */
+  size_t GetIvfUnsealedCount() const;
+
+  /**
+   * @brief Number of write-buffer seals that have published successfully
+   *
+   * How often sealing happens is what ivf_seal_threshold governs, so this
+   * counts threshold crossings rather than timing them: the count follows from
+   * how many vectors were ingested, not from how quickly the maintenance
+   * thread was scheduled. Deferred seals are not counted, since they publish
+   * nothing.
+   *
+   * @return Completed seal count, or 0 when the index type is not IVF
+   */
+  uint64_t GetIvfSealCount() const;
+
+  /**
    * @brief Force IVF index training/retraining now
    *
-   * Triggers asynchronous training using current vector data.
-   * Does nothing if IVF is disabled or training is already in progress.
+   * Retrains the partition and reassigns every vector the store currently
+   * holds. Training discards the previous inverted lists, so the reassignment
+   * has to cover the whole corpus and not just the write buffer: retraining
+   * without it leaves a trained index that reports readiness while holding
+   * nothing. Does nothing if IVF is disabled.
    */
   void ForceIvfTrain();
 
@@ -264,15 +302,18 @@ class SimilarityEngine {
   DistanceFunc distance_func_;                        ///< Distance function for similarity
   bool use_prenorm_ = false;                          ///< Whether to use pre-computed norm optimization (cosine only)
 
+  /// Selected implementation, parsed once from config_.index_type. Dispatch on
+  /// it is written as a `default:`-less switch so a new implementation cannot be
+  /// added without every engine path that branches on the index kind being
+  /// taught about it.
+  vectors::AnnIndexType index_type_ = vectors::AnnIndexType::kFlat;
+
   /// ANN index (HNSW or IVF adapter; null for flat/brute-force)
   std::unique_ptr<vectors::AnnIndex> ann_index_;
 
   /// Publishes ANN labels and the VectorStore generation as one mapping.
   mutable std::shared_mutex ann_publication_mutex_;
   std::atomic<uint64_t> ann_generation_{0};
-
-  /// Legacy direct IVF pointer (non-owning, null if index_type != "ivf")
-  vectors::IvfIndex* ivf_index_raw_ = nullptr;
 
   /// Dimension the ANN index is currently bound to (0 = flat/no index).
   uint32_t ann_dimension_ = 0;
@@ -300,6 +341,64 @@ class SimilarityEngine {
    * @brief Join the background training thread if it is joinable
    */
   void JoinTrainThread();
+
+  // =========================================================================
+  // IVF write-buffer maintenance
+  // =========================================================================
+
+  /// How long the maintenance thread waits for another write before treating
+  /// the write stream as quiet. A seal only becomes cheap relative to the
+  /// queries it saves once writes have stopped arriving, and the condition it
+  /// answers ("is anything still unsealed?") outlives the last write, so it
+  /// cannot be decided on the write path alone.
+  static constexpr std::chrono::milliseconds kIvfMaintenanceInterval{100};
+
+  /**
+   * @brief Publish buffered vectors into the IVF inverted lists
+   *
+   * Serialised against every other seal in the engine, so a seal in flight can
+   * never be silently skipped by a second caller. Takes no publication or
+   * store lock, so queries run throughout.
+   *
+   * @param only_when_over_threshold When true, seal only if the write buffer
+   *        has reached ivf_seal_threshold. When false, publish whatever is
+   *        buffered: this is the quiet-stream drain that bounds what a query
+   *        has to scan once ingestion stops.
+   */
+  void DrainIvfBuffer(bool only_when_over_threshold);
+
+  /// @brief Report that a write reached the IVF buffer
+  void RequestIvfSeal();
+
+  /// @brief Maintenance loop body; runs for the engine's lifetime when IVF
+  void IvfMaintenanceLoop();
+
+  /// @brief Stop and join the maintenance thread (idempotent)
+  void StopIvfMaintenance();
+
+  /// Serialises seals so only one publishes into the inverted lists at a time.
+  std::mutex ivf_seal_mutex_;
+
+  /// Maintenance thread (IVF only; never started for flat or HNSW)
+  std::unique_ptr<std::thread> ivf_maintenance_thread_;
+  std::mutex ivf_maintenance_mutex_;
+  std::condition_variable ivf_maintenance_cv_;
+  bool ivf_maintenance_stop_ = false;
+
+  /// Set when the buffer has reached the seal threshold and the maintenance
+  /// thread should not wait out the rest of its tick.
+  bool ivf_seal_now_ = false;
+
+  /// Set by every write that reaches the IVF buffer and cleared by each
+  /// maintenance pass, so a pass can tell an active write stream from a quiet
+  /// one. Deliberately outside ivf_maintenance_mutex_: taking a second lock per
+  /// write would serialise ingestion across connection threads, and losing a
+  /// flag costs one tick, never a missed drain.
+  std::atomic<bool> ivf_write_pending_{false};
+
+  /// Incremented once per seal that publishes. A seal that defers because the
+  /// layout was replaced under it publishes nothing and is not counted.
+  std::atomic<uint64_t> ivf_seal_count_{0};
 };
 
 }  // namespace nvecd::similarity
