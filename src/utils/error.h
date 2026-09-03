@@ -116,7 +116,6 @@ enum class ErrorCode : std::uint16_t {
   kWalCRCMismatch = 5032,              ///< WAL record CRC mismatch
   kWalCorrupted = 5033,                ///< WAL file corrupted
   kWalRotationFailed = 5034,           ///< WAL file rotation failed
-  kWalReplayFailed = 5035,             ///< WAL replay failed
   kWalTruncateFailed = 5036,           ///< WAL truncate failed
   kWalNotOpen = 5037,                  ///< WAL not open
 
@@ -138,6 +137,7 @@ enum class ErrorCode : std::uint16_t {
   kNetworkUnixSocketPathTooLong = 6014,  ///< Unix socket path exceeds system limit
   kNetworkUnixSocketStale = 6015,        ///< Another server is listening on the unix socket
   kNetworkRateLimited = 6016,            ///< Request rate limited
+  kNetworkAddressInUse = 6017,           ///< Another process is already bound to this address
 
   // ===== Client Errors (7000-7999) =====
   kClientNotConnected = 7000,      ///< Client not connected
@@ -147,7 +147,6 @@ enum class ErrorCode : std::uint16_t {
   kClientInvalidResponse = 7004,   ///< Invalid response from server
   kClientTimeout = 7005,           ///< Client operation timed out
   kClientAlreadyConnected = 7006,  ///< Already connected
-  kClientCommandFailed = 7007,     ///< Command execution failed
   kClientConnectionClosed = 7008,  ///< Connection closed by server
   kClientInvalidArgument = 7009,   ///< Invalid argument provided
   kClientServerError = 7010,       ///< Server returned an error
@@ -318,8 +317,6 @@ inline const char* ErrorCodeToString(ErrorCode code) {
       return "WAL corrupted";
     case ErrorCode::kWalRotationFailed:
       return "WAL rotation failed";
-    case ErrorCode::kWalReplayFailed:
-      return "WAL replay failed";
     case ErrorCode::kWalTruncateFailed:
       return "WAL truncate failed";
     case ErrorCode::kWalNotOpen:
@@ -360,6 +357,8 @@ inline const char* ErrorCodeToString(ErrorCode code) {
       return "Unix socket already in use by another server";
     case ErrorCode::kNetworkRateLimited:
       return "Rate limited";
+    case ErrorCode::kNetworkAddressInUse:
+      return "Address already in use by another server";
 
     // Client
     case ErrorCode::kClientNotConnected:
@@ -376,8 +375,6 @@ inline const char* ErrorCodeToString(ErrorCode code) {
       return "Timeout";
     case ErrorCode::kClientAlreadyConnected:
       return "Already connected";
-    case ErrorCode::kClientCommandFailed:
-      return "Command failed";
     case ErrorCode::kClientConnectionClosed:
       return "Connection closed";
     case ErrorCode::kClientInvalidArgument:

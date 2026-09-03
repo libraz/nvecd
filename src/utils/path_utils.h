@@ -377,13 +377,24 @@ class PrivateStorageTarget {
  * @return The validated canonical path, or an error on failure
  */
 inline Expected<std::string, Error> ValidateDumpPath(const std::string& filepath, const std::string& dump_dir) {
+  // An empty filepath names no file and must be refused on that ground alone.
+  // Left to the checks below it would never be joined to dump_dir, and
+  // weakly_canonical() resolves an empty path to the process working
+  // directory, so containment would be decided against wherever the daemon was
+  // started rather than against the input. A service run from its own data
+  // directory would then resolve an empty path to the dump directory itself
+  // and accept it.
+  if (filepath.empty()) {
+    return MakeUnexpected(MakeError(ErrorCode::kInvalidArgument, "Invalid filepath: must not be empty"));
+  }
+
   // Defense-in-depth: reject paths containing ".." segments before canonicalization
   if (filepath.find("..") != std::string::npos) {
     return MakeUnexpected(MakeError(ErrorCode::kInvalidArgument, "Invalid filepath: path traversal detected"));
   }
 
   std::string resolved = filepath;
-  if (!resolved.empty() && resolved[0] != '/') {
+  if (resolved[0] != '/') {
     resolved = dump_dir + "/" + resolved;
   }
 

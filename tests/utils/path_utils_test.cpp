@@ -16,7 +16,15 @@ using namespace nvecd::utils;
 class PathUtilsTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    test_dir_ = std::filesystem::temp_directory_path() / "nvecd_path_test";
+    // Give every case its own directory. Cases run as separate processes under
+    // a parallel test run, so a shared fixed path lets one case's TearDown()
+    // delete the directory another case is still working in.
+    const auto* info = ::testing::UnitTest::GetInstance()->current_test_info();
+    test_dir_ =
+        std::filesystem::temp_directory_path() / ("nvecd_path_test_" + std::to_string(::getpid()) + "_" + info->name());
+    // A previous run killed mid-test can leave the directory behind with the
+    // relaxed permissions one of the cases sets; start from a known state.
+    std::filesystem::remove_all(test_dir_);
     std::filesystem::create_directories(test_dir_);
   }
 
@@ -54,17 +62,29 @@ TEST_F(PathUtilsTest, NonExistentDumpDir) {
   EXPECT_FALSE(result.has_value());
 }
 
-TEST_F(PathUtilsTest, EmptyFilepath) {
-  // Empty filepath: resolved becomes empty string (not prepended since
-  // the empty check passes but the absolute check sees empty[0] would be UB).
-  // The function prepends dump_dir + "/" making it dump_dir path.
-  // Behavior depends on implementation; verify it returns a valid result
-  // or an error without crashing.
+TEST_F(PathUtilsTest, EmptyFilepathRejected) {
+  // An empty filepath names no file, so it is refused before any path is built
+  // from it.
   auto result = ValidateDumpPath("", test_dir_.string());
-  // Empty filepath resolves to dump_dir + "/" which canonicalizes to dump_dir.
-  // The relative path "." is valid, but the implementation may reject it.
-  // Just verify no crash - either outcome is acceptable.
-  (void)result;
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), ErrorCode::kInvalidArgument);
+  EXPECT_NE(result.error().message().find("must not be empty"), std::string::npos) << result.error().message();
+}
+
+TEST_F(PathUtilsTest, EmptyFilepathRejectedFromWorkingDirectoryInsideDumpDir) {
+  // The refusal must follow from the input, not from where the process runs.
+  // An empty path is never joined to dump_dir, and canonicalizing it yields the
+  // working directory, so a containment-only check would accept an empty path
+  // from a service started in its own data directory -- an ordinary way to run
+  // a daemon -- and hand back the dump directory itself as a writable target.
+  const auto previous_directory = std::filesystem::current_path();
+  ASSERT_EQ(::chdir(test_dir_.c_str()), 0);
+  auto result = ValidateDumpPath("", test_dir_.string());
+  ASSERT_EQ(::chdir(previous_directory.c_str()), 0);
+
+  ASSERT_FALSE(result.has_value()) << "empty filepath accepted, resolving to " << result.value();
+  EXPECT_EQ(result.error().code(), ErrorCode::kInvalidArgument);
+  EXPECT_NE(result.error().message().find("must not be empty"), std::string::npos) << result.error().message();
 }
 
 TEST_F(PathUtilsTest, NestedRelativePath) {

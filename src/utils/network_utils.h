@@ -46,7 +46,7 @@ std::optional<uint32_t> ParseIPv4(const std::string& ip_str);
  * @brief Check if an IP address is allowed by CIDR list
  * @param ip_str IP address string (e.g., "192.168.1.1")
  * @param allow_cidrs List of allowed CIDR ranges
- * @return True if IP is allowed (or if allow_cidrs is empty = allow all)
+ * @return True if IP is allowed; an empty allow_cidrs denies every address
  */
 bool IsIPAllowed(const std::string& ip_str, const std::vector<std::string>& allow_cidrs);
 
@@ -54,7 +54,7 @@ bool IsIPAllowed(const std::string& ip_str, const std::vector<std::string>& allo
  * @brief Check if an IP address is allowed using pre-parsed CIDR list
  * @param ip_str IP address string
  * @param parsed_allow_cidrs Parsed CIDR list
- * @return True if IP allowed (or if list empty = allow all)
+ * @return True if IP is allowed; an empty list denies every address
  */
 bool IsIPAllowed(const std::string& ip_str, const std::vector<CIDR>& parsed_allow_cidrs);
 
