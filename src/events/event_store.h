@@ -10,6 +10,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -21,6 +22,7 @@
 #include "events/dedup_cache.h"
 #include "events/ring_buffer.h"
 #include "events/state_cache.h"
+#include "events/validated.h"
 #include "utils/error.h"
 #include "utils/expected.h"
 
@@ -60,6 +62,44 @@ struct Event {
   Event() = default;
   Event(std::string item_id_, int score_, uint64_t timestamp_, EventType type_ = EventType::ADD)
       : item_id(std::move(item_id_)), score(score_), timestamp(timestamp_), type(type_) {}
+};
+
+class EventValidator;
+
+/**
+ * @brief An event together with the context it belongs to
+ */
+struct ContextEvent {
+  std::string ctx;  ///< Context identifier
+  Event event;      ///< Event as it will be stored
+};
+
+/// @brief A (context, event) pair that satisfies every event store invariant.
+using ValidatedEvent = Validated<ContextEvent, EventValidator>;
+
+/**
+ * @brief Sole producer of ValidatedEvent
+ *
+ * Wire ingestion (EventStore::PrepareEvent, EventStore::AddEventAndGetPrior)
+ * and snapshot/WAL restore (EventStore::RestoreEvent) both mint here, so an
+ * input the live path rejects is rejected by the restore path as well.
+ * Restore keeps the original score value, type and timestamp; what it does not
+ * get is an exemption from the invariants those values must satisfy.
+ */
+class EventValidator {
+ public:
+  /**
+   * @brief Check the store invariants and mint a ValidatedEvent
+   *
+   * The event must already be in its final stored form: the timestamp resolved
+   * and, for DEL, the score forced to 0. Nothing here rewrites the event.
+   *
+   * @param ctx Context identifier
+   * @param event Event in its final stored form
+   * @return Expected<ValidatedEvent, Error> The validated pair or the reason it
+   *         was rejected
+   */
+  static utils::Expected<ValidatedEvent, utils::Error> Validate(const std::string& ctx, const Event& event);
 };
 
 /**
@@ -172,6 +212,11 @@ class EventStore {
    * altered by replaying through the dedup path. The total event counter is
    * incremented to mirror the original ingestion count.
    *
+   * What is restored verbatim is the value, not an exemption from the store's
+   * invariants: the event goes through EventValidator just like a wire event,
+   * so an untrusted snapshot or a tampered WAL record cannot plant a score, a
+   * type or an identifier the live path would have refused.
+   *
    * Events MUST be restored in their original insertion order (oldest first)
    * so the ring buffer's eviction order matches the snapshot.
    *
@@ -262,6 +307,19 @@ class EventStore {
   size_t MemoryUsageLocked() const;
 
   /**
+   * @brief Append a validated event, optionally capturing the prior buffer
+   *
+   * The only path that writes into a context ring buffer. Taking a
+   * ValidatedEvent means no caller can reach the buffers with a raw value that
+   * has not been through EventValidator.
+   *
+   * @param validated Event to append
+   * @param prior_events When non-null, receives the buffer contents captured
+   *        under the same lock immediately before the append
+   */
+  void AppendValidated(const ValidatedEvent& validated, std::vector<Event>* prior_events);
+
+  /**
    * @brief Make room for a new context according to the configured LRU cap.
    * @pre mutex_ is held exclusively and @p ctx is not already present.
    */
@@ -276,8 +334,13 @@ class EventStore {
   // Uses shared_mutex for reader-writer lock pattern
   mutable std::shared_mutex mutex_;
   std::unordered_map<std::string, RingBuffer<Event>> ctx_events_;
-  std::unordered_map<std::string, uint64_t> ctx_last_access_;
-  uint64_t context_access_sequence_ = 0;
+
+  // Write recency as an intrusive LRU list: least recently written context at
+  // the front, one iterator per context. Eviction pops the front instead of
+  // scanning, so the exclusive lock is held for a time independent of
+  // max_contexts (which the schema allows to reach 1,000,000).
+  std::list<std::string> ctx_lru_;
+  std::unordered_map<std::string, std::list<std::string>::iterator> ctx_lru_pos_;
 
   std::atomic<uint64_t> total_events_{0};    ///< Total events processed
   std::atomic<uint64_t> deduped_events_{0};  ///< Total deduplicated events

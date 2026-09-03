@@ -7,6 +7,8 @@
 
 #include <gtest/gtest.h>
 
+#include <cmath>
+#include <limits>
 #include <thread>
 #include <vector>
 
@@ -402,9 +404,70 @@ TEST(CoOccurrenceIndexTest, LargeNumberOfEvents) {
 // SetScore Tests
 // ============================================================================
 
+namespace {
+
+// One candidate edge in the exact form it would be stored. Direct writes and
+// ingestion have to agree on which shapes may exist in the matrix: a score of
+// exactly 0.0F is a legitimate negative-signal baseline, whereas a self-edge or
+// a non-finite score is a shape ingestion can never build.
+struct EdgeCase {
+  const char* name;
+  std::string item1;
+  std::string item2;
+  float score;
+  bool storable;
+};
+
+std::vector<EdgeCase> EdgeCases() {
+  return {
+      {"distinct items", "a", "b", 12.0f, true},
+      {"zero baseline", "a", "c", 0.0f, true},
+      {"negative baseline", "a", "d", -4.0f, true},
+      {"self edge", "a", "a", 7.0f, false},
+      {"quiet nan", "a", "e", std::numeric_limits<float>::quiet_NaN(), false},
+      {"positive infinity", "a", "f", std::numeric_limits<float>::infinity(), false},
+      {"negative infinity", "a", "g", -std::numeric_limits<float>::infinity(), false},
+      {"empty id", "", "h", 1.0f, false},
+      {"id with newline", "a", "i\nj", 1.0f, false},
+      {"id with space", "a", "k l", 1.0f, false},
+  };
+}
+
+}  // namespace
+
+TEST(CoOccurrenceIndexTest, DirectWritesRejectEdgesIngestionCannotProduce) {
+  for (const auto& test_case : EdgeCases()) {
+    CoOccurrenceIndex index;
+
+    auto result = index.SetScore(test_case.item1, test_case.item2, test_case.score);
+    EXPECT_EQ(result.has_value(), test_case.storable) << test_case.name;
+    if (!result) {
+      // A rejected edge must leave no trace at all, not a half-written pair.
+      EXPECT_EQ(index.GetItemCount(), 0U) << test_case.name;
+      EXPECT_FLOAT_EQ(index.GetScore(test_case.item1, test_case.item2), 0.0f) << test_case.name;
+    }
+  }
+}
+
+TEST(CoOccurrenceIndexTest, IngestionNeverProducesEdgesDirectWritesReject) {
+  for (const auto& test_case : EdgeCases()) {
+    CoOccurrenceIndex index;
+    index.UpdateFromEvents("ctx1", MakeEvents({{test_case.item1, 10, 1000}, {test_case.item2, 10, 1001}}));
+
+    for (const auto& item : index.GetAllItems()) {
+      for (const auto& [neighbor, score] : index.GetAllNeighbors(item)) {
+        EXPECT_NE(neighbor, item) << test_case.name;
+        EXPECT_TRUE(std::isfinite(score)) << test_case.name;
+        EXPECT_TRUE(index.SetScore(item, neighbor, score).has_value())
+            << test_case.name << ": ingestion produced an edge the restore path would reject";
+      }
+    }
+  }
+}
+
 TEST(CoOccurrenceIndexTest, SetScoreBasic) {
   CoOccurrenceIndex index;
-  index.SetScore("item1", "item2", 150.0f);
+  ASSERT_TRUE(index.SetScore("item1", "item2", 150.0f).has_value());
 
   EXPECT_FLOAT_EQ(index.GetScore("item1", "item2"), 150.0f);
   EXPECT_FLOAT_EQ(index.GetScore("item2", "item1"), 150.0f);

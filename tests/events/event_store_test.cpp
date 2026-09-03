@@ -7,6 +7,9 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <map>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -410,14 +413,332 @@ TEST(EventStoreTest, SpecialCharacters) {
   EventStore store(config);
 
   std::string special_ctx = "user@#$%^&*()";
-  std::string special_id = "item\n\t\r";
+  std::string special_id = "item:42/\xE3\x81\x82";
 
   auto result = store.AddEvent(special_ctx, special_id, 10);
-  ASSERT_TRUE(result.has_value());
+  ASSERT_TRUE(result.has_value()) << result.error().message();
 
   auto events = store.GetEvents(special_ctx);
   ASSERT_EQ(events.size(), 1);
   EXPECT_EQ(events[0].item_id, special_id);
+}
+
+TEST(EventStoreTest, FramingBreakingIdentifiersRejected) {
+  auto config = MakeConfig();
+  EventStore store(config);
+
+  // Ids are written unescaped into the count-framed response, so an id able to
+  // carry a newline or a space lets one surface corrupt another's framing.
+  const std::vector<std::string> framing_breaking_ids = {"item\n", "item\r\nOK", "item id", "item\t2",
+                                                         std::string("item\0x", 6)};
+  for (const std::string& id : framing_breaking_ids) {
+    auto result = store.AddEvent("user1", id, 10);
+    EXPECT_FALSE(result.has_value()) << "accepted id: " << id;
+  }
+  for (const std::string& ctx : {"user\n1", "user 1"}) {
+    auto result = store.AddEvent(ctx, "item1", 10);
+    EXPECT_FALSE(result.has_value()) << "accepted ctx: " << ctx;
+  }
+
+  EXPECT_EQ(store.GetContextCount(), 0);
+  EXPECT_EQ(store.GetTotalEventCount(), 0);
+}
+
+// ============================================================================
+// Live / Restore Validation Symmetry
+// ============================================================================
+
+namespace {
+
+// One candidate event in the exact form it would be stored. A row is either
+// storable by both paths or rejected by both: the restore path may keep score
+// values, types and timestamps verbatim, but it is not exempt from the
+// invariants those values have to satisfy.
+struct StoredFormCase {
+  const char* name;
+  std::string ctx;
+  Event event;
+  bool storable;
+};
+
+std::vector<StoredFormCase> StoredFormCases() {
+  return {
+      {"add lower bound", "user1", Event("item1", 0, 1000, EventType::ADD), true},
+      {"add upper bound", "user1", Event("item2", 100, 1001, EventType::ADD), true},
+      {"set mid range", "user1", Event("item3", 50, 1002, EventType::SET), true},
+      {"del zero score", "user1", Event("item4", 0, 1003, EventType::DEL), true},
+      {"add above range", "user1", Event("item5", 101, 1004, EventType::ADD), false},
+      {"add negative score", "user1", Event("item6", -1, 1005, EventType::ADD), false},
+      {"set far above range", "user1", Event("item7", 1000000, 1006, EventType::SET), false},
+      {"del sentinel score", "user1", Event("item8", -1, 1007, EventType::DEL), false},
+      {"del weighted score", "user1", Event("item9", 5, 1008, EventType::DEL), false},
+      {"empty context", "", Event("item10", 10, 1009, EventType::ADD), false},
+      {"empty id", "user1", Event("", 10, 1010, EventType::ADD), false},
+      {"id with newline", "user1", Event("item\n11", 10, 1011, EventType::ADD), false},
+      {"id with space", "user1", Event("item 12", 10, 1012, EventType::ADD), false},
+      {"context with carriage return", "user\r1", Event("item13", 10, 1013, EventType::ADD), false},
+  };
+}
+
+}  // namespace
+
+TEST(EventStoreTest, RestorePathRejectsEverythingTheLivePathRejects) {
+  for (const auto& test_case : StoredFormCases()) {
+    auto config = MakeConfig();
+    EventStore store(config);
+
+    auto restored = store.RestoreEvent(test_case.ctx, test_case.event);
+    EXPECT_EQ(restored.has_value(), test_case.storable) << test_case.name;
+    if (!restored) {
+      EXPECT_EQ(store.GetContextCount(), 0U) << test_case.name;
+    } else {
+      auto events = store.GetEvents(test_case.ctx);
+      ASSERT_EQ(events.size(), 1U) << test_case.name;
+      // Accepted rows come back byte-for-byte, timestamp included.
+      EXPECT_EQ(events[0].item_id, test_case.event.item_id) << test_case.name;
+      EXPECT_EQ(events[0].score, test_case.event.score) << test_case.name;
+      EXPECT_EQ(events[0].timestamp, test_case.event.timestamp) << test_case.name;
+      EXPECT_EQ(events[0].type, test_case.event.type) << test_case.name;
+    }
+  }
+}
+
+TEST(EventStoreTest, LivePathStoresExactlyTheFormsTheRestorePathAccepts) {
+  for (const auto& test_case : StoredFormCases()) {
+    auto config = MakeConfig();
+    EventStore store(config);
+
+    auto live = store.AddEvent(test_case.ctx, test_case.event.item_id, test_case.event.score, test_case.event.type,
+                               test_case.event.timestamp);
+    if (test_case.storable) {
+      ASSERT_TRUE(live.has_value()) << test_case.name << ": " << live.error().message();
+      auto events = store.GetEvents(test_case.ctx);
+      ASSERT_EQ(events.size(), 1U) << test_case.name;
+      EXPECT_EQ(events[0].score, test_case.event.score) << test_case.name;
+      EXPECT_EQ(events[0].timestamp, test_case.event.timestamp) << test_case.name;
+      continue;
+    }
+
+    // A non-storable row is either refused outright or normalized into a
+    // different, storable form (a DEL always stores score 0). What must never
+    // happen is the row reaching a buffer in the form the restore path refuses.
+    if (live.has_value()) {
+      EXPECT_EQ(test_case.event.type, EventType::DEL) << test_case.name;
+      auto events = store.GetEvents(test_case.ctx);
+      ASSERT_EQ(events.size(), 1U) << test_case.name;
+      EXPECT_EQ(events[0].score, 0) << test_case.name;
+    } else {
+      EXPECT_EQ(store.GetContextCount(), 0U) << test_case.name;
+    }
+  }
+}
+
+TEST(EventStoreTest, PrepareEventAgreesWithTheStoredForm) {
+  for (const auto& test_case : StoredFormCases()) {
+    auto config = MakeConfig();
+    EventStore store(config);
+
+    auto prepared = store.PrepareEvent(test_case.ctx, test_case.event.item_id, test_case.event.score,
+                                       test_case.event.type, test_case.event.timestamp);
+    auto live = store.AddEvent(test_case.ctx, test_case.event.item_id, test_case.event.score, test_case.event.type,
+                               test_case.event.timestamp);
+    ASSERT_EQ(prepared.has_value(), live.has_value()) << test_case.name;
+    if (prepared) {
+      auto restore_check = store.RestoreEvent("preview", prepared->event);
+      EXPECT_TRUE(restore_check.has_value()) << test_case.name << ": " << restore_check.error().message();
+    }
+  }
+}
+
+// ============================================================================
+// LRU Bookkeeping (incremental vs full-scan reference)
+// ============================================================================
+
+namespace {
+
+// Full-scan reference model of the context LRU: it recomputes the victim by
+// scanning every tracked context, which is what the store used to do inline.
+// It lives here so production code cannot reach it, and so a future edit that
+// forgets to maintain the incremental structure fails mechanically.
+class LruReference {
+ public:
+  void Write(const std::string& ctx, uint32_t max_contexts) {
+    if (recency_.find(ctx) == recency_.end() && max_contexts > 0 && recency_.size() >= max_contexts) {
+      const auto victim = std::min_element(recency_.begin(), recency_.end(),
+                                           [](const auto& lhs, const auto& rhs) { return lhs.second < rhs.second; });
+      recency_.erase(victim);
+    }
+    recency_[ctx] = ++sequence_;
+  }
+
+  void Clear() { recency_.clear(); }
+
+  void Swap(LruReference& other) {
+    recency_.swap(other.recency_);
+    std::swap(sequence_, other.sequence_);
+  }
+
+  std::vector<std::string> Contexts() const {
+    std::vector<std::string> contexts;
+    contexts.reserve(recency_.size());
+    for (const auto& [ctx, _] : recency_) {
+      contexts.push_back(ctx);
+    }
+    std::sort(contexts.begin(), contexts.end());
+    return contexts;
+  }
+
+ private:
+  std::map<std::string, uint64_t> recency_;
+  uint64_t sequence_ = 0;
+};
+
+std::vector<std::string> SortedContexts(const EventStore& store) {
+  auto contexts = store.GetAllContexts();
+  std::sort(contexts.begin(), contexts.end());
+  return contexts;
+}
+
+}  // namespace
+
+TEST(EventStoreTest, IncrementalLruMatchesFullScanReference) {
+  auto config = MakeConfig(4);
+  config.max_contexts = 8;
+  EventStore store(config);
+  LruReference reference;
+
+  // Deterministic mixed workload: new contexts, repeat writes to existing ones,
+  // and restores, so every mutation kind that touches recency is exercised.
+  uint32_t state = 12345;
+  const auto next = [&state]() {
+    state = (state * 1664525U) + 1013904223U;
+    return state;
+  };
+
+  for (int i = 0; i < 400; ++i) {
+    const std::string ctx = "ctx" + std::to_string(next() % 20);
+    const std::string item = "item" + std::to_string(i);
+    if (i % 5 == 0) {
+      ASSERT_TRUE(store.RestoreEvent(ctx, Event(item, 7, 2000 + static_cast<uint64_t>(i), EventType::SET)).has_value());
+    } else {
+      ASSERT_TRUE(store.AddEvent(ctx, item, 7).has_value());
+    }
+    reference.Write(ctx, config.max_contexts);
+
+    ASSERT_EQ(SortedContexts(store), reference.Contexts()) << "diverged at write " << i;
+    ASSERT_LE(store.GetContextCount(), config.max_contexts) << "diverged at write " << i;
+  }
+}
+
+TEST(EventStoreTest, ClearResetsLruBookkeeping) {
+  auto config = MakeConfig(4);
+  config.max_contexts = 3;
+  EventStore store(config);
+  LruReference reference;
+
+  for (int i = 0; i < 6; ++i) {
+    const std::string ctx = "ctx" + std::to_string(i);
+    ASSERT_TRUE(store.AddEvent(ctx, "item" + std::to_string(i), 7).has_value());
+    reference.Write(ctx, config.max_contexts);
+  }
+  ASSERT_EQ(SortedContexts(store), reference.Contexts());
+
+  store.Clear();
+  reference.Clear();
+  EXPECT_EQ(SortedContexts(store), reference.Contexts());
+
+  // A stale entry left behind by Clear() would evict the wrong context here.
+  for (int i = 0; i < 5; ++i) {
+    const std::string ctx = "fresh" + std::to_string(i);
+    ASSERT_TRUE(store.AddEvent(ctx, "item" + std::to_string(i), 7).has_value());
+    reference.Write(ctx, config.max_contexts);
+    ASSERT_EQ(SortedContexts(store), reference.Contexts()) << "diverged at write " << i;
+  }
+}
+
+TEST(EventStoreTest, SwapStateMovesLruBookkeepingWithTheContexts) {
+  auto config = MakeConfig(4);
+  config.max_contexts = 3;
+  EventStore store(config);
+  EventStore staged(config);
+  LruReference store_reference;
+  LruReference staged_reference;
+
+  for (int i = 0; i < 3; ++i) {
+    const std::string ctx = "live" + std::to_string(i);
+    ASSERT_TRUE(store.AddEvent(ctx, "item" + std::to_string(i), 7).has_value());
+    store_reference.Write(ctx, config.max_contexts);
+  }
+  for (int i = 0; i < 3; ++i) {
+    const std::string ctx = "staged" + std::to_string(i);
+    ASSERT_TRUE(staged.RestoreEvent(ctx, Event("item" + std::to_string(i), 7, 3000, EventType::ADD)).has_value());
+    staged_reference.Write(ctx, config.max_contexts);
+  }
+
+  store.SwapState(staged);
+  store_reference.Swap(staged_reference);
+  ASSERT_EQ(SortedContexts(store), store_reference.Contexts());
+  ASSERT_EQ(SortedContexts(staged), staged_reference.Contexts());
+
+  // Eviction after the swap must follow the recency that came with the state.
+  for (int i = 0; i < 4; ++i) {
+    const std::string ctx = "after" + std::to_string(i);
+    ASSERT_TRUE(store.AddEvent(ctx, "item" + std::to_string(i), 7).has_value());
+    store_reference.Write(ctx, config.max_contexts);
+    ASSERT_EQ(SortedContexts(store), store_reference.Contexts()) << "diverged at write " << i;
+  }
+}
+
+// ============================================================================
+// Memory Accounting (in-place scan vs full-copy reference)
+// ============================================================================
+
+namespace {
+
+// Full-copy reference estimate: it materializes every stored event the way the
+// accessor used to, and must agree with the in-place traversal exactly.
+// Identifiers are kept short so the copies carry the same string capacity as
+// the stored originals.
+size_t ReferenceMemoryUsage(const EventStore& store, uint32_t ctx_buffer_size) {
+  size_t total = sizeof(EventStore);
+  for (const auto& ctx : store.GetAllContexts()) {
+    total += sizeof(std::string) + ctx.capacity();
+    for (const auto& event : store.GetEvents(ctx)) {
+      total += sizeof(Event);
+      total += event.item_id.capacity();
+    }
+    total += sizeof(RingBuffer<Event>);
+    total += ctx_buffer_size * sizeof(Event);
+  }
+  return total;
+}
+
+}  // namespace
+
+TEST(EventStoreTest, MemoryUsageMatchesFullCopyReference) {
+  constexpr uint32_t kBufferSize = 3;
+  auto config = MakeConfig(kBufferSize);
+  config.max_contexts = 4;
+  EventStore store(config);
+
+  EXPECT_EQ(store.MemoryUsage(), ReferenceMemoryUsage(store, kBufferSize)) << "empty store";
+
+  // Append, ring-buffer overwrite, restore, context eviction and clear: every
+  // mutation kind that can change the accounted set.
+  for (int i = 0; i < 12; ++i) {
+    ASSERT_TRUE(store.AddEvent("ctx" + std::to_string(i % 6), "item" + std::to_string(i), 7).has_value());
+    EXPECT_EQ(store.MemoryUsage(), ReferenceMemoryUsage(store, kBufferSize)) << "after add " << i;
+    EXPECT_EQ(store.GetStatistics().memory_bytes, ReferenceMemoryUsage(store, kBufferSize)) << "after add " << i;
+  }
+
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_TRUE(store.RestoreEvent("ctx" + std::to_string(i), Event("re" + std::to_string(i), 7, 4000, EventType::SET))
+                    .has_value());
+    EXPECT_EQ(store.MemoryUsage(), ReferenceMemoryUsage(store, kBufferSize)) << "after restore " << i;
+  }
+
+  store.Clear();
+  EXPECT_EQ(store.MemoryUsage(), ReferenceMemoryUsage(store, kBufferSize)) << "after clear";
 }
 
 }  // namespace

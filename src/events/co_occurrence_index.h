@@ -17,8 +17,50 @@
 #include <vector>
 
 #include "events/event_store.h"
+#include "events/validated.h"
+#include "utils/error.h"
+#include "utils/expected.h"
 
 namespace nvecd::events {
+
+class CoOccurrenceEdgeValidator;
+
+/**
+ * @brief One symmetric co-occurrence edge
+ */
+struct CoOccurrenceEdge {
+  std::string item1;  ///< First item ID
+  std::string item2;  ///< Second item ID
+  float score;        ///< Score to store in both directions
+};
+
+/// @brief A co-occurrence edge that satisfies every index invariant.
+using ValidatedEdge = Validated<CoOccurrenceEdge, CoOccurrenceEdgeValidator>;
+
+/**
+ * @brief Sole producer of ValidatedEdge
+ *
+ * The ingestion paths cannot produce a self-edge or a non-finite score: they
+ * skip self-pairs and multiply two bounded event scores. Direct writers
+ * (snapshot restore) mint here so an untrusted snapshot cannot introduce an
+ * edge the live path could never have built -- a self-edge corrupts the map
+ * during pruning, a non-finite score breaks the strict weak ordering of every
+ * later sort. A score of exactly 0.0F is a value, not a violation: the
+ * negative-signal baselines reach it and must survive a round trip.
+ */
+class CoOccurrenceEdgeValidator {
+ public:
+  /**
+   * @brief Check the index invariants and mint a ValidatedEdge
+   * @param item1 First item ID
+   * @param item2 Second item ID
+   * @param score Score to store in both directions
+   * @return Expected<ValidatedEdge, Error> The validated edge or the reason it
+   *         was rejected
+   */
+  static utils::Expected<ValidatedEdge, utils::Error> Validate(const std::string& item1, const std::string& item2,
+                                                               float score);
+};
 
 /**
  * @brief Co-occurrence index statistics
@@ -249,14 +291,18 @@ class CoOccurrenceIndex {
    * @brief Directly set co-occurrence score between two items
    *
    * Sets the score in both directions (symmetric). This bypasses
-   * UpdateFromEvents() and writes directly to the internal matrix.
-   * Primarily used for snapshot deserialization to preserve exact scores.
+   * UpdateFromEvents() and writes directly to the internal matrix, which is how
+   * snapshot deserialization preserves exact scores. What it does not bypass is
+   * CoOccurrenceEdgeValidator: an edge whose endpoints are equal or whose score
+   * is not finite is rejected instead of published, so a corrupt or tampered
+   * snapshot cannot plant state that the ingestion paths could never build.
    *
    * @param item1 First item ID
    * @param item2 Second item ID
    * @param score Co-occurrence score to set
+   * @return Expected<void, Error> Success or the reason the edge was rejected
    */
-  void SetScore(const std::string& item1, const std::string& item2, float score);
+  utils::Expected<void, utils::Error> SetScore(const std::string& item1, const std::string& item2, float score);
 
   /**
    * @brief Prune the entire index based on config settings
@@ -313,6 +359,9 @@ class CoOccurrenceIndex {
   /// @brief Internal implementation of AddEventIncremental (caller holds write lock)
   void AddEventIncrementalInternal(const std::vector<Event>& prior_events, const Event& new_event,
                                    bool temporal_enabled, double half_life_sec);
+
+  /// @brief Write a validated edge in both directions (acquires write lock)
+  void SetValidatedScore(const ValidatedEdge& edge);
 
   /// @brief Prune a single item's neighbor list (caller must hold write lock)
   void PruneItemLocked(const std::string& item_id);

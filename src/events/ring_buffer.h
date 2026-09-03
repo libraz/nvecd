@@ -49,6 +49,20 @@ class RingBuffer {
   std::vector<T> GetAll() const;
 
   /**
+   * @brief Visit every element in insertion order without copying
+   *
+   * Same traversal order as GetAll(), but the elements are passed by const
+   * reference instead of being materialized into a new vector. Read-only
+   * accessors that run under a lock (memory accounting, statistics) use this so
+   * they neither allocate nor deep-copy the stored elements while holding it.
+   *
+   * @tparam Visitor Callable invoked as visitor(const T&)
+   * @param visitor Callable applied to each element, oldest first
+   */
+  template <typename Visitor>
+  void ForEach(Visitor&& visitor) const;
+
+  /**
    * @brief Get current number of elements
    * @return Number of elements in buffer (0 to capacity)
    */
@@ -114,6 +128,28 @@ std::vector<T> RingBuffer<T>::GetAll() const {
   }
 
   return result;
+}
+
+template <typename T>
+template <typename Visitor>
+void RingBuffer<T>::ForEach(Visitor&& visitor) const {
+  if (size_ == 0) {
+    return;
+  }
+
+  if (size_ < capacity_) {
+    // Buffer not yet full: elements are at [0, size_)
+    for (size_t i = 0; i < size_; ++i) {
+      visitor(buffer_[i]);
+    }
+    return;
+  }
+
+  // Buffer full: oldest element is at head_, wrap around
+  for (size_t i = 0; i < capacity_; ++i) {
+    const size_t idx = (head_ + i) % capacity_;
+    visitor(buffer_[idx]);
+  }
 }
 
 template <typename T>

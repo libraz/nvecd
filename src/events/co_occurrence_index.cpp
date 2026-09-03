@@ -9,7 +9,32 @@
 #include <cmath>
 #include <mutex>
 
+#include "events/id_validation.h"
+
 namespace nvecd::events {
+
+utils::Expected<ValidatedEdge, utils::Error> CoOccurrenceEdgeValidator::Validate(const std::string& item1,
+                                                                                 const std::string& item2,
+                                                                                 float score) {
+  auto item1_valid = ValidateIdentifier("ID", item1);
+  if (!item1_valid) {
+    return utils::MakeUnexpected(item1_valid.error());
+  }
+  auto item2_valid = ValidateIdentifier("ID", item2);
+  if (!item2_valid) {
+    return utils::MakeUnexpected(item2_valid.error());
+  }
+  if (item1 == item2) {
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kEventCoOccurrenceError,
+                                                  "Co-occurrence edge cannot join an item to itself: " + item1));
+  }
+  if (!std::isfinite(score)) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kEventCoOccurrenceError, "Co-occurrence score must be finite"));
+  }
+
+  return ValidatedEdge(CoOccurrenceEdge{item1, item2, score});
+}
 
 CoOccurrenceIndex::CoOccurrenceIndex(const Config& config) : config_(config) {}
 
@@ -73,12 +98,21 @@ void CoOccurrenceIndex::AddEventIncrementalInternal(const std::vector<Event>& pr
   if (prior_events.empty()) {
     return;
   }
+  // Ingestion holds to the same identifier rules as the direct writers, so a
+  // caller assembling events itself cannot introduce a pair the restore path
+  // would reject.
+  if (!ValidateIdentifier("ID", new_event.item_id)) {
+    return;
+  }
 
   // Add only the pairs (new_event, prior_events[i]) once each (symmetric).
   for (size_t i = 0; i < prior_events.size(); ++i) {
     const auto& prior = prior_events[i];
     if (prior.item_id == new_event.item_id) {
       continue;  // Skip self-pairs
+    }
+    if (!ValidateIdentifier("ID", prior.item_id)) {
+      continue;
     }
 
     // Widen to int64_t before the float cast: callers such as snapshot
@@ -136,9 +170,23 @@ void CoOccurrenceIndex::AddEventIncrementalInternal(const std::vector<Event>& pr
 void CoOccurrenceIndex::UpdateFromEventsInternal(const std::string& ctx [[maybe_unused]],
                                                  const std::vector<Event>& events, bool temporal_enabled,
                                                  double half_life_sec) {
+  // Identifiers are checked once per event rather than once per pair: the rules
+  // are the ones the direct writers enforce, so a caller assembling events
+  // itself cannot introduce a pair the restore path would reject.
+  std::vector<char> usable(events.size(), 0);
+  for (size_t i = 0; i < events.size(); ++i) {
+    usable[i] = static_cast<char>(ValidateIdentifier("ID", events[i].item_id).has_value());
+  }
+
   // Compute pairwise co-occurrence scores
   for (size_t i = 0; i < events.size(); ++i) {
+    if (usable[i] == 0) {
+      continue;
+    }
     for (size_t j = i + 1; j < events.size(); ++j) {
+      if (usable[j] == 0) {
+        continue;
+      }
       const auto& event1 = events[i];
       const auto& event2 = events[j];
 
@@ -195,8 +243,15 @@ void CoOccurrenceIndex::ApplyNegativeSignalLocked(const std::string& removed_id,
     return;
   }
 
+  if (!ValidateIdentifier("ID", removed_id)) {
+    return;
+  }
+
   for (const auto& event : context_events) {
     if (event.item_id == removed_id) {
+      continue;
+    }
+    if (!ValidateIdentifier("ID", event.item_id)) {
       continue;
     }
 
@@ -343,10 +398,20 @@ std::vector<std::pair<std::string, float>> CoOccurrenceIndex::GetAllNeighbors(co
   return results;
 }
 
-void CoOccurrenceIndex::SetScore(const std::string& item1, const std::string& item2, float score) {
+utils::Expected<void, utils::Error> CoOccurrenceIndex::SetScore(const std::string& item1, const std::string& item2,
+                                                                float score) {
+  auto validated = CoOccurrenceEdgeValidator::Validate(item1, item2, score);
+  if (!validated) {
+    return utils::MakeUnexpected(validated.error());
+  }
+  SetValidatedScore(*validated);
+  return {};
+}
+
+void CoOccurrenceIndex::SetValidatedScore(const ValidatedEdge& edge) {
   std::unique_lock lock(mutex_);
-  co_scores_[item1][item2] = score;
-  co_scores_[item2][item1] = score;
+  co_scores_[edge->item1][edge->item2] = edge->score;
+  co_scores_[edge->item2][edge->item1] = edge->score;
   generation_.fetch_add(1, std::memory_order_release);
 }
 
@@ -379,9 +444,12 @@ void CoOccurrenceIndex::PruneItemLocked(const std::string& item_id) {
   if (config_.min_support > 0.0F) {
     for (auto nit = neighbors.begin(); nit != neighbors.end();) {
       if (std::abs(nit->second) < config_.min_support) {
-        // Also remove reverse entry
+        // Also remove reverse entry. A self-edge would make the reverse entry
+        // this very node: erasing it here would invalidate `neighbors` and the
+        // iterator still being walked, so leave the node to the single erase at
+        // the end of this function.
         auto rev_it = co_scores_.find(nit->first);
-        if (rev_it != co_scores_.end()) {
+        if (rev_it != co_scores_.end() && rev_it != it) {
           rev_it->second.erase(item_id);
           if (rev_it->second.empty()) {
             co_scores_.erase(rev_it);
@@ -405,9 +473,11 @@ void CoOccurrenceIndex::PruneItemLocked(const std::string& item_id) {
     for (size_t i = config_.max_neighbors_per_item; i < sorted_neighbors.size(); ++i) {
       const auto& removed_id = sorted_neighbors[i].first;
       neighbors.erase(removed_id);
-      // Also remove reverse entry
+      // Also remove reverse entry, except when it is this node (self-edge):
+      // erasing it here would leave `neighbors` dangling for the rest of the
+      // loop, and the trailing erase below already covers that case.
       auto rev_it = co_scores_.find(removed_id);
-      if (rev_it != co_scores_.end()) {
+      if (rev_it != co_scores_.end() && rev_it != it) {
         rev_it->second.erase(item_id);
         if (rev_it->second.empty()) {
           co_scores_.erase(rev_it);

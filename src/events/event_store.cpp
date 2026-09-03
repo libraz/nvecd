@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 
+#include "events/id_validation.h"
 #include "utils/error.h"
 #include "utils/structured_log.h"
 
@@ -43,6 +44,32 @@ uint64_t ResolveTimestamp(uint64_t timestamp) {
 
 }  // namespace
 
+utils::Expected<ValidatedEvent, utils::Error> EventValidator::Validate(const std::string& ctx, const Event& event) {
+  auto ctx_valid = ValidateIdentifier("Context", ctx);
+  if (!ctx_valid) {
+    return utils::MakeUnexpected(ctx_valid.error());
+  }
+  auto id_valid = ValidateIdentifier("ID", event.item_id);
+  if (!id_valid) {
+    return utils::MakeUnexpected(id_valid.error());
+  }
+
+  // Score range. DEL carries no weight, so it is stored as exactly 0; ADD and
+  // SET are bounded so the co-occurrence product (score1 * score2) cannot be
+  // driven out of its expected [0, 10000] range.
+  if (event.type == EventType::DEL) {
+    if (event.score != 0) {
+      return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kEventInvalidScore,
+                                                    "DEL score must be 0, got " + std::to_string(event.score)));
+    }
+  } else if (event.score < kMinEventScore || event.score > kMaxEventScore) {
+    return utils::MakeUnexpected(utils::MakeError(
+        utils::ErrorCode::kEventInvalidScore, "Score must be in range [0, 100], got " + std::to_string(event.score)));
+  }
+
+  return ValidatedEvent(ContextEvent{ctx, event});
+}
+
 utils::Expected<void, utils::Error> EventStore::AddEvent(const std::string& ctx, const std::string& id, int score,
                                                          EventType type, uint64_t timestamp) {
   auto result = AddEventAndGetPrior(ctx, id, score, type, timestamp);
@@ -56,18 +83,15 @@ utils::Expected<EventStore::PreparedEvent, utils::Error> EventStore::PrepareEven
                                                                                   const std::string& id, int score,
                                                                                   EventType type,
                                                                                   uint64_t timestamp) const {
-  if (ctx.empty()) {
-    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kEventStoreError, "Context cannot be empty"));
-  }
-  if (id.empty()) {
-    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kEventStoreError, "ID cannot be empty"));
-  }
-  if (type != EventType::DEL && (score < kMinEventScore || score > kMaxEventScore)) {
-    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kEventInvalidScore,
-                                                  "Score must be in range [0, 100], got " + std::to_string(score)));
+  const uint64_t resolved_timestamp = ResolveTimestamp(timestamp);
+  // DEL carries no weight: it is stored with score 0 whatever the request asked
+  // for, so the score is normalized before validation rather than after it.
+  const int stored_score = (type == EventType::DEL) ? 0 : score;
+  auto validated = EventValidator::Validate(ctx, Event(id, stored_score, resolved_timestamp, type));
+  if (!validated) {
+    return utils::MakeUnexpected(validated.error());
   }
 
-  const uint64_t resolved_timestamp = ResolveTimestamp(timestamp);
   PreparedEvent prepared;
   switch (type) {
     case EventType::ADD:
@@ -79,10 +103,9 @@ utils::Expected<EventStore::PreparedEvent, utils::Error> EventStore::PrepareEven
       break;
     case EventType::DEL:
       prepared.deduped = state_cache_ != nullptr && state_cache_->WouldDeduplicateDel(StateKey(ctx, id));
-      score = 0;
       break;
   }
-  prepared.event = Event(id, score, resolved_timestamp, type);
+  prepared.event = validated->Get().event;
   return prepared;
 }
 
@@ -90,32 +113,16 @@ utils::Expected<EventStore::IngestResult, utils::Error> EventStore::AddEventAndG
                                                                                         const std::string& id,
                                                                                         int score, EventType type,
                                                                                         uint64_t timestamp) {
-  // Validate inputs
-  if (ctx.empty()) {
-    auto error = utils::MakeError(utils::ErrorCode::kEventStoreError, "Context cannot be empty");
-    utils::LogEventStoreError("add_event", ctx, error.message());
-    return utils::MakeUnexpected(error);
-  }
-
-  if (id.empty()) {
-    auto error = utils::MakeError(utils::ErrorCode::kEventStoreError, "ID cannot be empty");
-    utils::LogEventStoreError("add_event", ctx, error.message());
-    return utils::MakeUnexpected(error);
-  }
-
-  // Validate score range defensively. DEL events ignore the score (it is forced
-  // to 0 below), so only ADD/SET scores are range-checked. Out-of-range scores
-  // are rejected here so the co-occurrence product (score1 * score2) cannot be
-  // driven out of its expected [0, 10000] range.
-  if (type != EventType::DEL && (score < kMinEventScore || score > kMaxEventScore)) {
-    auto error = utils::MakeError(utils::ErrorCode::kEventInvalidScore,
-                                  "Score must be in range [0, 100], got " + std::to_string(score));
-    utils::LogEventStoreError("add_event", ctx, error.message());
-    return utils::MakeUnexpected(error);
-  }
-
   // Use provided timestamp or current time
-  uint64_t ts = ResolveTimestamp(timestamp);
+  const uint64_t ts = ResolveTimestamp(timestamp);
+  // DEL events carry no weight and are stored with score 0.
+  const int stored_score = (type == EventType::DEL) ? 0 : score;
+
+  auto validated = EventValidator::Validate(ctx, Event(id, stored_score, ts, type));
+  if (!validated) {
+    utils::LogEventStoreError("add_event", ctx, validated.error().message());
+    return utils::MakeUnexpected(validated.error());
+  }
 
   // Increment total event count (includes duplicates)
   total_events_.fetch_add(1, std::memory_order_relaxed);
@@ -158,66 +165,27 @@ utils::Expected<EventStore::IngestResult, utils::Error> EventStore::AddEventAndG
           return result;  // Already deleted
         }
       }
-      // For DEL, store with score=0
-      score = 0;
       break;
   }
 
-  // Create event
-  Event event(id, score, ts, type);
-  result.stored_event = event;
-
-  // Atomically snapshot the prior buffer state and append the new event.
-  // Capturing prior_events under the same lock that performs the push
-  // guarantees that concurrent same-context ingests each observe a distinct,
-  // consistent prior view (no lost or duplicated co-occurrence pairs).
-  {
-    std::unique_lock lock(mutex_);
-
-    // Create ring buffer for context if it doesn't exist
-    auto it = ctx_events_.find(ctx);
-    if (it == ctx_events_.end()) {
-      EvictLeastRecentlyUsedContextLocked();
-      auto [new_it, inserted] = ctx_events_.emplace(ctx, RingBuffer<Event>(config_.ctx_buffer_size));
-      it = new_it;
-    }
-    TouchContextLocked(ctx);
-
-    // Snapshot the buffer contents that existed before this event.
-    result.prior_events = it->second.GetAll();
-
-    // Add event to ring buffer
-    it->second.Push(event);
-  }
+  result.stored_event = validated->Get().event;
+  AppendValidated(*validated, &result.prior_events);
 
   return result;
 }
 
 utils::Expected<void, utils::Error> EventStore::RestoreEvent(const std::string& ctx, const Event& event) {
-  if (ctx.empty()) {
-    auto error = utils::MakeError(utils::ErrorCode::kInvalidArgument, "Context cannot be empty");
-    utils::LogEventStoreError("restore_event", ctx, error.message());
-    return utils::MakeUnexpected(error);
-  }
-  if (event.item_id.empty()) {
-    auto error = utils::MakeError(utils::ErrorCode::kInvalidArgument, "ID cannot be empty");
-    utils::LogEventStoreError("restore_event", ctx, error.message());
-    return utils::MakeUnexpected(error);
+  // Same validator as the live path: the score value, type and timestamp are
+  // preserved verbatim, but an untrusted snapshot or WAL record cannot use that
+  // to plant something the live path would have refused.
+  auto validated = EventValidator::Validate(ctx, event);
+  if (!validated) {
+    utils::LogEventStoreError("restore_event", ctx, validated.error().message());
+    return utils::MakeUnexpected(validated.error());
   }
 
   total_events_.fetch_add(1, std::memory_order_relaxed);
-
-  std::unique_lock lock(mutex_);
-  auto it = ctx_events_.find(ctx);
-  if (it == ctx_events_.end()) {
-    EvictLeastRecentlyUsedContextLocked();
-    auto [new_it, inserted] = ctx_events_.emplace(ctx, RingBuffer<Event>(config_.ctx_buffer_size));
-    it = new_it;
-  }
-  TouchContextLocked(ctx);
-  // Push verbatim: preserve the original score, type, and timestamp so
-  // temporal-decay weights and DEL/SET semantics survive the reload exactly.
-  it->second.Push(event);
+  AppendValidated(*validated, nullptr);
 
   // Restore the last-value state cache in the same insertion order as the
   // ring buffer. Snapshot/WAL recovery bypasses AddEventAndGetPrior(), so
@@ -267,8 +235,8 @@ std::vector<std::string> EventStore::GetAllContexts() const {
 void EventStore::Clear() {
   std::unique_lock lock(mutex_);
   ctx_events_.clear();
-  ctx_last_access_.clear();
-  context_access_sequence_ = 0;
+  ctx_lru_.clear();
+  ctx_lru_pos_.clear();
   total_events_.store(0, std::memory_order_relaxed);
   deduped_events_.store(0, std::memory_order_relaxed);
   if (dedup_cache_) {
@@ -285,8 +253,10 @@ void EventStore::SwapState(EventStore& other) {
   }
   std::scoped_lock lock(mutex_, other.mutex_);
   ctx_events_.swap(other.ctx_events_);
-  ctx_last_access_.swap(other.ctx_last_access_);
-  std::swap(context_access_sequence_, other.context_access_sequence_);
+  // std::list::swap keeps iterators valid, so the position map stays paired
+  // with its list as long as both are swapped together.
+  ctx_lru_.swap(other.ctx_lru_);
+  ctx_lru_pos_.swap(other.ctx_lru_pos_);
 
   const uint64_t this_total = total_events_.load(std::memory_order_relaxed);
   total_events_.store(other.total_events_.load(std::memory_order_relaxed), std::memory_order_relaxed);
@@ -335,12 +305,13 @@ size_t EventStore::MemoryUsageLocked() const {
     // Context string
     total += sizeof(std::string) + ctx.capacity();
 
-    // Ring buffer events
-    auto events = ring_buffer.GetAll();
-    for (const auto& event : events) {
+    // Ring buffer events. Traversed in place: materializing them with GetAll()
+    // would deep-copy every stored event (and its heap-allocated item_id) on
+    // every statistics or metrics read, while the lock is held.
+    ring_buffer.ForEach([&total](const Event& event) {
       total += sizeof(Event);
       total += event.item_id.capacity();  // Event ID string
-    }
+    });
 
     // Ring buffer overhead
     total += sizeof(RingBuffer<Event>);
@@ -350,22 +321,53 @@ size_t EventStore::MemoryUsageLocked() const {
   return total;
 }
 
+void EventStore::AppendValidated(const ValidatedEvent& validated, std::vector<Event>* prior_events) {
+  const ContextEvent& pair = *validated;
+
+  // Capturing prior_events under the same lock that performs the push
+  // guarantees that concurrent same-context ingests each observe a distinct,
+  // consistent prior view (no lost or duplicated co-occurrence pairs).
+  std::unique_lock lock(mutex_);
+
+  // Create ring buffer for context if it doesn't exist
+  auto it = ctx_events_.find(pair.ctx);
+  if (it == ctx_events_.end()) {
+    EvictLeastRecentlyUsedContextLocked();
+    auto [new_it, inserted] = ctx_events_.emplace(pair.ctx, RingBuffer<Event>(config_.ctx_buffer_size));
+    it = new_it;
+  }
+  TouchContextLocked(pair.ctx);
+
+  if (prior_events != nullptr) {
+    // Snapshot the buffer contents that existed before this event.
+    *prior_events = it->second.GetAll();
+  }
+
+  it->second.Push(pair.event);
+}
+
 void EventStore::EvictLeastRecentlyUsedContextLocked() {
   if (config_.max_contexts == 0 || ctx_events_.size() < config_.max_contexts) {
     return;
   }
-
-  const auto victim = std::min_element(ctx_last_access_.begin(), ctx_last_access_.end(),
-                                       [](const auto& lhs, const auto& rhs) { return lhs.second < rhs.second; });
-  if (victim == ctx_last_access_.end()) {
+  if (ctx_lru_.empty()) {
     return;
   }
-  ctx_events_.erase(victim->first);
-  ctx_last_access_.erase(victim);
+
+  const std::string victim = ctx_lru_.front();
+  ctx_events_.erase(victim);
+  ctx_lru_pos_.erase(victim);
+  ctx_lru_.pop_front();
 }
 
 void EventStore::TouchContextLocked(const std::string& ctx) {
-  ctx_last_access_[ctx] = ++context_access_sequence_;
+  auto pos = ctx_lru_pos_.find(ctx);
+  if (pos == ctx_lru_pos_.end()) {
+    ctx_lru_pos_.emplace(ctx, ctx_lru_.insert(ctx_lru_.end(), ctx));
+    return;
+  }
+  // Splice keeps the iterator (and therefore ctx_lru_pos_) valid.
+  ctx_lru_.splice(ctx_lru_.end(), ctx_lru_, pos->second);
 }
 
 std::shared_lock<std::shared_mutex> EventStore::AcquireReadLock() const {
