@@ -95,6 +95,151 @@ class SnapshotFormatV1Test : public ::testing::Test {
 };
 
 // ---------------------------------------------------------------------------
+// 0. On-disk compatibility with snapshots written by an earlier build.
+//
+// A round trip through the current writer cannot test this: it would stay green
+// even if every previously stored snapshot had become unreadable. The fixture
+// is a byte-for-byte capture of a real snapshot, committed to the repository,
+// so any change to the layout shows up here as a failure to open stored data
+// rather than as a silent incompatibility discovered by an operator.
+//
+// Regenerate deliberately, never as a way to make this test pass:
+//   ./bin/snapshot_format_v1_test \
+//       --gtest_also_run_disabled_tests \
+//       --gtest_filter='*RegenerateCompatibilityFixture'
+// ---------------------------------------------------------------------------
+
+/// Stores whose serialized contents the compatibility fixture captures.
+void PopulateCompatibilityFixtureStores(events::EventStore& event_store, events::CoOccurrenceIndex& co_index,
+                                        vectors::VectorStore& vector_store) {
+  ASSERT_TRUE(event_store.AddEvent("ctx_a", "alpha", 100, events::EventType::ADD).has_value());
+  ASSERT_TRUE(event_store.AddEvent("ctx_a", "beta", 50, events::EventType::ADD).has_value());
+  co_index.UpdateFromEvents("ctx_a", event_store.GetEvents("ctx_a"));
+  ASSERT_TRUE(vector_store.SetVector("alpha", {0.25F, 0.5F, 0.75F}).has_value());
+  ASSERT_TRUE(vector_store.SetVector("beta", {1.0F, 0.0F, 0.0F}).has_value());
+}
+
+TEST_F(SnapshotFormatV1Test, DISABLED_RegenerateCompatibilityFixture) {
+  config::EventsConfig events_cfg;
+  config::VectorsConfig vectors_cfg;
+  events::EventStore event_store(events_cfg);
+  events::CoOccurrenceIndex co_index;
+  vectors::VectorStore vector_store(vectors_cfg);
+  PopulateCompatibilityFixtureStores(event_store, co_index, vector_store);
+
+  const std::string staged = TestFilePath("regenerated_fixture.dmp");
+  config::Config fixture_config;
+  auto written = WriteSnapshotV1(staged, fixture_config, event_store, co_index, vector_store);
+  ASSERT_TRUE(written.has_value()) << written.error().message();
+
+  std::error_code copy_error;
+  fs::copy_file(staged, NVECD_SNAPSHOT_V1_FIXTURE, fs::copy_options::overwrite_existing, copy_error);
+  ASSERT_FALSE(copy_error) << copy_error.message();
+}
+
+TEST_F(SnapshotFormatV1Test, LoadsASnapshotWrittenByAnEarlierBuild) {
+  ASSERT_TRUE(fs::exists(NVECD_SNAPSHOT_V1_FIXTURE)) << "compatibility fixture is missing";
+
+  config::EventsConfig events_cfg;
+  config::VectorsConfig vectors_cfg;
+  events::EventStore loaded_events(events_cfg);
+  events::CoOccurrenceIndex loaded_co;
+  vectors::VectorStore loaded_vectors(vectors_cfg);
+  config::Config loaded_config;
+
+  auto read_result = ReadSnapshotV1(NVECD_SNAPSHOT_V1_FIXTURE, loaded_config, loaded_events, loaded_co, loaded_vectors);
+  ASSERT_TRUE(read_result.has_value()) << "stored snapshot no longer opens: " << read_result.error().message();
+
+  // Contents, not just "it parsed". A layout change that shifted a field could
+  // still parse and yield different data.
+  auto events = loaded_events.GetEvents("ctx_a");
+  ASSERT_EQ(events.size(), 2U);
+  EXPECT_EQ(events[0].item_id, "alpha");
+  EXPECT_EQ(events[0].score, 100);
+  EXPECT_EQ(events[1].item_id, "beta");
+  EXPECT_EQ(events[1].score, 50);
+
+  EXPECT_GT(loaded_co.GetScore("alpha", "beta"), 0.0F);
+
+  EXPECT_EQ(loaded_vectors.GetDimension(), 3U);
+  EXPECT_EQ(loaded_vectors.GetVectorCount(), 2U);
+  auto alpha = loaded_vectors.GetVector("alpha");
+  ASSERT_TRUE(alpha.has_value());
+  ASSERT_EQ(alpha->data.size(), 3U);
+  EXPECT_FLOAT_EQ(alpha->data[0], 0.25F);
+  EXPECT_FLOAT_EQ(alpha->data[1], 0.5F);
+  EXPECT_FLOAT_EQ(alpha->data[2], 0.75F);
+
+  // The whole-file CRC is part of the stored bytes, so verification must also
+  // still accept the fixture.
+  snapshot_format::IntegrityError integrity_error;
+  auto verified = VerifySnapshotIntegrity(NVECD_SNAPSHOT_V1_FIXTURE, integrity_error);
+  EXPECT_TRUE(verified.has_value()) << integrity_error.message;
+}
+
+// ---------------------------------------------------------------------------
+// 0b. A store section is bounded by the file, not by a second smaller limit.
+//
+// The defect was a per-section constant that a documented corpus could reach
+// while the file limit still had room, with no configuration able to raise it.
+// Asserting the relationship rather than a magic number keeps this meaningful
+// if either limit is ever retuned.
+// ---------------------------------------------------------------------------
+TEST_F(SnapshotFormatV1Test, NoStoreSectionLimitBelowTheFileLimit) {
+  EXPECT_EQ(kMaxStoreDataSize, static_cast<uint32_t>(kMaxSnapshotFileSize));
+
+  // The write-side defaults must not reintroduce the smaller bound either.
+  const SnapshotWriteLimits defaults;
+  EXPECT_EQ(defaults.max_store_data_size, kMaxStoreDataSize);
+}
+
+// ---------------------------------------------------------------------------
+// 0c. Acceptance run for the section cap, kept out of the default suite.
+//
+// Builds a vectors section larger than the old 512MB per-section cap, which
+// takes tens of seconds and about a gigabyte of memory — too heavy for every
+// run, but this is the scenario the cap made impossible, so it is worth being
+// able to reproduce on demand:
+//   ./bin/snapshot_format_v1_test --gtest_also_run_disabled_tests \
+//       --gtest_filter='*SectionAboveTheOldPerSectionCap'
+// ---------------------------------------------------------------------------
+TEST_F(SnapshotFormatV1Test, DISABLED_WritesAndReadsASectionAboveTheOldPerSectionCap) {
+  constexpr size_t kDimension = 384;
+  constexpr size_t kVectors = 400000;  // 400k * 384 * 4B ~= 590MB, past the old 512MB cap
+  constexpr uint32_t kOldPerSectionCap = 512U * 1024U * 1024U;
+
+  config::EventsConfig events_cfg;
+  config::VectorsConfig vectors_cfg;
+  events::EventStore event_store(events_cfg);
+  events::CoOccurrenceIndex co_index;
+  vectors::VectorStore vector_store(vectors_cfg);
+
+  std::vector<float> embedding(kDimension, 0.125F);
+  for (size_t index = 0; index < kVectors; ++index) {
+    embedding[index % kDimension] = static_cast<float>(index % 97) / 97.0F;
+    ASSERT_TRUE(vector_store.SetVector("v" + std::to_string(index), embedding).has_value());
+  }
+  ASSERT_EQ(vector_store.GetVectorCount(), kVectors);
+
+  const std::string path = TestFilePath("large_section.dmp");
+  config::Config large_config;
+  auto written = WriteSnapshotV1(path, large_config, event_store, co_index, vector_store);
+  ASSERT_TRUE(written.has_value()) << written.error().message();
+
+  const auto file_size = fs::file_size(path);
+  EXPECT_GT(file_size, kOldPerSectionCap) << "the run must actually exceed the old cap to mean anything";
+
+  events::EventStore loaded_events(events_cfg);
+  events::CoOccurrenceIndex loaded_co;
+  vectors::VectorStore loaded_vectors(vectors_cfg);
+  config::Config loaded_config;
+  auto read_result = ReadSnapshotV1(path, loaded_config, loaded_events, loaded_co, loaded_vectors);
+  ASSERT_TRUE(read_result.has_value()) << read_result.error().message();
+  EXPECT_EQ(loaded_vectors.GetVectorCount(), kVectors);
+  EXPECT_EQ(loaded_vectors.GetDimension(), kDimension);
+}
+
+// ---------------------------------------------------------------------------
 // 1. WriteAndRead_RoundTrip
 // ---------------------------------------------------------------------------
 TEST_F(SnapshotFormatV1Test, WriteAndRead_RoundTrip) {
@@ -438,6 +583,50 @@ TEST_F(SnapshotFormatV1Test, VectorDimension_RoundTrip) {
 }
 
 // ---------------------------------------------------------------------------
+// 1f. EmptiedStoreRestoresItsDimension
+//
+// Pins the wiring, not the store contract. VectorStore's own tests prove that
+// RestoreDimension adopts and then enforces a dimension when it is called;
+// nothing there can observe whether the reader still calls it. Deleting the
+// call in DeserializeVectorStore leaves those tests green while a reloaded
+// store silently goes back to accepting any vector size.
+//
+// The state has to be reached by deletion, not Clear(): Clear() resets the
+// dimension to 0, so a cleared store legitimately persists no dimension and
+// never reaches the guard. Delete leaves dimension > 0 with zero live vectors,
+// which is exactly what the writer records.
+// ---------------------------------------------------------------------------
+TEST_F(SnapshotFormatV1Test, EmptiedStoreRestoresItsDimension) {
+  constexpr size_t kDimension = 384;
+  const std::vector<float> embedding(kDimension, 0.5F);
+  ASSERT_TRUE(vector_store_->SetVector("only", embedding).has_value());
+  ASSERT_TRUE(vector_store_->DeleteVector("only"));
+  ASSERT_EQ(vector_store_->GetVectorCount(), 0U);
+  ASSERT_EQ(vector_store_->GetDimension(), kDimension);
+
+  const std::string path = TestFilePath("emptied_store_dimension.dmp");
+  auto write_result = WriteSnapshotV1(path, config_, *event_store_, *co_index_, *vector_store_);
+  ASSERT_TRUE(write_result.has_value()) << write_result.error().message();
+
+  config::EventsConfig events_cfg;
+  config::VectorsConfig vectors_cfg;
+  events::EventStore loaded_events(events_cfg);
+  events::CoOccurrenceIndex loaded_co;
+  vectors::VectorStore loaded_vectors(vectors_cfg);
+  config::Config loaded_config;
+  auto read_result = ReadSnapshotV1(path, loaded_config, loaded_events, loaded_co, loaded_vectors);
+  ASSERT_TRUE(read_result.has_value()) << read_result.error().message();
+
+  EXPECT_EQ(loaded_vectors.GetDimension(), kDimension);
+
+  // The user-visible half: a corpus persisted for one embedding model must not
+  // come back accepting another one.
+  auto wrong_size = loaded_vectors.SetVector("mismatched", std::vector<float>(kDimension / 2, 0.5F));
+  ASSERT_FALSE(wrong_size.has_value());
+  EXPECT_EQ(wrong_size.error().code(), utils::ErrorCode::kVectorDimensionMismatch);
+}
+
+// ---------------------------------------------------------------------------
 // 2. WriteAndVerify_IntegrityOk
 // ---------------------------------------------------------------------------
 TEST_F(SnapshotFormatV1Test, WriteAndVerify_IntegrityOk) {
@@ -740,6 +929,62 @@ TEST_F(SnapshotFormatV1Test, HugeVectorDimensionIsRejectedBeforeAllocation) {
   auto result = DeserializeVectorStore(input, vectors);
   EXPECT_FALSE(result.has_value());
   EXPECT_EQ(vectors.GetVectorCount(), 0U);
+}
+
+// ---------------------------------------------------------------------------
+// Restore-path validation is wired, not just available.
+//
+// CoOccurrenceIndex::SetScore validates; its own tests prove that. They cannot
+// observe whether the reader still honours the result. Discarding it here lets
+// a tampered snapshot load "successfully" while quietly dropping edges, so the
+// restored index differs from the one that was written.
+//
+// The section bytes are built by hand because no writer can produce this state
+// any more: every ingestion path validates, so a self-edge can only arrive from
+// an untrusted file.
+// ---------------------------------------------------------------------------
+TEST_F(SnapshotFormatV1Test, RestoreRejectsASnapshotCarryingASelfEdge) {
+  const auto encode_section = [](const std::string& item1, const std::string& item2, float score) {
+    std::ostringstream encoded(std::ios::binary);
+    const auto write_u32 = [&encoded](uint32_t value) {
+      encoded.write(reinterpret_cast<const char*>(&value), sizeof(value));  // NOLINT
+    };
+    const auto write_string = [&](const std::string& text) {
+      write_u32(static_cast<uint32_t>(text.size()));
+      encoded.write(text.data(), static_cast<std::streamsize>(text.size()));
+    };
+    write_u32(1);  // one outer item
+    write_string(item1);
+    write_u32(1);  // one neighbour
+    write_string(item2);
+    encoded.write(reinterpret_cast<const char*>(&score), sizeof(score));  // NOLINT
+    return encoded.str();
+  };
+
+  // Control: the same shape with two distinct items restores cleanly, so the
+  // rejection below is about the edge and not about the encoding.
+  {
+    std::istringstream input(encode_section("aaa", "bbb", 1.5F), std::ios::binary);
+    events::CoOccurrenceIndex co_index;
+    auto result = DeserializeCoOccurrenceIndex(input, co_index);
+    ASSERT_TRUE(result.has_value()) << result.error().message();
+    EXPECT_FLOAT_EQ(co_index.GetScore("aaa", "bbb"), 1.5F);
+  }
+
+  {
+    std::istringstream input(encode_section("aaa", "aaa", 1.5F), std::ios::binary);
+    events::CoOccurrenceIndex co_index;
+    auto result = DeserializeCoOccurrenceIndex(input, co_index);
+    EXPECT_FALSE(result.has_value()) << "a self-edge must not load";
+    EXPECT_EQ(co_index.GetScore("aaa", "aaa"), 0.0F);
+  }
+
+  {
+    std::istringstream input(encode_section("aaa", "bbb", std::numeric_limits<float>::quiet_NaN()), std::ios::binary);
+    events::CoOccurrenceIndex co_index;
+    auto result = DeserializeCoOccurrenceIndex(input, co_index);
+    EXPECT_FALSE(result.has_value()) << "a non-finite score must not load";
+  }
 }
 
 TEST_F(SnapshotFormatV1Test, ImpossibleRecordCountsAreRejectedBeforeIteration) {

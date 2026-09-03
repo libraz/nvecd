@@ -8,19 +8,19 @@
 #include <pthread.h>
 #include <signal.h>
 #include <spdlog/spdlog.h>
-#include <sys/wait.h>
 #include <unistd.h>
 
-#include <chrono>
 #include <cstring>
 #include <ctime>
-#include <filesystem>
+#include <memory>
 #include <mutex>
-#include <thread>
+#include <new>
+#include <shared_mutex>
+#include <utility>
 
 #include "storage/snapshot_format_v1.h"
+#include "storage/snapshot_session.h"
 #include "storage/wal.h"
-#include "storage/wal_checkpoint.h"
 #include "utils/structured_log.h"
 
 #ifdef __linux__
@@ -32,8 +32,6 @@ namespace nvecd::storage {
 
 namespace {
 constexpr int kMinInheritedFD = 3;  // Close FDs >= 3 (preserve stdin/stdout/stderr)
-constexpr int kChildExitSuccess = 0;
-constexpr int kChildExitFailure = 1;
 
 /**
  * @brief Async-signal-safe error report to stderr.
@@ -79,15 +77,46 @@ void EnsureAtForkRegistered() {
   static std::once_flag once;
   std::call_once(once, [] { pthread_atfork(&AtForkPrepare, nullptr, nullptr); });
 }
+
+/**
+ * @brief Re-initialize a store lock the child inherited across fork()
+ *
+ * fork() copies a shared_mutex together with whatever state the parent's other
+ * threads had installed in it. A sibling thread parked inside lock() leaves the
+ * "writer waiting" flag set, and that thread does not exist in the child to
+ * clear it, so the child's next lock_shared() — taken by the serializer's own
+ * const getters — blocks forever. The child then never reaches _exit(), the
+ * snapshot stays in progress for the life of the process, and every later
+ * snapshot is refused while the WAL grows without bound. The window is not
+ * theoretical: the parent acquires the barrier, logs, and flushes the logger
+ * before it forks, and a writer arriving anywhere in there is enough.
+ *
+ * The child is single-threaded and the sole observer of these copies, so
+ * re-constructing each mutex in place restores a well-defined unlocked state.
+ * The lock is released rather than unlocked because its ownership refers to the
+ * object whose lifetime the reuse has just ended.
+ *
+ * @param lock Inherited lock; disassociated and its mutex reset to unlocked
+ */
+void ResetInheritedLock(std::shared_lock<std::shared_mutex>& lock) {
+  std::shared_mutex* mutex = lock.release();
+  if (mutex == nullptr) {
+    return;
+  }
+  new (mutex) std::shared_mutex();
+}
 }  // namespace
 
 ForkSnapshotWriter::~ForkSnapshotWriter() {
-  WaitForChild(5000);  // NOLINT(cppcoreguidelines-avoid-magic-numbers)
+  WaitForChild();
 }
 
 utils::Expected<void, utils::Error> ForkSnapshotWriter::StartBackgroundSave(
     const std::string& filepath, const config::Config& config, events::EventStore& event_store,
     events::CoOccurrenceIndex& co_index, vectors::VectorStore& vector_store, vectors::MetadataStore* metadata_store) {
+  // Release a session that has already finished so a caller who never polled
+  // for status is not told that a long-gone snapshot is still in progress.
+  CheckChild();
   {
     std::lock_guard lock(status_mutex_);
     if (current_result_.status == SnapshotStatus::kInProgress) {
@@ -115,12 +144,10 @@ utils::Expected<void, utils::Error> ForkSnapshotWriter::StartBackgroundSave(
 
   // Pre-fork barrier: hold a shared lock on every store simultaneously. This
   // drains any active writers and excludes new writers until fork has captured
-  // the COW image. Shared ownership is important here: on Linux a
-  // pthread_rwlock write owner is tracked by TID, and the post-fork child has a
-  // different TID. Attempting to unlock an inherited exclusive shared_mutex in
-  // the child therefore leaves it write-locked and the serializer deadlocks on
-  // its first read. Inherited reader ownership can be released by the child,
-  // after which normal const getters may take their own read locks.
+  // the COW image. Shared ownership is what the parent needs; the child does not
+  // try to release these copies at all, because their state is whatever the
+  // parent's other threads left in them. The child resets them instead — see
+  // ResetInheritedLock and ChildProcess.
   auto lock_es = event_store.AcquireReadLock();
   auto lock_co = co_index.AcquireReadLock();
   auto lock_vs = vector_store.AcquireReadLock();
@@ -160,18 +187,11 @@ utils::Expected<void, utils::Error> ForkSnapshotWriter::StartBackgroundSave(
 
   if (pid == 0) {
     // ===== Child process =====
-    // RAII lock guards will unlock in child — this is safe because
-    // child is single-threaded and these are copies of parent's mutexes.
-    // Release locks explicitly before doing any work.
-    lock_es.unlock();
-    lock_co.unlock();
-    lock_vs.unlock();
-    if (lock_ms.owns_lock()) {
-      lock_ms.unlock();
-    }
-
-    // Enter child process (never returns)
-    ChildProcess(filepath, config, event_store, co_index, vector_store, metadata_store);
+    // Surrender every inherited lock to the child entry point, which resets
+    // them before touching a store. Unlocking them here instead would keep the
+    // parent's "writer waiting" state and deadlock the serializer.
+    ChildProcess(InheritedStoreLocks{std::move(lock_es), std::move(lock_co), std::move(lock_vs), std::move(lock_ms)},
+                 filepath, config, event_store, co_index, vector_store, metadata_store);
     // UNREACHABLE
   }
 
@@ -184,11 +204,15 @@ utils::Expected<void, utils::Error> ForkSnapshotWriter::StartBackgroundSave(
     lock_ms.unlock();
   }
 
-  // Update status
+  // Hand the child to a session before returning. From this point the
+  // durability handshake has an owner that completes it on its own, without
+  // depending on a later client request, on a scheduler that may not exist, or
+  // on graceful shutdown.
   {
     std::lock_guard lock(status_mutex_);
     current_result_.child_pid = pid;
     current_result_.wal_sequence = captured_wal_sequence;
+    session_ = std::make_shared<SnapshotSession>(filepath, pid, captured_wal_sequence, wal_);
   }
 
   utils::LogStorageInfo("snapshot_fork", "Fork snapshot started (child pid: " + std::to_string(pid) + ")");
@@ -196,8 +220,9 @@ utils::Expected<void, utils::Error> ForkSnapshotWriter::StartBackgroundSave(
   return {};
 }
 
-void ForkSnapshotWriter::ChildProcess(const std::string& filepath, const config::Config& config,
-                                      const events::EventStore& event_store, const events::CoOccurrenceIndex& co_index,
+void ForkSnapshotWriter::ChildProcess(InheritedStoreLocks locks, const std::string& filepath,
+                                      const config::Config& config, const events::EventStore& event_store,
+                                      const events::CoOccurrenceIndex& co_index,
                                       const vectors::VectorStore& vector_store,
                                       const vectors::MetadataStore* metadata_store) {
   // After fork() in a multithreaded process the child must restrict itself to
@@ -207,6 +232,14 @@ void ForkSnapshotWriter::ChildProcess(const std::string& filepath, const config:
   // AtForkPrepare), and any spdlog call here could block forever on a
   // registry/sink mutex inherited in a locked state. All child diagnostics use
   // the async-signal-safe ChildWriteStderr() instead.
+
+  // 0. Reset every inherited store lock before anything can take one. These are
+  //    the only locks the serializer acquires, so after this the child cannot
+  //    block on a releaser that does not exist here (see ResetInheritedLock).
+  ResetInheritedLock(locks.event_store);
+  ResetInheritedLock(locks.co_index);
+  ResetInheritedLock(locks.vector_store);
+  ResetInheritedLock(locks.metadata_store);
 
   // 1. Close inherited file descriptors (server sockets, log files, etc.).
   //    This also drops the child's copies of the parent's log sink FDs, so the
@@ -232,7 +265,7 @@ void ForkSnapshotWriter::ChildProcess(const std::string& filepath, const config:
   }
 
   // 4. Exit (never call exit() — use _exit() to avoid atexit handlers)
-  _exit(result ? kChildExitSuccess : kChildExitFailure);
+  _exit(result ? kSnapshotChildExitSuccess : kSnapshotChildExitFailure);
 }
 
 void ForkSnapshotWriter::CloseInheritedFDs(int min_fd) {
@@ -252,86 +285,44 @@ void ForkSnapshotWriter::CloseInheritedFDs(int min_fd) {
 }
 
 void ForkSnapshotWriter::CheckChild() {
-  pid_t child_pid;
+  std::shared_ptr<SnapshotSession> session;
   {
     std::lock_guard lock(status_mutex_);
-    if (current_result_.status != SnapshotStatus::kInProgress) {
-      return;
-    }
-    child_pid = current_result_.child_pid;
-    if (child_pid <= 0) {
-      return;  // StartBackgroundSave still owns the pre-fork reservation.
-    }
+    session = session_;
+  }
+  if (session == nullptr) {
+    return;
   }
 
-  int status = 0;
-  pid_t result = waitpid(child_pid, &status, WNOHANG);
-
-  if (result == 0) {
-    return;  // Child still running
+  auto outcome = session->TryFinish();
+  if (!outcome.has_value()) {
+    return;  // The session's writer has not terminated yet.
   }
+  PublishOutcome(session, *outcome);
+}
 
-  bool completed = false;
-  std::string completed_filepath;
-  uint64_t completed_wal_sequence = 0;
+void ForkSnapshotWriter::PublishOutcome(const std::shared_ptr<SnapshotSession>& session,
+                                        const utils::Expected<SnapshotOutcome, utils::Error>& outcome) {
   {
     std::lock_guard lock(status_mutex_);
+    if (session_ != session) {
+      return;  // Another caller already published this session's outcome.
+    }
+    session_.reset();
     current_result_.end_time = static_cast<uint64_t>(std::time(nullptr));
-
-    if (result < 0) {
-      if (errno == ECHILD) {
-        // An existing pathname may predate this child, so it is not proof of
-        // success. Fail closed when child ownership was lost.
-        current_result_.status = SnapshotStatus::kFailed;
-        current_result_.error_message = "Snapshot child ownership lost before exit status was collected";
-        utils::LogStorageError("snapshot_fork", current_result_.filepath, current_result_.error_message);
-      } else {
-        current_result_.status = SnapshotStatus::kFailed;
-        current_result_.error_message = "waitpid failed: " + std::string(strerror(errno));
-        utils::LogStorageError("snapshot_fork", current_result_.filepath, current_result_.error_message);
-      }
-    } else if (WIFEXITED(status)) {
-      int exit_code = WEXITSTATUS(status);
-      if (exit_code == kChildExitSuccess) {
-        current_result_.status = SnapshotStatus::kCompleted;
-        utils::LogStorageInfo("snapshot_fork", "Fork snapshot completed: " + current_result_.filepath);
-      } else {
-        current_result_.status = SnapshotStatus::kFailed;
-        current_result_.error_message = "Child exited with code " + std::to_string(exit_code);
-        utils::LogStorageError("snapshot_fork", current_result_.filepath, current_result_.error_message);
-      }
-    } else if (WIFSIGNALED(status)) {
-      int sig = WTERMSIG(status);
+    if (outcome) {
+      current_result_.status = SnapshotStatus::kCompleted;
+      current_result_.error_message.clear();
+    } else {
       current_result_.status = SnapshotStatus::kFailed;
-      current_result_.error_message = "Child killed by signal " + std::to_string(sig);
-      utils::LogStorageError("snapshot_fork", current_result_.filepath, current_result_.error_message);
+      current_result_.error_message = outcome.error().message();
     }
-
-    completed = (current_result_.status == SnapshotStatus::kCompleted);
-    completed_filepath = current_result_.filepath;
-    completed_wal_sequence = current_result_.wal_sequence;
   }
 
-  // On a successful snapshot, record the checkpoint sidecar then truncate the
-  // WAL up to the sequence captured under the pre-fork barrier. Truncation only
-  // removes WAL files whose records are entirely contained in the snapshot, so
-  // any record beyond the captured sequence is preserved for the next recovery.
-  if (completed && wal_ != nullptr) {
-    auto checkpoint = WriteWalCheckpoint(completed_filepath, completed_wal_sequence);
-    if (!checkpoint) {
-      std::lock_guard lock(status_mutex_);
-      current_result_.status = SnapshotStatus::kFailed;
-      current_result_.error_message = "Failed to write WAL checkpoint: " + checkpoint.error().message();
-      utils::LogStorageError("snapshot_fork", completed_filepath, current_result_.error_message);
-      return;  // Do not truncate without a durable checkpoint.
-    }
-    auto truncated = wal_->Truncate(completed_wal_sequence);
-    if (!truncated) {
-      std::lock_guard lock(status_mutex_);
-      current_result_.status = SnapshotStatus::kFailed;
-      current_result_.error_message = "Failed to truncate WAL: " + truncated.error().message();
-      utils::LogStorageError("snapshot_fork", completed_filepath, current_result_.error_message);
-    }
+  if (outcome) {
+    utils::LogStorageInfo("snapshot_fork", "Fork snapshot completed: " + session->filepath());
+  } else {
+    utils::LogStorageError("snapshot_fork", session->filepath(), outcome.error().message());
   }
 }
 
@@ -346,37 +337,20 @@ bool ForkSnapshotWriter::IsInProgress() const {
 }
 
 void ForkSnapshotWriter::WaitForChild(uint32_t timeout_ms) {
-  pid_t child_pid;
+  std::shared_ptr<SnapshotSession> session;
   {
     std::lock_guard lock(status_mutex_);
-    if (current_result_.status != SnapshotStatus::kInProgress) {
-      return;
-    }
-    child_pid = current_result_.child_pid;
-    if (child_pid <= 0) {
-      return;
-    }
+    session = session_;
+  }
+  if (session == nullptr) {
+    return;
   }
 
-  // Poll with short sleeps
-  constexpr uint32_t kPollIntervalMs = 100;
-  uint32_t elapsed = 0;
-  while (elapsed < timeout_ms) {
-    CheckChild();
-    if (!IsInProgress()) {
-      return;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(kPollIntervalMs));
-    elapsed += kPollIntervalMs;
-  }
-
-  // Timeout — send SIGTERM
-  kill(child_pid, SIGTERM);
-  utils::LogStorageInfo("snapshot_fork", "Sent SIGTERM to snapshot child (pid: " + std::to_string(child_pid) + ")");
-
-  // Wait a bit more, then reap
-  std::this_thread::sleep_for(std::chrono::milliseconds(kPollIntervalMs));
-  CheckChild();
+  // Finish() always terminates: it escalates to SIGTERM and then SIGKILL when
+  // the child overruns the grace period, so this never blocks forever and the
+  // session's terminal outcome always exists by the time it returns.
+  auto outcome = session->Finish(timeout_ms);
+  PublishOutcome(session, outcome);
 }
 
 }  // namespace nvecd::storage

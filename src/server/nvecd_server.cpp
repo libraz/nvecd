@@ -158,7 +158,7 @@ utils::Expected<void, utils::Error> NvecdServer::Start() {
       reactor_.reset();
     }
     if (thread_pool_) {
-      thread_pool_->Shutdown(false, static_cast<uint32_t>(config_.perf.shutdown_timeout_ms));
+      thread_pool_->Shutdown(static_cast<uint32_t>(config_.perf.shutdown_timeout_ms));
       thread_pool_.reset();
     }
   };
@@ -191,17 +191,17 @@ utils::Expected<void, utils::Error> NvecdServer::Start() {
     io_config.max_query_length = static_cast<size_t>(config_.perf.max_query_length);
     io_config.max_accumulated_bytes = static_cast<size_t>(config_.perf.max_query_length) * 2;
     io_config.recv_timeout_sec = config_.perf.connection_timeout_sec;
-    auto connection = ReactorConnection::Create(
-        client_fd, reactor_.get(), thread_pool_.get(), io_config,
-        [this](const std::string& request, ConnectionContext& context) { return ProcessRequest(request, context); });
     // Increment before Register: the event loop may close a peer immediately
     // after registration and invoke the close callback on another thread.
     stats_.total_connections.fetch_add(1, std::memory_order_relaxed);
     stats_.active_connections.fetch_add(1, std::memory_order_relaxed);
-    auto result = reactor_->Register(std::move(connection));
+    auto result = reactor_->Register(
+        client_fd, thread_pool_.get(), io_config,
+        [this](const std::string& request, ConnectionContext& context) { return ProcessRequest(request, context); });
     if (!result) {
       stats_.active_connections.fetch_sub(1, std::memory_order_relaxed);
       spdlog::warn("Failed to register accepted fd with reactor: {}", result.error().message());
+      // Registration did not take the fd; the acceptor remains its only closer.
       return false;
     }
     return true;
@@ -327,9 +327,12 @@ void NvecdServer::Stop() {
     decay_scheduler_->Stop();
   }
 
-  // Wait for any in-progress fork snapshot
+  // Wait for any in-progress fork snapshot. The grace period is the operator's
+  // configured shutdown budget rather than the writer's own default, so a
+  // snapshot child cannot hold shutdown open past what the deployment allows.
+  // The cast is safe because the schema constrains this key to 100..60000.
   if (fork_writer_) {
-    fork_writer_->WaitForChild();
+    fork_writer_->WaitForChild(static_cast<uint32_t>(config_.perf.shutdown_timeout_ms));
   }
 
   // Stop HTTP server
@@ -365,13 +368,13 @@ void NvecdServer::Stop() {
     std::this_thread::sleep_for(std::chrono::milliseconds(kShutdownCheckIntervalMs));
   }
 
-  // Stop thread pool
+  // Stop thread pool. Queued tasks hold raw pointers to the reactor and to the
+  // stores destroyed below, so this wait is unbounded on purpose: the acceptors
+  // and the reactor are already stopped, no new task can be submitted, and the
+  // queue is finite. Returning from Stop() while a worker still runs would let
+  // that worker read freed state.
   if (thread_pool_) {
-    // ConnectionAcceptor::Stop has already shut down every active client fd,
-    // so connection handlers can observe shutdown and exit.  Bound this final
-    // wait by the configured server shutdown deadline instead of letting a
-    // misbehaving task make Stop() hang forever.
-    thread_pool_->Shutdown(false, static_cast<uint32_t>(config_.perf.shutdown_timeout_ms));
+    thread_pool_->Shutdown();
     thread_pool_.reset();
   }
   reactor_.reset();
@@ -467,6 +470,12 @@ utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
   } else {
     spdlog::info("Snapshot directory: {}", config_.snapshot.dir);
   }
+
+  // Reclaim temporaries left by a previous run that was killed outright. No
+  // destructor runs in that case, and the retention sweep that would otherwise
+  // catch them only exists while the scheduler thread does, which the default
+  // snapshot interval never starts.
+  ReclaimAbandonedTemporaries(config_.snapshot.dir);
 
   // Create ForkSnapshotWriter (always create, even in lock mode, for DUMP STATUS)
   fork_writer_ = std::make_unique<storage::ForkSnapshotWriter>();

@@ -8,12 +8,20 @@
 
 #include "server/snapshot_scheduler.h"
 
+#include <signal.h>
+
 #include <algorithm>
+#include <cctype>
+#include <cerrno>
 #include <chrono>
+#include <cstdlib>
 #include <ctime>
 #include <filesystem>
 #include <iomanip>
+#include <limits>
 #include <sstream>
+#include <string>
+#include <system_error>
 
 #include "utils/flag_guard.h"
 #include "utils/structured_log.h"
@@ -22,6 +30,45 @@ namespace nvecd::server {
 
 namespace {
 constexpr int kCheckIntervalMs = 1000;  // Check for shutdown every second
+
+/**
+ * @brief True for a snapshot temporary file whose writing process is gone
+ *
+ * PrivateStorageTarget::CreateTemporaryFile names temporaries
+ * ".<snapshot>.tmp.<pid>.<n>". A temporary owned by a live process is left
+ * alone; one whose owner no longer exists can never be published, so it is
+ * reclaimable.
+ */
+bool IsAbandonedTemporary(const std::string& filename) {
+  static constexpr char kMarker[] = ".tmp.";
+  if (filename.empty() || filename.front() != '.') {
+    return false;
+  }
+  const size_t marker = filename.rfind(kMarker);
+  if (marker == std::string::npos) {
+    return false;
+  }
+  const size_t pid_start = marker + (sizeof(kMarker) - 1);
+  const size_t pid_end = filename.find('.', pid_start);
+  if (pid_end == std::string::npos || pid_end == pid_start || pid_end + 1 >= filename.size()) {
+    return false;
+  }
+  const auto all_digits = [](const std::string& text) {
+    return std::all_of(text.begin(), text.end(), [](unsigned char c) { return std::isdigit(c) != 0; });
+  };
+  const std::string pid_text = filename.substr(pid_start, pid_end - pid_start);
+  if (!all_digits(pid_text) || !all_digits(filename.substr(pid_end + 1))) {
+    return false;
+  }
+
+  errno = 0;
+  const long owner_pid = std::strtol(pid_text.c_str(), nullptr, 10);
+  if (errno != 0 || owner_pid <= 0 || owner_pid > std::numeric_limits<pid_t>::max()) {
+    return false;
+  }
+  errno = 0;
+  return ::kill(static_cast<pid_t>(owner_pid), 0) != 0 && errno == ESRCH;
+}
 }  // namespace
 
 SnapshotScheduler::SnapshotScheduler(config::SnapshotConfig config, storage::ForkSnapshotWriter* fork_writer,
@@ -195,7 +242,29 @@ void SnapshotScheduler::TakeSnapshot() {
   }
 }
 
+void ReclaimAbandonedTemporaries(const std::string& dir) {
+  std::error_code error;
+  const std::filesystem::path snapshot_dir(dir);
+  if (!std::filesystem::is_directory(snapshot_dir, error)) {
+    return;
+  }
+  for (const auto& entry : std::filesystem::directory_iterator(snapshot_dir, error)) {
+    if (!entry.is_regular_file(error) || !IsAbandonedTemporary(entry.path().filename().string())) {
+      continue;
+    }
+    utils::StructuredLog().Event("snapshot_removing_abandoned_temp").Field("path", entry.path().string()).Info();
+    std::error_code remove_error;
+    std::filesystem::remove(entry.path(), remove_error);
+  }
+}
+
 void SnapshotScheduler::CleanupOldSnapshots() {
+  // Reclaim before the retention check: temporaries are dot-prefixed and carry
+  // the writing process id, so the retention scan never sees them, and a
+  // `retain` of 0 would otherwise skip the sweep entirely and let a killed
+  // writer's full-size file accumulate on every interrupted run.
+  ReclaimAbandonedTemporaries(config_.dir);
+
   if (config_.retain <= 0) {
     return;
   }
@@ -211,9 +280,13 @@ void SnapshotScheduler::CleanupOldSnapshots() {
     std::vector<std::pair<std::filesystem::path, std::filesystem::file_time_type>> snapshot_files;
 
     for (const auto& entry : std::filesystem::directory_iterator(snapshot_dir)) {
-      if (entry.is_regular_file() && entry.path().extension() == ".nvec") {
+      if (!entry.is_regular_file()) {
+        continue;
+      }
+      const std::string name = entry.path().filename().string();
+      if (entry.path().extension() == ".nvec") {
         // Only manage auto-saved files (starting with "auto_")
-        if (entry.path().filename().string().rfind("auto_", 0) == 0) {
+        if (name.rfind("auto_", 0) == 0) {
           snapshot_files.emplace_back(entry.path(), std::filesystem::last_write_time(entry));
         }
       }

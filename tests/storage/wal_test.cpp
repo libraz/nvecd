@@ -12,6 +12,7 @@
 #include <zlib.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <string>
@@ -456,6 +457,98 @@ TEST_F(WalTest, TruncatePropagatesUnlinkFailure) {
   auto result = wal.Truncate(wal.CurrentSequence());
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code(), utils::ErrorCode::kWalTruncateFailed);
+}
+
+TEST_F(WalTest, TruncateStopsAtTheFirstUnlinkFailure) {
+  WriteAheadLog wal;
+  ASSERT_TRUE(wal.Open(MakeConfig(128)));
+  for (int i = 0; i < 20; ++i) {
+    const std::string payload = "stop_at_failure_" + std::to_string(i);
+    ASSERT_TRUE(wal.Append(WalOpType::kVecSet, payload.data(), static_cast<uint32_t>(payload.size())).has_value());
+  }
+
+  std::vector<fs::path> segments;
+  for (const auto& entry : fs::directory_iterator(test_dir_)) {
+    if (entry.path().extension() == ".log") {
+      segments.push_back(entry.path());
+    }
+  }
+  std::sort(segments.begin(), segments.end());
+  ASSERT_GT(segments.size(), 2U);
+  ASSERT_TRUE(fs::remove(segments.front()));
+
+  ASSERT_FALSE(wal.Truncate(wal.CurrentSequence()).has_value());
+
+  // Every segment after the failed one must survive. Deleting past a failure
+  // leaves a hole in the sequence range, and the next Open() then refuses to
+  // start on a WAL that is no longer a single contiguous run.
+  std::vector<fs::path> surviving;
+  for (const auto& entry : fs::directory_iterator(test_dir_)) {
+    if (entry.path().extension() == ".log") {
+      surviving.push_back(entry.path());
+    }
+  }
+  std::sort(surviving.begin(), surviving.end());
+  const std::vector<fs::path> expected(segments.begin() + 1, segments.end());
+  EXPECT_EQ(surviving, expected);
+}
+
+TEST_F(WalTest, RotationFailsClosedAtTheWidestReadableSegmentNumber) {
+  {
+    WriteAheadLog wal;
+    ASSERT_TRUE(wal.Open(MakeConfig()));
+    const std::string payload = "last_segment";
+    ASSERT_TRUE(wal.Append(WalOpType::kVecSet, payload.data(), static_cast<uint32_t>(payload.size())).has_value());
+  }
+
+  // Present the scanner with the highest segment number it can still read back.
+  fs::rename(test_dir_ + "/wal-000001.log", test_dir_ + "/wal-999999.log");
+
+  // Rotating past it would produce a 15-character name the scanner ignores, so
+  // the segment would vanish from recovery and stay unreclaimable. Refuse
+  // instead of writing a file no reader will ever see.
+  WriteAheadLog wal;
+  auto opened = wal.Open(MakeConfig());
+  ASSERT_FALSE(opened.has_value());
+  EXPECT_EQ(opened.error().code(), utils::ErrorCode::kWalRotationFailed);
+  EXPECT_FALSE(fs::exists(test_dir_ + "/wal-1000000.log"));
+}
+
+TEST_F(WalTest, CloseReturnsPromptlyRegardlessOfSyncInterval) {
+  WriteAheadLog wal;
+  auto config = MakeConfig();
+  config.sync_on_write = false;
+  config.sync_interval_ms = 30000;
+  ASSERT_TRUE(wal.Open(config));
+  const std::string payload = "pending_sync";
+  ASSERT_TRUE(wal.Append(WalOpType::kVecSet, payload.data(), static_cast<uint32_t>(payload.size())).has_value());
+
+  // Shutdown must not depend on the sync thread's timer expiring.
+  const auto started = std::chrono::steady_clock::now();
+  wal.Close();
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+  EXPECT_LT(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count(), 2000);
+}
+
+TEST_F(WalTest, ZeroSyncIntervalKeepsPeriodicDurability) {
+  WriteAheadLog wal;
+  auto config = MakeConfig();
+  config.sync_on_write = false;
+  config.sync_interval_ms = 0;
+  ASSERT_TRUE(wal.Open(config));
+
+  // With no periodic sync thread there would be nobody to consume the pending
+  // flag, so appends must be synced inline instead. The observable contract is
+  // that appends keep succeeding and stay replayable without a clean Close().
+  for (int i = 0; i < 5; ++i) {
+    const std::string payload = "zero_interval_" + std::to_string(i);
+    ASSERT_TRUE(wal.Append(WalOpType::kVecSet, payload.data(), static_cast<uint32_t>(payload.size())).has_value());
+  }
+
+  size_t replayed = 0;
+  auto count = wal.Replay(1, [&](const WalRecord&) { ++replayed; });
+  ASSERT_TRUE(count.has_value()) << count.error().to_string();
+  EXPECT_EQ(replayed, 5U);
 }
 
 // --- Incomplete Records ---

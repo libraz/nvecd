@@ -14,6 +14,7 @@
 #include <memory>
 #include <shared_mutex>
 #include <sstream>
+#include <utility>
 
 #include "cache/similarity_cache.h"
 #include "config/config.h"
@@ -23,8 +24,8 @@
 #include "storage/snapshot_fork.h"
 #include "storage/snapshot_format_v1.h"
 #include "storage/snapshot_lock.h"
+#include "storage/snapshot_session.h"
 #include "storage/wal.h"
-#include "storage/wal_checkpoint.h"
 #include "utils/flag_guard.h"
 #include "utils/path_utils.h"
 #include "utils/structured_log.h"
@@ -37,16 +38,37 @@ constexpr int kFilepathBufferSize = 256;
 }  // namespace
 
 utils::Expected<std::string, utils::Error> HandleDumpSave(HandlerContext& ctx, const std::string& filepath) {
-  std::string resolved_path;
+  // Check if config is available. Resolving the destination needs it, because
+  // an argument-less DUMP SAVE uses the operator's configured filename.
+  if (ctx.config == nullptr) {
+    std::string error_msg = "Cannot save snapshot: server configuration is not available";
+    utils::LogStorageError("dump_save", filepath, error_msg);
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kInternalError, error_msg));
+  }
 
-  if (!filepath.empty()) {
-    auto validated = utils::ValidateDumpPath(filepath, ctx.dump_dir);
+  // Check required stores
+  if (ctx.event_store == nullptr || ctx.co_index == nullptr || ctx.vector_store == nullptr) {
+    std::string error_msg = "Cannot save snapshot: required stores not initialized";
+    utils::LogStorageError("dump_save", filepath, error_msg);
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kInternalError, error_msg));
+  }
+
+  // An argument-less DUMP SAVE writes to the configured name. It goes through
+  // the same dump-path validation as a client-supplied path: the value comes
+  // from a config file, so a name that escapes the dump directory is refused
+  // rather than resolved against it.
+  std::string resolved_path;
+  const std::string requested_path = filepath.empty() ? ctx.config->snapshot.default_filename : filepath;
+
+  if (!requested_path.empty()) {
+    auto validated = utils::ValidateDumpPath(requested_path, ctx.dump_dir);
     if (!validated) {
       return utils::MakeUnexpected(validated.error());
     }
     resolved_path = *validated;
   } else {
-    // Generate default filename with timestamp
+    // No configured name to fall back on: keep the timestamped form so a save
+    // still lands somewhere unambiguous.
     auto now = std::time(nullptr);
     std::tm tm_buf{};
     localtime_r(&now, &tm_buf);  // Thread-safe version of localtime
@@ -56,20 +78,6 @@ utils::Expected<std::string, utils::Error> HandleDumpSave(HandlerContext& ctx, c
   }
 
   utils::LogStorageInfo("dump_save", "Attempting to save snapshot to: " + resolved_path);
-
-  // Check if config is available
-  if (ctx.config == nullptr) {
-    std::string error_msg = "Cannot save snapshot: server configuration is not available";
-    utils::LogStorageError("dump_save", resolved_path, error_msg);
-    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kInternalError, error_msg));
-  }
-
-  // Check required stores
-  if (ctx.event_store == nullptr || ctx.co_index == nullptr || ctx.vector_store == nullptr) {
-    std::string error_msg = "Cannot save snapshot: required stores not initialized";
-    utils::LogStorageError("dump_save", resolved_path, error_msg);
-    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kInternalError, error_msg));
-  }
 
   if (ctx.loading.load(std::memory_order_acquire)) {
     return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kSnapshotAlreadyInProgress,
@@ -135,30 +143,20 @@ utils::Expected<std::string, utils::Error> HandleDumpSave(HandlerContext& ctx, c
         storage::WriteSnapshotWithLock(resolved_path, *ctx.config, *ctx.event_store, *ctx.co_index, *ctx.vector_store,
                                        nullptr, nullptr, ctx.metadata_store, ctx.wal, &captured_wal_sequence);
 
-    if (result) {
-      utils::LogStorageInfo("dump_save", "Successfully saved snapshot to: " + resolved_path);
-      // Record the checkpoint sidecar then truncate the WAL up to the sequence
-      // captured under the snapshot's write-lock barrier. Skipped entirely when
-      // the WAL is disabled (ctx.wal == nullptr).
-      if (ctx.wal != nullptr) {
-        auto checkpoint = storage::WriteWalCheckpoint(resolved_path, captured_wal_sequence);
-        if (!checkpoint) {
-          utils::LogStorageError("dump_save", resolved_path,
-                                 "Failed to write WAL checkpoint: " + checkpoint.error().message());
-        } else {
-          auto truncated = ctx.wal->Truncate(captured_wal_sequence);
-          if (!truncated) {
-            utils::LogStorageError("dump_save", resolved_path,
-                                   "Failed to truncate WAL: " + truncated.error().message());
-          }
-        }
-      }
-      return std::string("OK DUMP_SAVED " + resolved_path + "\r\n");
+    // Hand the write result to a session so lock mode runs exactly the same
+    // durability handshake as fork mode, and reports the same failures. A
+    // checkpoint or truncate failure is a failed snapshot, not a warning line
+    // under an OK response.
+    storage::SnapshotSession session(resolved_path, std::move(result), captured_wal_sequence, ctx.wal);
+    auto outcome = session.Finish(0);
+    if (!outcome) {
+      std::string error_msg = "Failed to save snapshot to " + resolved_path + ": " + outcome.error().message();
+      utils::LogStorageError("dump_save", resolved_path, outcome.error().message());
+      return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kSnapshotSaveFailed, error_msg));
     }
 
-    std::string error_msg = "Failed to save snapshot to " + resolved_path + ": " + result.error().message();
-    utils::LogStorageError("dump_save", resolved_path, result.error().message());
-    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kSnapshotSaveFailed, error_msg));
+    utils::LogStorageInfo("dump_save", "Successfully saved snapshot to: " + resolved_path);
+    return std::string("OK DUMP_SAVED " + resolved_path + "\r\n");
   }
 }
 
@@ -275,13 +273,13 @@ utils::Expected<std::string, utils::Error> HandleDumpLoad(HandlerContext& ctx, c
         return fail_stop(utils::MakeError(utils::ErrorCode::kStorageWriteError,
                                           "Failed to mark loaded snapshot as recovery base: " + ec.message()));
       }
-      auto checkpoint = storage::WriteWalCheckpoint(resolved_path, checkpoint_sequence);
-      if (!checkpoint) {
-        return fail_stop(checkpoint.error());
-      }
-      auto truncated = ctx.wal->Truncate(checkpoint_sequence);
-      if (!truncated) {
-        return fail_stop(truncated.error());
+      // Same handshake as a save: sidecar first, truncate only once it is
+      // durable. Routing it through a session keeps that order in one place.
+      storage::SnapshotSession session(resolved_path, utils::Expected<void, utils::Error>{}, checkpoint_sequence,
+                                       ctx.wal);
+      auto outcome = session.Finish(0);
+      if (!outcome) {
+        return fail_stop(outcome.error());
       }
     }
     utils::LogStorageInfo("dump_load", "Successfully loaded snapshot from: " + resolved_path);

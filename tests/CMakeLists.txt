@@ -172,7 +172,6 @@ gtest_discover_tests(http_server_test
   DISCOVERY_TIMEOUT 30
   PROPERTIES
     LABELS "http"
-    RESOURCE_LOCK http_port_18081
 )
 
 add_executable(thread_pool_test
@@ -420,6 +419,19 @@ target_link_libraries(hnsw_index_test
 )
 gtest_discover_tests(hnsw_index_test PROPERTIES LABELS "sanitizer;concurrency")
 
+# Shared ANN contract tests (every AnnIndex implementation)
+add_executable(ann_contract_test
+  vectors/ann_contract_test.cpp
+)
+target_link_libraries(ann_contract_test
+  nvecd_vectors
+  nvecd_config
+  nvecd_utils
+  gtest
+  gtest_main
+)
+gtest_discover_tests(ann_contract_test PROPERTIES LABELS "sanitizer;concurrency")
+
 # Metadata filter tests
 add_executable(metadata_filter_test
   vectors/metadata_filter_test.cpp
@@ -660,6 +672,9 @@ target_link_libraries(snapshot_format_v1_test
   gtest
   gtest_main
 )
+target_compile_definitions(snapshot_format_v1_test PRIVATE
+  NVECD_SNAPSHOT_V1_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/storage/fixtures/snapshot_v1_compat.dmp"
+)
 gtest_discover_tests(snapshot_format_v1_test)
 
 add_executable(snapshot_lock_test
@@ -690,6 +705,22 @@ target_link_libraries(wal_test
 )
 gtest_discover_tests(wal_test
   PROPERTIES TIMEOUT 30
+)
+
+add_executable(snapshot_session_test
+  storage/snapshot_session_test.cpp
+)
+target_link_libraries(snapshot_session_test
+  nvecd_storage
+  nvecd_events
+  nvecd_vectors
+  nvecd_config
+  nvecd_utils
+  gtest
+  gtest_main
+)
+gtest_discover_tests(snapshot_session_test
+  PROPERTIES TIMEOUT 120 LABELS integration
 )
 
 add_executable(snapshot_fork_test
@@ -725,6 +756,26 @@ target_link_libraries(connection_acceptor_unix_test
   gtest_main
 )
 gtest_discover_tests(connection_acceptor_unix_test
+  PROPERTIES TIMEOUT 60
+)
+
+# TCP bind failure classification
+add_executable(connection_acceptor_bind_test
+  server/connection_acceptor_bind_test.cpp
+)
+target_link_libraries(connection_acceptor_bind_test
+  nvecd_server
+  nvecd_storage
+  nvecd_cache
+  nvecd_similarity
+  nvecd_events
+  nvecd_vectors
+  nvecd_config
+  nvecd_utils
+  gtest
+  gtest_main
+)
+gtest_discover_tests(connection_acceptor_bind_test
   PROPERTIES TIMEOUT 60
 )
 

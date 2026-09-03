@@ -23,6 +23,19 @@
 namespace nvecd::server {
 
 /**
+ * @brief Remove snapshot temporaries whose writing process no longer exists
+ *
+ * A temporary is named ".<snapshot>.tmp.<pid>.<n>" and can only be published by
+ * the process that created it, so one left behind by a process that is gone can
+ * never complete. Destructors reclaim temporaries on every orderly exit; a
+ * parent that is killed outright runs none, which makes the startup call the
+ * only path that recovers its files. Safe to call when @p dir does not exist.
+ *
+ * @param dir Snapshot directory to scan
+ */
+void ReclaimAbandonedTemporaries(const std::string& dir);
+
+/**
  * @brief Background snapshot scheduler
  *
  * Periodically creates fork-based snapshots and cleans up old files

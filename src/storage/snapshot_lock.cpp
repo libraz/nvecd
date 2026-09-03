@@ -5,6 +5,8 @@
 
 #include "storage/snapshot_lock.h"
 
+#include <shared_mutex>
+
 #include "storage/snapshot_format_v1.h"
 #include "storage/wal.h"
 #include "utils/structured_log.h"
@@ -33,8 +35,14 @@ utils::Expected<void, utils::Error> WriteSnapshotWithLock(
     auto lock_es = event_store.AcquireWriteLock();
     auto lock_co = co_index.AcquireWriteLock();
     auto lock_vs = vector_store.AcquireWriteLock();
+    // The metadata barrier must span the same interval as the other three, not
+    // an inner scope of its own: a metadata write that lands after it is
+    // released but before the WAL sequence is captured yields a snapshot whose
+    // metadata section references a vector the vectors section does not carry,
+    // which its own load-time reference check then rejects.
+    std::unique_lock<std::shared_mutex> lock_ms;
     if (metadata_store != nullptr) {
-      auto lock_ms = metadata_store->AcquireWriteLock();
+      lock_ms = metadata_store->AcquireWriteLock();
     }
     // Capture the WAL sequence while the barrier is held: all in-flight writes
     // are drained and no new write can append, so the value equals the maximum

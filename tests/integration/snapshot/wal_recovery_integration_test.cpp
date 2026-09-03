@@ -128,9 +128,16 @@ struct Instance {
   void EnableWalForLiveWrites() { ctx->wal = &wal; }
 
   /// Replay records >= @p from while the WAL is NOT published (no re-append).
-  uint64_t Replay(uint64_t from) {
+  ///
+  /// The callback result is propagated exactly as NvecdServer propagates it, so
+  /// a record the dispatcher refuses stops recovery here too.
+  utils::Expected<uint64_t, utils::Error> TryReplay(uint64_t from) {
     ctx->wal = nullptr;  // ensure no re-append during replay
-    auto replayed = wal.Replay(from, [this](const storage::WalRecord& r) { dispatcher->ReplayRecord(r); });
+    return wal.Replay(from, [this](const storage::WalRecord& r) { return dispatcher->ReplayRecord(r); });
+  }
+
+  uint64_t Replay(uint64_t from) {
+    auto replayed = TryReplay(from);
     EXPECT_TRUE(replayed.has_value()) << replayed.error().message();
     return replayed ? *replayed : 0;
   }
@@ -225,6 +232,72 @@ TEST(WalRecoveryIntegration, VecdelPersistsAcrossWalReplay) {
     EXPECT_GE(b.Replay(/*from=*/0), 3U);
     EXPECT_FALSE(b.vector_store->HasVector("removed"));
     EXPECT_EQ(b.metadata_store->Get("removed"), nullptr);
+  }
+
+  fs::remove_all(root);
+}
+
+// ============================================================================
+// wal.include_vectors: false — the log the server writes must stay replayable.
+// ============================================================================
+
+TEST(WalRecoveryIntegration, ReplaySkipsRecordsWhoseVectorTheConfigOmitted) {
+  const std::string root = MakeTempDir("omitted_vectors");
+  const std::string wal_dir = root + "/wal";
+  fs::create_directories(wal_dir);
+
+  {
+    Instance a(root);
+    // A documented configuration: vectors live only in snapshots, while events
+    // and metadata still go through the WAL.
+    a.config->wal.include_vectors = false;
+    a.OpenWal(wal_dir);
+    a.EnableWalForLiveWrites();
+
+    ASSERT_NE(a.Dispatch("VECSET orphan 1 0").find("OK VECSET"), std::string::npos);
+    ASSERT_NE(a.Dispatch("METASET orphan status:active").find("OK METASET"), std::string::npos);
+    ASSERT_NE(a.Dispatch("VECDEL orphan").find("OK VECDEL"), std::string::npos);
+    a.wal.Close();
+
+    // No snapshot was taken, so nothing restores "orphan": the VECSET was
+    // deliberately left out of the log. Recovery must still reach a servable
+    // state instead of stopping on the first unreplayable record.
+    Instance b(root);
+    b.config->wal.include_vectors = false;
+    b.OpenWal(wal_dir);
+    auto replayed = b.TryReplay(/*from=*/0);
+    ASSERT_TRUE(replayed.has_value()) << replayed.error().message();
+    EXPECT_EQ(*replayed, 2U);  // the METASET and the VECDEL, both skipped
+    EXPECT_FALSE(b.vector_store->HasVector("orphan"));
+    EXPECT_EQ(b.metadata_store->Get("orphan"), nullptr);
+  }
+
+  fs::remove_all(root);
+}
+
+TEST(WalRecoveryIntegration, ReplayStillStopsOnACorruptRecord) {
+  const std::string root = MakeTempDir("corrupt_record");
+  const std::string wal_dir = root + "/wal";
+  fs::create_directories(wal_dir);
+
+  {
+    Instance a(root);
+    a.config->wal.include_vectors = false;
+    a.OpenWal(wal_dir);
+    a.EnableWalForLiveWrites();
+    ASSERT_NE(a.Dispatch("EVENT ctx1 ADD item_a 90").find("OK"), std::string::npos);
+
+    // Tolerating an intended gap must not turn into tolerating a damaged log.
+    const char payload = 'x';
+    ASSERT_TRUE(a.wal.Append(storage::WalOpType::kCoOccurrenceMaintenance, &payload, 1).has_value());
+    a.wal.Close();
+
+    Instance b(root);
+    b.config->wal.include_vectors = false;
+    b.OpenWal(wal_dir);
+    auto replayed = b.TryReplay(/*from=*/0);
+    ASSERT_FALSE(replayed.has_value());
+    EXPECT_EQ(replayed.error().code(), utils::ErrorCode::kWalCorrupted);
   }
 
   fs::remove_all(root);

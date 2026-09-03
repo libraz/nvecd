@@ -32,8 +32,10 @@ class WriteAheadLog;
  * then calls WriteSnapshotV1. All write operations are blocked during
  * the snapshot.
  *
- * Lock acquisition order: EventStore -> CoOccurrenceIndex -> VectorStore
- * (consistent ordering to prevent deadlocks)
+ * Lock acquisition order: EventStore -> CoOccurrenceIndex -> VectorStore ->
+ * MetadataStore (consistent ordering to prevent deadlocks). All four are held
+ * simultaneously, and the WAL sequence is captured while that combined barrier
+ * is still held.
  *
  * @param filepath Output file path
  * @param config Configuration to serialize

@@ -279,11 +279,30 @@ Expected<void, Error> ReadHeaderV1(std::istream& input_stream, HeaderV1& header)
  * @note All data is written in little-endian format
  * @note CRC32 uses zlib implementation (polynomial: 0xEDB88320)
  */
+/// Largest snapshot file the format accepts, in bytes.
+constexpr uint64_t kMaxSnapshotFileSize = 3ULL * 1024ULL * 1024ULL * 1024ULL;
+
+/// Largest single store section, in bytes.
+///
+/// A store section is bounded only by the file it lives in. A smaller
+/// per-section constant is not a format property — the on-disk size field is a
+/// uint32 either way — it is just a second limit that a corpus can hit while
+/// the file limit still has room, which is how a documented workload became
+/// unsnapshottable with no configuration able to raise it.
+constexpr uint32_t kMaxStoreDataSize = static_cast<uint32_t>(kMaxSnapshotFileSize);
+
+/// Auxiliary sections stay small: they hold configuration and counters, not corpus data.
+constexpr uint32_t kMaxConfigSize = 16U * 1024U * 1024U;
+constexpr uint32_t kMaxStatsSize = 16U * 1024U * 1024U;
+constexpr uint32_t kMaxStoreStatsSize = 16U * 1024U * 1024U;
+
+/// Per-section write limits. Defaults are the format limits above; tests lower
+/// them to exercise the rejection paths without building a multi-gigabyte store.
 struct SnapshotWriteLimits {
-  uint32_t max_config_size = 16U * 1024U * 1024U;
-  uint32_t max_stats_size = 16U * 1024U * 1024U;
-  uint32_t max_store_data_size = 512U * 1024U * 1024U;
-  uint32_t max_store_stats_size = 16U * 1024U * 1024U;
+  uint32_t max_config_size = kMaxConfigSize;
+  uint32_t max_stats_size = kMaxStatsSize;
+  uint32_t max_store_data_size = kMaxStoreDataSize;
+  uint32_t max_store_stats_size = kMaxStoreStatsSize;
 };
 
 Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config::Config& config,

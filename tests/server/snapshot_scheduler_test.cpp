@@ -6,6 +6,7 @@
 #include "server/snapshot_scheduler.h"
 
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <chrono>
 #include <filesystem>
@@ -201,6 +202,35 @@ TEST_F(SnapshotSchedulerTest, CleanupRetainsCorrectCount) {
   // Manual file should be untouched
   EXPECT_EQ(manual_count, 1);
   EXPECT_TRUE(std::filesystem::exists(temp_dir_ / "manual_snapshot.nvec"));
+}
+
+TEST_F(SnapshotSchedulerTest, CleanupReclaimsTemporariesOfDeadWritersOnly) {
+  // Snapshot temporaries are named ".<snapshot>.tmp.<pid>.<n>", so the retention
+  // scan (which matches auto_*.nvec) never sees them. A writer killed mid-write
+  // leaves a full-size file behind, and without this sweep the directory grows
+  // without bound no matter what `retain` says.
+  const std::filesystem::path abandoned = temp_dir_ / ".auto_20260101_000000.nvec.tmp.999999999.0";
+  const std::filesystem::path live =
+      temp_dir_ / (".auto_20260101_000001.nvec.tmp." + std::to_string(::getpid()) + ".0");
+  for (const auto& path : {abandoned, live}) {
+    std::ofstream ofs(path);
+    ofs << "partial snapshot";
+  }
+  ASSERT_TRUE(std::filesystem::exists(abandoned));
+  ASSERT_TRUE(std::filesystem::exists(live));
+
+  auto snap_config = MakeTestConfig(1, 3, temp_dir_.string());
+  SnapshotScheduler scheduler(snap_config, &fork_writer_, &full_config_, &event_store_, &co_index_, &vector_store_,
+                              read_only_);
+  scheduler.Start();
+  ASSERT_TRUE(scheduler.IsRunning());
+  std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+  scheduler.Stop();
+
+  EXPECT_FALSE(std::filesystem::exists(abandoned));
+  // A temporary owned by a living process is still being written; removing it
+  // would corrupt an in-flight snapshot.
+  EXPECT_TRUE(std::filesystem::exists(live));
 }
 
 }  // namespace

@@ -87,8 +87,12 @@ class TcpClient {
 class SnapshotIntegrationTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    // Create temporary test directory for snapshots
-    test_dir_ = fs::temp_directory_path() / "nvecd_test_snapshots";
+    // Give every case its own snapshot directory. Cases run as separate
+    // processes, so a shared fixed path lets one case's TearDown() delete the
+    // directory another case is still writing snapshots into.
+    const auto* info = ::testing::UnitTest::GetInstance()->current_test_info();
+    test_dir_ = fs::temp_directory_path() / ("nvecd_test_snapshots_" + std::to_string(::getpid()) + "_" + info->name());
+    fs::remove_all(test_dir_);
     fs::create_directories(test_dir_);
 
     // Create configuration
@@ -250,30 +254,21 @@ TEST_F(SnapshotIntegrationTest, BasicSaveLoadRoundTrip) {
 }
 
 /**
- * @brief Test DUMP SAVE with default filename (timestamp-based)
+ * @brief Test DUMP SAVE with no argument, which uses snapshot.default_filename
  */
 TEST_F(SnapshotIntegrationTest, SaveWithDefaultFilename) {
   TcpClient client("127.0.0.1", port_);
 
   PopulateTestData(client);
 
-  // Save with default filename
+  // Save with no path: the destination is the configured default filename.
   std::string save_response = client.SendCommand("DUMP SAVE");
   EXPECT_TRUE(save_response.find("OK") == 0);
-  EXPECT_TRUE(save_response.find("snapshot_") != std::string::npos);
+  EXPECT_NE(save_response.find(config_.snapshot.default_filename), std::string::npos) << save_response;
 
   ASSERT_TRUE(WaitForSnapshotComplete(client)) << "Snapshot did not complete in time";
 
-  // Extract filename from response
-  size_t start = save_response.find("snapshot_");
-  ASSERT_NE(start, std::string::npos);
-  size_t end = save_response.find(".dmp", start);
-  ASSERT_NE(end, std::string::npos);
-  std::string filename = save_response.substr(start, end - start + 4);
-
-  // Verify file exists
-  fs::path snapshot_path = test_dir_ / filename;
-  EXPECT_TRUE(fs::exists(snapshot_path));
+  EXPECT_TRUE(fs::exists(test_dir_ / config_.snapshot.default_filename));
 }
 
 /**

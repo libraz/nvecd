@@ -13,12 +13,15 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 
 #include "config/config.h"
 #include "events/co_occurrence_index.h"
 #include "events/event_store.h"
+#include "storage/snapshot_session.h"
 #include "utils/error.h"
 #include "utils/expected.h"
 #include "vectors/metadata_store.h"
@@ -27,6 +30,9 @@
 namespace nvecd::storage {
 
 class WriteAheadLog;
+
+/// Default grace period given to a snapshot child before it is signalled.
+constexpr uint32_t kDefaultChildWaitMs = 5000;
 
 /// Status of a background snapshot operation
 enum class SnapshotStatus : uint8_t {
@@ -51,6 +57,12 @@ struct SnapshotResult {
  * @brief Fork-based COW snapshot writer
  *
  * Manages the lifecycle of background snapshot operations using fork().
+ *
+ * The writer owns the fork and the reported status; the durability handshake
+ * that follows the fork belongs to SnapshotSession, which completes it on its
+ * own and hands back a terminal outcome. CheckChild() therefore only publishes
+ * an outcome that already exists — it never reaps a child itself, so no two
+ * callers can race over one child's exit status.
  *
  * Thread Safety: Thread-safe (uses mutex for status updates)
  *
@@ -114,11 +126,13 @@ class ForkSnapshotWriter {
                                                           vectors::MetadataStore* metadata_store = nullptr);
 
   /**
-   * @brief Check and reap child process (non-blocking)
+   * @brief Publish a finished snapshot's terminal status (non-blocking)
    *
-   * Uses waitpid(WNOHANG) to check if child has exited.
-   * Updates status to kCompleted or kFailed accordingly.
-   * Safe to call frequently (no-op if no child is running).
+   * Returns immediately while the active session's writer is still running.
+   * Once the session has completed its durability handshake, the reported
+   * status becomes kCompleted or kFailed and the session is released so the
+   * next snapshot can start. Safe to call frequently and from several threads:
+   * publishing the same terminal outcome twice is a no-op.
    */
   void CheckChild();
 
@@ -134,21 +148,46 @@ class ForkSnapshotWriter {
   bool IsInProgress() const;
 
   /**
-   * @brief Wait for child process to finish (blocking)
+   * @brief Wait for the active snapshot to reach a terminal state (blocking)
    *
-   * Used during server shutdown. Waits up to timeout_ms for child,
-   * then sends SIGTERM if still running.
+   * Used during server shutdown. Gives the child @p timeout_ms to exit on its
+   * own, then signals it and reaps it. Returns only once the durability
+   * handshake has completed and its result has been published.
    *
-   * @param timeout_ms Maximum wait time in milliseconds (0 = no wait)
+   * @param timeout_ms Grace period for a voluntary child exit, in milliseconds
    */
-  void WaitForChild(uint32_t timeout_ms = 5000);
+  void WaitForChild(uint32_t timeout_ms = kDefaultChildWaitMs);
 
  private:
+  /// Publish @p outcome as the terminal status of @p session, exactly once.
+  void PublishOutcome(const std::shared_ptr<SnapshotSession>& session,
+                      const utils::Expected<SnapshotOutcome, utils::Error>& outcome);
+
   mutable std::mutex status_mutex_;
   SnapshotResult current_result_;
 
+  /// Durability handshake of the snapshot currently in flight (null when idle).
+  std::shared_ptr<SnapshotSession> session_;
+
   /// Write-Ahead Log for checkpoint/truncate (non-owning, may be null).
   WriteAheadLog* wal_ = nullptr;
+
+  /**
+   * @brief The store read locks a forked child inherits from the pre-fork barrier
+   *
+   * These are the only synchronisation objects the child can block on: each
+   * store owns exactly one shared_mutex, and the serializer reaches every store
+   * through const getters that take it. Handing the whole set to ChildProcess
+   * by value is what makes their re-initialization unforgettable — the child
+   * entry point cannot be called without surrendering them, and re-initializing
+   * them is the first thing it does.
+   */
+  struct InheritedStoreLocks {
+    std::shared_lock<std::shared_mutex> event_store;
+    std::shared_lock<std::shared_mutex> co_index;
+    std::shared_lock<std::shared_mutex> vector_store;
+    std::shared_lock<std::shared_mutex> metadata_store;
+  };
 
   /**
    * @brief Child process entry point (runs after fork)
@@ -157,9 +196,11 @@ class ForkSnapshotWriter {
    * have held at fork time. In particular it must not call into spdlog; all
    * diagnostics use async-signal-safe write(2). This function never returns —
    * it calls _exit().
+   *
+   * @param locks Inherited store locks; re-initialized before any store access
    */
-  [[noreturn]] static void ChildProcess(const std::string& filepath, const config::Config& config,
-                                        const events::EventStore& event_store,
+  [[noreturn]] static void ChildProcess(InheritedStoreLocks locks, const std::string& filepath,
+                                        const config::Config& config, const events::EventStore& event_store,
                                         const events::CoOccurrenceIndex& co_index,
                                         const vectors::VectorStore& vector_store,
                                         const vectors::MetadataStore* metadata_store);

@@ -104,6 +104,17 @@ uint64_t ReadU64(const uint8_t* buf) {
   return val;
 }
 
+/// Number of digits in a WAL segment file name ("wal-NNNNNN.log").
+constexpr int kFileNumberDigits = 6;
+
+/// Highest segment number that still fits kFileNumberDigits. A larger number
+/// would widen the file name, and the reader matches a fixed-width name only,
+/// so such a segment would be invisible to recovery and to truncation.
+constexpr uint32_t kMaxFileNumber = 999999;
+
+/// Length of a WAL segment file name: "wal-" + digits + ".log".
+constexpr size_t kFileNameLength = 4 + kFileNumberDigits + 4;
+
 bool FsyncDirectory(const std::string& directory) {
   const int fd = ::open(directory.c_str(), O_RDONLY | O_DIRECTORY);
   if (fd < 0) {
@@ -133,6 +144,15 @@ Expected<void, Error> WriteAheadLog::Open(const Config& config) {
   std::lock_guard<std::mutex> lock(mutex_);
 
   config_ = config;
+
+  // A zero batch interval leaves nobody to consume needs_sync_: the periodic
+  // sync thread never starts, so an accepted record would only reach the platter
+  // when a segment happens to rotate or the process exits cleanly. Treat it as
+  // "fsync on every append" so every schema-valid combination of sync_on_write
+  // and sync_interval_ms still makes accepted records durable in bounded time.
+  if (!config_.sync_on_write && config_.sync_interval_ms == 0) {
+    config_.sync_on_write = true;
+  }
 
   // Ensure directory exists
   if (::mkdir(config_.directory.c_str(), 0700) != 0 && errno != EEXIST) {
@@ -209,9 +229,14 @@ Expected<void, Error> WriteAheadLog::Open(const Config& config) {
 }
 
 void WriteAheadLog::Close() {
-  // Stop sync thread
+  // Stop sync thread. The stop flag is published under sync_mutex_ so it cannot
+  // be stored between the sync thread's predicate check and its wait: a lost
+  // wakeup there would stall shutdown for a whole sync_interval_ms.
   if (sync_running_.load()) {
-    sync_running_.store(false);
+    {
+      std::lock_guard<std::mutex> sync_lock(sync_mutex_);
+      sync_running_.store(false);
+    }
     sync_cv_.notify_all();
     if (sync_thread_.joinable()) {
       sync_thread_.join();
@@ -427,7 +452,7 @@ Expected<uint64_t, Error> WriteAheadLog::ReplayValidated(
             .Warn();
         ::close(fd);
         return utils::MakeUnexpected(
-            utils::MakeError(utils::ErrorCode::kStorageCorrupted, "WAL record CRC mismatch in " + path));
+            utils::MakeError(utils::ErrorCode::kWalCRCMismatch, "WAL record CRC mismatch in " + path));
       }
 
       // Parse record
@@ -490,21 +515,26 @@ Expected<void, Error> WriteAheadLog::Truncate(uint64_t up_to_sequence) {
   for (auto& f : files_) {
     // Delete files where ALL records are <= up_to_sequence
     // (i.e., max_sequence <= up_to_sequence AND it's not the current file)
-    if (f.max_sequence <= up_to_sequence && f.max_sequence > 0 && f.file_number != current_file_number_) {
-      if (::unlink(f.path.c_str()) == 0) {
-        ++deleted_count;
-      } else {
-        const int saved_errno = errno;
-        remaining.push_back(std::move(f));
-        if (!unlink_error.has_value()) {
-          unlink_error = utils::MakeError(utils::ErrorCode::kWalTruncateFailed,
-                                          "Failed to unlink WAL segment '" + remaining.back().path +
-                                              "': " + std::string(std::strerror(saved_errno)));
-        }
-      }
-    } else {
+    const bool deletable =
+        f.max_sequence <= up_to_sequence && f.max_sequence > 0 && f.file_number != current_file_number_;
+    // Stop deleting at the first failure. files_ is ordered by segment number,
+    // so the deleted set stays a prefix and the surviving set stays a single
+    // contiguous range. Continuing past a failure would leave a gap that the
+    // next Open() rejects, making the server unstartable until the directory is
+    // repaired by hand.
+    if (!deletable || unlink_error.has_value()) {
       remaining.push_back(std::move(f));
+      continue;
     }
+    if (::unlink(f.path.c_str()) == 0) {
+      ++deleted_count;
+      continue;
+    }
+    const int saved_errno = errno;
+    remaining.push_back(std::move(f));
+    unlink_error = utils::MakeError(
+        utils::ErrorCode::kWalTruncateFailed,
+        "Failed to unlink WAL segment '" + remaining.back().path + "': " + std::string(std::strerror(saved_errno)));
   }
 
   files_ = std::move(remaining);
@@ -565,9 +595,13 @@ Expected<void, Error> WriteAheadLog::RotateFile() {
   std::string path;
   int fd = -1;
   do {
-    if (current_file_number_ == std::numeric_limits<uint32_t>::max()) {
+    // Fail closed at the widest name the reader recognises. A wider name would
+    // be written but never scanned back, so the segment would vanish from
+    // recovery and stay unreclaimable by Truncate() — a silent data loss that
+    // reports no error at all.
+    if (current_file_number_ >= kMaxFileNumber) {
       return utils::MakeUnexpected(
-          utils::MakeError(utils::ErrorCode::kWalRotationFailed, "WAL file number space exhausted"));
+          utils::MakeError(utils::ErrorCode::kWalRotationFailed, "WAL segment number space exhausted"));
     }
     ++current_file_number_;
     path = MakeFilePath(current_file_number_);
@@ -668,8 +702,9 @@ Expected<void, Error> WriteAheadLog::ScanExistingFiles() {
   while ((entry = ::readdir(dir)) != nullptr) {
     std::string name(entry->d_name);
     // Match wal-NNNNNN.log
-    if (name.size() == 14 && name.substr(0, 4) == "wal-" && name.substr(10, 4) == ".log") {
-      std::string num_str = name.substr(4, 6);
+    if (name.size() == kFileNameLength && name.substr(0, 4) == "wal-" &&
+        name.substr(4 + kFileNumberDigits, 4) == ".log") {
+      std::string num_str = name.substr(4, kFileNumberDigits);
       if (!std::all_of(num_str.begin(), num_str.end(),
                        [](unsigned char character) { return std::isdigit(character) != 0; })) {
         continue;
@@ -769,7 +804,7 @@ Expected<void, Error> WriteAheadLog::ScanExistingFiles() {
       if (CalcCRC32(body.data(), body.size()) != expected_crc) {
         ::close(fd);
         return utils::MakeUnexpected(
-            utils::MakeError(utils::ErrorCode::kWalCorrupted, "WAL record CRC mismatch: " + path));
+            utils::MakeError(utils::ErrorCode::kWalCRCMismatch, "WAL record CRC mismatch: " + path));
       }
 
       uint64_t seq = ReadU64(body.data());
@@ -817,14 +852,17 @@ Expected<void, Error> WriteAheadLog::ScanExistingFiles() {
 
 std::string WriteAheadLog::MakeFilePath(uint32_t file_number) const {
   char buf[32];
-  std::snprintf(buf, sizeof(buf), "wal-%06u.log", file_number);
+  std::snprintf(buf, sizeof(buf), "wal-%0*u.log", kFileNumberDigits, file_number);
   return config_.directory + "/" + buf;
 }
 
 void WriteAheadLog::SyncLoop() {
   while (sync_running_.load()) {
-    std::unique_lock<std::mutex> lock(sync_mutex_);
-    sync_cv_.wait_for(lock, std::chrono::milliseconds(config_.sync_interval_ms));
+    {
+      std::unique_lock<std::mutex> lock(sync_mutex_);
+      sync_cv_.wait_for(lock, std::chrono::milliseconds(config_.sync_interval_ms),
+                        [this] { return !sync_running_.load(); });
+    }
 
     if (!sync_running_.load())
       break;

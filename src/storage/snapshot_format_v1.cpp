@@ -48,13 +48,10 @@ using namespace utils;
 
 namespace {
 
-constexpr uint32_t kMaxConfigSize = 16 * 1024 * 1024;      // 16MB max for config section
-constexpr uint32_t kMaxStatsSize = 16 * 1024 * 1024;       // 16MB max for statistics section
-constexpr uint32_t kMaxStoreDataSize = 512 * 1024 * 1024;  // 512MB max for store data
-constexpr uint32_t kMaxStoreStatsSize = 16 * 1024 * 1024;  // 16MB max for store statistics
-constexpr uint32_t kMaxStringLength = 256 * 1024 * 1024;   // 256MB max for length-prefixed strings
-constexpr uint64_t kMaxSnapshotFileSize = 3ULL * 1024ULL * 1024ULL * 1024ULL;
-constexpr uint64_t kMaxVectorDimension = 4096;  // Matches the public configuration schema.
+constexpr uint32_t kMaxStringLength = 256 * 1024 * 1024;  // 256MB max for length-prefixed strings
+/// Reader-side dimension bound. Shares the store's single limit so a snapshot
+/// can never carry a dimension the live store would refuse.
+constexpr uint64_t kMaxVectorDimension = vectors::VectorStore::kMaxDimension;
 
 enum class MetadataValueType : uint8_t {
   kString = 1,
@@ -202,6 +199,147 @@ Expected<void, Error> WriteSizedPayload(std::ostream& output_stream, const std::
 
 bool IsFullyConsumed(std::istream& input_stream) {
   return input_stream.peek() == std::char_traits<char>::eof();
+}
+
+/**
+ * @brief Read-only stream view over an existing buffer
+ *
+ * std::istringstream copies the string it is handed, so parsing a section that
+ * had already been read into memory cost a second copy of it. This exposes the
+ * bytes that are already there instead. Seeking is supported because the
+ * section readers locate their own end through seekg/tellg.
+ */
+class BufferViewStreambuf : public std::streambuf {
+ public:
+  BufferViewStreambuf(char* data, size_t size) { setg(data, data, data + size); }
+
+ protected:
+  pos_type seekoff(off_type offset, std::ios_base::seekdir direction, std::ios_base::openmode which) override {
+    if ((which & std::ios_base::in) == 0) {
+      return pos_type(off_type(-1));
+    }
+    off_type target = offset;
+    if (direction == std::ios_base::cur) {
+      target += gptr() - eback();
+    } else if (direction == std::ios_base::end) {
+      target += egptr() - eback();
+    }
+    if (target < 0 || target > egptr() - eback()) {
+      return pos_type(off_type(-1));
+    }
+    setg(eback(), eback() + target, egptr());
+    return pos_type(target);
+  }
+
+  pos_type seekpos(pos_type position, std::ios_base::openmode which) override {
+    return seekoff(off_type(position), std::ios_base::beg, which);
+  }
+};
+
+/**
+ * @brief Output filter that forwards bytes onward and accumulates their CRC32
+ *
+ * Store sections are written straight into the snapshot file rather than being
+ * built in memory first, so peak memory stays a constant buffer plus the store
+ * itself instead of twice the serialized section. The size and CRC32 that
+ * precede a section are only known once it ends, so they are written as
+ * placeholders and patched afterwards; this filter supplies the CRC without a
+ * second pass over the bytes.
+ */
+class CrcTeeStreambuf : public std::streambuf {
+ public:
+  explicit CrcTeeStreambuf(std::ostream& sink) : sink_(sink) {}
+
+  [[nodiscard]] uint32_t Crc() const { return static_cast<uint32_t>(crc_); }
+
+ protected:
+  std::streamsize xsputn(const char* data, std::streamsize count) override {
+    sink_.write(data, count);
+    if (!sink_.good()) {
+      return 0;
+    }
+    // zlib takes a uInt length, which is narrower than a section can be.
+    std::streamsize remaining = count;
+    const auto* cursor = reinterpret_cast<const Bytef*>(data);  // NOLINT
+    while (remaining > 0) {
+      const auto chunk = static_cast<uInt>(std::min<std::streamsize>(remaining, kCrcChunkBytes));
+      crc_ = crc32(crc_, cursor, chunk);
+      cursor += chunk;
+      remaining -= chunk;
+    }
+    return count;
+  }
+
+  int_type overflow(int_type ch) override {
+    if (ch == traits_type::eof()) {
+      return traits_type::not_eof(ch);
+    }
+    const char byte = static_cast<char>(ch);
+    return xsputn(&byte, 1) == 1 ? ch : traits_type::eof();
+  }
+
+ private:
+  static constexpr std::streamsize kCrcChunkBytes = 1 << 20;
+
+  std::ostream& sink_;
+  uLong crc_ = crc32(0L, Z_NULL, 0);
+};
+
+/**
+ * @brief Write a section as [size:u32][crc32:u32][payload], streaming the payload
+ *
+ * The bytes are identical to those produced by materializing the section first,
+ * so snapshots written before and after this change are interchangeable.
+ *
+ * @param output_stream Seekable destination
+ * @param limit Largest payload this section may occupy
+ * @param label Section name used in error messages
+ * @param serialize Callable invoked with the payload stream
+ * @return Success, or the serializer's error / a kStorageDumpWriteError
+ */
+template <typename SerializeFn>
+Expected<void, Error> WriteStreamedSection(std::ostream& output_stream, uint32_t limit, const std::string& label,
+                                           SerializeFn&& serialize) {
+  const std::streampos header_pos = output_stream.tellp();
+  if (header_pos == std::streampos(-1)) {
+    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Cannot locate " + label + " header"));
+  }
+  const uint32_t placeholder = 0;
+  if (!WriteBinary(output_stream, placeholder) || !WriteBinary(output_stream, placeholder)) {
+    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write " + label + " header"));
+  }
+  const std::streampos data_pos = output_stream.tellp();
+
+  uint32_t crc = 0;
+  {
+    CrcTeeStreambuf tee(output_stream);
+    std::ostream tee_stream(&tee);
+    auto serialized = serialize(tee_stream);
+    if (!serialized) {
+      return serialized;
+    }
+    tee_stream.flush();
+    crc = tee.Crc();
+  }
+  if (!output_stream.good()) {
+    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write " + label + " data"));
+  }
+
+  const std::streampos end_pos = output_stream.tellp();
+  auto size = CheckedSizeToU32(static_cast<size_t>(end_pos - data_pos), limit, label);
+  if (!size) {
+    return MakeUnexpected(size.error());
+  }
+
+  output_stream.seekp(header_pos, std::ios::beg);
+  if (!WriteBinary(output_stream, *size) || !WriteBinary(output_stream, crc)) {
+    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to patch " + label + " header"));
+  }
+  output_stream.seekp(end_pos, std::ios::beg);
+  if (!output_stream.good()) {
+    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to resume after " + label + " header"));
+  }
+  return {};
 }
 
 }  // namespace
@@ -716,8 +854,18 @@ Expected<void, Error> DeserializeCoOccurrenceIndex(std::istream& input_stream, e
         return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read co-occurrence score"));
       }
 
-      // Set the score directly to preserve exact values from the snapshot
-      co_index.SetScore(item1, item2, score);
+      // Restore the score verbatim, but through the same validation the live
+      // path uses. Verbatim applies to the value, not to the invariants: a
+      // self-edge corrupts the map during pruning and a non-finite score breaks
+      // the ordering of every later sort, so a snapshot carrying one is
+      // rejected rather than partially applied. Loading it and dropping the
+      // edge would be worse — the file would appear to load while the restored
+      // index differed from the one that was written.
+      auto restored = co_index.SetScore(item1, item2, score);
+      if (!restored) {
+        return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError,
+                                        "Failed to restore co-occurrence edge: " + restored.error().message()));
+      }
     }
   }
 
@@ -833,6 +981,18 @@ Expected<void, Error> DeserializeVectorStore(std::istream& input_stream, vectors
     if (!result) {
       return MakeUnexpected(
           MakeError(ErrorCode::kStorageDumpReadError, "Failed to add vector: " + result.error().message()));
+    }
+  }
+
+  // A corpus that was emptied before it was persisted still carries the
+  // dimension it was built for. Without restoring it here the reloaded store
+  // has no dimension at all and accepts the next vector at any size, so a
+  // mismatched embedding model is admitted instead of rejected.
+  if (vector_count == 0 && dimension > 0) {
+    auto restored = vector_store.RestoreDimension(static_cast<size_t>(dimension));
+    if (!restored) {
+      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError,
+                                      "Failed to restore vector dimension: " + restored.error().message()));
     }
   }
 
@@ -1128,13 +1288,9 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
         WriteBinary(output_stream, zero);  // No store stats
       }
 
-      std::ostringstream store_data_ss;
-      auto serialize_result = SerializeEventStore(store_data_ss, event_store);
-      if (!serialize_result) {
-        return serialize_result;
-      }
-      std::string store_data = store_data_ss.str();
-      auto write_result = WriteSizedPayload(output_stream, store_data, max_store_data_size, "events store");
+      auto write_result =
+          WriteStreamedSection(output_stream, max_store_data_size, "events store",
+                               [&](std::ostream& section) { return SerializeEventStore(section, event_store); });
       if (!write_result) {
         return write_result;
       }
@@ -1160,13 +1316,9 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
         WriteBinary(output_stream, zero);  // No store stats
       }
 
-      std::ostringstream store_data_ss;
-      auto serialize_result = SerializeCoOccurrenceIndex(store_data_ss, co_index);
-      if (!serialize_result) {
-        return serialize_result;
-      }
-      std::string store_data = store_data_ss.str();
-      auto write_result = WriteSizedPayload(output_stream, store_data, max_store_data_size, "co-occurrence store");
+      auto write_result =
+          WriteStreamedSection(output_stream, max_store_data_size, "co-occurrence store",
+                               [&](std::ostream& section) { return SerializeCoOccurrenceIndex(section, co_index); });
       if (!write_result) {
         return write_result;
       }
@@ -1192,13 +1344,9 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
         WriteBinary(output_stream, zero);  // No store stats
       }
 
-      std::ostringstream store_data_ss;
-      auto serialize_result = SerializeVectorStore(store_data_ss, vector_store);
-      if (!serialize_result) {
-        return serialize_result;
-      }
-      std::string store_data = store_data_ss.str();
-      auto write_result = WriteSizedPayload(output_stream, store_data, max_store_data_size, "vectors store");
+      auto write_result =
+          WriteStreamedSection(output_stream, max_store_data_size, "vectors store",
+                               [&](std::ostream& section) { return SerializeVectorStore(section, vector_store); });
       if (!write_result) {
         return write_result;
       }
@@ -1210,13 +1358,9 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
       uint32_t zero = 0;
       WriteBinary(output_stream, zero);  // No store stats
 
-      std::ostringstream store_data_ss;
-      auto serialize_result = SerializeMetadataStore(store_data_ss, *metadata_store, vector_store);
-      if (!serialize_result) {
-        return serialize_result;
-      }
-      std::string store_data = store_data_ss.str();
-      auto write_result = WriteSizedPayload(output_stream, store_data, max_store_data_size, "metadata store");
+      auto write_result = WriteStreamedSection(
+          output_stream, max_store_data_size, "metadata store",
+          [&](std::ostream& section) { return SerializeMetadataStore(section, *metadata_store, vector_store); });
       if (!write_result) {
         return write_result;
       }
@@ -1595,7 +1739,10 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
         }
       }
 
-      std::istringstream store_data_ss(store_data);
+      // Parse the bytes that were already read rather than handing them to an
+      // istringstream, which would copy the whole section a second time.
+      BufferViewStreambuf store_data_buffer(store_data.data(), store_data.size());
+      std::istream store_data_ss(&store_data_buffer);
 
       // Deserialize based on store name
       if (store_name == "events") {

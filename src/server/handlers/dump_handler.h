@@ -27,6 +27,17 @@ namespace nvecd::server::handlers {
  * @param filepath Target file path (empty for auto-generated name)
  * @return OK response with saved path, or error
  */
+/**
+ * @brief Handle DUMP SAVE
+ *
+ * With no @p filepath the snapshot goes to `snapshot.default_filename` inside
+ * the dump directory, and only to a timestamped name when that setting is
+ * empty. Both forms are resolved through the same dump-path validation.
+ *
+ * @param ctx Handler context (stores, config, snapshot writer, WAL)
+ * @param filepath Client-supplied path, or empty to use the configured default
+ * @return Wire response, or an error
+ */
 utils::Expected<std::string, utils::Error> HandleDumpSave(HandlerContext& ctx, const std::string& filepath);
 
 /**

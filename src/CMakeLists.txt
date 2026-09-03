@@ -6,6 +6,7 @@
 # Include directories
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 
+
 # Utility library
 add_library(nvecd_utils STATIC
   utils/network_utils.cpp
@@ -185,6 +186,7 @@ add_library(nvecd_storage STATIC
   storage/snapshot_format_v1.cpp
   storage/snapshot_fork.cpp
   storage/snapshot_lock.cpp
+  storage/snapshot_session.cpp
   storage/wal.cpp
   storage/wal_checkpoint.cpp
 )
@@ -277,3 +279,23 @@ install(EXPORT nvecdTargets
   NAMESPACE nvecd::
   DESTINATION lib/cmake/nvecd
 )
+
+# A switch over an enumeration that omits `default:` is how several invariants
+# here are kept whole: adding an enumerator must break the build at every place
+# that decides something about it, instead of silently falling through. -Wswitch
+# reports that as a warning, and a warning is advisory in a build that carries no
+# -Werror, so it is promoted to an error for nvecd's own translation units.
+#
+# PRIVATE, and per target rather than in CMAKE_CXX_FLAGS, for two reasons: the
+# vendored dependencies are compiled in this same build and their diagnostics
+# are not ours to gate on, and a consumer of the installed client library must
+# not inherit our warning policy. Narrow by design; not a step toward a blanket
+# -Werror.
+foreach(nvecd_target
+  nvecd_utils nvecd_server nvecd_events nvecd_vectors nvecd_similarity
+  nvecd_config nvecd_cache nvecd_storage nvecdclient nvecd nvecd-cli
+)
+  target_compile_options(${nvecd_target} PRIVATE
+    $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-Werror=switch>
+  )
+endforeach()
