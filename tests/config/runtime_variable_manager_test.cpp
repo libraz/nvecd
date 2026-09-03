@@ -438,6 +438,28 @@ TEST(RuntimeVariableManagerTest, GetAllVariables_ReturnsAllKnownVariables) {
   EXPECT_NE(all_vars.find("wal.include_vectors"), all_vars.end());
 }
 
+/**
+ * @brief Every declared variable has a resolver
+ *
+ * The mutability table and the value resolver are two independent lists of the
+ * same names. A name present in the first and missing from the second answers
+ * CONFIG GET with an empty string and a success status, which the caller cannot
+ * tell apart from a variable that is genuinely unset.
+ */
+TEST(RuntimeVariableManagerTest, GetAllVariables_EveryDeclaredVariableResolves) {
+  Config config = MakeDefaultConfig();
+  auto manager = *RuntimeVariableManager::Create(config);
+
+  auto all_vars = manager->GetAllVariables();
+  ASSERT_FALSE(all_vars.empty());
+
+  for (const auto& [name, info] : all_vars) {
+    auto value = manager->GetVariable(name);
+    ASSERT_TRUE(value) << "declared variable has no resolver: " << name << " (" << value.error().message() << ")";
+    EXPECT_EQ(*value, info.value) << "CONFIG GET and SHOW VARIABLES disagree for " << name;
+  }
+}
+
 TEST(RuntimeVariableManagerTest, GetAllVariables_MutabilityFlagCorrect) {
   Config config = MakeDefaultConfig();
   auto manager = *RuntimeVariableManager::Create(config);

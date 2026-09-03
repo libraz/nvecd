@@ -9,18 +9,21 @@
     "events": {
       "type": "object",
       "description": "Event store and co-occurrence tracking configuration",
+      "description_ja": "イベントストアと共起追跡の設定",
       "additionalProperties": false,
       "properties": {
         "ctx_buffer_size": {
           "type": "integer",
           "description": "Number of events to track per context (ring buffer size)",
+          "description_ja": "コンテキストごとに追跡するイベント数（リングバッファのサイズ）",
           "default": 50,
           "minimum": 10,
           "maximum": 10000
         },
         "max_contexts": {
           "type": "integer",
-          "description": "Maximum active contexts retained by the LRU (0 = unlimited)",
+          "description": "Maximum active contexts retained by the LRU; least-recently-active contexts are pruned first (0 = unlimited)",
+          "description_ja": "LRU が保持するアクティブコンテキストの最大数。上限に達すると最後にアクセスされてから最も時間が経ったコンテキストから削除される（0 = 無制限）",
           "default": 0,
           "minimum": 0,
           "maximum": 1000000
@@ -28,6 +31,7 @@
         "max_neighbors_per_item": {
           "type": "integer",
           "description": "Maximum retained co-occurrence neighbors per item (0 = unlimited)",
+          "description_ja": "アイテムごとに保持する共起近傍の最大数（0 = 無制限）",
           "default": 0,
           "minimum": 0,
           "maximum": 1000000
@@ -35,19 +39,22 @@
         "min_support": {
           "type": "number",
           "description": "Prune co-occurrence edges with absolute score below this threshold (0 = disabled)",
+          "description_ja": "絶対スコアがこの閾値未満の共起エッジを削除する（0 = 無効）",
           "default": 0.0,
           "minimum": 0.0
         },
         "decay_interval_sec": {
           "type": "integer",
           "description": "Decay interval in seconds (0 = disabled)",
+          "description_ja": "減衰間隔（秒、0 = 無効）",
           "default": 3600,
           "minimum": 0,
           "maximum": 86400
         },
         "decay_alpha": {
           "type": "number",
-          "description": "Decay factor (0.0-1.0)",
+          "description": "Decay factor",
+          "description_ja": "減衰係数",
           "default": 0.99,
           "minimum": 0.0,
           "maximum": 1.0
@@ -55,13 +62,15 @@
         "dedup_window_sec": {
           "type": "integer",
           "description": "Deduplication time window in seconds (0 = disabled)",
+          "description_ja": "重複排除の時間窓（秒、0 = 無効）",
           "default": 60,
           "minimum": 0,
           "maximum": 86400
         },
         "dedup_cache_size": {
           "type": "integer",
-          "description": "Deduplication cache size (LRU)",
+          "description": "Deduplication cache size (LRU); 0 = disable deduplication entirely, including the SET/DEL idempotency tracking",
+          "description_ja": "重複排除キャッシュのサイズ（LRU）。0 = 重複排除を完全に無効化する。SET/DEL の冪等性追跡も無効になる",
           "default": 10000,
           "minimum": 0,
           "maximum": 1000000
@@ -69,22 +78,26 @@
         "temporal_cooccurrence": {
           "type": "boolean",
           "description": "Enable time-decay for co-occurrence updates",
+          "description_ja": "共起更新に時間減衰を適用する",
           "default": false
         },
         "temporal_half_life_sec": {
           "type": "number",
           "description": "Half-life in seconds for temporal decay (score halves per this many seconds of age)",
+          "description_ja": "時間減衰の半減期（秒。経過秒数がこの値になるごとにスコアが半分になる）",
           "default": 86400.0,
           "exclusiveMinimum": 0.0
         },
         "negative_signals": {
           "type": "boolean",
           "description": "Enable negative signal (down-ranking) on DEL events",
+          "description_ja": "DEL イベントによる負のシグナル（ランキング低下）を有効にする",
           "default": false
         },
         "negative_weight": {
           "type": "number",
-          "description": "Reduction weight applied for negative signals (0.0-1.0)",
+          "description": "Reduction weight applied for negative signals",
+          "description_ja": "負のシグナルに適用する減少の重み",
           "default": 0.5,
           "minimum": 0.0,
           "maximum": 1.0
@@ -94,11 +107,13 @@
     "vectors": {
       "type": "object",
       "description": "Vector store configuration",
+      "description_ja": "ベクトルストアの設定",
       "additionalProperties": false,
       "properties": {
         "default_dimension": {
           "type": "integer",
           "description": "Default vector dimension (number of features per vector)",
+          "description_ja": "既定のベクトル次元数（ベクトルごとの特徴量数）",
           "default": 768,
           "minimum": 1,
           "maximum": 4096
@@ -106,19 +121,26 @@
         "distance_metric": {
           "type": "string",
           "description": "Distance metric for similarity search",
+          "description_ja": "類似検索に用いる距離メトリック",
           "default": "cosine",
-          "enum": ["cosine", "dot", "l2"]
+          "enum": [
+            "cosine",
+            "dot",
+            "l2"
+          ]
         }
       }
     },
     "similarity": {
       "type": "object",
       "description": "Similarity search configuration",
+      "description_ja": "類似検索の設定",
       "additionalProperties": false,
       "properties": {
         "default_top_k": {
           "type": "integer",
           "description": "Default number of results to return in similarity searches",
+          "description_ja": "類似検索が返す既定の結果件数",
           "default": 100,
           "minimum": 1,
           "maximum": 10000
@@ -126,38 +148,45 @@
         "max_top_k": {
           "type": "integer",
           "description": "Maximum number of results allowed in similarity searches",
+          "description_ja": "類似検索で許可する結果件数の上限",
           "default": 1000,
           "minimum": 1,
           "maximum": 10000
         },
         "fusion_alpha": {
           "type": "number",
-          "description": "Weight for vector similarity component in fusion mode (0.0 - 1.0)",
+          "description": "Weight for the vector-similarity component in fusion mode",
+          "description_ja": "fusion モードにおけるベクトル類似度成分の重み",
           "default": 0.6,
           "minimum": 0.0,
           "maximum": 1.0
         },
         "fusion_beta": {
           "type": "number",
-          "description": "Weight for co-occurrence component in fusion mode (0.0 - 1.0)",
+          "description": "Weight for the co-occurrence component in fusion mode",
+          "description_ja": "fusion モードにおける共起成分の重み",
           "default": 0.4,
           "minimum": 0.0,
           "maximum": 1.0
         },
         "sample_size": {
           "type": "integer",
-          "description": "Random sampling size for approximate search (0 = exact search)",
+          "description": "Random sampling size for approximate search; sampling engages only once the corpus exceeds twice this value (0 = exact search), and the maximum is the largest value whose doubling stays inside the 32-bit counter that comparison uses",
+          "description_ja": "近似検索のランダムサンプリング件数。サンプリングはコーパスがこの値の 2 倍を超えたときにのみ有効になる（0 = 全探索）。上限は、その比較に使う 32 ビットカウンタ内に 2 倍した値が収まる最大値",
           "default": 10000,
-          "minimum": 0
+          "minimum": 0,
+          "maximum": 2147483647
         },
         "ivf_enabled": {
           "type": "boolean",
           "description": "Enable IVF (Inverted File) approximate nearest neighbor search",
+          "description_ja": "IVF（Inverted File）近似最近傍検索を有効にする",
           "default": false
         },
         "ivf_nlist": {
           "type": "integer",
           "description": "Number of Voronoi cells/clusters for IVF index (0 = auto sqrt(n))",
+          "description_ja": "IVF インデックスのボロノイセル（クラスタ）数（0 = 自動で sqrt(n)）",
           "default": 256,
           "minimum": 0,
           "maximum": 65536
@@ -165,104 +194,132 @@
         "ivf_nprobe": {
           "type": "integer",
           "description": "Number of clusters to probe at query time",
+          "description_ja": "クエリ時に探索するクラスタ数",
           "default": 8,
           "minimum": 1,
           "maximum": 65536
         },
         "ivf_train_threshold": {
           "type": "integer",
-          "description": "Minimum number of vectors before auto-training IVF index",
+          "description": "Minimum number of vectors before auto-training IVF index; the maximum is the range of the type it is read into, not a tuning limit",
+          "description_ja": "IVF インデックスを自動学習するまでに必要な最小ベクトル数。上限は読み込み先の型の範囲であり、チューニング上の制限ではない",
           "default": 10000,
-          "minimum": 1
+          "minimum": 1,
+          "maximum": 4294967295
         },
         "ivf_seal_threshold": {
           "type": "integer",
-          "description": "Seal the write buffer when it reaches this number of vectors",
+          "description": "Seal the write buffer when it reaches this number of vectors; the maximum is the range of the type it is read into, not a tuning limit",
+          "description_ja": "書き込みバッファをこのベクトル数に達した時点で確定する。上限は読み込み先の型の範囲であり、チューニング上の制限ではない",
           "default": 100000,
-          "minimum": 1
+          "minimum": 1,
+          "maximum": 4294967295
         },
         "adaptive_fusion": {
           "type": "boolean",
           "description": "Enable adaptive fusion weight computation based on item maturity",
+          "description_ja": "アイテムの成熟度に基づく適応的な fusion 重み計算を有効にする",
           "default": false
         },
         "adaptive_min_alpha": {
           "type": "number",
-          "description": "Minimum vector weight for mature items with many co-occurrences (0.0-1.0)",
+          "description": "Minimum vector weight, used for mature items with many co-occurrences",
+          "description_ja": "共起が多い成熟したアイテムに対するベクトル重みの下限",
           "default": 0.2,
           "minimum": 0.0,
           "maximum": 1.0
         },
         "adaptive_max_alpha": {
           "type": "number",
-          "description": "Maximum vector weight for new items with few co-occurrences (0.0-1.0)",
+          "description": "Maximum vector weight, used for new items with few co-occurrences",
+          "description_ja": "共起が少ない新しいアイテムに対するベクトル重みの上限",
           "default": 0.9,
           "minimum": 0.0,
           "maximum": 1.0
         },
         "adaptive_maturity_threshold": {
           "type": "integer",
-          "description": "Co-occurrence neighbor count at which an item is considered mature",
+          "description": "Co-occurrence neighbor count at which an item is considered mature; the maximum is the range of the type it is read into, not a tuning limit",
+          "description_ja": "アイテムを成熟とみなす共起近傍数。上限は読み込み先の型の範囲であり、チューニング上の制限ではない",
           "default": 50,
-          "minimum": 1
+          "minimum": 1,
+          "maximum": 4294967295
         },
         "index_type": {
           "type": "string",
           "description": "ANN index type: hnsw, ivf, or flat (brute-force)",
+          "description_ja": "ANN インデックスの種類: hnsw、ivf、flat（全探索）",
           "default": "flat",
-          "enum": ["hnsw", "ivf", "flat"]
+          "enum": [
+            "hnsw",
+            "ivf",
+            "flat"
+          ]
         },
         "hnsw_m": {
           "type": "integer",
-          "description": "HNSW number of connections per node",
+          "description": "HNSW number of connections per node; the maximum is the largest value whose doubled bottom-layer link count stays inside the 32-bit counter that holds it",
+          "description_ja": "HNSW のノードあたり接続数。上限は、最下層で 2 倍になるリンク数を保持する 32 ビットカウンタに収まる最大値",
           "default": 16,
-          "minimum": 2
+          "minimum": 2,
+          "maximum": 2147483647
         },
         "hnsw_ef_construction": {
           "type": "integer",
-          "description": "HNSW search width during construction",
+          "description": "HNSW search width during construction; the maximum is the range of the type it is read into, not a tuning limit",
+          "description_ja": "HNSW の構築時探索幅。上限は読み込み先の型の範囲であり、チューニング上の制限ではない",
           "default": 200,
-          "minimum": 1
+          "minimum": 1,
+          "maximum": 4294967295
         },
         "hnsw_ef_search": {
           "type": "integer",
-          "description": "HNSW search width during query",
+          "description": "HNSW search width during query; the maximum is the range of the type it is read into, not a tuning limit",
+          "description_ja": "HNSW のクエリ時探索幅。上限は読み込み先の型の範囲であり、チューニング上の制限ではない",
           "default": 50,
-          "minimum": 1
+          "minimum": 1,
+          "maximum": 4294967295
         },
         "hnsw_max_elements": {
           "type": "integer",
-          "description": "HNSW pre-allocated capacity (0 = dynamic growth)",
+          "description": "HNSW pre-allocated capacity (0 = dynamic growth); the value is reserved at startup and the maximum is the largest index the snapshot loader accepts, so reserving beyond it produces an index that cannot be reloaded",
+          "description_ja": "HNSW の事前確保容量（0 = 動的に拡張）。値は起動時に確保され、上限はスナップショット読み込みが受け付けるインデックスの最大サイズ。これを超えて確保すると再読み込みできないインデックスになる",
           "default": 0,
-          "minimum": 0
+          "minimum": 0,
+          "maximum": 10000000
         }
       }
     },
     "snapshot": {
       "type": "object",
       "description": "Snapshot persistence configuration",
+      "description_ja": "スナップショット永続化の設定",
       "additionalProperties": false,
       "properties": {
         "dir": {
           "type": "string",
           "description": "Snapshot directory path",
+          "description_ja": "スナップショットディレクトリのパス",
           "default": "/var/lib/nvecd/snapshots"
         },
         "default_filename": {
           "type": "string",
-          "description": "Default filename for manual snapshot save",
+          "description": "Filename an argument-less DUMP SAVE writes inside the snapshot directory; validated like a client-supplied path, so an absolute or escaping name is refused (empty = fall back to a timestamped name)",
+          "description_ja": "引数なしの DUMP SAVE がスナップショットディレクトリ内に書き込むファイル名。クライアント指定のパスと同様に検証されるため、絶対パスやディレクトリを抜け出す名前は拒否される（空 = タイムスタンプ付きの名前にフォールバック）",
           "default": "nvecd.snapshot"
         },
         "interval_sec": {
           "type": "integer",
           "description": "Snapshot interval in seconds (0 = disabled)",
+          "description_ja": "スナップショット間隔（秒、0 = 無効）",
           "default": 0,
           "minimum": 0,
           "maximum": 86400
         },
         "retain": {
           "type": "integer",
-          "description": "Number of snapshots to retain",
+          "description": "Number of automatic snapshots to retain; manual snapshots are never removed (0 = keep every file)",
+          "description_ja": "保持する自動スナップショット数。手動スナップショットは削除されない（0 = すべてのファイルを残す）",
           "default": 3,
           "minimum": 0,
           "maximum": 100
@@ -270,19 +327,25 @@
         "mode": {
           "type": "string",
           "description": "Snapshot consistency mode: fork (COW, non-blocking) or lock (global write lock, blocking)",
+          "description_ja": "スナップショットの一貫性モード: fork（COW、非ブロッキング）または lock（グローバル書き込みロック、ブロッキング）",
           "default": "fork",
-          "enum": ["fork", "lock"]
+          "enum": [
+            "fork",
+            "lock"
+          ]
         }
       }
     },
     "performance": {
       "type": "object",
       "description": "Performance and threading configuration",
+      "description_ja": "パフォーマンスとスレッドの設定",
       "additionalProperties": false,
       "properties": {
         "thread_pool_size": {
           "type": "integer",
-          "description": "Worker thread pool size",
+          "description": "Worker thread pool size (0 = one worker per detected hardware thread)",
+          "description_ja": "ワーカースレッドプールのサイズ（0 = 検出したハードウェアスレッド数に合わせる）",
           "default": 8,
           "minimum": 0,
           "maximum": 128
@@ -290,6 +353,7 @@
         "max_connections": {
           "type": "integer",
           "description": "Maximum concurrent connections",
+          "description_ja": "最大同時接続数",
           "default": 1000,
           "minimum": 1,
           "maximum": 100000
@@ -297,13 +361,15 @@
         "max_connections_per_ip": {
           "type": "integer",
           "description": "Maximum connections per IP address (0 = unlimited)",
+          "description_ja": "IP アドレスごとの最大接続数（0 = 無制限）",
           "default": 100,
           "minimum": 0,
           "maximum": 100000
         },
         "connection_timeout_sec": {
           "type": "integer",
-          "description": "Connection timeout in seconds",
+          "description": "Idle timeout, and the deadline for receiving the first complete request, in seconds",
+          "description_ja": "アイドル接続のタイムアウト、および最初の完全なリクエストを受け取るまでの期限（秒）",
           "default": 300,
           "minimum": 1,
           "maximum": 3600
@@ -311,6 +377,7 @@
         "recv_buffer_size": {
           "type": "integer",
           "description": "TCP receive buffer size in bytes",
+          "description_ja": "TCP 受信バッファサイズ（バイト）",
           "default": 4096,
           "minimum": 1024,
           "maximum": 1048576
@@ -318,13 +385,15 @@
         "send_buffer_size": {
           "type": "integer",
           "description": "TCP send buffer size in bytes",
+          "description_ja": "TCP 送信バッファサイズ（バイト）",
           "default": 65536,
           "minimum": 1024,
           "maximum": 16777216
         },
         "max_query_length": {
           "type": "integer",
-          "description": "Maximum query length in bytes",
+          "description": "Maximum bytes accepted for a single request",
+          "description_ja": "リクエスト 1 件あたりの最大バイト数",
           "default": 1048576,
           "minimum": 1024,
           "maximum": 16777216
@@ -332,6 +401,7 @@
         "shutdown_timeout_ms": {
           "type": "integer",
           "description": "Graceful shutdown timeout in milliseconds",
+          "description_ja": "グレースフルシャットダウンのタイムアウト（ミリ秒）",
           "default": 5000,
           "minimum": 100,
           "maximum": 60000
@@ -339,6 +409,7 @@
         "reactor_max_total_buffered_bytes": {
           "type": "integer",
           "description": "Process-wide cap for bytes buffered by the TCP reactor",
+          "description_ja": "TCP リアクターがバッファするバイト数のプロセス全体での上限",
           "default": 268435456,
           "minimum": 1048576,
           "maximum": 1073741824
@@ -348,21 +419,25 @@
     "api": {
       "type": "object",
       "description": "API server configuration",
+      "description_ja": "API サーバーの設定",
       "additionalProperties": false,
       "properties": {
         "tcp": {
           "type": "object",
           "description": "TCP server configuration",
+          "description_ja": "TCP サーバーの設定",
           "additionalProperties": false,
           "properties": {
             "bind": {
               "type": "string",
-              "description": "TCP bind address",
+              "description": "TCP bind address (\"0.0.0.0\" listens on every interface)",
+              "description_ja": "TCP バインドアドレス（\"0.0.0.0\" は全インターフェースで待ち受ける）",
               "default": "127.0.0.1"
             },
             "port": {
               "type": "integer",
               "description": "TCP port",
+              "description_ja": "TCP ポート",
               "default": 11017,
               "minimum": 1,
               "maximum": 65535
@@ -372,21 +447,25 @@
         "http": {
           "type": "object",
           "description": "HTTP server configuration",
+          "description_ja": "HTTP サーバーの設定",
           "additionalProperties": false,
           "properties": {
             "enable": {
               "type": "boolean",
               "description": "Enable HTTP server",
+              "description_ja": "HTTP サーバーを有効にする",
               "default": false
             },
             "bind": {
               "type": "string",
-              "description": "HTTP bind address",
+              "description": "HTTP bind address (\"0.0.0.0\" listens on every interface)",
+              "description_ja": "HTTP バインドアドレス（\"0.0.0.0\" は全インターフェースで待ち受ける）",
               "default": "127.0.0.1"
             },
             "port": {
               "type": "integer",
               "description": "HTTP port",
+              "description_ja": "HTTP ポート",
               "default": 8080,
               "minimum": 1,
               "maximum": 65535
@@ -394,16 +473,19 @@
             "enable_cors": {
               "type": "boolean",
               "description": "Enable CORS headers",
+              "description_ja": "CORS ヘッダーを有効にする",
               "default": false
             },
             "cors_allow_origin": {
               "type": "string",
               "description": "Value for Access-Control-Allow-Origin header when CORS is enabled",
+              "description_ja": "CORS 有効時の Access-Control-Allow-Origin ヘッダーの値",
               "default": ""
             },
             "timeout_sec": {
               "type": "integer",
               "description": "HTTP read/write timeout in seconds",
+              "description_ja": "HTTP の読み書きタイムアウト（秒）",
               "default": 5,
               "minimum": 1,
               "maximum": 300
@@ -413,11 +495,13 @@
         "unix_socket": {
           "type": "object",
           "description": "Unix domain socket configuration",
+          "description_ja": "Unix ドメインソケットの設定",
           "additionalProperties": false,
           "properties": {
             "path": {
               "type": "string",
               "description": "Unix socket path (empty string = disabled)",
+              "description_ja": "Unix ソケットのパス（空文字列 = 無効）",
               "default": ""
             }
           }
@@ -425,16 +509,19 @@
         "rate_limiting": {
           "type": "object",
           "description": "Rate limiting configuration (token bucket algorithm)",
+          "description_ja": "レート制限の設定（トークンバケット方式）",
           "additionalProperties": false,
           "properties": {
             "enable": {
               "type": "boolean",
               "description": "Enable rate limiting",
+              "description_ja": "レート制限を有効にする",
               "default": false
             },
             "capacity": {
               "type": "integer",
               "description": "Maximum number of tokens per client (burst size)",
+              "description_ja": "クライアントごとの最大トークン数（バースト幅）",
               "default": 100,
               "minimum": 1,
               "maximum": 10000
@@ -442,6 +529,7 @@
             "refill_rate": {
               "type": "integer",
               "description": "Tokens added per second per client",
+              "description_ja": "クライアントごとに毎秒補充されるトークン数",
               "default": 10,
               "minimum": 1,
               "maximum": 1000
@@ -449,6 +537,7 @@
             "max_clients": {
               "type": "integer",
               "description": "Maximum number of tracked clients (for memory management)",
+              "description_ja": "追跡するクライアントの最大数（メモリ管理用）",
               "default": 10000,
               "minimum": 10,
               "maximum": 100000
@@ -460,37 +549,53 @@
     "network": {
       "type": "object",
       "description": "Network security configuration",
+      "description_ja": "ネットワークセキュリティの設定",
       "additionalProperties": false,
       "properties": {
         "allow_cidrs": {
           "type": "array",
-          "description": "Allow CIDR list (empty = allow all)",
+          "description": "Allow CIDR list (empty = deny all)",
+          "description_ja": "接続を許可する CIDR のリスト（空 = すべて拒否）",
           "items": {
             "type": "string",
             "pattern": "^([0-9]{1,3}\\.){3}[0-9]{1,3}/[0-9]{1,2}$"
-          }
+          },
+          "default": [],
+          "example": [
+            "127.0.0.1/32"
+          ]
         }
       }
     },
     "logging": {
       "type": "object",
       "description": "Logging configuration",
+      "description_ja": "ログ出力の設定",
       "additionalProperties": false,
       "properties": {
         "level": {
           "type": "string",
           "description": "Log level",
+          "description_ja": "ログレベル",
           "default": "info",
-          "enum": ["trace", "debug", "info", "warn", "error"]
+          "enum": [
+            "trace",
+            "debug",
+            "info",
+            "warn",
+            "error"
+          ]
         },
         "json": {
           "type": "boolean",
           "description": "JSON format output",
+          "description_ja": "JSON 形式で出力する",
           "default": true
         },
         "file": {
           "type": "string",
           "description": "Log file path (empty string = stdout, path = file output)",
+          "description_ja": "ログファイルのパス（空文字列 = 標準出力、パス指定 = ファイル出力）",
           "default": ""
         }
       }
@@ -498,52 +603,64 @@
     "cache": {
       "type": "object",
       "description": "Query cache configuration",
+      "description_ja": "クエリ結果キャッシュの設定",
       "additionalProperties": false,
       "properties": {
         "enabled": {
           "type": "boolean",
           "description": "Enable/disable cache",
+          "description_ja": "キャッシュの有効/無効",
           "default": true
         },
         "max_memory_mb": {
           "type": "integer",
-          "description": "Maximum cache memory in MB",
+          "description": "Maximum cache memory in MB; the maximum is the range of the type it is read into, not a tuning limit",
+          "description_ja": "キャッシュの最大メモリ量（MB）。上限は読み込み先の型の範囲であり、チューニング上の制限ではない",
           "default": 32,
-          "minimum": 1
+          "minimum": 1,
+          "maximum": 2147483647
         },
         "min_query_cost_ms": {
           "type": "number",
           "description": "Minimum query cost to cache (ms)",
+          "description_ja": "キャッシュ対象とする最小クエリコスト（ms）",
           "default": 10.0,
           "minimum": 0.0
         },
         "ttl_seconds": {
           "type": "integer",
-          "description": "Cache entry TTL (seconds, 0 = no TTL)",
+          "description": "Cache entry TTL (seconds, 0 = no TTL); the maximum is the range of the type it is read into, not a tuning limit",
+          "description_ja": "キャッシュエントリの TTL（秒、0 = TTL なし）。上限は読み込み先の型の範囲であり、チューニング上の制限ではない",
           "default": 3600,
-          "minimum": 0
+          "minimum": 0,
+          "maximum": 2147483647
         },
         "compression_enabled": {
           "type": "boolean",
           "description": "Enable LZ4 compression",
+          "description_ja": "LZ4 圧縮を有効にする",
           "default": true
         },
         "eviction_batch_size": {
           "type": "integer",
-          "description": "Number of entries to evict at once",
+          "description": "Number of entries to evict at once; the maximum is the range of the type it is read into, not a tuning limit",
+          "description_ja": "一度に退避するエントリ数。上限は読み込み先の型の範囲であり、チューニング上の制限ではない",
           "default": 10,
-          "minimum": 1
+          "minimum": 1,
+          "maximum": 2147483647
         }
       }
     },
     "security": {
       "type": "object",
       "description": "Security configuration",
+      "description_ja": "セキュリティの設定",
       "additionalProperties": false,
       "properties": {
         "requirepass": {
           "type": "string",
           "description": "Required password for write/admin commands (empty = no auth)",
+          "description_ja": "write/admin コマンドに必要なパスワード（空 = 認証なし）",
           "default": ""
         }
       }
@@ -551,38 +668,47 @@
     "wal": {
       "type": "object",
       "description": "Write-Ahead Log configuration for crash recovery",
+      "description_ja": "クラッシュ復旧のための Write-Ahead Log の設定",
       "additionalProperties": false,
       "properties": {
         "enabled": {
           "type": "boolean",
           "description": "Enable WAL-based crash recovery",
+          "description_ja": "WAL によるクラッシュ復旧を有効にする",
           "default": false
         },
         "dir": {
           "type": "string",
           "description": "Directory holding WAL segment files",
+          "description_ja": "WAL セグメントファイルを置くディレクトリ",
           "default": "/var/lib/nvecd/wal"
         },
         "max_file_size": {
           "type": "integer",
-          "description": "Maximum size per WAL file in bytes",
+          "description": "Maximum size per WAL file in bytes; the maximum is the largest integer the configuration reader carries, not a tuning limit",
+          "description_ja": "WAL ファイル 1 本あたりの最大サイズ（バイト）。上限は設定リーダーが扱える最大の整数であり、チューニング上の制限ではない",
           "default": 67108864,
-          "minimum": 1
+          "minimum": 1,
+          "maximum": 9223372036854775807
         },
         "sync_on_write": {
           "type": "boolean",
-          "description": "fsync after every write (high durability, lower throughput)",
+          "description": "fsync after every append (high durability, lower throughput); sync_interval_ms selects the batch interval when this is false",
+          "description_ja": "追記ごとに fsync する（高い耐久性、低いスループット）。false のときは sync_interval_ms がバッチ間隔を決める",
           "default": false
         },
         "sync_interval_ms": {
           "type": "integer",
-          "description": "Batch fsync interval in milliseconds",
+          "description": "Batch fsync interval in milliseconds when sync_on_write is false (0 = fsync on every append); the maximum is the range of the type it is read into, not a tuning limit",
+          "description_ja": "sync_on_write が false のときのバッチ fsync 間隔（ミリ秒、0 = 追記ごとに fsync）。上限は読み込み先の型の範囲であり、チューニング上の制限ではない",
           "default": 100,
-          "minimum": 0
+          "minimum": 0,
+          "maximum": 4294967295
         },
         "include_vectors": {
           "type": "boolean",
-          "description": "Persist vector bodies in VECSET WAL records",
+          "description": "Persist vector bodies in VECSET WAL records; disable only when snapshots provide the required vector durability",
+          "description_ja": "VECSET の WAL レコードにベクトル本体を永続化する。無効化してよいのは、ベクトルの耐久性をスナップショットで満たせる場合だけ",
           "default": true
         }
       }

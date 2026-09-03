@@ -12,6 +12,7 @@
 
 #include <charconv>
 #include <cmath>
+#include <optional>
 #include <shared_mutex>
 #include <string_view>
 
@@ -256,7 +257,11 @@ Expected<std::string, Error> RuntimeVariableManager::GetVariable(const std::stri
   if (kVariableMutability.find(canonical_name) == kVariableMutability.end()) {
     return MakeUnexpected(MakeError(ErrorCode::kInvalidArgument, "Unknown variable: " + variable_name));
   }
-  return GetVariableInternal(canonical_name);
+  auto value = GetVariableInternal(canonical_name);
+  if (!value) {
+    return MakeUnexpected(MakeError(ErrorCode::kInternalError, "No value resolver for variable: " + canonical_name));
+  }
+  return *value;
 }
 
 std::map<std::string, VariableInfo> RuntimeVariableManager::GetAllVariables(const std::string& prefix) const {
@@ -269,8 +274,7 @@ std::map<std::string, VariableInfo> RuntimeVariableManager::GetAllVariables(cons
       continue;  // Skip if doesn't match prefix
     }
 
-    std::string value = GetVariableInternal(name);
-    result[name] = {value, is_mutable};
+    result[name] = {GetVariableInternal(name).value_or(std::string{}), is_mutable};
   }
 
   return result;
@@ -352,7 +356,7 @@ Expected<void, Error> RuntimeVariableManager::ApplyCacheTtl(int value) {
   return cache_controller_->SetTtl(value);
 }
 
-std::string RuntimeVariableManager::GetVariableInternal(const std::string& variable_name) const {
+std::optional<std::string> RuntimeVariableManager::GetVariableInternal(const std::string& variable_name) const {
   // Check runtime values first (for mutable variables)
   auto runtime_iter = runtime_values_.find(variable_name);
   if (runtime_iter != runtime_values_.end()) {
@@ -584,7 +588,7 @@ std::string RuntimeVariableManager::GetVariableInternal(const std::string& varia
   if (variable_name == "wal.include_vectors")
     return base_config_.wal.include_vectors ? "true" : "false";
 
-  return "";  // Unknown variable
+  return std::nullopt;  // No resolver for this name
 }
 
 // ========== Parse helpers ==========

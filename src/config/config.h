@@ -186,7 +186,7 @@ struct ApiConfig {
  * @brief Network security configuration
  */
 struct NetworkConfig {
-  std::vector<std::string> allow_cidrs;  ///< Allowed CIDR ranges (empty = allow all)
+  std::vector<std::string> allow_cidrs;  ///< Allowed CIDR ranges (empty = deny all, fail-closed)
 };
 
 /**

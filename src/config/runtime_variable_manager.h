@@ -11,6 +11,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <utility>
@@ -176,8 +177,13 @@ class RuntimeVariableManager {
 
   /**
    * @brief Get current value for a variable (internal, no lock)
+   * @return The value, or nullopt when the name has no resolver
+   *
+   * A name declared in the mutability table but left without a resolver would
+   * otherwise answer with an empty string, which a caller cannot tell apart
+   * from a variable that is genuinely unset.
    */
-  std::string GetVariableInternal(const std::string& variable_name) const;
+  std::optional<std::string> GetVariableInternal(const std::string& variable_name) const;
 
   /**
    * @brief Initialize runtime values from config

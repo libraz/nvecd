@@ -17,6 +17,8 @@
 #include <nlohmann/json-schema.hpp>
 #include <nlohmann/json.hpp>
 #include <sstream>
+#include <stdexcept>
+#include <utility>
 
 #include "config/config_schema_embedded.h"
 #include "utils/error.h"
@@ -95,59 +97,90 @@ nlohmann::json YamlToJson(const YAML::Node& yaml_node) {
 }
 
 /**
- * @brief Convert YAML node to JSON-like value for parsing
- * Reference: ../mygram-db/src/config/config.cpp:YamlToJson
+ * @brief A scalar that is well-formed YAML but does not fit the type it is read into
+ *
+ * yaml-cpp reports such a value as a YAML::TypedBadConversion that carries no
+ * key, so LoadConfig's YAML::Exception handler can only call it a parser syntax
+ * error. Carrying the key here keeps the diagnostic on the setting the operator
+ * mistyped.
  */
-template <typename T>
-T GetYamlValue(const YAML::Node& node, const std::string& key, const T& default_value) {
-  if (!node[key]) {
-    return default_value;
+class InvalidConfigValue : public std::runtime_error {
+ public:
+  InvalidConfigValue(const std::string& key, const std::string& scalar)
+      : std::runtime_error("Invalid value for " + key + ": '" + scalar + "' is out of range for this setting") {}
+};
+
+/**
+ * @brief Reads the scalars of one configuration section, naming the key on failure
+ *
+ * Every keyed read goes through here so that an out-of-range value is reported
+ * as a configuration error naming its key, whichever section and whichever type
+ * it belongs to.
+ */
+class ScalarReader {
+ public:
+  ScalarReader(YAML::Node node, std::string section) : node_(std::move(node)), section_(std::move(section)) {}
+
+  /**
+   * @brief Convert the value of @p key to T
+   * @throws InvalidConfigValue when the value does not fit T
+   */
+  template <typename T>
+  T As(const char* key) const {
+    try {
+      return node_[key].as<T>();
+    } catch (const YAML::TypedBadConversion<T>&) {
+      throw InvalidConfigValue(section_ + "." + key, node_[key].as<std::string>(""));
+    }
   }
-  // yaml-cpp's as<T>(fallback) returns fallback on conversion failure without throwing
-  return node[key].as<T>(default_value);
-}
+
+ private:
+  const YAML::Node node_;
+  const std::string section_;
+};
 
 /**
  * @brief Parse events configuration
  */
 EventsConfig ParseEventsConfig(const YAML::Node& node) {
   EventsConfig config;
+  const ScalarReader read(node, "events");
 
   if (node["ctx_buffer_size"]) {
-    config.ctx_buffer_size = node["ctx_buffer_size"].as<uint32_t>();
+    config.ctx_buffer_size = read.As<uint32_t>("ctx_buffer_size");
   }
   if (node["max_contexts"]) {
-    config.max_contexts = node["max_contexts"].as<uint32_t>();
+    config.max_contexts = read.As<uint32_t>("max_contexts");
   }
   if (node["max_neighbors_per_item"]) {
-    config.max_neighbors_per_item = node["max_neighbors_per_item"].as<uint32_t>();
+    config.max_neighbors_per_item = read.As<uint32_t>("max_neighbors_per_item");
   }
   if (node["min_support"]) {
-    config.min_support = node["min_support"].as<double>();
+    config.min_support = read.As<double>("min_support");
   }
   if (node["decay_interval_sec"]) {
-    config.decay_interval_sec = node["decay_interval_sec"].as<uint32_t>();
+    config.decay_interval_sec = read.As<uint32_t>("decay_interval_sec");
   }
   if (node["decay_alpha"]) {
-    config.decay_alpha = node["decay_alpha"].as<double>();
+    config.decay_alpha = read.As<double>("decay_alpha");
   }
   if (node["dedup_window_sec"]) {
-    config.dedup_window_sec = node["dedup_window_sec"].as<uint32_t>();
+    config.dedup_window_sec = read.As<uint32_t>("dedup_window_sec");
   }
   if (node["dedup_cache_size"]) {
-    config.dedup_cache_size = node["dedup_cache_size"].as<uint32_t>();
+    config.dedup_cache_size = read.As<uint32_t>("dedup_cache_size");
   }
   if (node["temporal_cooccurrence"]) {
-    config.temporal_cooccurrence = node["temporal_cooccurrence"].as<bool>();
+    config.temporal_cooccurrence = read.As<bool>("temporal_cooccurrence");
   }
   if (node["temporal_half_life_sec"]) {
-    config.temporal_half_life_sec = node["temporal_half_life_sec"].as<double>();
+    config.temporal_half_life_sec = read.As<double>("temporal_half_life_sec");
   }
   if (node["negative_signals"]) {
-    config.negative_signals = node["negative_signals"].as<bool>();
+    config.negative_signals = read.As<bool>("negative_signals");
   }
   if (node["negative_weight"]) {
-    config.negative_weight = node["negative_weight"].as<double>();
+    config.negative_weight = read.As<double>("negative_weight");
   }
 
   return config;
@@ -158,12 +191,13 @@ EventsConfig ParseEventsConfig(const YAML::Node& node) {
  */
 VectorsConfig ParseVectorsConfig(const YAML::Node& node) {
   VectorsConfig config;
+  const ScalarReader read(node, "vectors");
 
   if (node["default_dimension"]) {
-    config.default_dimension = node["default_dimension"].as<uint32_t>();
+    config.default_dimension = read.As<uint32_t>("default_dimension");
   }
   if (node["distance_metric"]) {
-    config.distance_metric = node["distance_metric"].as<std::string>();
+    config.distance_metric = read.As<std::string>("distance_metric");
   }
 
   return config;
@@ -174,63 +208,64 @@ VectorsConfig ParseVectorsConfig(const YAML::Node& node) {
  */
 SimilarityConfig ParseSimilarityConfig(const YAML::Node& node) {
   SimilarityConfig config;
+  const ScalarReader read(node, "similarity");
 
   if (node["default_top_k"]) {
-    config.default_top_k = node["default_top_k"].as<uint32_t>();
+    config.default_top_k = read.As<uint32_t>("default_top_k");
   }
   if (node["max_top_k"]) {
-    config.max_top_k = node["max_top_k"].as<uint32_t>();
+    config.max_top_k = read.As<uint32_t>("max_top_k");
   }
   if (node["fusion_alpha"]) {
-    config.fusion_alpha = node["fusion_alpha"].as<double>();
+    config.fusion_alpha = read.As<double>("fusion_alpha");
   }
   if (node["fusion_beta"]) {
-    config.fusion_beta = node["fusion_beta"].as<double>();
+    config.fusion_beta = read.As<double>("fusion_beta");
   }
   if (node["sample_size"]) {
-    config.sample_size = node["sample_size"].as<uint32_t>();
+    config.sample_size = read.As<uint32_t>("sample_size");
   }
   if (node["adaptive_fusion"]) {
-    config.adaptive_fusion = node["adaptive_fusion"].as<bool>();
+    config.adaptive_fusion = read.As<bool>("adaptive_fusion");
   }
   if (node["adaptive_min_alpha"]) {
-    config.adaptive_min_alpha = node["adaptive_min_alpha"].as<double>();
+    config.adaptive_min_alpha = read.As<double>("adaptive_min_alpha");
   }
   if (node["adaptive_max_alpha"]) {
-    config.adaptive_max_alpha = node["adaptive_max_alpha"].as<double>();
+    config.adaptive_max_alpha = read.As<double>("adaptive_max_alpha");
   }
   if (node["adaptive_maturity_threshold"]) {
-    config.adaptive_maturity_threshold = node["adaptive_maturity_threshold"].as<uint32_t>();
+    config.adaptive_maturity_threshold = read.As<uint32_t>("adaptive_maturity_threshold");
   }
   if (node["index_type"]) {
-    config.index_type = node["index_type"].as<std::string>();
+    config.index_type = read.As<std::string>("index_type");
   }
   if (node["ivf_enabled"]) {
-    config.ivf_enabled = node["ivf_enabled"].as<bool>();
+    config.ivf_enabled = read.As<bool>("ivf_enabled");
   }
   if (node["ivf_nlist"]) {
-    config.ivf_nlist = node["ivf_nlist"].as<uint32_t>();
+    config.ivf_nlist = read.As<uint32_t>("ivf_nlist");
   }
   if (node["ivf_nprobe"]) {
-    config.ivf_nprobe = node["ivf_nprobe"].as<uint32_t>();
+    config.ivf_nprobe = read.As<uint32_t>("ivf_nprobe");
   }
   if (node["ivf_train_threshold"]) {
-    config.ivf_train_threshold = node["ivf_train_threshold"].as<uint32_t>();
+    config.ivf_train_threshold = read.As<uint32_t>("ivf_train_threshold");
   }
   if (node["ivf_seal_threshold"]) {
-    config.ivf_seal_threshold = node["ivf_seal_threshold"].as<uint32_t>();
+    config.ivf_seal_threshold = read.As<uint32_t>("ivf_seal_threshold");
   }
   if (node["hnsw_m"]) {
-    config.hnsw_m = node["hnsw_m"].as<uint32_t>();
+    config.hnsw_m = read.As<uint32_t>("hnsw_m");
   }
   if (node["hnsw_ef_construction"]) {
-    config.hnsw_ef_construction = node["hnsw_ef_construction"].as<uint32_t>();
+    config.hnsw_ef_construction = read.As<uint32_t>("hnsw_ef_construction");
   }
   if (node["hnsw_ef_search"]) {
-    config.hnsw_ef_search = node["hnsw_ef_search"].as<uint32_t>();
+    config.hnsw_ef_search = read.As<uint32_t>("hnsw_ef_search");
   }
   if (node["hnsw_max_elements"]) {
-    config.hnsw_max_elements = node["hnsw_max_elements"].as<uint32_t>();
+    config.hnsw_max_elements = read.As<uint32_t>("hnsw_max_elements");
   }
 
   return config;
@@ -241,21 +276,22 @@ SimilarityConfig ParseSimilarityConfig(const YAML::Node& node) {
  */
 SnapshotConfig ParseSnapshotConfig(const YAML::Node& node) {
   SnapshotConfig config;
+  const ScalarReader read(node, "snapshot");
 
   if (node["dir"]) {
-    config.dir = node["dir"].as<std::string>();
+    config.dir = read.As<std::string>("dir");
   }
   if (node["default_filename"]) {
-    config.default_filename = node["default_filename"].as<std::string>();
+    config.default_filename = read.As<std::string>("default_filename");
   }
   if (node["interval_sec"]) {
-    config.interval_sec = node["interval_sec"].as<int>();
+    config.interval_sec = read.As<int>("interval_sec");
   }
   if (node["retain"]) {
-    config.retain = node["retain"].as<int>();
+    config.retain = read.As<int>("retain");
   }
   if (node["mode"]) {
-    config.mode = node["mode"].as<std::string>();
+    config.mode = read.As<std::string>("mode");
   }
 
   return config;
@@ -266,33 +302,34 @@ SnapshotConfig ParseSnapshotConfig(const YAML::Node& node) {
  */
 PerformanceConfig ParsePerformanceConfig(const YAML::Node& node) {
   PerformanceConfig config;
+  const ScalarReader read(node, "performance");
 
   if (node["thread_pool_size"]) {
-    config.thread_pool_size = node["thread_pool_size"].as<int>();
+    config.thread_pool_size = read.As<int>("thread_pool_size");
   }
   if (node["max_connections"]) {
-    config.max_connections = node["max_connections"].as<int>();
+    config.max_connections = read.As<int>("max_connections");
   }
   if (node["max_connections_per_ip"]) {
-    config.max_connections_per_ip = node["max_connections_per_ip"].as<int>();
+    config.max_connections_per_ip = read.As<int>("max_connections_per_ip");
   }
   if (node["connection_timeout_sec"]) {
-    config.connection_timeout_sec = node["connection_timeout_sec"].as<int>();
+    config.connection_timeout_sec = read.As<int>("connection_timeout_sec");
   }
   if (node["recv_buffer_size"]) {
-    config.recv_buffer_size = node["recv_buffer_size"].as<int>();
+    config.recv_buffer_size = read.As<int>("recv_buffer_size");
   }
   if (node["send_buffer_size"]) {
-    config.send_buffer_size = node["send_buffer_size"].as<int>();
+    config.send_buffer_size = read.As<int>("send_buffer_size");
   }
   if (node["max_query_length"]) {
-    config.max_query_length = node["max_query_length"].as<int>();
+    config.max_query_length = read.As<int>("max_query_length");
   }
   if (node["shutdown_timeout_ms"]) {
-    config.shutdown_timeout_ms = node["shutdown_timeout_ms"].as<int>();
+    config.shutdown_timeout_ms = read.As<int>("shutdown_timeout_ms");
   }
   if (node["reactor_max_total_buffered_bytes"]) {
-    config.reactor_max_total_buffered_bytes = node["reactor_max_total_buffered_bytes"].as<int>();
+    config.reactor_max_total_buffered_bytes = read.As<int>("reactor_max_total_buffered_bytes");
   }
 
   return config;
@@ -307,57 +344,62 @@ ApiConfig ParseApiConfig(const YAML::Node& node) {
   // TCP configuration
   if (node["tcp"]) {
     const auto& tcp_node = node["tcp"];
+    const ScalarReader read(tcp_node, "api.tcp");
     if (tcp_node["bind"]) {
-      config.tcp.bind = tcp_node["bind"].as<std::string>();
+      config.tcp.bind = read.As<std::string>("bind");
     }
     if (tcp_node["port"]) {
-      config.tcp.port = tcp_node["port"].as<int>();
+      config.tcp.port = read.As<int>("port");
     }
   }
 
   // HTTP configuration
   if (node["http"]) {
     const auto& http_node = node["http"];
+    const ScalarReader read(http_node, "api.http");
     if (http_node["enable"]) {
-      config.http.enable = http_node["enable"].as<bool>();
+      config.http.enable = read.As<bool>("enable");
     }
     if (http_node["bind"]) {
-      config.http.bind = http_node["bind"].as<std::string>();
+      config.http.bind = read.As<std::string>("bind");
     }
     if (http_node["port"]) {
-      config.http.port = http_node["port"].as<int>();
+      config.http.port = read.As<int>("port");
     }
     if (http_node["enable_cors"]) {
-      config.http.enable_cors = http_node["enable_cors"].as<bool>();
+      config.http.enable_cors = read.As<bool>("enable_cors");
     }
     if (http_node["cors_allow_origin"]) {
-      config.http.cors_allow_origin = http_node["cors_allow_origin"].as<std::string>();
+      config.http.cors_allow_origin = read.As<std::string>("cors_allow_origin");
     }
     if (http_node["timeout_sec"]) {
-      config.http.timeout_sec = http_node["timeout_sec"].as<int>();
+      config.http.timeout_sec = read.As<int>("timeout_sec");
     }
   }
 
   // Unix socket configuration
   if (node["unix_socket"]) {
     const auto& unix_node = node["unix_socket"];
-    config.unix_socket.path = GetYamlValue<std::string>(unix_node, "path", "");
+    if (unix_node["path"]) {
+      config.unix_socket.path = ScalarReader(unix_node, "api.unix_socket").As<std::string>("path");
+    }
   }
 
   // Rate limiting configuration
   if (node["rate_limiting"]) {
     const auto& rl_node = node["rate_limiting"];
+    const ScalarReader read(rl_node, "api.rate_limiting");
     if (rl_node["enable"]) {
-      config.rate_limiting.enable = rl_node["enable"].as<bool>();
+      config.rate_limiting.enable = read.As<bool>("enable");
     }
     if (rl_node["capacity"]) {
-      config.rate_limiting.capacity = rl_node["capacity"].as<int>();
+      config.rate_limiting.capacity = read.As<int>("capacity");
     }
     if (rl_node["refill_rate"]) {
-      config.rate_limiting.refill_rate = rl_node["refill_rate"].as<int>();
+      config.rate_limiting.refill_rate = read.As<int>("refill_rate");
     }
     if (rl_node["max_clients"]) {
-      config.rate_limiting.max_clients = rl_node["max_clients"].as<int>();
+      config.rate_limiting.max_clients = read.As<int>("max_clients");
     }
   }
 
@@ -384,15 +426,16 @@ NetworkConfig ParseNetworkConfig(const YAML::Node& node) {
  */
 LoggingConfig ParseLoggingConfig(const YAML::Node& node) {
   LoggingConfig config;
+  const ScalarReader read(node, "logging");
 
   if (node["level"]) {
-    config.level = node["level"].as<std::string>();
+    config.level = read.As<std::string>("level");
   }
   if (node["json"]) {
-    config.json = node["json"].as<bool>();
+    config.json = read.As<bool>("json");
   }
   if (node["file"]) {
-    config.file = node["file"].as<std::string>();
+    config.file = read.As<std::string>("file");
   }
 
   return config;
@@ -403,25 +446,26 @@ LoggingConfig ParseLoggingConfig(const YAML::Node& node) {
  */
 CacheConfig ParseCacheConfig(const YAML::Node& node) {
   CacheConfig config;
+  const ScalarReader read(node, "cache");
 
   if (node["enabled"]) {
-    config.enabled = node["enabled"].as<bool>();
+    config.enabled = read.As<bool>("enabled");
   }
   if (node["max_memory_mb"]) {
     // Convert MB to bytes
-    config.max_memory_bytes = static_cast<size_t>(node["max_memory_mb"].as<int>()) * kBytesPerMB;
+    config.max_memory_bytes = static_cast<size_t>(read.As<int>("max_memory_mb")) * kBytesPerMB;
   }
   if (node["min_query_cost_ms"]) {
-    config.min_query_cost_ms = node["min_query_cost_ms"].as<double>();
+    config.min_query_cost_ms = read.As<double>("min_query_cost_ms");
   }
   if (node["ttl_seconds"]) {
-    config.ttl_seconds = node["ttl_seconds"].as<int>();
+    config.ttl_seconds = read.As<int>("ttl_seconds");
   }
   if (node["compression_enabled"]) {
-    config.compression_enabled = node["compression_enabled"].as<bool>();
+    config.compression_enabled = read.As<bool>("compression_enabled");
   }
   if (node["eviction_batch_size"]) {
-    config.eviction_batch_size = node["eviction_batch_size"].as<int>();
+    config.eviction_batch_size = read.As<int>("eviction_batch_size");
   }
 
   return config;
@@ -433,7 +477,7 @@ CacheConfig ParseCacheConfig(const YAML::Node& node) {
 SecurityConfig ParseSecurityConfig(const YAML::Node& node) {
   SecurityConfig config;
   if (node["requirepass"]) {
-    config.requirepass = node["requirepass"].as<std::string>();
+    config.requirepass = ScalarReader(node, "security").As<std::string>("requirepass");
   }
   return config;
 }
@@ -443,24 +487,25 @@ SecurityConfig ParseSecurityConfig(const YAML::Node& node) {
  */
 WalConfig ParseWalConfig(const YAML::Node& node) {
   WalConfig config;
+  const ScalarReader read(node, "wal");
 
   if (node["enabled"]) {
-    config.enabled = node["enabled"].as<bool>();
+    config.enabled = read.As<bool>("enabled");
   }
   if (node["dir"]) {
-    config.dir = node["dir"].as<std::string>();
+    config.dir = read.As<std::string>("dir");
   }
   if (node["max_file_size"]) {
-    config.max_file_size = node["max_file_size"].as<uint64_t>();
+    config.max_file_size = read.As<uint64_t>("max_file_size");
   }
   if (node["sync_on_write"]) {
-    config.sync_on_write = node["sync_on_write"].as<bool>();
+    config.sync_on_write = read.As<bool>("sync_on_write");
   }
   if (node["sync_interval_ms"]) {
-    config.sync_interval_ms = node["sync_interval_ms"].as<uint32_t>();
+    config.sync_interval_ms = read.As<uint32_t>("sync_interval_ms");
   }
   if (node["include_vectors"]) {
-    config.include_vectors = node["include_vectors"].as<bool>();
+    config.include_vectors = read.As<bool>("include_vectors");
   }
 
   return config;
@@ -566,6 +611,8 @@ utils::Expected<Config, utils::Error> LoadConfig(const std::string& path) {
 
     return config;
 
+  } catch (const InvalidConfigValue& e) {
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kConfigInvalidValue, e.what()));
   } catch (const YAML::BadFile& e) {
     return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kConfigFileNotFound,
                                                   "Failed to open config file: " + std::string(e.what())));

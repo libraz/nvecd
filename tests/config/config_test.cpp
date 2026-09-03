@@ -7,6 +7,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
 #include <fstream>
 #include <limits>
 
@@ -260,6 +261,48 @@ TEST(ConfigTest, DisplayConfigIncludesEmptyAndSensitiveRuntimeVariables) {
   EXPECT_NE(display->find("allow_cidrs:"), std::string::npos);
   EXPECT_NE(display->find("requirepass: \"***\""), std::string::npos);
   EXPECT_EQ(display->find("never-display-this"), std::string::npos);
+}
+
+/**
+ * @brief Test that a number too large for its setting is reported as a value error
+ *
+ * A mistyped digit is not a syntax error. Reporting one as kConfigYamlError
+ * sends the operator to audit indentation, so every integer key states the
+ * range it accepts and a value outside it must come back in the configuration
+ * band naming the key that was rejected.
+ */
+TEST(ConfigTest, OutOfRangeNumberNamesTheKeyInsteadOfReportingASyntaxError) {
+  struct Case {
+    const char* yaml;
+    const char* key;
+  };
+  const Case cases[] = {
+      {"cache:\n  max_memory_mb: 9999999999\n", "max_memory_mb"},
+      {"cache:\n  ttl_seconds: 4294967296\n", "ttl_seconds"},
+      {"similarity:\n  hnsw_ef_search: 99999999999\n", "hnsw_ef_search"},
+      {"similarity:\n  sample_size: 5000000000\n", "sample_size"},
+      {"wal:\n  sync_interval_ms: 4294967296\n", "sync_interval_ms"},
+      {"wal:\n  max_file_size: 184467440737095516160\n", "max_file_size"},
+  };
+
+  for (const auto& test_case : cases) {
+    std::ofstream ofs("out_of_range_test_config.yaml");
+    ofs << test_case.yaml;
+    ofs.close();
+
+    auto config_result = LoadConfig("out_of_range_test_config.yaml");
+    ASSERT_FALSE(config_result) << "accepted an out-of-range value for " << test_case.key;
+
+    const auto code = static_cast<uint16_t>(config_result.error().code());
+    EXPECT_GE(code, 1000) << test_case.key;
+    EXPECT_LT(code, 2000) << test_case.key;
+    EXPECT_NE(config_result.error().code(), nvecd::utils::ErrorCode::kConfigYamlError)
+        << test_case.key << " was reported as a YAML syntax error: " << config_result.error().message();
+    EXPECT_NE(config_result.error().message().find(test_case.key), std::string::npos)
+        << "error does not name the rejected key: " << config_result.error().message();
+
+    std::remove("out_of_range_test_config.yaml");
+  }
 }
 
 /**
