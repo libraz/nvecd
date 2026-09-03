@@ -17,17 +17,6 @@
 namespace nvecd::server::handlers {
 
 /**
- * @brief Handle DUMP SAVE command
- *
- * Saves a snapshot of all stores to the specified filepath. If filepath is
- * empty, generates a timestamped default filename. Sets read-only mode
- * during the save operation.
- *
- * @param ctx Handler context (must have config, event_store, co_index, vector_store)
- * @param filepath Target file path (empty for auto-generated name)
- * @return OK response with saved path, or error
- */
-/**
  * @brief Handle DUMP SAVE
  *
  * With no @p filepath the snapshot goes to `snapshot.default_filename` inside
