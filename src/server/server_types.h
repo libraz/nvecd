@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "config/config.h"
+#include "server/command_types.h"
 #include "utils/network_utils.h"
 
 // Forward declarations (must be outside nvecd::server namespace)
@@ -111,6 +112,11 @@ struct ServerStats {
   std::atomic<uint64_t> dump_commands{0};
   std::atomic<uint64_t> cache_commands{0};
 
+  /// WAL records that recovery classified as an intended gap and skipped.
+  /// Reported by INFO so the size of a recovery gap is observable rather than
+  /// only visible as individual log lines.
+  std::atomic<uint64_t> wal_replay_records_skipped{0};
+
   /**
    * @brief Get uptime in seconds
    * Reference: ../mygram-db/src/server/server_stats.cpp:GetUptimeSeconds
@@ -127,6 +133,97 @@ struct ServerStats {
     }
     return static_cast<double>(total_commands.load()) / static_cast<double>(uptime);
   }
+};
+
+/**
+ * @brief RAII accounting for one dispatched command
+ *
+ * Construction counts the command in ServerStats::total_commands and in the
+ * per-type counter for @p type; destruction counts it in
+ * ServerStats::failed_commands unless MarkSucceeded() has been called. Handler
+ * bodies therefore never touch the counters, and adding an early return cannot
+ * drop an increment or leave failed_commands above total_commands: every exit
+ * path of a scope that owns a guard is accounted exactly once.
+ *
+ * The guard is created after a request has been recognised as a command, so
+ * both surfaces count the same population: the TCP dispatcher creates one per
+ * Dispatch() call (including a parse failure, as kUnknown), and the HTTP route
+ * wrapper creates one per request to a route that mirrors a TCP command.
+ */
+class CommandStatsScope {
+ public:
+  CommandStatsScope(ServerStats& stats, CommandType type) : stats_(stats) {
+    stats_.total_commands.fetch_add(1, std::memory_order_relaxed);
+    CountByType(stats_, type);
+  }
+
+  CommandStatsScope(const CommandStatsScope&) = delete;
+  CommandStatsScope& operator=(const CommandStatsScope&) = delete;
+  CommandStatsScope(CommandStatsScope&&) = delete;
+  CommandStatsScope& operator=(CommandStatsScope&&) = delete;
+
+  ~CommandStatsScope() {
+    if (!succeeded_) {
+      stats_.failed_commands.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
+  /// Record that the client receives a success response for this command.
+  void MarkSucceeded() { succeeded_ = true; }
+
+ private:
+  /// Per-type accounting. Types without a dedicated counter are listed
+  /// explicitly so that adding a command type forces a decision here.
+  static void CountByType(ServerStats& stats, CommandType type) {
+    switch (type) {
+      case CommandType::kEvent:
+        stats.event_commands.fetch_add(1, std::memory_order_relaxed);
+        return;
+      case CommandType::kVecset:
+        stats.vecset_commands.fetch_add(1, std::memory_order_relaxed);
+        return;
+      case CommandType::kSim:
+      case CommandType::kSimv:
+        stats.sim_commands.fetch_add(1, std::memory_order_relaxed);
+        return;
+      case CommandType::kInfo:
+        stats.info_commands.fetch_add(1, std::memory_order_relaxed);
+        return;
+      case CommandType::kConfigHelp:
+      case CommandType::kConfigShow:
+      case CommandType::kConfigVerify:
+      case CommandType::kSet:
+      case CommandType::kGet:
+      case CommandType::kShowVariables:
+        stats.config_commands.fetch_add(1, std::memory_order_relaxed);
+        return;
+      case CommandType::kDumpSave:
+      case CommandType::kDumpLoad:
+      case CommandType::kDumpVerify:
+      case CommandType::kDumpInfo:
+      case CommandType::kDumpStatus:
+        stats.dump_commands.fetch_add(1, std::memory_order_relaxed);
+        return;
+      case CommandType::kCacheStats:
+      case CommandType::kCacheClear:
+      case CommandType::kCacheEnable:
+      case CommandType::kCacheDisable:
+        stats.cache_commands.fetch_add(1, std::memory_order_relaxed);
+        return;
+      // Counted in total_commands only: these have no per-type counter.
+      case CommandType::kVecdel:
+      case CommandType::kMetaset:
+      case CommandType::kDebugOn:
+      case CommandType::kDebugOff:
+      case CommandType::kAuth:
+      case CommandType::kUnknown:
+      case CommandType::kCount:
+        return;
+    }
+  }
+
+  ServerStats& stats_;
+  bool succeeded_ = false;
 };
 
 /**
@@ -180,6 +277,16 @@ struct HandlerContext {
 
   // Security
   std::string requirepass;  ///< Required password (empty = no auth)
+
+  /// Directory a client-supplied CONFIG VERIFY path must resolve inside.
+  ///
+  /// Holds the directory of the configuration file the server was started
+  /// with. CONFIG VERIFY opens files on behalf of a network client, so the
+  /// path is canonicalised and confined to this root exactly as the sibling
+  /// DUMP commands are confined to dump_dir. When the server was started
+  /// without a configuration file this is empty and dump_dir is used as the
+  /// root, so the command is never unrooted.
+  std::string config_dir;
 
   // Snapshot fork writer (non-owning, owned by NvecdServer)
   storage::ForkSnapshotWriter* fork_snapshot_writer = nullptr;

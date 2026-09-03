@@ -15,6 +15,7 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -48,6 +49,7 @@
 using namespace nvecd::server;
 using namespace nvecd::server::handlers;
 using ::testing::HasSubstr;
+using ::testing::Not;
 
 // ============================================================================
 // Main test fixture with real objects
@@ -95,7 +97,8 @@ class HandlerTest : public ::testing::Test {
                                              /*.loading=*/loading_,
                                              /*.read_only=*/read_only_,
                                              /*.dump_dir=*/dump_dir_.string(),
-                                             /*.requirepass=*/""};
+                                             /*.requirepass=*/"",
+                                             /*.config_dir=*/""};
     cache_controller_ =
         std::make_unique<nvecd::cache::SimilarityCacheController>(1024 * 1024, 0, 0, true, 1, true, &ctx_->cache);
     cache_ = &cache_controller_->Cache();
@@ -161,7 +164,8 @@ class HandlerNullTest : public ::testing::Test {
                                              /*.loading=*/loading_,
                                              /*.read_only=*/read_only_,
                                              /*.dump_dir=*/"",
-                                             /*.requirepass=*/""};
+                                             /*.requirepass=*/"",
+                                             /*.config_dir=*/""};
   }
 
   void TearDown() override {
@@ -377,15 +381,57 @@ TEST_F(HandlerTest, ConfigHelp_InvalidPath_ReturnsError) {
 }
 
 TEST_F(HandlerTest, ConfigVerify_EmptyFilepath_ReturnsError) {
-  auto result = HandleConfigVerify("");
+  auto result = HandleConfigVerify(*ctx_, "");
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code(), nvecd::utils::ErrorCode::kInvalidArgument);
   EXPECT_THAT(result.error().message(), HasSubstr("requires a filepath"));
 }
 
 TEST_F(HandlerTest, ConfigVerify_NonexistentFile_ReturnsError) {
-  auto result = HandleConfigVerify("/tmp/nonexistent_config_12345.yaml");
+  auto result = HandleConfigVerify(*ctx_, "/tmp/nonexistent_config_12345.yaml");
   ASSERT_FALSE(result.has_value());
+}
+
+TEST_F(HandlerTest, ConfigVerify_PathOutsideAllowedRoot_IsNotAnExistenceOracle) {
+  // A readable file that exists but is not YAML, and a path that does not
+  // exist, must be indistinguishable when both are outside the allowed root:
+  // otherwise the command answers questions about the filesystem.
+  const std::filesystem::path outside = std::filesystem::temp_directory_path() / "nvecd_config_verify_probe.yaml";
+  {
+    std::ofstream out(outside);
+    ASSERT_TRUE(out.is_open());
+    out << "{{not yaml";
+  }
+
+  auto existing = HandleConfigVerify(*ctx_, outside.string());
+  auto missing = HandleConfigVerify(*ctx_, (outside.string() + ".absent"));
+  std::filesystem::remove(outside);
+
+  ASSERT_FALSE(existing.has_value());
+  ASSERT_FALSE(missing.has_value());
+  EXPECT_EQ(existing.error().code(), nvecd::utils::ErrorCode::kPermissionDenied);
+  EXPECT_EQ(existing.error().code(), missing.error().code());
+  EXPECT_EQ(existing.error().message(), missing.error().message());
+  EXPECT_THAT(existing.error().message(), Not(HasSubstr(outside.string())));
+}
+
+TEST_F(HandlerTest, ConfigVerify_TraversalOutOfAllowedRootIsRejected) {
+  auto result = HandleConfigVerify(*ctx_, "../../etc/passwd");
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code(), nvecd::utils::ErrorCode::kPermissionDenied);
+}
+
+TEST_F(HandlerTest, ConfigVerify_FileInsideAllowedRootIsAccepted) {
+  const std::filesystem::path inside = dump_dir_ / "verifiable.yaml";
+  {
+    std::ofstream out(inside);
+    ASSERT_TRUE(out.is_open());
+    out << "vectors:\n  default_dimension: 3\n";
+  }
+
+  auto result = HandleConfigVerify(*ctx_, inside.string());
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+  EXPECT_THAT(*result, HasSubstr("Configuration is valid"));
 }
 
 // ============================================================================
@@ -462,6 +508,32 @@ TEST_F(HandlerTest, DumpSave_WithValidData_Succeeds) {
 
   // Clean up
   std::filesystem::remove(dump_path);
+}
+
+TEST_F(HandlerTest, DumpSave_WithoutPath_UsesConfiguredDefaultFilename) {
+  vector_store_->SetVector("item1", {0.1f, 0.2f, 0.3f});
+  config_->snapshot.mode = "lock";
+  config_->snapshot.dir = dump_dir_.string();
+  config_->snapshot.default_filename = "configured.nvec";
+
+  auto result = HandleDumpSave(*ctx_, "");
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+  EXPECT_THAT(*result, HasSubstr("configured.nvec"));
+  EXPECT_TRUE(std::filesystem::exists(dump_dir_ / "configured.nvec"));
+
+  std::filesystem::remove(dump_dir_ / "configured.nvec");
+}
+
+TEST_F(HandlerTest, DumpSave_RejectsADefaultFilenameThatEscapesTheDumpDirectory) {
+  // The name comes from a config file, so it gets the same containment check a
+  // client-supplied path gets rather than being trusted.
+  config_->snapshot.mode = "lock";
+  config_->snapshot.dir = dump_dir_.string();
+  config_->snapshot.default_filename = "../escaped.nvec";
+
+  auto result = HandleDumpSave(*ctx_, "");
+  ASSERT_FALSE(result.has_value());
+  EXPECT_FALSE(std::filesystem::exists(dump_dir_.parent_path() / "escaped.nvec"));
 }
 
 TEST_F(HandlerTest, DumpLoad_RoundTrip_RestoresData) {

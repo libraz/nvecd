@@ -382,5 +382,30 @@ TEST(WalCheckpointTest, RejectsMalformedUnboundAndUnsafeFrames) {
   fs::remove_all(test_dir);
 }
 
+TEST(WalCodecTest, OnlyOmittableVectorSubjectsCountAsAnIntendedReplayGap) {
+  // `include_vectors: false` omits VECSET payloads, so exactly these two
+  // operations can name a vector nothing will ever restore.
+  EXPECT_TRUE(IsIntendedReplayGap(WalOpType::kVecDel, utils::ErrorCode::kVectorNotFound));
+  EXPECT_TRUE(IsIntendedReplayGap(WalOpType::kMetaSet, utils::ErrorCode::kVectorNotFound));
+
+  // Everything else stays fail-closed even for the same error.
+  EXPECT_FALSE(IsIntendedReplayGap(WalOpType::kVecSet, utils::ErrorCode::kVectorNotFound));
+  EXPECT_FALSE(IsIntendedReplayGap(WalOpType::kEventAdd, utils::ErrorCode::kVectorNotFound));
+  EXPECT_FALSE(IsIntendedReplayGap(WalOpType::kEventDel, utils::ErrorCode::kVectorNotFound));
+  EXPECT_FALSE(IsIntendedReplayGap(WalOpType::kMetaDel, utils::ErrorCode::kVectorNotFound));
+  EXPECT_FALSE(IsIntendedReplayGap(WalOpType::kCoOccurrenceMaintenance, utils::ErrorCode::kVectorNotFound));
+}
+
+TEST(WalCodecTest, DamageIsNeverAnIntendedReplayGap) {
+  // A gap is defined by a missing vector and nothing else. Anything that says
+  // the log does not describe what the server wrote must still stop recovery.
+  for (const auto code : {utils::ErrorCode::kStorageCorrupted, utils::ErrorCode::kWalCorrupted,
+                          utils::ErrorCode::kWalCRCMismatch, utils::ErrorCode::kStorageInvalidFormat,
+                          utils::ErrorCode::kInvalidArgument, utils::ErrorCode::kInternalError}) {
+    EXPECT_FALSE(IsIntendedReplayGap(WalOpType::kVecDel, code));
+    EXPECT_FALSE(IsIntendedReplayGap(WalOpType::kMetaSet, code));
+  }
+}
+
 }  // namespace
 }  // namespace nvecd::server

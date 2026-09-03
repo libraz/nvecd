@@ -54,225 +54,47 @@ bool IsSnapshotProtectedCommand(CommandType type) {
   return IsSnapshotProtectedWrite(type) || type == CommandType::kSim || type == CommandType::kSimv;
 }
 
-}  // namespace
-
-RequestDispatcher::RequestDispatcher(HandlerContext& handler_ctx) : ctx_(handler_ctx) {}
-
-std::string RequestDispatcher::Dispatch(const std::string& request, ConnectionContext& conn_ctx) {
-  // Parse command. Pass the configured maximum top_k so the upper bound is
-  // enforced at parse time (0 = no check when no config is wired).
-  const uint32_t max_top_k = ctx_.config != nullptr ? ctx_.config->similarity.max_top_k : 0;
-  auto cmd = ParseCommand(request, max_top_k);
-  if (!cmd) {
-    utils::LogCommandParseError(request, cmd.error().message(), 0);
-    return FormatError(cmd.error().message());
+/**
+ * @brief Append a write command to the WAL
+ *
+ * A failed append is propagated so no caller acknowledges a durable write the
+ * log could not accept.
+ *
+ * @param ctx Handler context (ctx.wal is null during replay, which skips the append)
+ * @param cmd Effective write command to persist (timestamps already resolved)
+ */
+utils::Expected<void, utils::Error> AppendToWal(HandlerContext& ctx, const Command& cmd) {
+  if (ctx.wal == nullptr) {
+    return {};
   }
 
-  // Handle AUTH command
-  if (cmd->type == CommandType::kAuth) {
-    return HandleAuth(*cmd, conn_ctx);
+  // Operators can opt out of retaining vector payloads in the WAL when
+  // snapshots are their chosen vector durability boundary. Keep all other
+  // mutations in the log so event and metadata recovery semantics are intact.
+  if (cmd.type == CommandType::kVecset && ctx.config != nullptr && !ctx.config->wal.include_vectors) {
+    return {};
   }
 
-  // Check authorization for non-read commands
-  if (!ctx_.requirepass.empty()) {
-    auto privilege = GetCommandPrivilege(cmd->type);
-    if (privilege != CommandPrivilege::kRead && !conn_ctx.authenticated) {
-      ctx_.stats.failed_commands++;
-      return FormatError("NOAUTH Authentication required");
-    }
+  std::vector<uint8_t> payload = EncodeCommand(cmd);
+  auto appended = ctx.wal->Append(WalOpForCommand(cmd), payload.data(), payload.size());
+  if (!appended) {
+    ctx.read_only.store(true, std::memory_order_release);
+    utils::StructuredLog()
+        .Event("wal_append_failed")
+        .Field("command", CommandTypeToString(cmd.type))
+        .Field("error", appended.error().message())
+        .Warn();
+    return utils::MakeUnexpected(appended.error());
   }
-
-  if (IsSnapshotProtectedCommand(cmd->type) && ctx_.loading.load(std::memory_order_acquire)) {
-    ctx_.stats.failed_commands++;
-    return FormatError("LOADING Snapshot load in progress");
-  }
-
-  // Lock-mode snapshots set read_only before taking their store-lock barrier.
-  // Reject a write before it can enter a store mutation path so the snapshot is
-  // a true point-in-time image rather than a mix of pre/post-barrier updates.
-  if (GetCommandPrivilege(cmd->type) != CommandPrivilege::kRead && ctx_.read_only.load(std::memory_order_acquire)) {
-    ctx_.stats.failed_commands++;
-    return FormatError("READONLY Snapshot in progress");
-  }
-
-  // Keep the shared gate for the full store-mutation and WAL append sequence.
-  // A lock-mode snapshot sets read_only first, then takes this gate exclusively
-  // to drain any writer that already passed the initial flag check. Rechecking
-  // after acquisition closes the check-then-mutate race at the boundary.
-  std::shared_lock<std::shared_mutex> snapshot_write_guard;
-  if (IsSnapshotProtectedCommand(cmd->type) && ctx_.snapshot_write_gate != nullptr) {
-    snapshot_write_guard = std::shared_lock(*ctx_.snapshot_write_gate);
-    if (ctx_.loading.load(std::memory_order_acquire)) {
-      ctx_.stats.failed_commands++;
-      return FormatError("LOADING Snapshot load in progress");
-    }
-    if (ctx_.read_only.load(std::memory_order_acquire)) {
-      if (IsSnapshotProtectedWrite(cmd->type)) {
-        ctx_.stats.failed_commands++;
-        return FormatError("READONLY Snapshot in progress");
-      }
-    }
-  }
-
-  // Keep the same command-level critical section through the WAL append. The
-  // WAL is replayed in sequence order, so allowing another writer to append a
-  // dependent METASET before this VECSET is durable corrupts recovery.
-  std::unique_lock<std::mutex> write_serialization_guard;
-  if (IsSnapshotProtectedWrite(cmd->type) && ctx_.write_serialization_gate != nullptr) {
-    write_serialization_guard = std::unique_lock(*ctx_.write_serialization_gate);
-  }
-
-  // Route to appropriate handler
-  utils::Expected<std::string, utils::Error> result =
-      utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandUnknown, "Unknown command type"));
-
-  switch (cmd->type) {
-    case CommandType::kEvent:
-      ctx_.stats.event_commands++;
-      result = HandleEvent(*cmd);
-      break;
-
-    case CommandType::kVecset:
-      ctx_.stats.vecset_commands++;
-      result = HandleVecset(*cmd);
-      break;
-
-    case CommandType::kVecdel:
-      result = HandleVecdel(*cmd);
-      break;
-
-    case CommandType::kMetaset:
-      result = HandleMetaset(*cmd);
-      break;
-
-    case CommandType::kSim:
-      ctx_.stats.sim_commands++;
-      result = HandleSim(*cmd, conn_ctx);
-      break;
-
-    case CommandType::kSimv:
-      ctx_.stats.sim_commands++;
-      result = HandleSimv(*cmd, conn_ctx);
-      break;
-
-    case CommandType::kInfo:
-      ctx_.stats.info_commands++;
-      result = HandleInfo(*cmd);
-      break;
-
-    case CommandType::kConfigHelp:
-      ctx_.stats.config_commands++;
-      result = HandleConfigHelp(*cmd);
-      break;
-
-    case CommandType::kConfigShow:
-      ctx_.stats.config_commands++;
-      result = HandleConfigShow(*cmd);
-      break;
-
-    case CommandType::kConfigVerify:
-      ctx_.stats.config_commands++;
-      result = HandleConfigVerify(*cmd);
-      break;
-
-    case CommandType::kDumpSave:
-      ctx_.stats.dump_commands++;
-      result = HandleDumpSave(*cmd);
-      break;
-
-    case CommandType::kDumpLoad:
-      ctx_.stats.dump_commands++;
-      result = HandleDumpLoad(*cmd);
-      break;
-
-    case CommandType::kDumpVerify:
-      ctx_.stats.dump_commands++;
-      result = HandleDumpVerify(*cmd);
-      break;
-
-    case CommandType::kDumpInfo:
-      ctx_.stats.dump_commands++;
-      result = HandleDumpInfo(*cmd);
-      break;
-
-    case CommandType::kDumpStatus:
-      ctx_.stats.dump_commands++;
-      result = HandleDumpStatus();
-      break;
-
-    case CommandType::kDebugOn:
-      result = HandleDebugOn(conn_ctx);
-      break;
-
-    case CommandType::kDebugOff:
-      result = HandleDebugOff(conn_ctx);
-      break;
-
-    case CommandType::kSet:
-      ctx_.stats.config_commands++;
-      result = HandleSet(*cmd);
-      break;
-
-    case CommandType::kGet:
-      ctx_.stats.config_commands++;
-      result = HandleGet(*cmd);
-      break;
-
-    case CommandType::kShowVariables:
-      ctx_.stats.config_commands++;
-      result = HandleShowVariables(*cmd);
-      break;
-
-    case CommandType::kCacheStats:
-      ctx_.stats.cache_commands++;
-      result = handlers::HandleCacheStats(ctx_);
-      break;
-
-    case CommandType::kCacheClear:
-      ctx_.stats.cache_commands++;
-      result = handlers::HandleCacheClear(ctx_);
-      break;
-
-    case CommandType::kCacheEnable:
-      ctx_.stats.cache_commands++;
-      result = handlers::HandleCacheEnable(ctx_);
-      break;
-
-    case CommandType::kCacheDisable:
-      ctx_.stats.cache_commands++;
-      result = handlers::HandleCacheDisable(ctx_);
-      break;
-
-    case CommandType::kAuth:
-      // Handled above before the switch; should not reach here
-      break;
-
-    case CommandType::kUnknown:
-      result = utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandUnknown, "Unknown command"));
-      break;
-  }
-
-  // Handle result — always increment total_commands
-  ctx_.stats.total_commands++;
-
-  if (!result) {
-    ctx_.stats.failed_commands++;
-    return FormatError(result.error().message());
-  }
-
-  return *result;
+  return {};
 }
 
-//
-// Handler implementations
-//
-
-utils::Expected<std::string, utils::Error> RequestDispatcher::HandleEvent(const Command& cmd) const {
-  if (ctx_.event_store == nullptr) {
+utils::Expected<WriteOutcome, utils::Error> ApplyEvent(HandlerContext& ctx, const Command& cmd) {
+  if (ctx.event_store == nullptr) {
     return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kInternalError, "EventStore not initialized"));
   }
 
-  auto prepared = ctx_.event_store->PrepareEvent(cmd.ctx, cmd.id, cmd.score, cmd.event_type, cmd.timestamp.value_or(0));
+  auto prepared = ctx.event_store->PrepareEvent(cmd.ctx, cmd.id, cmd.score, cmd.event_type, cmd.timestamp.value_or(0));
   if (!prepared) {
     return utils::MakeUnexpected(prepared.error());
   }
@@ -281,90 +103,92 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleEvent(const 
     // Apply the no-op through the normal path so observability counters remain
     // accurate, but do not write a WAL record for a deduplicated event.
     auto duplicate =
-        ctx_.event_store->AddEventAndGetPrior(cmd.ctx, cmd.id, cmd.score, cmd.event_type, prepared->event.timestamp);
+        ctx.event_store->AddEventAndGetPrior(cmd.ctx, cmd.id, cmd.score, cmd.event_type, prepared->event.timestamp);
     if (!duplicate || !duplicate->deduped) {
-      ctx_.read_only.store(true, std::memory_order_release);
+      ctx.read_only.store(true, std::memory_order_release);
       return utils::MakeUnexpected(
           utils::MakeError(utils::ErrorCode::kInternalError, "Event dedup state changed during acceptance"));
     }
-    return FormatOK("EVENT");
+    return WriteOutcome{CommandType::kEvent, /*deduplicated=*/true, /*dimension=*/0};
   }
 
   Command wal_cmd = cmd;
   wal_cmd.score = prepared->event.score;
   wal_cmd.event_type = prepared->event.type;
   wal_cmd.timestamp = prepared->event.timestamp;
-  auto wal_result = AppendToWal(wal_cmd);
+  auto wal_result = AppendToWal(ctx, wal_cmd);
   if (!wal_result) {
     return utils::MakeUnexpected(wal_result.error());
   }
 
-  // Apply only after the WAL record has been accepted. The dispatcher-wide
-  // write gate keeps the preview and commit free from competing mutations.
-  auto result = ctx_.event_store->AddEventAndGetPrior(cmd.ctx, cmd.id, prepared->event.score, prepared->event.type,
-                                                      prepared->event.timestamp);
+  // Apply only after the WAL record has been accepted. The write gate keeps the
+  // preview and commit free from competing mutations.
+  auto result = ctx.event_store->AddEventAndGetPrior(cmd.ctx, cmd.id, prepared->event.score, prepared->event.type,
+                                                     prepared->event.timestamp);
   if (!result || result->deduped) {
-    ctx_.read_only.store(true, std::memory_order_release);
+    ctx.read_only.store(true, std::memory_order_release);
     return utils::MakeUnexpected(
         utils::MakeError(utils::ErrorCode::kInternalError, "Event apply diverged after WAL acceptance"));
   }
 
   // Update co-occurrence index incrementally (only new pairs, once each).
-  if (ctx_.co_index != nullptr) {
+  if (ctx.co_index != nullptr) {
     events::CoOccurrenceIndex::IngestOptions options;
-    options.temporal_enabled = ctx_.config->events.temporal_cooccurrence;
-    options.half_life_sec = ctx_.config->events.temporal_half_life_sec;
-    options.negative_signals = ctx_.config->events.negative_signals;
-    options.negative_weight = ctx_.config->events.negative_weight;
-    ctx_.co_index->ApplyIngestedEvent(cmd.ctx, result->prior_events, result->stored_event, options);
+    if (ctx.config != nullptr) {
+      options.temporal_enabled = ctx.config->events.temporal_cooccurrence;
+      options.half_life_sec = ctx.config->events.temporal_half_life_sec;
+      options.negative_signals = ctx.config->events.negative_signals;
+      options.negative_weight = ctx.config->events.negative_weight;
+    }
+    ctx.co_index->ApplyIngestedEvent(cmd.ctx, result->prior_events, result->stored_event, options);
   }
 
   // Selective cache invalidation for mutated item
-  auto* cache_ptr = ctx_.cache.load(std::memory_order_acquire);
+  auto* cache_ptr = ctx.cache.load(std::memory_order_acquire);
   if (cache_ptr != nullptr) {
     cache_ptr->InvalidateByItemId(cmd.id);
   }
 
-  return FormatOK("EVENT");
+  return WriteOutcome{CommandType::kEvent, /*deduplicated=*/false, /*dimension=*/0};
 }
 
-utils::Expected<std::string, utils::Error> RequestDispatcher::HandleVecset(const Command& cmd) const {
-  if (ctx_.vector_store == nullptr) {
+utils::Expected<WriteOutcome, utils::Error> ApplyVecset(HandlerContext& ctx, const Command& cmd) {
+  if (ctx.vector_store == nullptr) {
     return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kInternalError, "VectorStore not initialized"));
   }
 
-  auto validation = ctx_.vector_store->ValidateVector(cmd.id, cmd.vector);
+  auto validation = ctx.vector_store->ValidateVector(cmd.id, cmd.vector);
   if (!validation) {
     return utils::MakeUnexpected(validation.error());
   }
 
   // WAL-before-apply: a failed durability acceptance must leave every live
   // store, ANN generation, and cache unchanged.
-  auto wal_result = AppendToWal(cmd);
+  auto wal_result = AppendToWal(ctx, cmd);
   if (!wal_result) {
     return utils::MakeUnexpected(wal_result.error());
   }
 
-  auto result = ctx_.vector_store->SetVector(cmd.id, cmd.vector);
+  auto result = ctx.vector_store->SetVector(cmd.id, cmd.vector);
   if (!result) {
-    ctx_.read_only.store(true, std::memory_order_release);
+    ctx.read_only.store(true, std::memory_order_release);
     return utils::MakeUnexpected(result.error());
   }
-  if (cmd.metadata.has_value() && ctx_.metadata_store != nullptr) {
-    ctx_.metadata_store->Set(cmd.id, *cmd.metadata);
+  if (cmd.metadata.has_value() && ctx.metadata_store != nullptr) {
+    ctx.metadata_store->Set(cmd.id, *cmd.metadata);
   }
 
   // Notify IVF index of the new/updated vector.
   // Copy the vector data under a brief read lock, then notify without holding any lock.
   // This avoids recursive shared_mutex acquisition (undefined behavior in C++17).
-  if (ctx_.similarity_engine != nullptr) {
+  if (ctx.similarity_engine != nullptr) {
     // Resolve the index and copy the vector data atomically under a single
     // snapshot (read lock). Looking the index up separately from the copy
     // would race with a concurrent defragment that re-indexes slots.
     std::optional<size_t> compact_idx;
     std::vector<float> vec_copy;
     {
-      auto snap = ctx_.vector_store->GetCompactSnapshot();
+      auto snap = ctx.vector_store->GetCompactSnapshot();
       if (!snap.Empty()) {
         auto idx_it = snap.id_to_idx->find(cmd.id);
         if (idx_it != snap.id_to_idx->end()) {
@@ -375,7 +199,7 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleVecset(const
       }
     }
     if (compact_idx.has_value()) {
-      ctx_.similarity_engine->NotifyVectorAdded(compact_idx.value(), vec_copy.data());
+      ctx.similarity_engine->NotifyVectorAdded(compact_idx.value(), vec_copy.data());
     }
   }
 
@@ -384,13 +208,13 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleVecset(const
   // already reference an existing ID, so a brand-new item would otherwise be a
   // no-op and stale cached results could omit it. The generation participates
   // in both SIM and SIMV keys, invalidating that space on any vector mutation.
-  ctx_.vector_generation.fetch_add(1, std::memory_order_acq_rel);
+  ctx.vector_generation.fetch_add(1, std::memory_order_acq_rel);
   if (cmd.metadata.has_value()) {
-    ctx_.metadata_generation.fetch_add(1, std::memory_order_acq_rel);
+    ctx.metadata_generation.fetch_add(1, std::memory_order_acq_rel);
   }
 
   // Selective cache invalidation for mutated item
-  auto* cache_ptr = ctx_.cache.load(std::memory_order_acquire);
+  auto* cache_ptr = ctx.cache.load(std::memory_order_acquire);
   if (cache_ptr != nullptr) {
     cache_ptr->InvalidateByItemId(cmd.id);
     if (cmd.metadata.has_value()) {
@@ -398,69 +222,72 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleVecset(const
     }
   }
 
-  return FormatOK("VECSET");
+  return WriteOutcome{CommandType::kVecset, /*deduplicated=*/false, cmd.vector.size()};
 }
 
-utils::Expected<std::string, utils::Error> RequestDispatcher::HandleVecdel(const Command& cmd) const {
-  if (ctx_.vector_store == nullptr) {
+utils::Expected<WriteOutcome, utils::Error> ApplyVecdel(HandlerContext& ctx, const Command& cmd) {
+  if (ctx.vector_store == nullptr) {
     return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kInternalError, "VectorStore not initialized"));
   }
 
-  // Capture the compact index before deletion. The store may defragment during
-  // DeleteVector(), invalidating every later compact index, so ANN cleanup must
-  // happen before the mutation and a full rebuild follows it.
-  const auto compact_index = ctx_.vector_store->GetCompactIndex(cmd.id);
+  // Capture the compact index before deletion. The store may compact during
+  // DeleteVector(), invalidating every later compact index, so the ANN cleanup
+  // decision is made from row counts observed around the mutation.
+  const auto compact_index = ctx.vector_store->GetCompactIndex(cmd.id);
   if (!compact_index.has_value()) {
     return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kVectorNotFound, "Vector not found: " + cmd.id));
   }
-  auto wal_result = AppendToWal(cmd);
+  auto wal_result = AppendToWal(ctx, cmd);
   if (!wal_result) {
     return utils::MakeUnexpected(wal_result.error());
   }
-  if (!ctx_.vector_store->DeleteVector(cmd.id)) {
-    ctx_.read_only.store(true, std::memory_order_release);
+  const size_t rows_before = ctx.vector_store->GetCompactCount();
+  if (!ctx.vector_store->DeleteVector(cmd.id)) {
+    ctx.read_only.store(true, std::memory_order_release);
     return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kVectorNotFound, "Vector not found: " + cmd.id));
   }
-  // RebuildAnnFromStore labels entries by compact index. Compact the store
-  // unconditionally after a public delete so the rebuilt index never sees a
-  // tombstoned row or a shifted label.
-  ctx_.vector_store->Defragment();
 
-  if (ctx_.metadata_store != nullptr) {
-    ctx_.metadata_store->Delete(cmd.id);
+  if (ctx.metadata_store != nullptr) {
+    ctx.metadata_store->Delete(cmd.id);
   }
-  if (ctx_.similarity_engine != nullptr) {
-    ctx_.similarity_engine->NotifyVectorRemoved(*compact_index);
-    // Deletion can trigger VectorStore defragmentation and re-key every live
-    // compact index. Rebuilding is required for HNSW/IVF labels to remain
-    // associated with the correct external IDs.
-    ctx_.similarity_engine->RebuildAnnFromStore();
+  if (ctx.similarity_engine != nullptr) {
+    // The store compacts itself once its own fragmentation threshold is
+    // reached; a delete that left a tombstone in place has not moved any other
+    // row, so removing the single label is enough. Only a compaction re-keys
+    // every live compact index and therefore requires a full rebuild.
+    if (ctx.vector_store->GetCompactCount() < rows_before) {
+      ctx.similarity_engine->RebuildAnnFromStore();
+    } else {
+      ctx.similarity_engine->NotifyVectorRemoved(*compact_index);
+    }
   }
 
-  ctx_.vector_generation.fetch_add(1, std::memory_order_acq_rel);
-  ctx_.metadata_generation.fetch_add(1, std::memory_order_acq_rel);
-  auto* cache_ptr = ctx_.cache.load(std::memory_order_acquire);
+  ctx.vector_generation.fetch_add(1, std::memory_order_acq_rel);
+  ctx.metadata_generation.fetch_add(1, std::memory_order_acq_rel);
+  auto* cache_ptr = ctx.cache.load(std::memory_order_acquire);
   if (cache_ptr != nullptr) {
     cache_ptr->InvalidateByItemId(cmd.id);
   }
 
-  return FormatOK("VECDEL");
+  return WriteOutcome{CommandType::kVecdel, /*deduplicated=*/false, /*dimension=*/0};
 }
 
-utils::Expected<std::string, utils::Error> RequestDispatcher::HandleMetaset(const Command& cmd) const {
-  if (ctx_.vector_store == nullptr) {
+utils::Expected<WriteOutcome, utils::Error> ApplyMetaset(HandlerContext& ctx, const Command& cmd) {
+  if (ctx.vector_store == nullptr) {
     return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kInternalError, "VectorStore not initialized"));
   }
-  if (ctx_.metadata_store == nullptr) {
+  if (ctx.metadata_store == nullptr) {
     return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kInternalError, "MetadataStore not initialized"));
   }
 
   // Validate that the target vector exists; METASET must fail for unknown IDs.
-  if (!ctx_.vector_store->GetCompactIndex(cmd.id).has_value()) {
+  if (!ctx.vector_store->GetCompactIndex(cmd.id).has_value()) {
     return utils::MakeUnexpected(
         utils::MakeError(utils::ErrorCode::kVectorNotFound, "Vector not found for metadata: " + cmd.id));
   }
 
+  // Typed metadata arrives from the JSON surface and from WAL replay; the TCP
+  // text protocol carries the same pairs as a filter expression.
   vectors::Metadata metadata;
   if (cmd.metadata.has_value()) {
     metadata = *cmd.metadata;
@@ -477,19 +304,273 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleMetaset(cons
       metadata[condition.field] = condition.value;
     }
   }
-  auto wal_result = AppendToWal(cmd);
+  auto wal_result = AppendToWal(ctx, cmd);
   if (!wal_result) {
     return utils::MakeUnexpected(wal_result.error());
   }
-  ctx_.metadata_store->Set(cmd.id, std::move(metadata));
-  ctx_.metadata_generation.fetch_add(1, std::memory_order_acq_rel);
+  ctx.metadata_store->Set(cmd.id, std::move(metadata));
+  ctx.metadata_generation.fetch_add(1, std::memory_order_acq_rel);
 
-  auto* cache_ptr = ctx_.cache.load(std::memory_order_acquire);
+  // Metadata changes affect filtered results broadly, so the whole cache goes.
+  auto* cache_ptr = ctx.cache.load(std::memory_order_acquire);
   if (cache_ptr != nullptr) {
     cache_ptr->Clear();
   }
 
-  return FormatOK("METASET");
+  return WriteOutcome{CommandType::kMetaset, /*deduplicated=*/false, /*dimension=*/0};
+}
+
+}  // namespace
+
+utils::Expected<WriteOutcome, utils::Error> ApplyWrite(HandlerContext& ctx, const Command& cmd) {
+  // Keep the command-level critical section around the mutation and its WAL
+  // append. The WAL is replayed in sequence order, so allowing another writer
+  // to append a dependent METASET before this VECSET is durable corrupts
+  // recovery.
+  std::unique_lock<std::mutex> write_serialization_guard;
+  if (ctx.write_serialization_gate != nullptr) {
+    write_serialization_guard = std::unique_lock(*ctx.write_serialization_gate);
+  }
+
+  switch (cmd.type) {
+    case CommandType::kEvent:
+      return ApplyEvent(ctx, cmd);
+    case CommandType::kVecset:
+      return ApplyVecset(ctx, cmd);
+    case CommandType::kVecdel:
+      return ApplyVecdel(ctx, cmd);
+    case CommandType::kMetaset:
+      return ApplyMetaset(ctx, cmd);
+
+    // Not writes: these never mutate a store and must not reach this function.
+    case CommandType::kSim:
+    case CommandType::kSimv:
+    case CommandType::kInfo:
+    case CommandType::kConfigHelp:
+    case CommandType::kConfigShow:
+    case CommandType::kConfigVerify:
+    case CommandType::kDumpSave:
+    case CommandType::kDumpLoad:
+    case CommandType::kDumpVerify:
+    case CommandType::kDumpInfo:
+    case CommandType::kDumpStatus:
+    case CommandType::kDebugOn:
+    case CommandType::kDebugOff:
+    case CommandType::kCacheStats:
+    case CommandType::kCacheClear:
+    case CommandType::kCacheEnable:
+    case CommandType::kCacheDisable:
+    case CommandType::kSet:
+    case CommandType::kGet:
+    case CommandType::kShowVariables:
+    case CommandType::kAuth:
+    case CommandType::kUnknown:
+    case CommandType::kCount:
+      break;
+  }
+  return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandUnknown,
+                                                "Not a write command: " + std::string(CommandTypeToString(cmd.type))));
+}
+
+RequestDispatcher::RequestDispatcher(HandlerContext& handler_ctx) : ctx_(handler_ctx) {}
+
+std::string RequestDispatcher::Dispatch(const std::string& request, ConnectionContext& conn_ctx) {
+  // Parse command. Pass the configured maximum top_k so the upper bound is
+  // enforced at parse time (0 = no check when no config is wired).
+  const uint32_t max_top_k = ctx_.config != nullptr ? ctx_.config->similarity.max_top_k : 0;
+  auto cmd = ParseCommand(request, max_top_k);
+  if (!cmd) {
+    // A rejected request is still a command the client sent: account it so the
+    // failure ratio an operator alerts on cannot exceed one.
+    CommandStatsScope parse_failure_scope(ctx_.stats, CommandType::kUnknown);
+    utils::LogCommandParseError(request, cmd.error().message(), 0);
+    return FormatError(cmd.error().message());
+  }
+
+  // Every exit below is accounted by this guard: total_commands on entry,
+  // failed_commands on destruction unless the command succeeded.
+  CommandStatsScope stats_scope(ctx_.stats, cmd->type);
+
+  // AUTH is answered before the gate so a client can acquire the credential it
+  // is about to be asked for.
+  if (cmd->type == CommandType::kAuth) {
+    auto auth_result = HandleAuth(*cmd, conn_ctx);
+    if (!auth_result) {
+      return FormatError(auth_result.error().message());
+    }
+    stats_scope.MarkSucceeded();
+    return *auth_result;
+  }
+
+  // Check authorization for non-read commands
+  if (!ctx_.requirepass.empty()) {
+    auto privilege = GetCommandPrivilege(cmd->type);
+    if (privilege != CommandPrivilege::kRead && !conn_ctx.authenticated) {
+      return FormatError("NOAUTH Authentication required");
+    }
+  }
+
+  if (IsSnapshotProtectedCommand(cmd->type) && ctx_.loading.load(std::memory_order_acquire)) {
+    return FormatError("LOADING Snapshot load in progress");
+  }
+
+  // Lock-mode snapshots set read_only before taking their store-lock barrier.
+  // Reject a write before it can enter a store mutation path so the snapshot is
+  // a true point-in-time image rather than a mix of pre/post-barrier updates.
+  if (GetCommandPrivilege(cmd->type) != CommandPrivilege::kRead && ctx_.read_only.load(std::memory_order_acquire)) {
+    return FormatError("READONLY Snapshot in progress");
+  }
+
+  // Keep the shared gate for the full store-mutation and WAL append sequence.
+  // A lock-mode snapshot sets read_only first, then takes this gate exclusively
+  // to drain any writer that already passed the initial flag check. Rechecking
+  // after acquisition closes the check-then-mutate race at the boundary.
+  std::shared_lock<std::shared_mutex> snapshot_write_guard;
+  if (IsSnapshotProtectedCommand(cmd->type) && ctx_.snapshot_write_gate != nullptr) {
+    snapshot_write_guard = std::shared_lock(*ctx_.snapshot_write_gate);
+    if (ctx_.loading.load(std::memory_order_acquire)) {
+      return FormatError("LOADING Snapshot load in progress");
+    }
+    if (ctx_.read_only.load(std::memory_order_acquire) && IsSnapshotProtectedWrite(cmd->type)) {
+      return FormatError("READONLY Snapshot in progress");
+    }
+  }
+
+  // Route to appropriate handler. Command counting is owned by stats_scope, so
+  // no branch here touches a counter.
+  utils::Expected<std::string, utils::Error> result =
+      utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandUnknown, "Unknown command type"));
+
+  switch (cmd->type) {
+    case CommandType::kEvent:
+    case CommandType::kVecset:
+    case CommandType::kVecdel:
+    case CommandType::kMetaset:
+      result = HandleWrite(*cmd);
+      break;
+
+    case CommandType::kSim:
+      result = HandleSim(*cmd, conn_ctx);
+      break;
+
+    case CommandType::kSimv:
+      result = HandleSimv(*cmd, conn_ctx);
+      break;
+
+    case CommandType::kInfo:
+      result = HandleInfo(*cmd);
+      break;
+
+    case CommandType::kConfigHelp:
+      result = HandleConfigHelp(*cmd);
+      break;
+
+    case CommandType::kConfigShow:
+      result = HandleConfigShow(*cmd);
+      break;
+
+    case CommandType::kConfigVerify:
+      result = HandleConfigVerify(*cmd);
+      break;
+
+    case CommandType::kDumpSave:
+      result = HandleDumpSave(*cmd);
+      break;
+
+    case CommandType::kDumpLoad:
+      result = HandleDumpLoad(*cmd);
+      break;
+
+    case CommandType::kDumpVerify:
+      result = HandleDumpVerify(*cmd);
+      break;
+
+    case CommandType::kDumpInfo:
+      result = HandleDumpInfo(*cmd);
+      break;
+
+    case CommandType::kDumpStatus:
+      result = HandleDumpStatus();
+      break;
+
+    case CommandType::kDebugOn:
+      result = HandleDebugOn(conn_ctx);
+      break;
+
+    case CommandType::kDebugOff:
+      result = HandleDebugOff(conn_ctx);
+      break;
+
+    case CommandType::kSet:
+      result = HandleSet(*cmd);
+      break;
+
+    case CommandType::kGet:
+      result = HandleGet(*cmd);
+      break;
+
+    case CommandType::kShowVariables:
+      result = HandleShowVariables(*cmd);
+      break;
+
+    case CommandType::kCacheStats:
+      result = handlers::HandleCacheStats(ctx_);
+      break;
+
+    case CommandType::kCacheClear:
+      result = handlers::HandleCacheClear(ctx_);
+      break;
+
+    case CommandType::kCacheEnable:
+      result = handlers::HandleCacheEnable(ctx_);
+      break;
+
+    case CommandType::kCacheDisable:
+      result = handlers::HandleCacheDisable(ctx_);
+      break;
+
+    case CommandType::kAuth:
+      // Handled above before the gate; unreachable here.
+      break;
+
+    case CommandType::kUnknown:
+    case CommandType::kCount:
+      result = utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandUnknown, "Unknown command"));
+      break;
+  }
+
+  if (!result) {
+    return FormatError(result.error().message());
+  }
+
+  stats_scope.MarkSucceeded();
+  return *result;
+}
+
+utils::Expected<std::string, utils::Error> RequestDispatcher::HandleWrite(const Command& cmd) const {
+  auto outcome = ApplyWrite(ctx_, cmd);
+  if (!outcome) {
+    return utils::MakeUnexpected(outcome.error());
+  }
+  // The status word is written out literally rather than derived, so the
+  // documented TCP vocabulary stays greppable in the source that emits it.
+  // Exhaustiveness over CommandType is enforced inside ApplyWrite; anything
+  // that reaches the fallback here is a write with no wire form, which is an
+  // internal error rather than a silently formatted response.
+  switch (outcome->type) {
+    case CommandType::kEvent:
+      return FormatOK("EVENT");
+    case CommandType::kVecset:
+      return FormatOK("VECSET");
+    case CommandType::kVecdel:
+      return FormatOK("VECDEL");
+    case CommandType::kMetaset:
+      return FormatOK("METASET");
+    default:
+      break;
+  }
+  return utils::MakeUnexpected(
+      utils::MakeError(utils::ErrorCode::kInternalError, "Write produced an unformattable outcome"));
 }
 
 utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSim(const Command& cmd,
@@ -718,7 +799,7 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleConfigShow(c
 }
 
 utils::Expected<std::string, utils::Error> RequestDispatcher::HandleConfigVerify(const Command& cmd) {
-  return handlers::HandleConfigVerify(cmd.path);
+  return handlers::HandleConfigVerify(ctx_, cmd.path);
 }
 
 utils::Expected<std::string, utils::Error> RequestDispatcher::HandleDumpSave(const Command& cmd) {
@@ -795,50 +876,24 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleShowVariable
 // Auth handler
 //
 
-std::string RequestDispatcher::HandleAuth(const Command& cmd, ConnectionContext& conn_ctx) {
+utils::Expected<std::string, utils::Error> RequestDispatcher::HandleAuth(const Command& cmd,
+                                                                         ConnectionContext& conn_ctx) const {
   if (ctx_.requirepass.empty()) {
     // No password configured - auth not needed
-    return "+OK (no password required)\r\n";
+    return std::string("+OK (no password required)\r\n");
   }
 
   if (utils::ConstantTimeEquals(cmd.variable_value, ctx_.requirepass)) {
     conn_ctx.authenticated = true;
-    return "+OK\r\n";
+    return std::string("+OK\r\n");
   }
 
-  ctx_.stats.failed_commands++;
-  return FormatError("ERR invalid password");
+  return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kPermissionDenied, "ERR invalid password"));
 }
 
 //
 // Write-Ahead Log integration
 //
-
-utils::Expected<void, utils::Error> RequestDispatcher::AppendToWal(const Command& cmd) const {
-  if (ctx_.wal == nullptr) {
-    return {};
-  }
-
-  // Operators can opt out of retaining vector payloads in the WAL when
-  // snapshots are their chosen vector durability boundary. Keep all other
-  // mutations in the log so event and metadata recovery semantics are intact.
-  if (cmd.type == CommandType::kVecset && ctx_.config != nullptr && !ctx_.config->wal.include_vectors) {
-    return {};
-  }
-
-  std::vector<uint8_t> payload = EncodeCommand(cmd);
-  auto appended = ctx_.wal->Append(WalOpForCommand(cmd), payload.data(), payload.size());
-  if (!appended) {
-    ctx_.read_only.store(true, std::memory_order_release);
-    utils::StructuredLog()
-        .Event("wal_append_failed")
-        .Field("command", CommandTypeToString(cmd.type))
-        .Field("error", appended.error().message())
-        .Warn();
-    return utils::MakeUnexpected(appended.error());
-  }
-  return {};
-}
 
 utils::Expected<void, utils::Error> RequestDispatcher::ReplayRecord(const storage::WalRecord& record) {
   if (record.op == storage::WalOpType::kCoOccurrenceMaintenance) {
@@ -871,28 +926,30 @@ utils::Expected<void, utils::Error> RequestDispatcher::ReplayRecord(const storag
     return utils::MakeUnexpected(decoded.error());
   }
 
-  // Re-apply via the matching write handler. ctx_.wal is null during replay, so
-  // these handlers will not re-append the record to the WAL.
-  utils::Expected<std::string, utils::Error> applied =
-      utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandUnknown, "Unsupported WAL command"));
-  switch (decoded->type) {
-    case CommandType::kEvent:
-      applied = HandleEvent(*decoded);
-      break;
-    case CommandType::kVecset:
-      applied = HandleVecset(*decoded);
-      break;
-    case CommandType::kVecdel:
-      applied = HandleVecdel(*decoded);
-      break;
-    case CommandType::kMetaset:
-      applied = HandleMetaset(*decoded);
-      break;
-    default:
-      break;
-  }
+  // Re-apply through the same write choke point live traffic uses, so recovery
+  // reconstructs exactly the state the original command produced. ctx_.wal is
+  // null during replay, so the record is not appended a second time.
+  auto applied = ApplyWrite(ctx_, *decoded);
 
   if (!applied) {
+    if (IsIntendedReplayGap(record.op, applied.error().code())) {
+      // The configuration that produced this log cannot restore this record's
+      // subject. Skipping keeps recovery moving; aborting would make a server
+      // configured with `wal.include_vectors: false` permanently unstartable
+      // after any VECDEL or metadata write. Every skip is reported so the gap
+      // is visible rather than silent, and the running total is reported by
+      // INFO so the size of the gap survives log rotation.
+      const uint64_t skipped_total = ctx_.stats.wal_replay_records_skipped.fetch_add(1) + 1;
+      utils::StructuredLog()
+          .Event("wal_replay_record_skipped")
+          .Field("sequence", static_cast<int64_t>(record.sequence))
+          .Field("op", static_cast<int64_t>(static_cast<uint8_t>(record.op)))
+          .Field("item_id", decoded->id)
+          .Field("skipped_total", static_cast<int64_t>(skipped_total))
+          .Field("reason", applied.error().message())
+          .Warn();
+      return {};
+    }
     utils::StructuredLog()
         .Event("wal_replay_apply_failed")
         .Field("sequence", static_cast<int64_t>(record.sequence))

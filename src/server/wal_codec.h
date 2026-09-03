@@ -72,4 +72,26 @@ std::vector<uint8_t> EncodeCommand(const Command& cmd);
  */
 utils::Expected<Command, utils::Error> DecodeWalRecord(const storage::WalRecord& record);
 
+/**
+ * @brief Whether a replay failure is an intended recovery gap, not corruption
+ *
+ * With `wal.include_vectors: false` the server deliberately omits VECSET
+ * payloads from the log, so a later VECDEL or METASET record can legitimately
+ * refer to a vector that neither the snapshot nor the WAL can restore. Replay
+ * must skip those records and continue; stopping on them makes a server that
+ * was configured this way unable to start again, with no recovery other than
+ * deleting the WAL by hand.
+ *
+ * The tolerated set is deliberately narrow. Only a missing vector, and only for
+ * the two operations whose subject the configuration is allowed to omit, is a
+ * gap. Every other operation, and every other error — CRC mismatch, truncation,
+ * decode failure, an invalid payload — stays fail-closed, because those mean the
+ * log does not say what the server wrote.
+ *
+ * @param op WAL operation type of the record being replayed
+ * @param code Error code returned by the handler that applied the record
+ * @return true when the record may be skipped and replay continued
+ */
+bool IsIntendedReplayGap(storage::WalOpType op, utils::ErrorCode code);
+
 }  // namespace nvecd::server

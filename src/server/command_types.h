@@ -63,7 +63,12 @@ enum class CommandType : std::uint8_t {
   kAuth,
 
   // Special
-  kUnknown
+  kUnknown,
+
+  /// Sentinel holding the number of declared command types. Every enumerator
+  /// must be added before it, so a compile-time table sized by kCount fails to
+  /// build until the new command is classified.
+  kCount
 };
 
 /**
@@ -122,6 +127,7 @@ inline const char* CommandTypeToString(CommandType type) {
     case CommandType::kAuth:
       return "AUTH";
     case CommandType::kUnknown:
+    case CommandType::kCount:
       return "UNKNOWN";
   }
   return "UNKNOWN";
@@ -138,6 +144,13 @@ enum class CommandPrivilege : std::uint8_t {
 
 /**
  * @brief Get privilege level for a command type
+ *
+ * This is the single authority for "may an unauthenticated client run this?",
+ * consumed by both the TCP dispatcher and the HTTP route table. Every
+ * enumerator is listed explicitly and there is no catch-all: a command type
+ * added without a classification is reported by -Wswitch, and the unreachable
+ * fallback after the switch is kAdmin so an unclassified value fails closed
+ * rather than becoming an open read.
  */
 inline CommandPrivilege GetCommandPrivilege(CommandType type) {
   switch (type) {
@@ -150,6 +163,7 @@ inline CommandPrivilege GetCommandPrivilege(CommandType type) {
     case CommandType::kCacheEnable:
     case CommandType::kCacheDisable:
       return CommandPrivilege::kWrite;
+
     case CommandType::kDumpSave:
     case CommandType::kDumpLoad:
     case CommandType::kDumpVerify:
@@ -157,9 +171,27 @@ inline CommandPrivilege GetCommandPrivilege(CommandType type) {
     case CommandType::kDumpStatus:
     case CommandType::kConfigVerify:
       return CommandPrivilege::kAdmin;
-    default:
+
+    case CommandType::kSim:
+    case CommandType::kSimv:
+    case CommandType::kInfo:
+    case CommandType::kConfigHelp:
+    case CommandType::kConfigShow:
+    case CommandType::kDebugOn:
+    case CommandType::kDebugOff:
+    case CommandType::kCacheStats:
+    case CommandType::kGet:
+    case CommandType::kShowVariables:
       return CommandPrivilege::kRead;
+
+    // AUTH is answered before the gate, an unparsed command never reaches a
+    // handler, and kCount is not a command. None of them is an open read.
+    case CommandType::kAuth:
+    case CommandType::kUnknown:
+    case CommandType::kCount:
+      return CommandPrivilege::kAdmin;
   }
+  return CommandPrivilege::kAdmin;
 }
 
 }  // namespace nvecd::server

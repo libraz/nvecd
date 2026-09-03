@@ -9,7 +9,9 @@
 
 #include "server/handlers/admin_handler.h"
 
+#include <filesystem>
 #include <sstream>
+#include <system_error>
 
 #include "config/config.h"
 #include "config/config_help.h"
@@ -66,19 +68,84 @@ utils::Expected<std::string, utils::Error> HandleConfigShow(const ServerContext&
   return std::string("+OK\n") + *result + "END\r\n";
 }
 
-utils::Expected<std::string, utils::Error> HandleConfigVerify(const std::string& filepath) {
+namespace {
+
+/// Reported for every path that does not resolve inside the allowed root,
+/// whatever the reason. Collapsing "outside the root", "does not exist" and
+/// "cannot be opened" into one message keeps the command from answering
+/// questions about the filesystem outside the directory an operator opted in.
+constexpr const char* kConfigPathNotAllowed = "Configuration file is not accessible";
+
+/**
+ * @brief Resolve a client-supplied config path inside the allowed root
+ *
+ * @param filepath Raw path from the client (absolute, or relative to the root)
+ * @param allowed_root Directory the resolved path must reside in
+ * @return Canonical path inside @p allowed_root, or a non-identifying error
+ */
+utils::Expected<std::string, utils::Error> ResolveConfigPath(const std::string& filepath,
+                                                             const std::string& allowed_root) {
+  const auto denied = [] {
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kPermissionDenied, kConfigPathNotAllowed));
+  };
+
+  if (allowed_root.empty()) {
+    return denied();
+  }
+  // Defense-in-depth: reject traversal segments before canonicalization.
+  if (filepath.find("..") != std::string::npos) {
+    return denied();
+  }
+
+  std::string resolved = filepath;
+  if (resolved[0] != '/') {
+    resolved = allowed_root + "/" + resolved;
+  }
+
+  std::error_code ec;
+  const std::filesystem::path root_canonical = std::filesystem::canonical(allowed_root, ec);
+  if (ec) {
+    return denied();
+  }
+  const std::filesystem::path resolved_canonical = std::filesystem::canonical(resolved, ec);
+  if (ec) {
+    return denied();
+  }
+  const auto relative = resolved_canonical.lexically_relative(root_canonical);
+  if (relative.empty() || relative.string().substr(0, 2) == "..") {
+    return denied();
+  }
+  return resolved_canonical.string();
+}
+
+}  // namespace
+
+utils::Expected<std::string, utils::Error> HandleConfigVerify(const HandlerContext& ctx, const std::string& filepath) {
   if (filepath.empty()) {
     return utils::MakeUnexpected(
         utils::MakeError(utils::ErrorCode::kInvalidArgument, "CONFIG VERIFY requires a filepath"));
   }
 
+  // A server started without a configuration file has no config directory; the
+  // snapshot directory is then the operator-configured root, so the command is
+  // never unrooted.
+  auto resolved = ResolveConfigPath(filepath, ctx.config_dir.empty() ? ctx.dump_dir : ctx.config_dir);
+  if (!resolved) {
+    utils::StructuredLog()
+        .Event("server_warning")
+        .Field("operation", "config_verify")
+        .Field("reason", "path_not_allowed")
+        .Warn();
+    return utils::MakeUnexpected(resolved.error());
+  }
+
   // Try to load and validate the configuration file
-  auto config_result = config::LoadConfig(filepath);
+  auto config_result = config::LoadConfig(*resolved);
   if (!config_result) {
     utils::StructuredLog()
         .Event("server_error")
         .Field("operation", "config_verify")
-        .Field("filepath", filepath)
+        .Field("filepath", *resolved)
         .Field("error", config_result.error().to_string())
         .Error();
     return utils::MakeUnexpected(

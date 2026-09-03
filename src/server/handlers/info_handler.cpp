@@ -38,6 +38,7 @@ utils::Expected<std::string, utils::Error> HandleInfo(const HandlerContext& ctx)
   oss << "event_commands: " << ctx.stats.event_commands.load() << "\n";
   oss << "sim_commands: " << ctx.stats.sim_commands.load() << "\n";
   oss << "vecset_commands: " << ctx.stats.vecset_commands.load() << "\n";
+  oss << "wal_replay_records_skipped: " << ctx.stats.wal_replay_records_skipped.load() << "\n";
   oss << "\n";
 
   // Memory section

@@ -270,6 +270,33 @@ std::vector<uint8_t> EncodeCommand(const Command& cmd) {
   return buf;
 }
 
+bool IsIntendedReplayGap(storage::WalOpType op, utils::ErrorCode code) {
+  if (code != utils::ErrorCode::kVectorNotFound) {
+    return false;
+  }
+  // No default label: adding a WAL operation must not silently inherit either
+  // answer. Whoever adds one has to state whether its subject can be absent by
+  // configuration.
+  switch (op) {
+    case WalOpType::kVecDel:
+    case WalOpType::kMetaSet:
+      // These name a vector that `include_vectors: false` is allowed to have
+      // left out of the log. The record is unreplayable by design, not corrupt.
+      return true;
+    case WalOpType::kVecSet:
+      // VECSET carries its own payload, so a missing vector here means the
+      // handler rejected the record rather than that the log omitted it.
+      return false;
+    case WalOpType::kEventAdd:
+    case WalOpType::kEventDel:
+    case WalOpType::kMetaDel:
+    case WalOpType::kCoOccurrenceMaintenance:
+      // Nothing the vector configuration can omit is involved in these.
+      return false;
+  }
+  return false;
+}
+
 utils::Expected<Command, utils::Error> DecodeWalRecord(const storage::WalRecord& record) {
   Reader reader(record.payload.data(), record.payload.size());
   Command cmd;

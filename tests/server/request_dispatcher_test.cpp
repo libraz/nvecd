@@ -7,6 +7,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -71,7 +72,8 @@ class RequestDispatcherTest : public ::testing::Test {
                                              /*.loading=*/loading_,
                                              /*.read_only=*/read_only_,
                                              /*.dump_dir=*/"/tmp",
-                                             /*.requirepass=*/""};
+                                             /*.requirepass=*/"",
+                                             /*.config_dir=*/""};
     ctx_->cache.store(cache_.get(), std::memory_order_release);
     ctx_->write_serialization_gate = &write_serialization_gate_;
 
@@ -207,29 +209,69 @@ TEST_F(RequestDispatcherTest, AuthRequired_BlocksWriteWithoutAuth) {
   EXPECT_NE(response.find("NOAUTH"), std::string::npos);
 }
 
-TEST(RequestDispatcherAuthTest, PrivilegeClassificationCoversEveryProtectedCommand) {
-  // Dispatch gates every non-read command through GetCommandPrivilege(). Keep
-  // this exhaustive list beside the dispatcher tests so a newly added mutable
-  // endpoint cannot silently default to unauthenticated read access.
-  constexpr std::array writes = {CommandType::kEvent,       CommandType::kVecset,      CommandType::kVecdel,
-                                 CommandType::kMetaset,     CommandType::kSet,         CommandType::kCacheClear,
-                                 CommandType::kCacheEnable, CommandType::kCacheDisable};
-  constexpr std::array admins = {CommandType::kDumpSave, CommandType::kDumpLoad,   CommandType::kDumpVerify,
-                                 CommandType::kDumpInfo, CommandType::kDumpStatus, CommandType::kConfigVerify};
-  constexpr std::array reads = {CommandType::kSim,          CommandType::kSimv,       CommandType::kInfo,
-                                CommandType::kConfigHelp,   CommandType::kConfigShow, CommandType::kDebugOn,
-                                CommandType::kDebugOff,     CommandType::kCacheStats, CommandType::kGet,
-                                CommandType::kShowVariables};
+namespace {
 
-  for (const auto command : writes) {
+/// Every CommandType value, keyed by the privilege the protocol grants it.
+/// Sized by CommandType::kCount so the table cannot silently fall behind the
+/// enum: an added command type that is not listed here fails the size check
+/// below, and a value listed twice or not at all fails the coverage check.
+constexpr std::array<CommandType, 8> kWriteCommands = {
+    CommandType::kEvent, CommandType::kVecset,     CommandType::kVecdel,      CommandType::kMetaset,
+    CommandType::kSet,   CommandType::kCacheClear, CommandType::kCacheEnable, CommandType::kCacheDisable};
+constexpr std::array<CommandType, 6> kAdminCommands = {CommandType::kDumpSave,   CommandType::kDumpLoad,
+                                                       CommandType::kDumpVerify, CommandType::kDumpInfo,
+                                                       CommandType::kDumpStatus, CommandType::kConfigVerify};
+constexpr std::array<CommandType, 10> kReadCommands = {
+    CommandType::kSim,        CommandType::kSimv,         CommandType::kInfo,     CommandType::kConfigHelp,
+    CommandType::kConfigShow, CommandType::kDebugOn,      CommandType::kDebugOff, CommandType::kCacheStats,
+    CommandType::kGet,        CommandType::kShowVariables};
+/// Not reachable as a gated command: AUTH is answered before the gate, an
+/// unparsed request never reaches a handler, and kCount is the sentinel. They
+/// must nonetheless be classified fail-closed.
+constexpr std::array<CommandType, 3> kNonDispatchable = {CommandType::kAuth, CommandType::kUnknown,
+                                                         CommandType::kCount};
+
+static_assert(kWriteCommands.size() + kAdminCommands.size() + kReadCommands.size() + kNonDispatchable.size() ==
+                  static_cast<size_t>(CommandType::kCount) + 1,
+              "every CommandType enumerator must be classified in exactly one privilege table");
+
+bool Contains(const CommandType* begin, const CommandType* end, CommandType value) {
+  return std::find(begin, end, value) != end;
+}
+
+}  // namespace
+
+TEST(RequestDispatcherAuthTest, PrivilegeClassificationCoversEveryCommandType) {
+  // Walk the enum itself, not a hand-written list: a newly added command type
+  // that nobody classified appears here as an unclassified value and fails,
+  // which is the drift the classification exists to prevent.
+  for (size_t raw = 0; raw <= static_cast<size_t>(CommandType::kCount); ++raw) {
+    const auto command = static_cast<CommandType>(raw);
+    const int listed = static_cast<int>(Contains(kWriteCommands.begin(), kWriteCommands.end(), command)) +
+                       static_cast<int>(Contains(kAdminCommands.begin(), kAdminCommands.end(), command)) +
+                       static_cast<int>(Contains(kReadCommands.begin(), kReadCommands.end(), command)) +
+                       static_cast<int>(Contains(kNonDispatchable.begin(), kNonDispatchable.end(), command));
+    EXPECT_EQ(listed, 1) << "CommandType value " << raw << " is classified " << listed << " times";
+  }
+
+  for (const auto command : kWriteCommands) {
     EXPECT_EQ(GetCommandPrivilege(command), CommandPrivilege::kWrite) << CommandTypeToString(command);
   }
-  for (const auto command : admins) {
+  for (const auto command : kAdminCommands) {
     EXPECT_EQ(GetCommandPrivilege(command), CommandPrivilege::kAdmin) << CommandTypeToString(command);
   }
-  for (const auto command : reads) {
+  for (const auto command : kReadCommands) {
     EXPECT_EQ(GetCommandPrivilege(command), CommandPrivilege::kRead) << CommandTypeToString(command);
   }
+}
+
+TEST(RequestDispatcherAuthTest, UnclassifiedCommandTypeFailsClosed) {
+  // The fallback an unclassified value reaches must never be an open read.
+  for (const auto command : kNonDispatchable) {
+    EXPECT_NE(GetCommandPrivilege(command), CommandPrivilege::kRead) << CommandTypeToString(command);
+  }
+  EXPECT_EQ(GetCommandPrivilege(static_cast<CommandType>(static_cast<uint8_t>(CommandType::kCount) + 1)),
+            CommandPrivilege::kAdmin);
 }
 
 TEST_F(RequestDispatcherTest, AuthRequired_AllowsReadWithoutAuth) {
@@ -356,6 +398,109 @@ TEST_F(RequestDispatcherTest, StatsIncrementOnDispatch) {
 
   uint64_t after = stats_.total_commands.load();
   EXPECT_GE(after - before, 3u);
+}
+
+// ============================================================================
+// Command accounting: owned by the RAII scope, not by handler bodies
+// ============================================================================
+
+TEST_F(RequestDispatcherTest, EveryDispatchExitAccountsExactlyOneCommand) {
+  // One entry per exit path the dispatcher can take: parse failure, the
+  // authorization gate, the snapshot gates, a handler error, and success.
+  ctx_->requirepass = "secret123";
+  read_only_.store(false, std::memory_order_release);
+
+  struct Case {
+    const char* request;
+    bool expect_failure;
+  };
+  const std::array<Case, 5> cases = {Case{"NOT_A_COMMAND\r\n", true}, Case{"VECSET blocked 1 0\r\n", true},
+                                     Case{"AUTH wrong\r\n", true}, Case{"AUTH secret123\r\n", false},
+                                     Case{"INFO\r\n", false}};
+
+  for (const auto& item : cases) {
+    ConnectionContext conn_ctx;
+    const uint64_t total_before = stats_.total_commands.load();
+    const uint64_t failed_before = stats_.failed_commands.load();
+
+    Dispatch(item.request, conn_ctx);
+
+    EXPECT_EQ(stats_.total_commands.load(), total_before + 1) << item.request;
+    EXPECT_EQ(stats_.failed_commands.load(), failed_before + (item.expect_failure ? 1U : 0U)) << item.request;
+    EXPECT_LE(stats_.failed_commands.load(), stats_.total_commands.load()) << item.request;
+  }
+}
+
+TEST_F(RequestDispatcherTest, ReadOnlyRejectionIsAccountedAsOneFailedCommand) {
+  read_only_.store(true, std::memory_order_release);
+  const uint64_t total_before = stats_.total_commands.load();
+  const uint64_t failed_before = stats_.failed_commands.load();
+
+  EXPECT_NE(Dispatch("VECSET item 1 0\r\n").find("READONLY"), std::string::npos);
+
+  EXPECT_EQ(stats_.total_commands.load(), total_before + 1);
+  EXPECT_EQ(stats_.failed_commands.load(), failed_before + 1);
+}
+
+// ============================================================================
+// Write choke point: the dispatcher owns no write semantics of its own
+// ============================================================================
+
+TEST_F(RequestDispatcherTest, ApplyWriteProducesTheSameEffectsAsDispatchedWrites) {
+  // The side-effect set of a write must not depend on the surface it arrived
+  // on. Driving ApplyWrite directly, as the HTTP handlers do, must reach the
+  // same stores, generations and cache state that a dispatched command does.
+  ASSERT_NE(Dispatch("VECSET dispatched 1 0\r\n").find("OK VECSET"), std::string::npos);
+
+  const auto vector_generation_before = ctx_->vector_generation.load();
+  const auto metadata_generation_before = ctx_->metadata_generation.load();
+
+  Command direct;
+  direct.type = CommandType::kVecset;
+  direct.id = "applied";
+  direct.vector = {0.0F, 1.0F};
+  auto outcome = ApplyWrite(*ctx_, direct);
+  ASSERT_TRUE(outcome.has_value()) << outcome.error().message();
+  EXPECT_EQ(outcome->type, CommandType::kVecset);
+  EXPECT_EQ(outcome->dimension, 2U);
+
+  EXPECT_TRUE(vector_store_->HasVector("applied"));
+  EXPECT_EQ(ctx_->vector_generation.load(), vector_generation_before + 1);
+  EXPECT_EQ(ctx_->metadata_generation.load(), metadata_generation_before);
+
+  // ApplyWrite performs no command accounting: that belongs to the surface.
+  const uint64_t total_before = stats_.total_commands.load();
+  Command another;
+  another.type = CommandType::kVecdel;
+  another.id = "applied";
+  ASSERT_TRUE(ApplyWrite(*ctx_, another).has_value());
+  EXPECT_EQ(stats_.total_commands.load(), total_before);
+}
+
+TEST_F(RequestDispatcherTest, ApplyWriteRejectsNonWriteCommandTypes) {
+  Command read_command;
+  read_command.type = CommandType::kSim;
+  read_command.id = "anything";
+
+  auto outcome = ApplyWrite(*ctx_, read_command);
+  ASSERT_FALSE(outcome.has_value());
+  EXPECT_EQ(outcome.error().code(), nvecd::utils::ErrorCode::kCommandUnknown);
+}
+
+TEST_F(RequestDispatcherTest, DeleteBelowFragmentationThresholdDoesNotCompactTheStore) {
+  // The store compacts itself once its documented fragmentation threshold is
+  // reached. A single delete out of many must leave a tombstone in place
+  // rather than rewriting the whole matrix on every VECDEL.
+  for (int i = 0; i < 8; ++i) {
+    ASSERT_NE(Dispatch("VECSET item" + std::to_string(i) + " 1 0\r\n").find("OK VECSET"), std::string::npos);
+  }
+  const size_t rows_before = vector_store_->GetCompactCount();
+
+  ASSERT_NE(Dispatch("VECDEL item0\r\n").find("OK VECDEL"), std::string::npos);
+
+  EXPECT_EQ(vector_store_->GetCompactCount(), rows_before);
+  EXPECT_FALSE(vector_store_->HasVector("item0"));
+  EXPECT_TRUE(vector_store_->HasVector("item7"));
 }
 
 TEST_F(RequestDispatcherTest, SimvCachedResultStillAppliesMinScore) {

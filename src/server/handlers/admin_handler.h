@@ -34,9 +34,17 @@ utils::Expected<std::string, utils::Error> HandleConfigShow(const ServerContext&
 
 /**
  * @brief Handle CONFIG VERIFY command
+ *
+ * The path comes from a network client, so it is canonicalised and confined to
+ * an allowed root the same way the sibling DUMP commands are confined to
+ * HandlerContext::dump_dir. A path that resolves outside the root is answered
+ * with one non-identifying error, so the command cannot be used to probe the
+ * existence, readability or parseability of arbitrary files.
+ *
+ * @param ctx Handler context supplying the allowed root
  * @param filepath Path to configuration file
  * @return Response string or error
  */
-utils::Expected<std::string, utils::Error> HandleConfigVerify(const std::string& filepath);
+utils::Expected<std::string, utils::Error> HandleConfigVerify(const HandlerContext& ctx, const std::string& filepath);
 
 }  // namespace nvecd::server::handlers
