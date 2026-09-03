@@ -52,16 +52,17 @@ if(APPLE)
     include_directories(SYSTEM "${MACOS_SDK_PATH}/usr/include")
   endif()
 
-  # Add Homebrew paths
-  if(EXISTS "/usr/local/include")
-    include_directories(SYSTEM "/usr/local/include")
-    link_directories("/usr/local/lib")
-  endif()
-
-  if(EXISTS "/opt/homebrew/include")
-    include_directories(SYSTEM "/opt/homebrew/include")
-    link_directories("/opt/homebrew/lib")
-  endif()
+  # Homebrew installs outside the prefixes CMake searches by default, so name it
+  # as a search prefix. Deliberately not include_directories(): a prefix on every
+  # target's system include path also shadows the dependencies pinned in
+  # third_party/, so a Homebrew copy of one of them silently replaces the pinned
+  # version and the build mixes headers from two releases. Naming it here reaches
+  # find_package() and find_library() and nothing else.
+  foreach(brew_prefix "/opt/homebrew" "/usr/local")
+    if(EXISTS "${brew_prefix}/include")
+      list(APPEND CMAKE_PREFIX_PATH "${brew_prefix}")
+    endif()
+  endforeach()
 
   add_compile_options(-Wno-unused-command-line-argument -Qunused-arguments)
 endif()
