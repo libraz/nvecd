@@ -84,10 +84,11 @@ class HttpServerTest : public ::testing::Test {
     handler_ctx_.config = config_.get();
     handler_ctx_.write_serialization_gate = &write_serialization_gate_;
 
-    // Create HTTP server
+    // Create HTTP server. Port 0 lets the OS pick a free port, so the suite
+    // never collides with whatever else happens to be listening on the host.
     server::HttpServerConfig http_config;
     http_config.bind = "127.0.0.1";
-    http_config.port = 18081;  // Use different port for testing
+    http_config.port = 0;
     http_config.allow_cidrs = {"127.0.0.0/8"};
     ConfigureHttpServer(&http_config);
 
@@ -97,11 +98,14 @@ class HttpServerTest : public ::testing::Test {
     auto result = http_server_->Start();
     ASSERT_TRUE(result) << "Failed to start HTTP server: " << result.error().message();
 
+    port_ = http_server_->GetPort();
+    ASSERT_GT(port_, 0) << "HTTP server did not report a bound port";
+
     // Wait for server to be ready
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
     // Create HTTP client
-    client_ = std::make_unique<httplib::Client>("http://127.0.0.1:18081");
+    client_ = std::make_unique<httplib::Client>(BaseUrl());
   }
 
   void TearDown() override {
@@ -113,6 +117,9 @@ class HttpServerTest : public ::testing::Test {
   }
 
   virtual void ConfigureHttpServer(server::HttpServerConfig* /* config */) {}
+
+  /// Base URL of the server on the port the OS assigned.
+  std::string BaseUrl() const { return "http://127.0.0.1:" + std::to_string(port_); }
 
   std::unique_ptr<config::Config> config_;
   std::unique_ptr<events::EventStore> event_store_;
@@ -144,6 +151,7 @@ class HttpServerTest : public ::testing::Test {
 
   std::unique_ptr<server::HttpServer> http_server_;
   std::unique_ptr<httplib::Client> client_;
+  int port_ = 0;
 };
 
 // Health endpoint tests
@@ -531,14 +539,73 @@ TEST_F(HttpServerTest, SimAndSimvRejectWrongOptionalFieldTypesWithBadRequest) {
 TEST_F(HttpServerTest, BindFailureIsReportedSynchronouslyAndStopStillJoinsSafely) {
   server::HttpServerConfig duplicate_config;
   duplicate_config.bind = "invalid-bind-address";
-  duplicate_config.port = 18089;
+  // The bind fails while resolving the address, so no port is ever claimed;
+  // 0 keeps the test from depending on a fixed port being free anyway.
+  duplicate_config.port = 0;
   duplicate_config.allow_cidrs = {"127.0.0.0/8"};
   server::HttpServer duplicate(duplicate_config, &handler_ctx_, config_.get(), &loading_, &stats_);
 
   auto started = duplicate.Start();
-  EXPECT_FALSE(started.has_value());
+  ASSERT_FALSE(started.has_value());
+  // A failure to resolve the address is not a port conflict, and must not be
+  // reported as one.
+  EXPECT_EQ(started.error().code(), utils::ErrorCode::kNetworkBindFailed) << started.error().to_string();
   duplicate.Stop();
   EXPECT_FALSE(duplicate.IsRunning());
+}
+
+TEST_F(HttpServerTest, SecondServerOnTheSamePortIsRefused) {
+  // The fixture's server already holds port_. A second listener on the same
+  // address must be refused rather than admitted alongside it: two servers
+  // sharing one port would have the kernel hand each connection to whichever
+  // instance it picked, so clients would see answers from two different
+  // datasets with nothing logged.
+  server::HttpServerConfig duplicate_config;
+  duplicate_config.bind = "127.0.0.1";
+  duplicate_config.port = port_;
+  duplicate_config.allow_cidrs = {"127.0.0.0/8"};
+  server::HttpServer duplicate(duplicate_config, &handler_ctx_, config_.get(), &loading_, &stats_);
+
+  auto started = duplicate.Start();
+  ASSERT_FALSE(started.has_value()) << "Second server bound port " << port_ << " already held by the first";
+  EXPECT_EQ(started.error().code(), utils::ErrorCode::kNetworkAddressInUse) << started.error().to_string();
+  EXPECT_NE(started.error().message().find("another server is listening"), std::string::npos)
+      << "Bind conflict was not reported as such: " << started.error().message();
+  EXPECT_FALSE(duplicate.IsRunning());
+
+  // The original server must still be the one serving the port.
+  auto res = client_->Get("/health/live");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(res->status, 200);
+}
+
+TEST_F(HttpServerTest, RestartOnTheSamePortSucceedsWhileEarlierSocketsLinger) {
+  // Drive a connection the server itself closes, so the accepted socket is
+  // still lingering on the port when the listener is rebound the way an
+  // operator restart would. SO_REUSEADDR is what lets that bind succeed; the
+  // duplicate-bind refusal above must not come at the cost of every restart.
+  const httplib::Headers close_connection = {{"Connection", "close"}};
+  auto res = client_->Get("/health/live", close_connection);
+  ASSERT_TRUE(res);
+  ASSERT_EQ(res->status, 200);
+  client_.reset();
+  http_server_->Stop();
+
+  server::HttpServerConfig restart_config;
+  restart_config.bind = "127.0.0.1";
+  restart_config.port = port_;
+  restart_config.allow_cidrs = {"127.0.0.0/8"};
+  server::HttpServer restarted(restart_config, &handler_ctx_, config_.get(), &loading_, &stats_);
+
+  auto started = restarted.Start();
+  ASSERT_TRUE(started) << "Restart on port " << port_ << " failed: " << started.error().message();
+  EXPECT_EQ(restarted.GetPort(), port_);
+
+  httplib::Client reconnected("http://127.0.0.1:" + std::to_string(port_));
+  auto after_restart = reconnected.Get("/health/live");
+  ASSERT_TRUE(after_restart);
+  EXPECT_EQ(after_restart->status, 200);
+  restarted.Stop();
 }
 
 // Cache management tests
@@ -780,8 +847,8 @@ TEST_F(HttpServerTest, MetadataCommitPreventsInflightFilteredResultReadmission) 
   const auto queries_before = cache_->GetStatistics().total_queries;
 
   std::unique_lock mutation_guard(write_serialization_gate_);
-  auto query = std::async(std::launch::async, [body = query_body.dump()] {
-    httplib::Client client("http://127.0.0.1:18081");
+  auto query = std::async(std::launch::async, [body = query_body.dump(), url = BaseUrl()] {
+    httplib::Client client(url);
     auto response = client.Post("/simv", body, "application/json");
     return response ? response->status : -1;
   });
@@ -978,6 +1045,149 @@ TEST_F(HttpServerTest, FiniteDoubleOutsideFloatRangeIsRejectedWithoutMutation) {
   EXPECT_EQ(simv_response->status, 400);
 }
 
+TEST_F(HttpServerTest, VecsetWritesNoWalRecordWhenVectorPayloadsAreExcluded) {
+  // include_vectors=false makes snapshots the vector durability boundary, so
+  // no record is produced for a VECSET even when it carries metadata. A closed
+  // WAL therefore cannot fail the request: if this surface still synthesised a
+  // record of its own, the append would be rejected and the response would be
+  // 503 instead of 200. This is the same contract the TCP path is pinned to.
+  config_->wal.include_vectors = false;
+  storage::WriteAheadLog closed_wal;
+  handler_ctx_.wal = &closed_wal;
+
+  json body;
+  body["id"] = "snapshot-backed";
+  body["vector"] = {1.0, 0.0, 0.0, 0.0};
+  body["metadata"] = {{"status", "active"}};
+
+  auto res = client_->Post("/vecset", body.dump(), "application/json");
+
+  ASSERT_TRUE(res);
+  EXPECT_EQ(res->status, 200) << res->body;
+  EXPECT_TRUE(vector_store_->HasVector("snapshot-backed"));
+  EXPECT_FALSE(read_only_.load(std::memory_order_acquire));
+  handler_ctx_.wal = nullptr;
+}
+
+TEST_F(HttpServerTest, EventScoreRangeIsEnforcedByTheSharedWritePath) {
+  json body;
+  body["ctx"] = "ctx1";
+  body["id"] = "item1";
+  body["type"] = "ADD";
+  body["score"] = 101;
+
+  auto res = client_->Post("/event", body.dump(), "application/json");
+
+  ASSERT_TRUE(res);
+  EXPECT_EQ(res->status, 400) << res->body;
+  EXPECT_EQ(event_store_->GetTotalEventCount(), 0U);
+}
+
+TEST_F(HttpServerTest, EventScoreBoundsAreInclusiveAndValuesOutsideThemAreRejected) {
+  // Both ends of the accepted range are valid values, and the first value past
+  // either end is not. Posting all four over HTTP pins the boundary rather than
+  // one side of it, and the store count distinguishes a rejected write from an
+  // accepted one that merely reported an error.
+  const auto post_score = [this](const std::string& id, const json& score) {
+    json body;
+    body["ctx"] = "bounds";
+    body["id"] = id;
+    body["type"] = "ADD";
+    body["score"] = score;
+    return client_->Post("/event", body.dump(), "application/json");
+  };
+
+  auto lower_bound = post_score("at-zero", 0);
+  ASSERT_TRUE(lower_bound);
+  EXPECT_EQ(lower_bound->status, 200) << lower_bound->body;
+
+  auto upper_bound = post_score("at-hundred", 100);
+  ASSERT_TRUE(upper_bound);
+  EXPECT_EQ(upper_bound->status, 200) << upper_bound->body;
+
+  const uint64_t accepted = event_store_->GetTotalEventCount();
+  EXPECT_EQ(accepted, 2U) << "Both boundary values should have been stored";
+
+  auto below = post_score("below-zero", -1);
+  ASSERT_TRUE(below);
+  EXPECT_EQ(below->status, 400) << below->body;
+  EXPECT_NE(below->body.find("[0, 100]"), std::string::npos)
+      << "Rejection did not name the accepted range: " << below->body;
+
+  auto above = post_score("above-hundred", 101);
+  ASSERT_TRUE(above);
+  EXPECT_EQ(above->status, 400) << above->body;
+  EXPECT_NE(above->body.find("[0, 100]"), std::string::npos)
+      << "Rejection did not name the accepted range: " << above->body;
+
+  EXPECT_EQ(event_store_->GetTotalEventCount(), accepted) << "A rejected score must not reach the store";
+}
+
+TEST_F(HttpServerTest, EventScoreMustBeAnIntegerBeforeTheWriteIsAttempted) {
+  // A fractional or textual score is rejected by the HTTP layer itself. The
+  // shared write path cannot stand in for this check: it only ever sees an int,
+  // so a fraction that got past here would be truncated to a value the store
+  // happily accepts, and the request would report success for a score the
+  // client never sent.
+  const auto post_raw_score = [this](const std::string& id, const std::string& raw_score) {
+    const std::string body = R"({"ctx":"types","id":")" + id + R"(","type":"ADD","score":)" + raw_score + "}";
+    return client_->Post("/event", body, "application/json");
+  };
+
+  auto fractional = post_raw_score("fractional", "50.5");
+  ASSERT_TRUE(fractional);
+  EXPECT_EQ(fractional->status, 400) << fractional->body;
+  EXPECT_NE(fractional->body.find("must be an integer"), std::string::npos)
+      << "Fractional score was not rejected as a type error: " << fractional->body;
+
+  auto textual = post_raw_score("textual", R"("fifty")");
+  ASSERT_TRUE(textual);
+  EXPECT_EQ(textual->status, 400) << textual->body;
+  EXPECT_NE(textual->body.find("must be an integer"), std::string::npos)
+      << "Non-numeric score was not rejected as a type error: " << textual->body;
+
+  EXPECT_EQ(event_store_->GetTotalEventCount(), 0U) << "A non-integer score must not reach the store";
+}
+
+TEST_F(HttpServerTest, RoutesWithoutASuccessBodyAreStillCountedByType) {
+  // /config and /cache/stats have no per-handler counter of their own: the
+  // route declaration is what puts them in the command statistics, exactly as
+  // the TCP dispatcher counts CONFIG SHOW and CACHE STATS.
+  const uint64_t config_before = stats_.config_commands.load();
+  const uint64_t cache_before = stats_.cache_commands.load();
+
+  ASSERT_TRUE(client_->Get("/config"));
+  ASSERT_TRUE(client_->Get("/cache/stats"));
+
+  EXPECT_EQ(stats_.config_commands.load(), config_before + 1);
+  EXPECT_EQ(stats_.cache_commands.load(), cache_before + 1);
+}
+
+TEST_F(HttpServerTest, HealthAndMetricsAreNotCountedAsCommands) {
+  const uint64_t total_before = stats_.total_commands.load();
+
+  ASSERT_TRUE(client_->Get("/health"));
+  ASSERT_TRUE(client_->Get("/health/live"));
+  ASSERT_TRUE(client_->Get("/health/ready"));
+  ASSERT_TRUE(client_->Get("/health/detail"));
+  ASSERT_TRUE(client_->Get("/metrics"));
+
+  EXPECT_EQ(stats_.total_commands.load(), total_before);
+}
+
+TEST_F(HttpServerTest, RejectedWriteIsCountedAsAFailedCommand) {
+  const uint64_t total_before = stats_.total_commands.load();
+  const uint64_t failed_before = stats_.failed_commands.load();
+
+  auto res = client_->Post("/vecset", "{not json", "application/json");
+
+  ASSERT_TRUE(res);
+  ASSERT_EQ(res->status, 400);
+  EXPECT_EQ(stats_.total_commands.load(), total_before + 1);
+  EXPECT_EQ(stats_.failed_commands.load(), failed_before + 1);
+  EXPECT_LE(stats_.failed_commands.load(), stats_.total_commands.load());
+}
+
 TEST_F(HttpServerTest, WriteEndpointsRejectDuringLockSnapshot) {
   read_only_.store(true);
   json vec;
@@ -1019,14 +1229,16 @@ class HttpServerAuthTest : public ::testing::Test {
 
     server::HttpServerConfig http_config;
     http_config.bind = "127.0.0.1";
-    http_config.port = 18082;
+    http_config.port = 0;
     http_config.allow_cidrs = {"127.0.0.0/8"};
     http_config.requirepass = kPassword;
 
     http_server_ = std::make_unique<server::HttpServer>(http_config, &handler_ctx_, config_.get(), &loading_, &stats_);
     ASSERT_TRUE(http_server_->Start());
+    const int port = http_server_->GetPort();
+    ASSERT_GT(port, 0) << "HTTP server did not report a bound port";
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    client_ = std::make_unique<httplib::Client>("http://127.0.0.1:18082");
+    client_ = std::make_unique<httplib::Client>("http://127.0.0.1:" + std::to_string(port));
   }
 
   void TearDown() override {
@@ -1132,24 +1344,210 @@ TEST_F(HttpServerAuthTest, UnauthenticatedDumpStatusRejected) {
   EXPECT_EQ(res->status, 401);
 }
 
+namespace {
+
+/// One row of the HTTP gating contract.
+struct GatedRoute {
+  const char* method;
+  const char* path;
+  const char* body;
+};
+
+/// Every route whose command type carries a write or admin privilege. The
+/// route table derives the gate from GetCommandPrivilege, so this list is the
+/// externally observable form of that classification.
+const std::array<GatedRoute, 12> kGatedRoutes = {
+    GatedRoute{"POST", "/event", R"({"ctx":"c","id":"gated","type":"ADD","score":1})"},
+    GatedRoute{"POST", "/vecset", R"({"id":"gated","vector":[0.1,0.2,0.3,0.4]})"},
+    GatedRoute{"DELETE", "/vecset", R"({"id":"seeded"})"},
+    GatedRoute{"POST", "/metaset", R"({"id":"seeded","metadata":{"k":"v"}})"},
+    GatedRoute{"POST", "/dump/save", R"({"filepath":"gated.dmp"})"},
+    GatedRoute{"POST", "/dump/load", R"({"filepath":"gated.dmp"})"},
+    GatedRoute{"POST", "/dump/verify", R"({"filepath":"gated.dmp"})"},
+    GatedRoute{"POST", "/dump/info", R"({"filepath":"gated.dmp"})"},
+    GatedRoute{"GET", "/dump/status", ""},
+    GatedRoute{"POST", "/cache/clear", R"({"scope":"all"})"},
+    GatedRoute{"POST", "/cache/enable", ""},
+    GatedRoute{"POST", "/cache/disable", ""}};
+
+}  // namespace
+
+TEST_F(HttpServerAuthTest, EveryGatedRouteRejectsAnAbsentCredential) {
+  ASSERT_TRUE(vector_store_->SetVector("seeded", {0.1F, 0.2F, 0.3F, 0.4F}).has_value());
+  metadata_store_->Set("seeded", {{"k", std::string("original")}});
+
+  for (const auto& route : kGatedRoutes) {
+    httplib::Result res =
+        (std::string(route.method) == "GET")
+            ? client_->Get(route.path)
+            : (std::string(route.method) == "DELETE" ? client_->Delete(route.path, route.body, "application/json")
+                                                     : client_->Post(route.path, route.body, "application/json"));
+    ASSERT_TRUE(res) << route.method << " " << route.path;
+    EXPECT_EQ(res->status, 401) << route.method << " " << route.path;
+  }
+
+  // No gated request may have changed state on its way to the rejection.
+  EXPECT_TRUE(vector_store_->HasVector("seeded"));
+  EXPECT_FALSE(vector_store_->HasVector("gated"));
+  ASSERT_NE(metadata_store_->Get("seeded"), nullptr);
+  EXPECT_EQ(std::get<std::string>(metadata_store_->Get("seeded")->at("k")), "original");
+  EXPECT_EQ(event_store_->GetTotalEventCount(), 0U);
+}
+
+TEST_F(HttpServerAuthTest, EveryGatedRouteAcceptsTheConfiguredCredential) {
+  // The same routes must stop returning 401 once the credential is presented;
+  // otherwise the gate would be indistinguishable from a route that is closed
+  // outright.
+  const httplib::Headers headers = {{"Authorization", std::string("Bearer ") + kPassword}};
+  for (const auto& route : kGatedRoutes) {
+    httplib::Result res = (std::string(route.method) == "GET")
+                              ? client_->Get(route.path, headers)
+                              : (std::string(route.method) == "DELETE"
+                                     ? client_->Delete(route.path, headers, route.body, "application/json")
+                                     : client_->Post(route.path, headers, route.body, "application/json"));
+    ASSERT_TRUE(res) << route.method << " " << route.path;
+    EXPECT_NE(res->status, 401) << route.method << " " << route.path;
+  }
+}
+
+TEST_F(HttpServerAuthTest, DocumentedPublicRoutesAreNeverGated) {
+  const std::array<const char*, 7> get_routes = {"/health", "/health/live", "/health/ready", "/health/detail",
+                                                 "/info",   "/config",      "/metrics"};
+  for (const auto* path : get_routes) {
+    auto res = client_->Get(path);
+    ASSERT_TRUE(res) << path;
+    EXPECT_NE(res->status, 401) << path;
+  }
+
+  auto cache_stats = client_->Get("/cache/stats");
+  ASSERT_TRUE(cache_stats);
+  EXPECT_NE(cache_stats->status, 401);
+
+  auto sim = client_->Post("/sim", R"({"id":"anything"})", "application/json");
+  ASSERT_TRUE(sim);
+  EXPECT_NE(sim->status, 401);
+
+  auto simv = client_->Post("/simv", R"({"vector":[0.1,0.2,0.3,0.4]})", "application/json");
+  ASSERT_TRUE(simv);
+  EXPECT_NE(simv->status, 401);
+}
+
+TEST_F(HttpServerAuthTest, NonConformingAuthorizationValuesAreRejected) {
+  const std::array<const char*, 7> rejected = {
+      "",                       // present but empty
+      "Bearer",                 // scheme without a credential
+      "Bearer ",                // scheme with an empty credential
+      "Bearer wrong",           // wrong credential
+      "Token s3cret",           // unknown scheme
+      "Basic !!not-base64!!",   // undecodable Basic payload
+      "Basic dXNlcjp3cm9uZw=="  // base64("user:wrong")
+  };
+  const json body = {{"id", "rejected"}, {"vector", {0.1F, 0.2F, 0.3F, 0.4F}}};
+  for (const auto* value : rejected) {
+    httplib::Headers headers = {{"Authorization", value}};
+    auto res = client_->Post("/vecset", headers, body.dump(), "application/json");
+    ASSERT_TRUE(res) << value;
+    EXPECT_EQ(res->status, 401) << value;
+  }
+  EXPECT_FALSE(vector_store_->HasVector("rejected"));
+}
+
+TEST_F(HttpServerAuthTest, BasicPayloadWithoutColonIsTreatedAsThePasswordItself) {
+  // Deliberate current behavior: the username is ignored, and a payload with
+  // no colon is the password. Pinned so it is changed on purpose, not by
+  // accident.
+  const json body = {{"id", "colonless"}, {"vector", {0.1F, 0.2F, 0.3F, 0.4F}}};
+  httplib::Headers headers = {{"Authorization", "Basic czNjcmV0"}};  // base64("s3cret")
+  auto res = client_->Post("/vecset", headers, body.dump(), "application/json");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(res->status, 200);
+}
+
+TEST_F(HttpServerAuthTest, RejectedRequestIsAccountedAsExactlyOneFailedCommand) {
+  const uint64_t total_before = stats_.total_commands.load();
+  const uint64_t failed_before = stats_.failed_commands.load();
+
+  const json body = {{"id", "unauthorized"}, {"vector", {0.1F, 0.2F, 0.3F, 0.4F}}};
+  auto res = client_->Post("/vecset", body.dump(), "application/json");
+  ASSERT_TRUE(res);
+  ASSERT_EQ(res->status, 401);
+
+  EXPECT_EQ(stats_.total_commands.load(), total_before + 1);
+  EXPECT_EQ(stats_.failed_commands.load(), failed_before + 1);
+  EXPECT_LE(stats_.failed_commands.load(), stats_.total_commands.load());
+}
+
+TEST_F(HttpServerAuthTest, AcceptedRequestIsAccountedWithoutAFailure) {
+  const httplib::Headers headers = {{"Authorization", std::string("Bearer ") + kPassword}};
+  const uint64_t total_before = stats_.total_commands.load();
+  const uint64_t failed_before = stats_.failed_commands.load();
+  const uint64_t vecset_before = stats_.vecset_commands.load();
+
+  const json body = {{"id", "authorized"}, {"vector", {0.1F, 0.2F, 0.3F, 0.4F}}};
+  auto res = client_->Post("/vecset", headers, body.dump(), "application/json");
+  ASSERT_TRUE(res);
+  ASSERT_EQ(res->status, 200);
+
+  EXPECT_EQ(stats_.total_commands.load(), total_before + 1);
+  EXPECT_EQ(stats_.failed_commands.load(), failed_before);
+  EXPECT_EQ(stats_.vecset_commands.load(), vecset_before + 1);
+}
+
 class HttpServerRateLimitTest : public HttpServerAuthTest {
  protected:
+  // Smallest bucket the configuration schema accepts, so the burst below
+  // outruns the refill by the widest margin the product allows.
+  static constexpr int kCapacity = 1;
+  static constexpr int kRefillPerSec = 1;
+
   void ConfigureServerConfig() override {
     config_->api.rate_limiting.enable = true;
-    config_->api.rate_limiting.capacity = 1;
-    config_->api.rate_limiting.refill_rate = 1;
+    config_->api.rate_limiting.capacity = kCapacity;
+    config_->api.rate_limiting.refill_rate = kRefillPerSec;
     config_->api.rate_limiting.max_clients = 10;
   }
 };
 
 TEST_F(HttpServerRateLimitTest, AppliesConfiguredLimitToHttpRequests) {
-  auto first = client_->Get("/health/live");
-  ASSERT_TRUE(first);
-  EXPECT_EQ(first->status, 200);
+  // The token bucket refills against a steady clock, so the number of admitted
+  // requests is only bounded by what elapsed while the burst ran. Measuring
+  // that elapsed time and asserting the bucket invariant against it keeps the
+  // expectation exact under any scheduling delay, where asserting that two
+  // consecutive requests land inside the refill interval would not.
+  constexpr int kBurst = 50;
+  int allowed = 0;
+  int limited = 0;
 
-  auto limited = client_->Get("/health/live");
-  ASSERT_TRUE(limited);
-  EXPECT_EQ(limited->status, 429);
+  const auto started = std::chrono::steady_clock::now();
+  for (int i = 0; i < kBurst; ++i) {
+    auto res = client_->Get("/health/live");
+    ASSERT_TRUE(res) << "Request " << i << " produced no response";
+    if (res->status == 200) {
+      ++allowed;
+    } else {
+      EXPECT_EQ(res->status, 429) << "Unexpected status for request " << i;
+      ++limited;
+    }
+  }
+  const double elapsed_sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+
+  EXPECT_EQ(allowed + limited, kBurst);
+  EXPECT_GE(allowed, 1);
+
+  // A bucket that starts full can admit its capacity plus whatever the refill
+  // granted over the measured window, and nothing more. The window is measured
+  // from before the first request to after the last, so it can only overstate
+  // what the limiter had available.
+  const double max_admissible = kCapacity + (elapsed_sec * kRefillPerSec);
+  EXPECT_LE(allowed, max_admissible) << "Admitted " << allowed << " requests in " << elapsed_sec
+                                     << "s, more than the configured bucket allows";
+
+  // Conversely, the burst can only be served in full if the refill covered it.
+  // Asserting the rejection only when the measurement rules that out keeps the
+  // check honest on a machine slow enough to have earned the tokens.
+  if (elapsed_sec * kRefillPerSec < kBurst - kCapacity) {
+    EXPECT_GT(limited, 0) << "No request was rejected in " << elapsed_sec << "s despite the configured limit";
+  }
 }
 
 class HttpServerAdmissionTest : public HttpServerTest {
@@ -1164,14 +1562,14 @@ class HttpServerAdmissionTest : public HttpServerTest {
 };
 
 TEST_F(HttpServerAdmissionTest, RejectsSecondSlowConnectionFromSameIpBeforeParsing) {
-  auto connect_socket = []() {
+  auto connect_socket = [port = static_cast<uint16_t>(port_)]() {
     const int socket_fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (socket_fd < 0) {
       return socket_fd;
     }
     sockaddr_in address = {};
     address.sin_family = AF_INET;
-    address.sin_port = htons(18081);
+    address.sin_port = htons(port);
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (::connect(socket_fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
       ::close(socket_fd);
@@ -1200,7 +1598,7 @@ TEST_F(HttpServerAdmissionTest, RejectsSecondSlowConnectionFromSameIpBeforeParsi
 // Access-Control-Allow-Origin header must be omitted (not emitted as "null").
 class HttpServerCorsTest : public ::testing::Test {
  protected:
-  void StartServer(int port, const std::string& origin) {
+  void StartServer(const std::string& origin) {
     config_ = std::make_unique<config::Config>();
     config_->vectors.default_dimension = 4;
 
@@ -1221,13 +1619,15 @@ class HttpServerCorsTest : public ::testing::Test {
 
     server::HttpServerConfig http_config;
     http_config.bind = "127.0.0.1";
-    http_config.port = port;
+    http_config.port = 0;
     http_config.allow_cidrs = {"127.0.0.0/8"};
     http_config.enable_cors = true;
     http_config.cors_allow_origin = origin;
 
     http_server_ = std::make_unique<server::HttpServer>(http_config, &handler_ctx_, config_.get(), &loading_, &stats_);
     ASSERT_TRUE(http_server_->Start());
+    const int port = http_server_->GetPort();
+    ASSERT_GT(port, 0) << "HTTP server did not report a bound port";
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     client_ = std::make_unique<httplib::Client>("http://127.0.0.1:" + std::to_string(port));
   }
@@ -1268,7 +1668,7 @@ class HttpServerCorsTest : public ::testing::Test {
 };
 
 TEST_F(HttpServerCorsTest, EmptyOriginOmitsAcaoHeader) {
-  StartServer(18083, "");
+  StartServer("");
   auto res = client_->Get("/health/live");
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 200);
@@ -1276,7 +1676,7 @@ TEST_F(HttpServerCorsTest, EmptyOriginOmitsAcaoHeader) {
 }
 
 TEST_F(HttpServerCorsTest, ConfiguredOriginEmitsAcaoHeader) {
-  StartServer(18084, "https://example.com");
+  StartServer("https://example.com");
   auto res = client_->Get("/health/live");
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 200);
@@ -1285,7 +1685,7 @@ TEST_F(HttpServerCorsTest, ConfiguredOriginEmitsAcaoHeader) {
 }
 
 TEST_F(HttpServerCorsTest, PreflightAllowsAuthenticatedDeleteRoutes) {
-  StartServer(18085, "https://example.com");
+  StartServer("https://example.com");
   httplib::Headers headers = {{"Origin", "https://example.com"},
                               {"Access-Control-Request-Method", "DELETE"},
                               {"Access-Control-Request-Headers", "Authorization, Content-Type"}};

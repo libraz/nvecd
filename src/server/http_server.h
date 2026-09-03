@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "config/config.h"
+#include "server/command_types.h"
 #include "server/rate_limiter.h"
 #include "server/server_types.h"
 #include "utils/error.h"
@@ -109,9 +110,15 @@ class HttpServer {
   bool IsRunning() const { return running_; }
 
   /**
-   * @brief Get server port
+   * @brief Get the port the listening socket is bound to
+   *
+   * When the configuration requests port 0 the operating system picks an
+   * ephemeral port, so the configured value cannot answer this question. The
+   * reported value comes from the listening socket itself (getsockname), and
+   * is therefore only meaningful while the server is bound; before Start()
+   * succeeds and after Stop() it falls back to the configured value.
    */
-  int GetPort() const { return config_.port; }
+  int GetPort() const { return bound_port_.load(std::memory_order_acquire); }
 
   /**
    * @brief Get total requests handled
@@ -128,6 +135,9 @@ class HttpServer {
   HandlerContext* handler_context_;
 
   std::atomic<bool> running_{false};
+
+  /// Port reported by the listening socket; equals config_.port while unbound.
+  std::atomic<int> bound_port_;
 
   // Statistics
   ServerStats stats_;
@@ -146,10 +156,52 @@ class HttpServer {
   std::unique_ptr<RateLimiter> owned_rate_limiter_;
   RateLimiter* rate_limiter_ = nullptr;
 
+  /// HTTP verb a route is registered under.
+  enum class RouteMethod : uint8_t { kGet, kPost, kDelete };
+
+  /// Member handler invoked once a route has been admitted.
+  using RouteHandler = void (HttpServer::*)(const httplib::Request&, httplib::Response&);
+
   /**
    * @brief Setup routes
    */
   void SetupRoutes();
+
+  /**
+   * @brief Register a route that mirrors a TCP command
+   *
+   * Authorization and statistics are the wrapper's responsibility, not the
+   * handler's. The required privilege is derived from GetCommandPrivilege(),
+   * so both surfaces read the same authority and a route cannot be opened by
+   * forgetting a gate line: registering it without naming a command type does
+   * not compile. The request is accounted through CommandStatsScope on every
+   * exit path, including the 401.
+   *
+   * @param method HTTP verb
+   * @param path Route path
+   * @param command TCP command this route is the HTTP form of
+   * @param handler Member handler to invoke once admitted
+   */
+  void RegisterRoute(RouteMethod method, const std::string& path, CommandType command, RouteHandler handler);
+
+  /**
+   * @brief Register an endpoint that has no TCP command counterpart
+   *
+   * Used for the health probes and the Prometheus scrape endpoint: they are
+   * not protocol commands, so they are deliberately neither gated nor counted
+   * in the command statistics. The separate entry point makes that exemption
+   * an explicit declaration rather than an omission.
+   */
+  void RegisterUncountedRoute(RouteMethod method, const std::string& path, RouteHandler handler);
+
+  /// Bind an already-wrapped handler to @p path under @p method.
+  void RegisterHandler(RouteMethod method, const std::string& path, httplib::Server::Handler handler);
+
+  /**
+   * @brief Statistics instance both surfaces share when wired together
+   */
+  ServerStats& EffectiveStats();
+  const ServerStats& EffectiveStats() const;
 
   /**
    * @brief Setup CIDR-based access control
@@ -304,13 +356,16 @@ class HttpServer {
   static void SendError(httplib::Response& res, int status_code, const std::string& message);
 
   /**
-   * @brief Check whether a request is authorized for a non-read endpoint
+   * @brief Check whether a request carries the configured credential
    *
    * When no password is configured (requirepass empty) every request is
    * authorized. Otherwise the request must present a matching credential via
    * the Authorization header, either "Bearer <password>" or
    * "Basic base64(user:<password>)" (the username is ignored, mirroring TCP
    * AUTH which only compares the password).
+   *
+   * Called only from the route wrapper: handler bodies must not gate
+   * themselves, because a gate that lives in a handler body can be omitted.
    *
    * @param req Incoming request
    * @return true if authorized

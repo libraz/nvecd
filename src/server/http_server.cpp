@@ -16,8 +16,11 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <cstring>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
@@ -35,6 +38,7 @@
 #include "server/command_parser.h"
 #include "server/filter_parser.h"
 #include "server/handlers/dump_handler.h"
+#include "server/request_dispatcher.h"
 #include "server/score_format.h"
 #include "server/similarity_result_utils.h"
 #include "server/wal_codec.h"
@@ -202,6 +206,13 @@ int ErrorCodeToHttpStatus(utils::ErrorCode code) {
       return kHttpBadRequest;
     case utils::ErrorCode::kPermissionDenied:
       return kHttpForbidden;
+    // Durability could not accept the write. The state is unchanged and the
+    // condition is transient from the client's point of view, so it is
+    // reported as unavailable rather than as a request defect.
+    case utils::ErrorCode::kWalWriteError:
+    case utils::ErrorCode::kWalNotOpen:
+    case utils::ErrorCode::kWalRotationFailed:
+      return kHttpServiceUnavailable;
     default:
       return kHttpInternalServerError;
   }
@@ -313,28 +324,6 @@ utils::Expected<vectors::Metadata, utils::Error> ParseMetadataJson(const json& v
   return metadata;
 }
 
-utils::Expected<void, utils::Error> AppendCommandToWal(HandlerContext* ctx, const Command& cmd) {
-  if (ctx == nullptr || ctx->wal == nullptr) {
-    return {};
-  }
-  if (cmd.type == CommandType::kVecset && ctx->config != nullptr && !ctx->config->wal.include_vectors) {
-    return {};
-  }
-  std::vector<uint8_t> payload = EncodeCommand(cmd);
-  auto appended = ctx->wal->Append(WalOpForCommand(cmd), payload.data(), payload.size());
-  if (!appended) {
-    ctx->read_only.store(true, std::memory_order_release);
-    nvecd::utils::StructuredLog()
-        .Event("wal_append_failed")
-        .Field("surface", "http")
-        .Field("command", CommandTypeToString(cmd.type))
-        .Field("error", appended.error().message())
-        .Warn();
-    return utils::MakeUnexpected(appended.error());
-  }
-  return {};
-}
-
 }  // namespace
 
 HttpServer::HttpServer(HttpServerConfig config, HandlerContext* handler_context, const config::Config* full_config,
@@ -345,6 +334,7 @@ HttpServer::HttpServer(HttpServerConfig config, HandlerContext* handler_context,
       loading_(loading),
       tcp_stats_(tcp_stats),
       rate_limiter_(rate_limiter) {
+  bound_port_.store(config_.port, std::memory_order_release);
   parsed_allow_cidrs_ = ParseAllowCidrs(config_.allow_cidrs);
 
   // Standalone HTTP users do not have NvecdServer's shared limiter. Build a
@@ -361,6 +351,31 @@ HttpServer::HttpServer(HttpServerConfig config, HandlerContext* handler_context,
   server_->new_task_queue = [worker_threads, max_queued_connections] {
     return new httplib::ThreadPool(worker_threads, max_queued_connections);
   };
+
+  // Replace httplib's default socket options. On POSIX those set SO_REUSEPORT
+  // and, being the other arm of the same #ifdef, no SO_REUSEADDR at all. Under
+  // SO_REUSEPORT a second instance binds the same port instead of being
+  // refused: the kernel then splits incoming connections between two servers
+  // holding two different datasets, and a client gets answers from whichever
+  // one it happened to reach. Set SO_REUSEADDR only, matching
+  // ConnectionAcceptor, so a duplicate bind fails while a restart over a
+  // socket still in TIME_WAIT keeps working.
+  //
+  // POSIX only. A Windows port must not reuse this callback as written:
+  // SO_REUSEADDR there permits hijacking a port another process already holds,
+  // which is the opposite of what is wanted, and httplib's own default pairs it
+  // with SO_EXCLUSIVEADDRUSE for exactly that reason.
+  server_->set_socket_options([](::socket_t sock) {
+    const int enable = 1;
+    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable)) < 0) {
+      nvecd::utils::StructuredLog()
+          .Event("server_error")
+          .Field("operation", "setsockopt")
+          .Field("option", "SO_REUSEADDR")
+          .Field("error", std::string(strerror(errno)))
+          .Error();
+    }
+  });
 
   // Set timeouts
   server_->set_read_timeout(config_.read_timeout_sec, 0);
@@ -388,59 +403,105 @@ HttpServer::~HttpServer() {
   Stop();
 }
 
+ServerStats& HttpServer::EffectiveStats() {
+  if (handler_context_ != nullptr) {
+    return handler_context_->stats;
+  }
+  if (tcp_stats_ != nullptr) {
+    return *tcp_stats_;
+  }
+  return stats_;
+}
+
+const ServerStats& HttpServer::EffectiveStats() const {
+  return const_cast<HttpServer*>(this)->EffectiveStats();
+}
+
+void HttpServer::RegisterHandler(RouteMethod method, const std::string& path, httplib::Server::Handler handler) {
+  switch (method) {
+    case RouteMethod::kGet:
+      server_->Get(path, std::move(handler));
+      return;
+    case RouteMethod::kPost:
+      server_->Post(path, std::move(handler));
+      return;
+    case RouteMethod::kDelete:
+      server_->Delete(path, std::move(handler));
+      return;
+  }
+}
+
+void HttpServer::RegisterRoute(RouteMethod method, const std::string& path, CommandType command, RouteHandler handler) {
+  auto invoke = [this, command, handler](const httplib::Request& req, httplib::Response& res) {
+    // Accounted on every exit path, including the rejection below.
+    CommandStatsScope stats_scope(EffectiveStats(), command);
+
+    // Credentials are checked here rather than inside each handler, so a route
+    // cannot serve a gated operation to an uncredentialed caller by omitting a
+    // check of its own. The rejection happens before the handler reads any
+    // state or assembles any body.
+    if (GetCommandPrivilege(command) != CommandPrivilege::kRead && !IsAuthorized(req)) {
+      SendError(res, kHttpUnauthorized, "Authentication required");
+      return;
+    }
+
+    (this->*handler)(req, res);
+
+    if (res.status >= kHttpOk && res.status < kHttpBadRequest) {
+      stats_scope.MarkSucceeded();
+    }
+  };
+  RegisterHandler(method, path, std::move(invoke));
+}
+
+void HttpServer::RegisterUncountedRoute(RouteMethod method, const std::string& path, RouteHandler handler) {
+  RegisterHandler(method, path,
+                  [this, handler](const httplib::Request& req, httplib::Response& res) { (this->*handler)(req, res); });
+}
+
 void HttpServer::SetupRoutes() {
+  // Each route names the TCP command it is the HTTP form of. That single
+  // declaration decides both the authorization gate (via GetCommandPrivilege)
+  // and which per-type counter the request lands in, so the two surfaces
+  // cannot drift apart on either.
+
   // nvecd-specific operations
-  server_->Post("/event", [this](const httplib::Request& req, httplib::Response& res) { HandleEvent(req, res); });
-  server_->Post("/vecset", [this](const httplib::Request& req, httplib::Response& res) { HandleVecset(req, res); });
-  server_->Delete("/vecset", [this](const httplib::Request& req, httplib::Response& res) { HandleVecdel(req, res); });
-  server_->Post("/metaset", [this](const httplib::Request& req, httplib::Response& res) { HandleMetaset(req, res); });
-  server_->Post("/sim", [this](const httplib::Request& req, httplib::Response& res) { HandleSim(req, res); });
-  server_->Post("/simv", [this](const httplib::Request& req, httplib::Response& res) { HandleSimv(req, res); });
+  RegisterRoute(RouteMethod::kPost, "/event", CommandType::kEvent, &HttpServer::HandleEvent);
+  RegisterRoute(RouteMethod::kPost, "/vecset", CommandType::kVecset, &HttpServer::HandleVecset);
+  RegisterRoute(RouteMethod::kDelete, "/vecset", CommandType::kVecdel, &HttpServer::HandleVecdel);
+  RegisterRoute(RouteMethod::kPost, "/metaset", CommandType::kMetaset, &HttpServer::HandleMetaset);
+  RegisterRoute(RouteMethod::kPost, "/sim", CommandType::kSim, &HttpServer::HandleSim);
+  RegisterRoute(RouteMethod::kPost, "/simv", CommandType::kSimv, &HttpServer::HandleSimv);
 
   // MygramDB-compatible operations
-  server_->Get("/info", [this](const httplib::Request& req, httplib::Response& res) { HandleInfo(req, res); });
-
-  // Health check endpoints
-  server_->Get("/health", [this](const httplib::Request& req, httplib::Response& res) { HandleHealth(req, res); });
-  server_->Get("/health/live",
-               [this](const httplib::Request& req, httplib::Response& res) { HandleHealthLive(req, res); });
-  server_->Get("/health/ready",
-               [this](const httplib::Request& req, httplib::Response& res) { HandleHealthReady(req, res); });
-  server_->Get("/health/detail",
-               [this](const httplib::Request& req, httplib::Response& res) { HandleHealthDetail(req, res); });
-
-  // Configuration
-  server_->Get("/config", [this](const httplib::Request& req, httplib::Response& res) { HandleConfig(req, res); });
-
-  // Metrics
-  server_->Get("/metrics", [this](const httplib::Request& req, httplib::Response& res) { HandleMetrics(req, res); });
+  RegisterRoute(RouteMethod::kGet, "/info", CommandType::kInfo, &HttpServer::HandleInfo);
+  RegisterRoute(RouteMethod::kGet, "/config", CommandType::kConfigShow, &HttpServer::HandleConfig);
 
   // Cache management
-  server_->Get("/cache/stats",
-               [this](const httplib::Request& req, httplib::Response& res) { HandleCacheStats(req, res); });
-  server_->Post("/cache/clear",
-                [this](const httplib::Request& req, httplib::Response& res) { HandleCacheClear(req, res); });
-  server_->Post("/cache/enable",
-                [this](const httplib::Request& req, httplib::Response& res) { HandleCacheEnable(req, res); });
-  server_->Post("/cache/disable",
-                [this](const httplib::Request& req, httplib::Response& res) { HandleCacheDisable(req, res); });
+  RegisterRoute(RouteMethod::kGet, "/cache/stats", CommandType::kCacheStats, &HttpServer::HandleCacheStats);
+  RegisterRoute(RouteMethod::kPost, "/cache/clear", CommandType::kCacheClear, &HttpServer::HandleCacheClear);
+  RegisterRoute(RouteMethod::kPost, "/cache/enable", CommandType::kCacheEnable, &HttpServer::HandleCacheEnable);
+  RegisterRoute(RouteMethod::kPost, "/cache/disable", CommandType::kCacheDisable, &HttpServer::HandleCacheDisable);
 
   // Snapshot management
-  server_->Post("/dump/save",
-                [this](const httplib::Request& req, httplib::Response& res) { HandleDumpSave(req, res); });
-  server_->Post("/dump/load",
-                [this](const httplib::Request& req, httplib::Response& res) { HandleDumpLoad(req, res); });
-  server_->Post("/dump/verify",
-                [this](const httplib::Request& req, httplib::Response& res) { HandleDumpVerify(req, res); });
-  server_->Post("/dump/info",
-                [this](const httplib::Request& req, httplib::Response& res) { HandleDumpInfo(req, res); });
-  server_->Get("/dump/status",
-               [this](const httplib::Request& req, httplib::Response& res) { HandleDumpStatus(req, res); });
+  RegisterRoute(RouteMethod::kPost, "/dump/save", CommandType::kDumpSave, &HttpServer::HandleDumpSave);
+  RegisterRoute(RouteMethod::kPost, "/dump/load", CommandType::kDumpLoad, &HttpServer::HandleDumpLoad);
+  RegisterRoute(RouteMethod::kPost, "/dump/verify", CommandType::kDumpVerify, &HttpServer::HandleDumpVerify);
+  RegisterRoute(RouteMethod::kPost, "/dump/info", CommandType::kDumpInfo, &HttpServer::HandleDumpInfo);
+  RegisterRoute(RouteMethod::kGet, "/dump/status", CommandType::kDumpStatus, &HttpServer::HandleDumpStatus);
 
   // Debug mode
-  server_->Post("/debug/on", [this](const httplib::Request& req, httplib::Response& res) { HandleDebugOn(req, res); });
-  server_->Post("/debug/off",
-                [this](const httplib::Request& req, httplib::Response& res) { HandleDebugOff(req, res); });
+  RegisterRoute(RouteMethod::kPost, "/debug/on", CommandType::kDebugOn, &HttpServer::HandleDebugOn);
+  RegisterRoute(RouteMethod::kPost, "/debug/off", CommandType::kDebugOff, &HttpServer::HandleDebugOff);
+
+  // Endpoints without a TCP counterpart: liveness/readiness probes and the
+  // metrics scrape are transport concerns, not protocol commands, so they are
+  // neither gated nor counted as commands.
+  RegisterUncountedRoute(RouteMethod::kGet, "/health", &HttpServer::HandleHealth);
+  RegisterUncountedRoute(RouteMethod::kGet, "/health/live", &HttpServer::HandleHealthLive);
+  RegisterUncountedRoute(RouteMethod::kGet, "/health/ready", &HttpServer::HandleHealthReady);
+  RegisterUncountedRoute(RouteMethod::kGet, "/health/detail", &HttpServer::HandleHealthDetail);
+  RegisterUncountedRoute(RouteMethod::kGet, "/metrics", &HttpServer::HandleMetrics);
 }
 
 void HttpServer::SetupAccessControl() {
@@ -514,11 +575,33 @@ nvecd::utils::Expected<void, nvecd::utils::Error> HttpServer::Start() {
   }
 
   spdlog::info("Starting HTTP server on {}:{}", config_.bind, config_.port);
-  if (!server_->bind_to_port(config_.bind, config_.port)) {
-    auto error = MakeError(ErrorCode::kNetworkBindFailed,
-                           "Failed to bind to " + config_.bind + ":" + std::to_string(config_.port));
+  // Port 0 means "let the OS choose"; bind_to_any_port reports back what the
+  // listening socket actually got, so GetPort() can answer truthfully.
+  errno = 0;
+  const int bound_port = config_.port == 0 ? server_->bind_to_any_port(config_.bind)
+                                           : (server_->bind_to_port(config_.bind, config_.port) ? config_.port : -1);
+  if (bound_port <= 0) {
+    // The listener sets SO_REUSEADDR only, so EADDRINUSE here means another
+    // process already holds the port. Report that as its own condition: an
+    // operator who started a second instance needs to know that, not just that
+    // a bind failed.
+    const int bind_errno = errno;
+    const bool address_in_use = bind_errno == EADDRINUSE;
+    const std::string target = config_.bind + ":" + std::to_string(config_.port);
+    const std::string detail = address_in_use ? " (another server is listening on this address)"
+                                              : (bind_errno != 0 ? " (" + std::string(strerror(bind_errno)) + ")" : "");
+    auto error = MakeError(address_in_use ? ErrorCode::kNetworkAddressInUse : ErrorCode::kNetworkBindFailed,
+                           "Failed to bind to " + target + detail);
+    nvecd::utils::StructuredLog()
+        .Event("server_error")
+        .Field("operation", "http_server_bind")
+        .Field("bind", config_.bind)
+        .Field("port", static_cast<uint64_t>(config_.port))
+        .Field("error", error.to_string())
+        .Error();
     return MakeUnexpected(error);
   }
+  bound_port_.store(bound_port, std::memory_order_release);
 
   running_ = true;
   server_thread_ = std::make_unique<std::thread>([this]() {
@@ -529,19 +612,20 @@ nvecd::utils::Expected<void, nvecd::utils::Error> HttpServer::Start() {
           .Event("server_error")
           .Field("operation", "http_server_listen")
           .Field("bind", config_.bind)
-          .Field("port", static_cast<uint64_t>(config_.port))
+          .Field("port", static_cast<uint64_t>(bound_port_.load(std::memory_order_acquire)))
           .Error();
     }
   });
   server_->wait_until_ready();
   if (!server_->is_running()) {
     server_thread_->join();
+    bound_port_.store(config_.port, std::memory_order_release);
     auto error = MakeError(ErrorCode::kNetworkListenFailed, "HTTP listener stopped during startup on " + config_.bind +
-                                                                ":" + std::to_string(config_.port));
+                                                                ":" + std::to_string(bound_port));
     return MakeUnexpected(error);
   }
 
-  spdlog::info("HTTP server started successfully on {}:{}", config_.bind, config_.port);
+  spdlog::info("HTTP server started successfully on {}:{}", config_.bind, bound_port);
   return {};
 }
 
@@ -562,6 +646,9 @@ void HttpServer::Stop() {
   if (has_thread) {
     server_thread_->join();
   }
+
+  // Nothing is bound any more, so stop reporting the port that was.
+  bound_port_.store(config_.port, std::memory_order_release);
 
   spdlog::info("HTTP server stopped");
 }
@@ -667,7 +754,7 @@ void HttpServer::HandleHealthDetail(const httplib::Request& /*req*/, httplib::Re
   response["timestamp"] =
       std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 
-  const ServerStats& effective_stats = (tcp_stats_ != nullptr) ? *tcp_stats_ : stats_;
+  const ServerStats& effective_stats = EffectiveStats();
   response["uptime_seconds"] = effective_stats.GetUptimeSeconds();
 
   // Components status
@@ -720,19 +807,12 @@ void HttpServer::HandleHealthDetail(const httplib::Request& /*req*/, httplib::Re
 //
 
 void HttpServer::HandleInfo(const httplib::Request& /*req*/, httplib::Response& res) {
-  // Increment request counter on the effective stats instance
-  if (tcp_stats_ != nullptr) {
-    tcp_stats_->info_commands.fetch_add(1);
-  } else {
-    stats_.info_commands.fetch_add(1);
-  }
-
   // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
     json response;
 
     // Use TCP server's stats if available (includes all protocol stats), otherwise use HTTP-only stats
-    const ServerStats& effective_stats = (tcp_stats_ != nullptr) ? *tcp_stats_ : stats_;
+    const ServerStats& effective_stats = EffectiveStats();
 
     // Server info
     response["server"] = "nvecd";
@@ -921,11 +1001,6 @@ void HttpServer::HandleConfig(const httplib::Request& /*req*/, httplib::Response
 //
 
 void HttpServer::HandleEvent(const httplib::Request& req, httplib::Response& res) {
-  if (!IsAuthorized(req)) {
-    SendError(res, kHttpUnauthorized, "Authentication required");
-    return;
-  }
-
   if (WritesBlocked(handler_context_)) {
     SendError(res, kHttpServiceUnavailable, "Server is read-only or loading");
     return;
@@ -935,7 +1010,6 @@ void HttpServer::HandleEvent(const httplib::Request& req, httplib::Response& res
     SendError(res, kHttpServiceUnavailable, "Server is read-only or loading");
     return;
   }
-  auto write_serialization_guard = AcquireWriteSerializationGuard(handler_context_);
 
   // Check if server is loading
   if (loading_ != nullptr && loading_->load()) {
@@ -988,19 +1062,18 @@ void HttpServer::HandleEvent(const httplib::Request& req, httplib::Response& res
       return;
     }
 
-    constexpr int kMinEventScore = 0;
-    constexpr int kMaxEventScore = 100;
     int score = 0;
     if (event_type != events::EventType::DEL) {
-      // Scores are integers in [0, 100]. Reject non-integer (float) values
-      // instead of silently truncating, to match the TCP integer contract.
+      // Scores are integers. Reject non-integer (float) values instead of
+      // silently truncating, to match the TCP integer contract; the value range
+      // itself is enforced by the shared write path.
       if (!body["score"].is_number_integer()) {
         SendError(res, kHttpBadRequest, "Field 'score' must be an integer");
         return;
       }
       int64_t raw_score = body["score"].get<int64_t>();
-      if (raw_score < kMinEventScore || raw_score > kMaxEventScore) {
-        SendError(res, kHttpBadRequest, "Field 'score' must be in range [0, 100], got " + std::to_string(raw_score));
+      if (raw_score < std::numeric_limits<int>::min() || raw_score > std::numeric_limits<int>::max()) {
+        SendError(res, kHttpBadRequest, "Field 'score' is out of range, got " + std::to_string(raw_score));
         return;
       }
       score = static_cast<int>(raw_score);
@@ -1015,65 +1088,19 @@ void HttpServer::HandleEvent(const httplib::Request& req, httplib::Response& res
       timestamp = body["timestamp"];
     }
 
-    // Add event to event store, atomically capturing the prior buffer state.
-    if (handler_context_->event_store == nullptr) {
-      SendError(res, kHttpInternalServerError, "Event store not initialized");
+    Command command;
+    command.type = CommandType::kEvent;
+    command.ctx = ctx;
+    command.id = id;
+    command.score = score;
+    command.event_type = event_type;
+    command.timestamp = timestamp;
+
+    auto outcome = ApplyWrite(*handler_context_, command);
+    if (!outcome) {
+      SendError(res, ErrorCodeToHttpStatus(outcome.error().code()), outcome.error().message());
       return;
     }
-    auto prepared = handler_context_->event_store->PrepareEvent(ctx, id, score, event_type, timestamp);
-    if (!prepared) {
-      SendError(res, kHttpBadRequest, prepared.error().message());
-      return;
-    }
-
-    if (prepared->deduped) {
-      auto duplicate =
-          handler_context_->event_store->AddEventAndGetPrior(ctx, id, score, event_type, prepared->event.timestamp);
-      if (!duplicate || !duplicate->deduped) {
-        handler_context_->read_only.store(true, std::memory_order_release);
-        SendError(res, kHttpServiceUnavailable, "Event dedup state changed during acceptance");
-        return;
-      }
-    } else {
-      Command wal_cmd;
-      wal_cmd.type = CommandType::kEvent;
-      wal_cmd.ctx = ctx;
-      wal_cmd.id = id;
-      wal_cmd.score = prepared->event.score;
-      wal_cmd.event_type = prepared->event.type;
-      wal_cmd.timestamp = prepared->event.timestamp;
-      auto appended = AppendCommandToWal(handler_context_, wal_cmd);
-      if (!appended) {
-        SendError(res, kHttpServiceUnavailable, appended.error().message());
-        return;
-      }
-
-      auto result = handler_context_->event_store->AddEventAndGetPrior(ctx, id, prepared->event.score,
-                                                                       prepared->event.type, prepared->event.timestamp);
-      if (!result || result->deduped) {
-        handler_context_->read_only.store(true, std::memory_order_release);
-        SendError(res, kHttpServiceUnavailable, "Event apply diverged after WAL acceptance");
-        return;
-      }
-      if (handler_context_->co_index != nullptr) {
-        events::CoOccurrenceIndex::IngestOptions options;
-        if (handler_context_->config != nullptr) {
-          options.temporal_enabled = handler_context_->config->events.temporal_cooccurrence;
-          options.half_life_sec = handler_context_->config->events.temporal_half_life_sec;
-          options.negative_signals = handler_context_->config->events.negative_signals;
-          options.negative_weight = handler_context_->config->events.negative_weight;
-        }
-        handler_context_->co_index->ApplyIngestedEvent(ctx, result->prior_events, result->stored_event, options);
-      }
-    }
-
-    auto* cache_ptr = handler_context_->cache.load(std::memory_order_acquire);
-    if (cache_ptr != nullptr) {
-      cache_ptr->InvalidateByItemId(id);
-    }
-
-    handler_context_->stats.event_commands.fetch_add(1);
-    handler_context_->stats.total_commands.fetch_add(1);
 
     json response;
     response["status"] = "ok";
@@ -1086,11 +1113,6 @@ void HttpServer::HandleEvent(const httplib::Request& req, httplib::Response& res
 }
 
 void HttpServer::HandleVecset(const httplib::Request& req, httplib::Response& res) {
-  if (!IsAuthorized(req)) {
-    SendError(res, kHttpUnauthorized, "Authentication required");
-    return;
-  }
-
   if (WritesBlocked(handler_context_)) {
     SendError(res, kHttpServiceUnavailable, "Server is read-only or loading");
     return;
@@ -1100,7 +1122,6 @@ void HttpServer::HandleVecset(const httplib::Request& req, httplib::Response& re
     SendError(res, kHttpServiceUnavailable, "Server is read-only or loading");
     return;
   }
-  auto write_serialization_guard = AcquireWriteSerializationGuard(handler_context_);
 
   // Check if server is loading
   if (loading_ != nullptr && loading_->load()) {
@@ -1134,109 +1155,30 @@ void HttpServer::HandleVecset(const httplib::Request& req, httplib::Response& re
       SendError(res, kHttpBadRequest, vector_result.error().message());
       return;
     }
-    std::vector<float> vector = std::move(vector_result.value());
-    if (vector.empty()) {
-      SendError(res, kHttpBadRequest, "Field 'vector' must not be empty");
-      return;
-    }
+    Command command;
+    command.type = CommandType::kVecset;
+    command.id = id;
+    command.vector = std::move(vector_result.value());
+    command.dimension = static_cast<int>(command.vector.size());
 
-    // Reject an obviously inconsistent dimension early. Once the store has its
-    // dimension fixed (by the first vector), a mismatched length can never be
-    // stored, so fail fast with a clear 400 instead of doing further work.
-    if (handler_context_->vector_store != nullptr) {
-      size_t expected_dim = handler_context_->vector_store->GetDimension();
-      if (expected_dim > 0 && vector.size() != expected_dim) {
-        SendError(res, kHttpBadRequest,
-                  "Field 'vector' dimension mismatch: expected " + std::to_string(expected_dim) + ", got " +
-                      std::to_string(vector.size()));
-        return;
-      }
-    }
-
-    vectors::Metadata metadata;
-    bool has_metadata = body.contains("metadata");
-    if (has_metadata) {
+    if (body.contains("metadata")) {
       auto metadata_result = ParseMetadataJson(body["metadata"]);
       if (!metadata_result) {
         SendError(res, kHttpBadRequest, metadata_result.error().message());
         return;
       }
-      metadata = std::move(*metadata_result);
+      command.metadata = std::move(*metadata_result);
     }
 
-    if (handler_context_->vector_store == nullptr) {
-      SendError(res, kHttpInternalServerError, "Vector store not initialized");
+    auto outcome = ApplyWrite(*handler_context_, command);
+    if (!outcome) {
+      SendError(res, ErrorCodeToHttpStatus(outcome.error().code()), outcome.error().message());
       return;
     }
-    auto validation = handler_context_->vector_store->ValidateVector(id, vector);
-    if (!validation) {
-      SendError(res, kHttpBadRequest, validation.error().message());
-      return;
-    }
-
-    Command wal_command;
-    if (handler_context_->config == nullptr || handler_context_->config->wal.include_vectors) {
-      wal_command.type = CommandType::kVecset;
-      wal_command.id = id;
-      wal_command.vector = vector;
-      wal_command.dimension = static_cast<int>(vector.size());
-      if (has_metadata) {
-        wal_command.metadata = metadata;
-      }
-    } else if (has_metadata) {
-      wal_command.type = CommandType::kMetaset;
-      wal_command.id = id;
-      wal_command.metadata = metadata;
-    }
-    if (wal_command.type != CommandType::kUnknown) {
-      auto appended = AppendCommandToWal(handler_context_, wal_command);
-      if (!appended) {
-        SendError(res, kHttpServiceUnavailable, appended.error().message());
-        return;
-      }
-    }
-
-    auto result = handler_context_->vector_store->SetVector(id, vector);
-    if (!result) {
-      handler_context_->read_only.store(true, std::memory_order_release);
-      SendError(res, kHttpServiceUnavailable, result.error().message());
-      return;
-    }
-
-    auto compact_idx = handler_context_->vector_store->GetCompactIndex(id);
-    if (compact_idx.has_value()) {
-      if (has_metadata && handler_context_->metadata_store != nullptr) {
-        handler_context_->metadata_store->Set(id, metadata);
-      }
-
-      if (handler_context_->similarity_engine != nullptr) {
-        handler_context_->similarity_engine->NotifyVectorAdded(compact_idx.value(), vector.data());
-      }
-    }
-
-    // Keep HTTP mutations in the same cache-generation domain as TCP VECSET.
-    // Selective invalidation cannot evict entries that never contained this new
-    // id, so bumping the generation is required for a warmed SIM/SIMV response
-    // to observe an HTTP-created vector.
-    handler_context_->vector_generation.fetch_add(1, std::memory_order_acq_rel);
-    if (has_metadata) {
-      handler_context_->metadata_generation.fetch_add(1, std::memory_order_acq_rel);
-    }
-
-    auto* cache_ptr = handler_context_->cache.load(std::memory_order_acquire);
-    if (cache_ptr != nullptr) {
-      cache_ptr->InvalidateByItemId(id);
-      if (has_metadata) {
-        cache_ptr->Clear();
-      }
-    }
-
-    handler_context_->stats.vecset_commands.fetch_add(1);
-    handler_context_->stats.total_commands.fetch_add(1);
 
     json response;
     response["status"] = "ok";
-    response["dimension"] = vector.size();
+    response["dimension"] = outcome->dimension;
     SendJson(res, kHttpOk, response);
 
   } catch (const std::exception& e) {
@@ -1246,11 +1188,6 @@ void HttpServer::HandleVecset(const httplib::Request& req, httplib::Response& re
 }
 
 void HttpServer::HandleVecdel(const httplib::Request& req, httplib::Response& res) {
-  if (!IsAuthorized(req)) {
-    SendError(res, kHttpUnauthorized, "Authentication required");
-    return;
-  }
-
   if (WritesBlocked(handler_context_)) {
     SendError(res, kHttpServiceUnavailable, "Server is read-only or loading");
     return;
@@ -1260,7 +1197,6 @@ void HttpServer::HandleVecdel(const httplib::Request& req, httplib::Response& re
     SendError(res, kHttpServiceUnavailable, "Server is read-only or loading");
     return;
   }
-  auto write_serialization_guard = AcquireWriteSerializationGuard(handler_context_);
 
   try {
     const auto body = json::parse(req.body, nullptr, false);
@@ -1268,52 +1204,21 @@ void HttpServer::HandleVecdel(const httplib::Request& req, httplib::Response& re
       SendError(res, kHttpBadRequest, "Missing or invalid required field: id");
       return;
     }
-    const std::string id = body["id"];
-    if (id.empty()) {
+
+    Command command;
+    command.type = CommandType::kVecdel;
+    command.id = body["id"];
+    if (command.id.empty()) {
       SendError(res, kHttpBadRequest, "Field 'id' must not be empty");
       return;
     }
-    if (handler_context_ == nullptr || handler_context_->vector_store == nullptr) {
-      SendError(res, kHttpInternalServerError, "Vector store not initialized");
+
+    auto outcome = ApplyWrite(*handler_context_, command);
+    if (!outcome) {
+      SendError(res, ErrorCodeToHttpStatus(outcome.error().code()), outcome.error().message());
       return;
     }
 
-    const auto compact_index = handler_context_->vector_store->GetCompactIndex(id);
-    if (!compact_index.has_value()) {
-      SendError(res, kHttpNotFound, "Vector not found: " + id);
-      return;
-    }
-    Command wal_vecdel;
-    wal_vecdel.type = CommandType::kVecdel;
-    wal_vecdel.id = id;
-    auto appended = AppendCommandToWal(handler_context_, wal_vecdel);
-    if (!appended) {
-      SendError(res, kHttpServiceUnavailable, appended.error().message());
-      return;
-    }
-    if (!handler_context_->vector_store->DeleteVector(id)) {
-      handler_context_->read_only.store(true, std::memory_order_release);
-      SendError(res, kHttpServiceUnavailable, "Vector disappeared after WAL acceptance");
-      return;
-    }
-    handler_context_->vector_store->Defragment();
-
-    if (handler_context_->metadata_store != nullptr) {
-      handler_context_->metadata_store->Delete(id);
-    }
-    if (handler_context_->similarity_engine != nullptr) {
-      handler_context_->similarity_engine->NotifyVectorRemoved(*compact_index);
-      handler_context_->similarity_engine->RebuildAnnFromStore();
-    }
-    handler_context_->vector_generation.fetch_add(1, std::memory_order_acq_rel);
-    handler_context_->metadata_generation.fetch_add(1, std::memory_order_acq_rel);
-
-    auto* cache_ptr = handler_context_->cache.load(std::memory_order_acquire);
-    if (cache_ptr != nullptr) {
-      cache_ptr->InvalidateByItemId(id);
-    }
-
-    handler_context_->stats.total_commands.fetch_add(1);
     json response;
     response["status"] = "ok";
     SendJson(res, kHttpOk, response);
@@ -1324,11 +1229,6 @@ void HttpServer::HandleVecdel(const httplib::Request& req, httplib::Response& re
 }
 
 void HttpServer::HandleMetaset(const httplib::Request& req, httplib::Response& res) {
-  if (!IsAuthorized(req)) {
-    SendError(res, kHttpUnauthorized, "Authentication required");
-    return;
-  }
-
   if (WritesBlocked(handler_context_)) {
     SendError(res, kHttpServiceUnavailable, "Server is read-only or loading");
     return;
@@ -1338,7 +1238,6 @@ void HttpServer::HandleMetaset(const httplib::Request& req, httplib::Response& r
     SendError(res, kHttpServiceUnavailable, "Server is read-only or loading");
     return;
   }
-  auto write_serialization_guard = AcquireWriteSerializationGuard(handler_context_);
 
   // Check if server is loading
   if (loading_ != nullptr && loading_->load()) {
@@ -1365,49 +1264,22 @@ void HttpServer::HandleMetaset(const httplib::Request& req, httplib::Response& r
       return;
     }
 
-    std::string id = body["id"];
-
     auto metadata_result = ParseMetadataJson(body["metadata"]);
     if (!metadata_result) {
       SendError(res, kHttpBadRequest, metadata_result.error().message());
       return;
     }
 
-    if (handler_context_->vector_store == nullptr) {
-      SendError(res, kHttpInternalServerError, "Vector store not initialized");
+    Command command;
+    command.type = CommandType::kMetaset;
+    command.id = body["id"];
+    command.metadata = std::move(*metadata_result);
+
+    auto outcome = ApplyWrite(*handler_context_, command);
+    if (!outcome) {
+      SendError(res, ErrorCodeToHttpStatus(outcome.error().code()), outcome.error().message());
       return;
     }
-    if (handler_context_->metadata_store == nullptr) {
-      SendError(res, kHttpInternalServerError, "Metadata store not initialized");
-      return;
-    }
-
-    // Metadata is keyed by item id; the target vector must already exist
-    // (mirrors the TCP METASET behavior in RequestDispatcher).
-    if (!handler_context_->vector_store->GetCompactIndex(id).has_value()) {
-      SendError(res, kHttpNotFound, "Vector not found for metadata: " + id);
-      return;
-    }
-
-    Command wal_metaset;
-    wal_metaset.type = CommandType::kMetaset;
-    wal_metaset.id = id;
-    wal_metaset.metadata = *metadata_result;
-    auto appended = AppendCommandToWal(handler_context_, wal_metaset);
-    if (!appended) {
-      SendError(res, kHttpServiceUnavailable, appended.error().message());
-      return;
-    }
-    handler_context_->metadata_store->Set(id, std::move(*metadata_result));
-    handler_context_->metadata_generation.fetch_add(1, std::memory_order_acq_rel);
-
-    // Metadata changes affect filtered results broadly: clear the cache, as TCP does.
-    auto* cache_ptr = handler_context_->cache.load(std::memory_order_acquire);
-    if (cache_ptr != nullptr) {
-      cache_ptr->Clear();
-    }
-
-    handler_context_->stats.total_commands.fetch_add(1);
 
     json response;
     response["status"] = "ok";
@@ -1525,9 +1397,6 @@ void HttpServer::HandleSim(const httplib::Request& req, httplib::Response& res) 
 
       auto cached = cache_ptr->Lookup(cache_key, search_type);
       if (cached.has_value()) {
-        handler_context_->stats.sim_commands.fetch_add(1);
-        handler_context_->stats.total_commands.fetch_add(1);
-
         json response;
         response["status"] = "ok";
         auto cached_results = ApplyMinScore(*cached, min_score);
@@ -1594,9 +1463,6 @@ void HttpServer::HandleSim(const httplib::Request& req, httplib::Response& res) 
         cache_ptr->InsertAndRegister(cache_key, *result, item_ids, elapsed_ms, search_type);
       }
     }
-
-    handler_context_->stats.sim_commands.fetch_add(1);
-    handler_context_->stats.total_commands.fetch_add(1);
 
     // Build JSON response
     json response;
@@ -1707,9 +1573,6 @@ void HttpServer::HandleSimv(const httplib::Request& req, httplib::Response& res)
 
       auto cached = cache_ptr->Lookup(cache_key, search_type);
       if (cached.has_value()) {
-        handler_context_->stats.sim_commands.fetch_add(1);
-        handler_context_->stats.total_commands.fetch_add(1);
-
         json response;
         response["status"] = "ok";
         auto cached_results = ApplyMinScore(*cached, min_score);
@@ -1757,9 +1620,6 @@ void HttpServer::HandleSimv(const httplib::Request& req, httplib::Response& res)
         cache_ptr->InsertAndRegister(cache_key, *result, item_ids, elapsed_ms, search_type);
       }
     }
-
-    handler_context_->stats.sim_commands.fetch_add(1);
-    handler_context_->stats.total_commands.fetch_add(1);
 
     // Build JSON response
     json response;
@@ -1811,11 +1671,6 @@ std::string ExtractDumpPath(const std::string& response, const std::string& fall
 }  // namespace
 
 void HttpServer::HandleDumpSave(const httplib::Request& req, httplib::Response& res) {
-  if (!IsAuthorized(req)) {
-    SendError(res, kHttpUnauthorized, "Authentication required");
-    return;
-  }
-
   // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
     // Parse JSON body (filepath is optional)
@@ -1835,9 +1690,6 @@ void HttpServer::HandleDumpSave(const httplib::Request& req, httplib::Response& 
       return;
     }
 
-    handler_context_->stats.dump_commands.fetch_add(1);
-    handler_context_->stats.total_commands.fetch_add(1);
-
     json response;
     response["status"] = "ok";
     response["filepath"] = ExtractDumpPath(*result, filepath);
@@ -1850,11 +1702,6 @@ void HttpServer::HandleDumpSave(const httplib::Request& req, httplib::Response& 
 }
 
 void HttpServer::HandleDumpLoad(const httplib::Request& req, httplib::Response& res) {
-  if (!IsAuthorized(req)) {
-    SendError(res, kHttpUnauthorized, "Authentication required");
-    return;
-  }
-
   // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
     // Parse JSON body (non-throwing)
@@ -1882,9 +1729,6 @@ void HttpServer::HandleDumpLoad(const httplib::Request& req, httplib::Response& 
       return;
     }
 
-    handler_context_->stats.dump_commands.fetch_add(1);
-    handler_context_->stats.total_commands.fetch_add(1);
-
     json response;
     response["status"] = "ok";
     response["filepath"] = ExtractDumpPath(*result, filepath);
@@ -1897,11 +1741,6 @@ void HttpServer::HandleDumpLoad(const httplib::Request& req, httplib::Response& 
 }
 
 void HttpServer::HandleDumpVerify(const httplib::Request& req, httplib::Response& res) {
-  if (!IsAuthorized(req)) {
-    SendError(res, kHttpUnauthorized, "Authentication required");
-    return;
-  }
-
   // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
     // Parse JSON body (non-throwing)
@@ -1948,11 +1787,6 @@ void HttpServer::HandleDumpVerify(const httplib::Request& req, httplib::Response
 }
 
 void HttpServer::HandleDumpInfo(const httplib::Request& req, httplib::Response& res) {
-  if (!IsAuthorized(req)) {
-    SendError(res, kHttpUnauthorized, "Authentication required");
-    return;
-  }
-
   // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
     // Parse JSON body (non-throwing)
@@ -2031,7 +1865,7 @@ void HttpServer::HandleMetrics(const httplib::Request& /*req*/, httplib::Respons
   // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
     // Use TCP server's stats if available (includes all protocol stats), otherwise use HTTP-only stats
-    const ServerStats& effective_stats = (tcp_stats_ != nullptr) ? *tcp_stats_ : stats_;
+    const ServerStats& effective_stats = EffectiveStats();
 
     std::ostringstream metrics;
 
@@ -2168,11 +2002,6 @@ void HttpServer::HandleCacheStats(const httplib::Request& /*req*/, httplib::Resp
 }
 
 void HttpServer::HandleCacheClear(const httplib::Request& req, httplib::Response& res) {
-  if (!IsAuthorized(req)) {
-    SendError(res, kHttpUnauthorized, "Authentication required");
-    return;
-  }
-
   // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
     auto* controller = (handler_context_ != nullptr) ? handler_context_->cache_controller : nullptr;
@@ -2227,12 +2056,7 @@ void HttpServer::HandleCacheClear(const httplib::Request& req, httplib::Response
   }
 }
 
-void HttpServer::HandleCacheEnable(const httplib::Request& req, httplib::Response& res) {
-  if (!IsAuthorized(req)) {
-    SendError(res, kHttpUnauthorized, "Authentication required");
-    return;
-  }
-
+void HttpServer::HandleCacheEnable(const httplib::Request& /*req*/, httplib::Response& res) {
   // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
     auto* manager = (handler_context_ != nullptr) ? handler_context_->variable_manager : nullptr;
@@ -2258,12 +2082,7 @@ void HttpServer::HandleCacheEnable(const httplib::Request& req, httplib::Respons
   }
 }
 
-void HttpServer::HandleCacheDisable(const httplib::Request& req, httplib::Response& res) {
-  if (!IsAuthorized(req)) {
-    SendError(res, kHttpUnauthorized, "Authentication required");
-    return;
-  }
-
+void HttpServer::HandleCacheDisable(const httplib::Request& /*req*/, httplib::Response& res) {
   // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
     auto* manager = (handler_context_ != nullptr) ? handler_context_->variable_manager : nullptr;
@@ -2289,12 +2108,7 @@ void HttpServer::HandleCacheDisable(const httplib::Request& req, httplib::Respon
   }
 }
 
-void HttpServer::HandleDumpStatus(const httplib::Request& req, httplib::Response& res) {
-  if (!IsAuthorized(req)) {
-    SendError(res, kHttpUnauthorized, "Authentication required");
-    return;
-  }
-
+void HttpServer::HandleDumpStatus(const httplib::Request& /*req*/, httplib::Response& res) {
   // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
     if (handler_context_ == nullptr || handler_context_->fork_snapshot_writer == nullptr) {
