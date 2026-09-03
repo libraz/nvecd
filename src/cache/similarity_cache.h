@@ -417,11 +417,53 @@ class SimilarityCache {
     }
   };
 
+  /// Value stored in cache_map_: the entry plus its position in lru_list_.
+  using EntrySlot = std::pair<CachedEntry, std::list<CacheKey>::iterator>;
+
+  /**
+   * @brief Incrementally maintained components of the memory estimate
+   *
+   * Holds the two summed terms of the accounting function. Every operation is
+   * constant-cost and the type deliberately has no access to the cache
+   * containers, so nothing reachable through it can scan them. Mutating cache
+   * paths hold mutex_ exclusively and touch the accounting only through this
+   * handle, which is what keeps the critical section independent of the number
+   * of resident entries.
+   *
+   * The full-scan reference computation lives outside the production library
+   * (see SimilarityCacheTestHelper in the cache tests) precisely so it cannot
+   * be reached from a locked path; the tests assert that it agrees with the
+   * value maintained here.
+   */
+  class LockedMemoryAccount {
+   public:
+    void AddEntry(size_t bytes) { entry_bytes_ += bytes; }
+    void RemoveEntry(size_t bytes) { entry_bytes_ -= bytes; }
+    void AddReverse(size_t bytes) { reverse_bytes_ += bytes; }
+    void RemoveReverse(size_t bytes) { reverse_bytes_ -= bytes; }
+    void Reset() {
+      entry_bytes_ = 0;
+      reverse_bytes_ = 0;
+    }
+
+    /**
+     * @brief Total accounted bytes
+     * @param container_overhead_bytes Bucket/list overhead, computed by the caller in O(1)
+     */
+    [[nodiscard]] size_t Total(size_t container_overhead_bytes) const {
+      return container_overhead_bytes + entry_bytes_ + reverse_bytes_;
+    }
+
+   private:
+    size_t entry_bytes_ = 0;    ///< Sum of the per-cache_map_-entry terms
+    size_t reverse_bytes_ = 0;  ///< Sum of the per-reverse-index-item terms
+  };
+
   // LRU list: most recently used at front
   std::list<CacheKey> lru_list_;
 
   // Map: cache key -> (cached entry, LRU iterator)
-  std::unordered_map<CacheKey, std::pair<CachedEntry, std::list<CacheKey>::iterator>> cache_map_;
+  std::unordered_map<CacheKey, EntrySlot> cache_map_;
 
   // Configuration
   size_t max_memory_bytes_;
@@ -441,8 +483,10 @@ class SimilarityCache {
   mutable std::mutex policy_mutex_;
   CachePolicy policies_[kSearchTypeCount];
 
-  // Memory tracking
+  // Memory tracking. total_memory_bytes_ is the published value; account_ holds
+  // the incrementally maintained terms it is recomputed from in O(1).
   size_t total_memory_bytes_ = 0;
+  LockedMemoryAccount account_;
 
   // Thread safety
   mutable std::shared_mutex mutex_;
@@ -488,7 +532,45 @@ class SimilarityCache {
 
   void RegisterResultItemsLocked(const CacheKey& key, CachedEntry& entry, const std::vector<std::string>& item_ids);
 
-  [[nodiscard]] size_t EstimateMemoryLocked() const;
+  /**
+   * @brief Memory attributed to a single cache_map_ entry
+   *
+   * Cost is bounded by kMaxTrackedItemsPerEntry, not by the number of resident
+   * entries. Caller must hold mutex_.
+   */
+  [[nodiscard]] static size_t EntryFootprint(const CachedEntry& entry);
+
+  /**
+   * @brief Memory attributed to a single item_to_cache_keys_ element
+   *
+   * Constant cost: the referencing key set is measured through size() and
+   * bucket_count(), never iterated. Caller must hold mutex_.
+   *
+   * @param item_id The stored key string (its capacity is what is accounted)
+   * @param keys The set of cache keys referencing that item
+   */
+  [[nodiscard]] static size_t ReverseFootprint(const std::string& item_id, const std::unordered_set<CacheKey>& keys);
+
+  /**
+   * @brief Container overhead that cannot be attributed to an individual element
+   *
+   * Bucket arrays and LRU nodes; read in O(1) from the containers themselves.
+   * Caller must hold mutex_.
+   */
+  [[nodiscard]] size_t ContainerOverheadLocked() const;
+
+  /**
+   * @brief Current memory estimate from the incrementally maintained account
+   *
+   * Constant cost. Caller must hold mutex_.
+   */
+  [[nodiscard]] size_t AccountedMemoryLocked() const;
+
+  /**
+   * @brief Republish the memory estimate into total_memory_bytes_ and stats_
+   *
+   * Constant cost. Caller must hold mutex_ exclusively.
+   */
   void RefreshMemoryLocked();
 
   /**

@@ -275,11 +275,12 @@ bool SimilarityCache::InsertWithTtl(const CacheKey& key, const std::vector<simil
   stats_.current_entries++;
 
   auto inserted = cache_map_.find(key);
+  account_.AddEntry(EntryFootprint(inserted->second.first));
   if (item_ids != nullptr) {
     RegisterResultItemsLocked(key, inserted->second.first, *item_ids);
   }
 
-  // Account for cache-map/LRU nodes, entry strings, and the full reverse index.
+  // Account for cache-map/LRU nodes, entry strings, and the reverse index.
   RefreshMemoryLocked();
   EvictForSpace(0);
   if (cache_map_.find(key) == cache_map_.end()) {
@@ -305,6 +306,7 @@ void SimilarityCache::RegisterResultItems(const CacheKey& key, const std::vector
 
 void SimilarityCache::RegisterResultItemsLocked(const CacheKey& key, CachedEntry& entry,
                                                 const std::vector<std::string>& item_ids) {
+  account_.RemoveEntry(EntryFootprint(entry));
   std::unordered_set<std::string> already_registered(entry.referenced_item_ids.begin(),
                                                      entry.referenced_item_ids.end());
   for (const auto& item_id : item_ids) {
@@ -315,8 +317,19 @@ void SimilarityCache::RegisterResultItemsLocked(const CacheKey& key, CachedEntry
       continue;
     }
     entry.referenced_item_ids.push_back(item_id);
-    item_to_cache_keys_[item_id].insert(key);
+
+    // Re-measure only the reverse-index element being touched: the stored key
+    // string and the referencing set are both measured in O(1).
+    auto reverse = item_to_cache_keys_.find(item_id);
+    if (reverse == item_to_cache_keys_.end()) {
+      reverse = item_to_cache_keys_.emplace(item_id, std::unordered_set<CacheKey>{}).first;
+    } else {
+      account_.RemoveReverse(ReverseFootprint(reverse->first, reverse->second));
+    }
+    reverse->second.insert(key);
+    account_.AddReverse(ReverseFootprint(reverse->first, reverse->second));
   }
+  account_.AddEntry(EntryFootprint(entry));
 }
 
 size_t SimilarityCache::InvalidateByItemId(const std::string& item_id) {
@@ -328,6 +341,7 @@ size_t SimilarityCache::InvalidateByItemId(const std::string& item_id) {
   }
 
   // Move keys to avoid iterator invalidation during erasure
+  account_.RemoveReverse(ReverseFootprint(rev_it->first, rev_it->second));
   auto keys_to_invalidate = std::move(rev_it->second);
   item_to_cache_keys_.erase(rev_it);
 
@@ -371,11 +385,15 @@ bool SimilarityCache::EraseLocked(const CacheKey& key) {
     if (reverse == item_to_cache_keys_.end()) {
       continue;
     }
+    account_.RemoveReverse(ReverseFootprint(reverse->first, reverse->second));
     reverse->second.erase(key);
     if (reverse->second.empty()) {
       item_to_cache_keys_.erase(reverse);
+    } else {
+      account_.AddReverse(ReverseFootprint(reverse->first, reverse->second));
     }
   }
+  account_.RemoveEntry(EntryFootprint(iter->second.first));
 
   // Remove from LRU list
   lru_list_.erase(iter->second.second);
@@ -389,32 +407,39 @@ bool SimilarityCache::EraseLocked(const CacheKey& key) {
   return true;
 }
 
-size_t SimilarityCache::EstimateMemoryLocked() const {
-  if (cache_map_.empty() && item_to_cache_keys_.empty()) {
-    return 0;
-  }
-
-  size_t bytes = cache_map_.bucket_count() * sizeof(void*) + item_to_cache_keys_.bucket_count() * sizeof(void*);
-  bytes += lru_list_.size() * (sizeof(CacheKey) + 2 * sizeof(void*));
-  for (const auto& [key, entry_pair] : cache_map_) {
-    (void)key;
-    const auto& entry = entry_pair.first;
-    bytes += sizeof(key) + sizeof(entry_pair) + 2 * sizeof(void*) + entry.compressed_data.capacity();
-    bytes += entry.referenced_item_ids.capacity() * sizeof(std::string);
-    for (const auto& item_id : entry.referenced_item_ids) {
-      bytes += item_id.capacity() + 1;
-    }
-  }
-  for (const auto& [item_id, keys] : item_to_cache_keys_) {
-    bytes += sizeof(item_id) + sizeof(keys) + 2 * sizeof(void*) + item_id.capacity() + 1;
-    bytes += keys.bucket_count() * sizeof(void*);
-    bytes += keys.size() * (sizeof(CacheKey) + 2 * sizeof(void*));
+size_t SimilarityCache::EntryFootprint(const CachedEntry& entry) {
+  size_t bytes = sizeof(CacheKey) + sizeof(EntrySlot) + 2 * sizeof(void*) + entry.compressed_data.capacity();
+  bytes += entry.referenced_item_ids.capacity() * sizeof(std::string);
+  for (const auto& item_id : entry.referenced_item_ids) {
+    bytes += item_id.capacity() + 1;
   }
   return bytes;
 }
 
+size_t SimilarityCache::ReverseFootprint(const std::string& item_id, const std::unordered_set<CacheKey>& keys) {
+  size_t bytes =
+      sizeof(std::string) + sizeof(std::unordered_set<CacheKey>) + 2 * sizeof(void*) + item_id.capacity() + 1;
+  bytes += keys.bucket_count() * sizeof(void*);
+  bytes += keys.size() * (sizeof(CacheKey) + 2 * sizeof(void*));
+  return bytes;
+}
+
+size_t SimilarityCache::ContainerOverheadLocked() const {
+  return cache_map_.bucket_count() * sizeof(void*) + item_to_cache_keys_.bucket_count() * sizeof(void*) +
+         lru_list_.size() * (sizeof(CacheKey) + 2 * sizeof(void*));
+}
+
+size_t SimilarityCache::AccountedMemoryLocked() const {
+  // An empty cache reports zero rather than the residual bucket arrays the
+  // containers keep after their last erase.
+  if (cache_map_.empty() && item_to_cache_keys_.empty()) {
+    return 0;
+  }
+  return account_.Total(ContainerOverheadLocked());
+}
+
 void SimilarityCache::RefreshMemoryLocked() {
-  total_memory_bytes_ = EstimateMemoryLocked();
+  total_memory_bytes_ = AccountedMemoryLocked();
   stats_.current_memory_bytes = total_memory_bytes_;
 }
 
@@ -424,6 +449,7 @@ void SimilarityCache::Clear() {
   lru_list_.clear();
   cache_map_.clear();
   item_to_cache_keys_.clear();
+  account_.Reset();
   total_memory_bytes_ = 0;
   stats_.current_entries = 0;
   stats_.current_memory_bytes = 0;

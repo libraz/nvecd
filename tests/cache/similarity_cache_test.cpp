@@ -9,6 +9,9 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <chrono>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -45,6 +48,51 @@ class SimilarityCacheTestHelper {
     std::shared_lock lock(cache.mutex_);
     auto iter = cache.cache_map_.find(key);
     return iter != cache.cache_map_.end() && iter->second.first.compressed;
+  }
+
+  /**
+   * @brief Full-scan reference computation of the cache's memory accounting
+   *
+   * This is the definition of the accounting function, spelled out by walking
+   * every resident entry and every reverse-index element. It is O(resident
+   * entries) and therefore lives here rather than in the cache: no production
+   * path may run it, because every mutating path holds the exclusive lock.
+   *
+   * The production accounting is maintained incrementally instead. Tests assert
+   * that the two agree, so a mutating path that forgets to update the increment
+   * fails mechanically, and so does a change to one definition of the cost
+   * function that is not mirrored in the other.
+   */
+  static size_t ScanMemoryBytes(SimilarityCache& cache) {
+    std::shared_lock lock(cache.mutex_);
+    if (cache.cache_map_.empty() && cache.item_to_cache_keys_.empty()) {
+      return 0;
+    }
+
+    size_t bytes =
+        cache.cache_map_.bucket_count() * sizeof(void*) + cache.item_to_cache_keys_.bucket_count() * sizeof(void*);
+    bytes += cache.lru_list_.size() * (sizeof(CacheKey) + 2 * sizeof(void*));
+    for (const auto& [key, entry_pair] : cache.cache_map_) {
+      (void)key;
+      const auto& entry = entry_pair.first;
+      bytes += sizeof(key) + sizeof(entry_pair) + 2 * sizeof(void*) + entry.compressed_data.capacity();
+      bytes += entry.referenced_item_ids.capacity() * sizeof(std::string);
+      for (const auto& item_id : entry.referenced_item_ids) {
+        bytes += item_id.capacity() + 1;
+      }
+    }
+    for (const auto& [item_id, keys] : cache.item_to_cache_keys_) {
+      bytes += sizeof(item_id) + sizeof(keys) + 2 * sizeof(void*) + item_id.capacity() + 1;
+      bytes += keys.bucket_count() * sizeof(void*);
+      bytes += keys.size() * (sizeof(CacheKey) + 2 * sizeof(void*));
+    }
+    return bytes;
+  }
+
+  /// Memory value the cache maintains incrementally and publishes to callers.
+  static size_t AccountedMemoryBytes(SimilarityCache& cache) {
+    std::shared_lock lock(cache.mutex_);
+    return cache.AccountedMemoryLocked();
   }
 };
 
@@ -1004,6 +1052,155 @@ TEST(SimilarityCacheTest, ConcurrentInsertAndRegisterPublishesOnlyWinnerReferenc
 
   EXPECT_EQ(winners.load(), 1);
   EXPECT_EQ(SimilarityCacheTestHelper::ReverseItemCount(cache), 1U);
+}
+
+// ============================================================================
+// Memory accounting: incremental value must equal the full-scan value
+// ============================================================================
+
+/// Assert that the incrementally maintained accounting matches a full scan.
+void ExpectAccountingMatchesScan(SimilarityCache& cache, const std::string& stage) {
+  EXPECT_EQ(SimilarityCacheTestHelper::AccountedMemoryBytes(cache), SimilarityCacheTestHelper::ScanMemoryBytes(cache))
+      << "memory accounting drifted after " << stage;
+  EXPECT_EQ(cache.GetStatistics().current_memory_bytes, SimilarityCacheTestHelper::ScanMemoryBytes(cache))
+      << "published memory drifted after " << stage;
+}
+
+TEST(SimilarityCacheTest, AccountingMatchesFullScanAcrossEveryMutation) {
+  SimilarityCache cache(4 * 1024 * 1024, 0.0);
+  const std::vector<similarity::SimilarityResult> results = {{"result_a", 0.9F}, {"result_b", 0.8F}};
+
+  ExpectAccountingMatchesScan(cache, "construction");
+
+  // Plain inserts (no reverse-index references).
+  for (int i = 0; i < 40; ++i) {
+    ASSERT_TRUE(cache.Insert(MakeKey("plain_" + std::to_string(i), 10), results, 1.0));
+    ExpectAccountingMatchesScan(cache, "Insert #" + std::to_string(i));
+  }
+
+  // Inserts that register references in the same critical section.
+  for (int i = 0; i < 40; ++i) {
+    std::vector<std::string> references = {"item_" + std::to_string(i), "shared_group_" + std::to_string(i % 4),
+                                           "a_much_longer_item_identifier_" + std::to_string(i)};
+    ASSERT_TRUE(cache.InsertAndRegister(MakeKey("registered_" + std::to_string(i), 10), results, references, 1.0,
+                                        SearchType::kItemSearch));
+    ExpectAccountingMatchesScan(cache, "InsertAndRegister #" + std::to_string(i));
+  }
+
+  // Late registration onto an existing entry, including duplicate item ids.
+  for (int i = 0; i < 40; ++i) {
+    cache.RegisterResultItems(
+        MakeKey("plain_" + std::to_string(i), 10),
+        {"late_" + std::to_string(i), "shared_group_" + std::to_string(i % 4), "late_" + std::to_string(i)});
+    ExpectAccountingMatchesScan(cache, "RegisterResultItems #" + std::to_string(i));
+  }
+
+  // Selective invalidation through the reverse index.
+  for (int group = 0; group < 4; ++group) {
+    cache.InvalidateByItemId("shared_group_" + std::to_string(group));
+    ExpectAccountingMatchesScan(cache, "InvalidateByItemId #" + std::to_string(group));
+  }
+
+  // Single-key erase.
+  for (int i = 0; i < 10; ++i) {
+    cache.Erase(MakeKey("plain_" + std::to_string(i), 10));
+    ExpectAccountingMatchesScan(cache, "Erase #" + std::to_string(i));
+  }
+
+  // Predicate clear over whatever is left.
+  cache.ClearIf([](const CacheKey&) { return true; });
+  ExpectAccountingMatchesScan(cache, "ClearIf");
+
+  cache.Clear();
+  ExpectAccountingMatchesScan(cache, "Clear");
+  EXPECT_EQ(cache.GetStatistics().current_memory_bytes, 0U);
+}
+
+TEST(SimilarityCacheTest, AccountingMatchesFullScanUnderEviction) {
+  // A budget small enough that admission evicts on nearly every insert, so the
+  // eviction batch path is what maintains the accounting.
+  constexpr size_t kMemoryLimit = 8192;
+  SimilarityCache cache(kMemoryLimit, 0.0, 0, true, 4);
+  const std::vector<similarity::SimilarityResult> results = {{"result", 0.95F}};
+
+  for (int i = 0; i < 200; ++i) {
+    std::vector<std::string> references;
+    references.reserve(8);
+    for (int item = 0; item < 8; ++item) {
+      references.push_back("evicting_item_" + std::to_string(i) + "_" + std::to_string(item));
+    }
+    cache.InsertAndRegister(MakeKey("evicting_" + std::to_string(i), 10), results, references, 1.0,
+                            SearchType::kItemSearch);
+    ExpectAccountingMatchesScan(cache, "eviction insert #" + std::to_string(i));
+    EXPECT_LE(cache.GetStatistics().current_memory_bytes, kMemoryLimit);
+  }
+}
+
+TEST(SimilarityCacheTest, AccountingMatchesFullScanAfterTtlPurge) {
+  SimilarityCache cache(1024 * 1024, 0.0, 1);
+  for (int i = 0; i < 20; ++i) {
+    ASSERT_TRUE(cache.InsertAndRegister(MakeKey("purged_" + std::to_string(i), 10), {{"result", 0.9F}},
+                                        {"purge_item_" + std::to_string(i), "purge_shared"}, 1.0,
+                                        SearchType::kItemSearch));
+  }
+  ExpectAccountingMatchesScan(cache, "population");
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+  EXPECT_EQ(cache.PurgeExpired(), 20U);
+  ExpectAccountingMatchesScan(cache, "PurgeExpired");
+  EXPECT_EQ(cache.GetStatistics().current_memory_bytes, 0U);
+}
+
+TEST(SimilarityCacheTest, AccountingMatchesFullScanAfterConcurrentMutations) {
+  SimilarityCache cache(4 * 1024 * 1024, 0.0);
+  const std::vector<similarity::SimilarityResult> results = {{"result", 0.95F}};
+  constexpr int kEntryCount = 100;
+  for (int i = 0; i < kEntryCount; ++i) {
+    ASSERT_TRUE(cache.Insert(MakeKey("concurrent_" + std::to_string(i), 10), results, 1.0));
+  }
+
+  std::atomic<bool> stop{false};
+  std::vector<std::thread> threads;
+  for (int t = 0; t < 2; ++t) {
+    threads.emplace_back([&cache, &stop, t]() {
+      int i = 0;
+      while (!stop.load(std::memory_order_relaxed)) {
+        cache.RegisterResultItems(
+            MakeKey("concurrent_" + std::to_string(i % kEntryCount), 10),
+            {"owned_" + std::to_string(t) + "_" + std::to_string(i), "shared_" + std::to_string(i % 8)});
+        ++i;
+        std::this_thread::yield();
+      }
+    });
+  }
+  for (int t = 0; t < 2; ++t) {
+    threads.emplace_back([&cache, &stop]() {
+      int i = 0;
+      while (!stop.load(std::memory_order_relaxed)) {
+        cache.InvalidateByItemId("shared_" + std::to_string(i % 8));
+        ++i;
+        std::this_thread::yield();
+      }
+    });
+  }
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  stop.store(true, std::memory_order_relaxed);
+  for (auto& thread : threads) {
+    thread.join();
+  }
+
+  // Post-join: the accounting must be exactly the full-scan value, and further
+  // mutations on the quiesced cache must keep it that way. The erases matter --
+  // they leave a non-empty cache, so a missed decrement cannot hide behind the
+  // empty-cache special case.
+  ExpectAccountingMatchesScan(cache, "concurrent mutation");
+  for (int i = 0; i < kEntryCount / 2; ++i) {
+    cache.Erase(MakeKey("concurrent_" + std::to_string(i), 10));
+    ExpectAccountingMatchesScan(cache, "post-join Erase #" + std::to_string(i));
+  }
+  cache.Clear();
+  ExpectAccountingMatchesScan(cache, "Clear after concurrent mutation");
 }
 
 TEST(SimilarityCacheTest, ConcurrentRegisterAndInvalidate) {
