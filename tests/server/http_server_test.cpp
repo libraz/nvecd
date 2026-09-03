@@ -19,6 +19,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <future>
 #include <mutex>
@@ -1433,10 +1434,13 @@ TEST_F(HttpServerAuthTest, DocumentedPublicRoutesAreNeverGated) {
 }
 
 TEST_F(HttpServerAuthTest, NonConformingAuthorizationValuesAreRejected) {
-  const std::array<const char*, 7> rejected = {
+  // "Bearer " is absent deliberately. Trailing whitespace is optional
+  // whitespace around a field value, stripped while the header is parsed, so by
+  // the time the server compares anything it holds "Bearer" -- the entry above.
+  // It reads like a separate case and is not one.
+  const std::array<const char*, 6> rejected = {
       "",                       // present but empty
       "Bearer",                 // scheme without a credential
-      "Bearer ",                // scheme with an empty credential
       "Bearer wrong",           // wrong credential
       "Token s3cret",           // unknown scheme
       "Basic !!not-base64!!",   // undecodable Basic payload
@@ -1446,8 +1450,9 @@ TEST_F(HttpServerAuthTest, NonConformingAuthorizationValuesAreRejected) {
   for (const auto* value : rejected) {
     httplib::Headers headers = {{"Authorization", value}};
     auto res = client_->Post("/vecset", headers, body.dump(), "application/json");
-    ASSERT_TRUE(res) << value;
-    EXPECT_EQ(res->status, 401) << value;
+    // Bracketed so a value that is empty or ends in a space is legible here.
+    ASSERT_TRUE(res) << "Authorization: [" << value << "]";
+    EXPECT_EQ(res->status, 401) << "Authorization: [" << value << "]";
   }
   EXPECT_FALSE(vector_store_->HasVector("rejected"));
 }
