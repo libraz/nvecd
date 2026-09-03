@@ -6,9 +6,8 @@
  * Reusability: 75% (adapted for nvecd commands)
  */
 
-#include <arpa/inet.h>
 #include <fcntl.h>
-#include <netinet/in.h>
+#include <netdb.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -28,6 +27,7 @@
 #include <vector>
 
 #include "client/protocol_transport.h"
+#include "utils/fd_guard.h"
 
 // Try to use readline if available
 #ifdef HAVE_READLINE
@@ -358,11 +358,14 @@ class NvecdClient {
  public:
   NvecdClient(Config config) : config_(std::move(config)) {}
 
-  // Non-copyable (manages socket file descriptor)
+  // Non-copyable (owns a socket file descriptor)
   NvecdClient(const NvecdClient&) = delete;
   NvecdClient& operator=(const NvecdClient&) = delete;
 
-  // Movable (default)
+  // Movable: the descriptor lives in a move-only owning guard, so the defaulted
+  // move operations leave the source holding no descriptor. Exactly one object
+  // is ever responsible for closing a given fd, and a moved-from client reports
+  // IsConnected() == false instead of aliasing the descriptor it gave away.
   NvecdClient(NvecdClient&&) = default;
   NvecdClient& operator=(NvecdClient&&) = default;
 
@@ -379,37 +382,47 @@ class NvecdClient {
         sleep(config_.retry_interval);
       }
 
-      sock_ = socket(AF_INET, SOCK_STREAM, 0);
-      if (sock_ < 0) {
-        std::cerr << "Failed to create socket: " << strerror(errno) << '\n';
-        attempts++;
-        continue;
+      struct addrinfo* candidates = nullptr;
+      if (auto resolve_error = nvecd::client::transport::ResolveHostV4(config_.host, config_.port, &candidates)) {
+        std::cerr << *resolve_error << '\n';
+        sock_ = nvecd::utils::FDGuard{};
+        return false;  // A name that does not resolve will not resolve on a retry
       }
-      (void)nvecd::client::transport::ConfigureNoSigpipe(sock_);
+      const nvecd::utils::ScopeGuard release_candidates([candidates]() { ::freeaddrinfo(candidates); });
 
-      constexpr int kCliTimeoutSeconds = 5;
-      struct timeval timeout_value = {};
-      timeout_value.tv_sec = kCliTimeoutSeconds;
-      (void)setsockopt(sock_, SOL_SOCKET, SO_RCVTIMEO, &timeout_value, sizeof(timeout_value));
-      (void)setsockopt(sock_, SOL_SOCKET, SO_SNDTIMEO, &timeout_value, sizeof(timeout_value));
+      // Resolution can yield several addresses for one name; try them in order so
+      // an unreachable first candidate does not fail an otherwise usable host.
+      bool connected = false;
+      int saved_errno = 0;
+      for (const struct addrinfo* candidate = candidates; candidate != nullptr; candidate = candidate->ai_next) {
+        sock_ = nvecd::utils::FDGuard{socket(candidate->ai_family, candidate->ai_socktype, candidate->ai_protocol)};
+        if (sock_.Get() < 0) {
+          std::cerr << "Failed to create socket: " << strerror(errno) << '\n';
+          continue;
+        }
+        (void)nvecd::client::transport::ConfigureNoSigpipe(sock_.Get());
 
-      struct sockaddr_in server_addr = {};
-      server_addr.sin_family = AF_INET;
-      server_addr.sin_port = htons(config_.port);
+        constexpr int kCliTimeoutSeconds = 5;
+        struct timeval timeout_value = {};
+        timeout_value.tv_sec = kCliTimeoutSeconds;
+        (void)setsockopt(sock_.Get(), SOL_SOCKET, SO_RCVTIMEO, &timeout_value, sizeof(timeout_value));
+        (void)setsockopt(sock_.Get(), SOL_SOCKET, SO_SNDTIMEO, &timeout_value, sizeof(timeout_value));
 
-      if (inet_pton(AF_INET, config_.host.c_str(), &server_addr.sin_addr) <= 0) {
-        std::cerr << "Invalid address: " << config_.host << '\n';
-        close(sock_);
-        sock_ = -1;
-        return false;  // Don't retry invalid address
+        if (connect(sock_.Get(), candidate->ai_addr, candidate->ai_addrlen) == 0) {
+          connected = true;
+          break;
+        }
+        // Read errno before the guard closes the descriptor, which may overwrite it.
+        saved_errno = errno;
+        sock_ = nvecd::utils::FDGuard{};
       }
 
-      // POSIX socket API requires sockaddr* type conversion from sockaddr_in*
-      if (connect(
-              sock_,
-              reinterpret_cast<struct sockaddr*>(&server_addr),  // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
-              sizeof(server_addr)) < 0) {
-        int saved_errno = errno;
+      if (!connected) {
+        if (saved_errno == 0) {
+          // No candidate survived socket creation; the message is already printed.
+          attempts++;
+          continue;
+        }
         std::cerr << "Connection failed: " << strerror(saved_errno) << '\n';
 
         // Provide helpful hints based on error type
@@ -426,9 +439,6 @@ class NvecdClient {
         } else if (saved_errno == ENETUNREACH || saved_errno == EHOSTUNREACH) {
           std::cerr << "\nNetwork is unreachable. Check hostname and network connectivity.\n";
         }
-
-        close(sock_);
-        sock_ = -1;
 
         // Only retry on ECONNREFUSED (server not ready yet)
         if (saved_errno != ECONNREFUSED) {
@@ -450,15 +460,13 @@ class NvecdClient {
   }
 
   void Disconnect() const {
-    if (sock_ >= 0) {
-      close(sock_);
-      sock_ = -1;
-    }
+    // Move-assigning an empty guard closes the descriptor this client owns.
+    sock_ = nvecd::utils::FDGuard{};
     response_buffer_.clear();
     debug_mode_ = false;
   }
 
-  [[nodiscard]] bool IsConnected() const { return sock_ >= 0; }
+  [[nodiscard]] bool IsConnected() const { return sock_.Get() >= 0; }
 
   [[nodiscard]] std::string SendCommand(const std::string& command) const {
     if (!IsConnected()) {
@@ -468,7 +476,7 @@ class NvecdClient {
     // Send command with \n
     std::string msg = command + "\n";
     int io_error = 0;
-    if (!nvecd::client::transport::SendAll(sock_, msg, &io_error)) {
+    if (!nvecd::client::transport::SendAll(sock_.Get(), msg, &io_error)) {
       const int saved_errno = io_error;
       Disconnect();
       if (saved_errno == EPIPE || saved_errno == ECONNRESET) {
@@ -492,7 +500,8 @@ class NvecdClient {
         break;
       }
       // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
-      const ssize_t received = nvecd::client::transport::ReceiveRetryingEintr(sock_, buffer, sizeof(buffer), &io_error);
+      const ssize_t received =
+          nvecd::client::transport::ReceiveRetryingEintr(sock_.Get(), buffer, sizeof(buffer), &io_error);
       if (received <= 0) {
         Disconnect();
         if (received == 0) {
@@ -506,7 +515,7 @@ class NvecdClient {
         if (saved_errno == ECONNRESET) {
           return "(error) SERVER_DISCONNECTED: Connection reset by server. The server may have crashed.";
         }
-        if (saved_errno == ETIMEDOUT) {
+        if (nvecd::client::transport::IsReceiveTimeout(saved_errno)) {
           return "(error) SERVER_TIMEOUT: Server did not respond in time. It may be under heavy load or frozen.";
         }
         return "(error) Failed to receive response: " + std::string(strerror(saved_errno));
@@ -514,23 +523,20 @@ class NvecdClient {
 
       // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
       response_buffer_.append(buffer, static_cast<size_t>(received));
-      constexpr size_t kMaxBufferedResponseBytes = 64U * 1024U * 1024U;
-      if (response_buffer_.size() > kMaxBufferedResponseBytes) {
+      if (response_buffer_.size() > nvecd::client::transport::kMaxBufferedResponseBytes) {
         Disconnect();
         return "(error) Protocol response exceeds 64 MiB limit";
       }
     }
 
-    // Remove trailing newline
-    if (!response.empty() && response.back() == '\n') {
-      response.pop_back();
-    }
-    // Also remove \r if present
-    if (!response.empty() && response.back() == '\r') {
+    // Remove trailing \r\n
+    while (!response.empty() && (response.back() == '\n' || response.back() == '\r')) {
       response.pop_back();
     }
 
-    if (response.rfind("ERROR", 0) != 0 && response.rfind("-ERR", 0) != 0) {
+    // A refused DEBUG command must not latch the mode: framing a later SIM
+    // response as a debug block the server never sends stalls the read loop.
+    if (!nvecd::client::transport::IsErrorResponse(response)) {
       const std::string upper = nvecd::client::transport::UpperCommand(command);
       if (upper == "DEBUG ON") {
         debug_mode_ = true;
@@ -652,12 +658,12 @@ class NvecdClient {
   [[nodiscard]] int RunSingleCommand(const std::string& command) const {
     std::string response = SendCommand(command);
     PrintResponse(response);
-    return IsErrorResponse(response) ? 1 : 0;
+    return nvecd::client::transport::IsErrorResponse(response) ? 1 : 0;
   }
 
   [[nodiscard]] bool Authenticate(const std::string& password) const {
     const std::string response = SendCommand("AUTH " + password);
-    if (IsErrorResponse(response)) {
+    if (nvecd::client::transport::IsErrorResponse(response)) {
       PrintResponse(response);
       return false;
     }
@@ -665,16 +671,6 @@ class NvecdClient {
   }
 
  private:
-  /**
-   * @brief Classify a server/transport response as an error.
-   *
-   * Recognizes the server's "ERROR ..." replies as well as the locally
-   * synthesized "(error) ..." transport messages produced by SendCommand.
-   */
-  static bool IsErrorResponse(const std::string& response) {
-    return response.find("ERROR") == 0 || response.find("(error)") == 0 || response.find("-ERR") == 0;
-  }
-
   static void PrintHelp() {
     std::cout << "Available commands:" << '\n';
     std::cout << "  EVENT <ctx> ADD <id> <score>      - Track user behavior event" << '\n';
@@ -768,7 +764,7 @@ class NvecdClient {
   }
 
   Config config_;
-  mutable int sock_{-1};
+  mutable nvecd::utils::FDGuard sock_;
   mutable std::string response_buffer_;
   mutable bool debug_mode_{false};
 };
@@ -777,7 +773,7 @@ void PrintUsage(const char* program_name) {
   std::cout << "Usage: " << program_name << " [OPTIONS] [COMMAND]" << '\n';
   std::cout << '\n';
   std::cout << "Options:" << '\n';
-  std::cout << "  -h HOST         Server hostname (default: 127.0.0.1)" << '\n';
+  std::cout << "  -h HOST         Server hostname or IPv4 address (default: 127.0.0.1)" << '\n';
   std::cout << "  -p PORT         Server port (default: 11017)" << '\n';
   std::cout << "  --retry N       Retry connection N times if refused (default: 0)" << '\n';
   std::cout << "  --wait-ready    Keep retrying until server is ready (max 100 attempts)" << '\n';

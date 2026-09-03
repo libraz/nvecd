@@ -10,13 +10,16 @@
 #include <gtest/gtest.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <string>
 #include <thread>
 #include <vector>
 
+#include "canned_response_server.h"
 #include "config/config.h"
 #include "server/nvecd_server.h"
 
@@ -95,6 +98,43 @@ TEST_F(NvecdClientCTest, CreateAndConnect) {
   EXPECT_EQ(nvecdclient_is_connected(client), 1);
 
   nvecdclient_disconnect(client);
+  EXPECT_EQ(nvecdclient_is_connected(client), 0);
+
+  nvecdclient_destroy(client);
+}
+
+TEST_F(NvecdClientCTest, ConnectAcceptsAHostnameAsWellAsANumericAddress) {
+  // The quick-start snippets for this ABI pass "localhost", so the C path has to
+  // resolve a name exactly as the C++ one does.
+  NvecdClientConfig_C config = {};
+  config.host = "localhost";
+  config.port = port_;
+  config.timeout_ms = 5000;         // NOLINT
+  config.recv_buffer_size = 65536;  // NOLINT
+
+  NvecdClient_C* client = nvecdclient_create(&config);
+  ASSERT_NE(client, nullptr);
+
+  EXPECT_EQ(nvecdclient_connect(client), 0) << "Connect failed: " << nvecdclient_get_last_error(client);
+  EXPECT_EQ(nvecdclient_is_connected(client), 1);
+
+  nvecdclient_destroy(client);
+}
+
+TEST(NvecdClientCConnectTest, UnresolvableHostReportsTheResolutionFailure) {
+  // The .invalid top-level domain is reserved precisely so it never resolves.
+  NvecdClientConfig_C config = {};
+  config.host = "nvecd-no-such-host.invalid";
+  config.port = 11017;       // NOLINT
+  config.timeout_ms = 1000;  // NOLINT
+
+  NvecdClient_C* client = nvecdclient_create(&config);
+  ASSERT_NE(client, nullptr);
+
+  EXPECT_EQ(nvecdclient_connect(client), -1);
+  const std::string message = nvecdclient_get_last_error(client);
+  EXPECT_NE(message.find("Failed to resolve host"), std::string::npos) << message;
+  EXPECT_EQ(message.find("Invalid address"), std::string::npos) << message;
   EXPECT_EQ(nvecdclient_is_connected(client), 0);
 
   nvecdclient_destroy(client);
@@ -489,4 +529,74 @@ TEST(NvecdClientCFailureTest, AllocationExceptionCannotEscapeCAbi) {
   config.host = "127.0.0.1";
   nvecd::client::testing::FailNextCAllocationForTest();
   EXPECT_EQ(nvecdclient_create(&config), nullptr);
+}
+
+TEST(NvecdClientCConcurrencyTest, SharedHandleSurvivesConcurrentFailures) {
+  // A handle shared between threads must keep its error slot intact: the
+  // message a caller reads may not be a half-written or already-freed string.
+  NvecdClientConfig_C config = {};
+  config.host = "127.0.0.1";
+  config.port = 1;  // Never connected, so every command fails and reports.
+
+  NvecdClient_C* client = nvecdclient_create(&config);
+  ASSERT_NE(client, nullptr);
+
+  constexpr int kThreadCount = 8;
+  constexpr int kIterations = 200;
+  std::atomic<int> unreadable_messages{0};
+  std::vector<std::thread> threads;
+  threads.reserve(kThreadCount);
+  for (int thread_index = 0; thread_index < kThreadCount; ++thread_index) {
+    threads.emplace_back([client, &unreadable_messages]() {
+      for (int iteration = 0; iteration < kIterations; ++iteration) {
+        if (nvecdclient_event(client, "ctx", "ADD", "item", 1) != -1) {
+          ++unreadable_messages;
+          continue;
+        }
+        const char* message = nvecdclient_get_last_error(client);
+        if (message == nullptr || std::string(message).empty()) {
+          ++unreadable_messages;
+        }
+      }
+    });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+
+  EXPECT_EQ(unreadable_messages.load(), 0);
+  nvecdclient_destroy(client);
+}
+
+TEST(NvecdClientCSaveTest, StartedSaveGetsItsOwnReturnCode) {
+  // Fork mode answers DUMP SAVE before the snapshot exists. Reporting that as
+  // a plain success would tell a backup script to copy a file that is missing
+  // or still holds the previous snapshot.
+  nvecd::testing::CannedResponseServer server(
+      {"OK DUMP_SAVED /tmp/nvecd-complete.dmp\r\n", "OK DUMP_SAVE_STARTED /tmp/nvecd-pending.dmp\r\n"});
+  ASSERT_GT(server.Port(), 0);
+
+  NvecdClientConfig_C config = {};
+  config.host = "127.0.0.1";
+  config.port = server.Port();
+  config.timeout_ms = 2000;
+
+  NvecdClient_C* client = nvecdclient_create(&config);
+  ASSERT_NE(client, nullptr);
+  ASSERT_EQ(nvecdclient_connect(client), 0) << nvecdclient_get_last_error(client);
+
+  char* completed_path = nullptr;
+  EXPECT_EQ(nvecdclient_save(client, nullptr, &completed_path), 0);
+  ASSERT_NE(completed_path, nullptr);
+  EXPECT_STREQ(completed_path, "/tmp/nvecd-complete.dmp");
+  nvecdclient_free_string(completed_path);
+
+  char* pending_path = nullptr;
+  EXPECT_EQ(nvecdclient_save(client, nullptr, &pending_path), 1);
+  ASSERT_NE(pending_path, nullptr);
+  EXPECT_STREQ(pending_path, "/tmp/nvecd-pending.dmp");
+  nvecdclient_free_string(pending_path);
+
+  nvecdclient_disconnect(client);
+  nvecdclient_destroy(client);
 }

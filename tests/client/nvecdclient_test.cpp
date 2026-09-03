@@ -21,8 +21,11 @@
 #include <string>
 #include <thread>
 
+#include "canned_response_server.h"
 #include "client/protocol_transport.h"
 #include "config/config.h"
+#include "events/id_validation.h"
+#include "server/command_parser.h"
 #include "server/nvecd_server.h"
 
 using namespace nvecd;
@@ -237,6 +240,146 @@ TEST(NvecdClientTransportTest, PeerCloseClearsConnectedStateAndBufferedBytes) {
   peer.get();
 }
 
+namespace {
+
+/**
+ * @brief Create a loopback listener whose peer behaviour a test scripts itself.
+ *
+ * @param port Receives the port the listener was bound to.
+ * @return Listening descriptor, or -1 on failure. The caller closes it.
+ */
+int MakeLoopbackListener(uint16_t* port) {
+  const int listener = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (listener < 0) {
+    return -1;
+  }
+  sockaddr_in address = {};
+  address.sin_family = AF_INET;
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  address.sin_port = 0;
+  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) - Required for socket API
+  if (::bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 || ::listen(listener, 1) != 0) {
+    ::close(listener);
+    return -1;
+  }
+  socklen_t address_length = sizeof(address);
+  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) - Required for socket API
+  ::getsockname(listener, reinterpret_cast<sockaddr*>(&address), &address_length);
+  *port = ntohs(address.sin_port);
+  return listener;
+}
+
+// Close so the peer sees a reset. An orderly shutdown would give the client a
+// clean end of stream, which is a different outcome from an I/O failure.
+void CloseWithReset(int connection) {
+  struct linger reset = {};
+  reset.l_onoff = 1;
+  reset.l_linger = 0;
+  (void)::setsockopt(connection, SOL_SOCKET, SO_LINGER, &reset, sizeof(reset));
+  ::close(connection);
+}
+
+}  // namespace
+
+//
+// Socket I/O classification tests
+//
+// A caller that retries a timeout but fails fast on everything else needs the
+// three outcomes apart without reading strerror text out of the message.
+//
+
+TEST(NvecdClientIoClassificationTest, ASilentPeerTimesOutInsteadOfFailingToReceive) {
+  uint16_t port = 0;
+  const int listener = MakeLoopbackListener(&port);
+  ASSERT_GE(listener, 0);
+
+  auto peer = std::async(std::launch::async, [listener]() {
+    const int connection = ::accept(listener, nullptr, nullptr);
+    if (connection >= 0) {
+      char byte = 0;
+      (void)::recv(connection, &byte, 1, 0);  // Take the command, answer nothing
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      ::close(connection);
+    }
+    ::close(listener);
+  });
+
+  ClientConfig config;
+  config.host = "127.0.0.1";
+  config.port = port;
+  config.timeout_ms = 200;
+  NvecdClient client(config);
+  ASSERT_TRUE(client.Connect());
+
+  const auto result = client.SendCommand("PING");
+  ASSERT_FALSE(result);
+  EXPECT_EQ(result.error().code(), ErrorCode::kClientTimeout) << result.error().message();
+  peer.get();
+}
+
+TEST(NvecdClientIoClassificationTest, AResetWhileWaitingIsAReceiveFailure) {
+  uint16_t port = 0;
+  const int listener = MakeLoopbackListener(&port);
+  ASSERT_GE(listener, 0);
+
+  auto peer = std::async(std::launch::async, [listener]() {
+    const int connection = ::accept(listener, nullptr, nullptr);
+    if (connection >= 0) {
+      char byte = 0;
+      (void)::recv(connection, &byte, 1, 0);
+      CloseWithReset(connection);
+    }
+    ::close(listener);
+  });
+
+  ClientConfig config;
+  config.host = "127.0.0.1";
+  config.port = port;
+  config.timeout_ms = 5000;
+  NvecdClient client(config);
+  ASSERT_TRUE(client.Connect());
+
+  const auto result = client.SendCommand("PING");
+  ASSERT_FALSE(result);
+  EXPECT_EQ(result.error().code(), ErrorCode::kClientReceiveFailed) << result.error().message();
+  peer.get();
+}
+
+TEST(NvecdClientIoClassificationTest, ASendOntoAResetConnectionIsASendFailure) {
+  uint16_t port = 0;
+  const int listener = MakeLoopbackListener(&port);
+  ASSERT_GE(listener, 0);
+
+  auto peer = std::async(std::launch::async, [listener]() {
+    const int connection = ::accept(listener, nullptr, nullptr);
+    if (connection >= 0) {
+      char buffer[64] = {};
+      (void)::recv(connection, buffer, sizeof(buffer), 0);
+      const std::string reply = "OK\r\n";
+      (void)::send(connection, reply.data(), reply.size(), 0);
+      CloseWithReset(connection);
+    }
+    ::close(listener);
+  });
+
+  ClientConfig config;
+  config.host = "127.0.0.1";
+  config.port = port;
+  config.timeout_ms = 5000;
+  NvecdClient client(config);
+  ASSERT_TRUE(client.Connect());
+
+  // The first round trip completes, so the reset that follows it is already on
+  // its way when the second command is written.
+  ASSERT_TRUE(client.SendCommand("PING"));
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+  const auto result = client.SendCommand("PING");
+  ASSERT_FALSE(result);
+  EXPECT_EQ(result.error().code(), ErrorCode::kClientSendFailed) << result.error().message();
+  peer.get();
+}
+
 TEST(NvecdClientValidationTest, RejectsWhitespaceInTokenArgumentsInsteadOfQuoting) {
   NvecdClient client(ClientConfig{});
   EXPECT_FALSE(client.Vecset("item with space", {1.0F, 0.0F, 0.0F}));
@@ -245,6 +388,207 @@ TEST(NvecdClientValidationTest, RejectsWhitespaceInTokenArgumentsInsteadOfQuotin
   SearchOptions options;
   options.filter = "category:two words";
   EXPECT_FALSE(client.Simv({1.0F, 0.0F, 0.0F}, 1, "vectors", options));
+}
+
+namespace {
+
+// An unconnected client validates its arguments before it needs a socket, so
+// the error code says whether the argument itself was refused.
+bool ClientRejectsArgument(const Expected<void, Error>& result) {
+  return !result && result.error().code() == ErrorCode::kClientInvalidArgument;
+}
+
+// Byte sequences that sit on the boundary of "what the line protocol can
+// carry": framing bytes, non-framing control bytes, and ordinary text.
+const std::vector<std::string>& BoundaryByteSamples() {
+  static const std::vector<std::string> samples = {"plain",
+                                                   "tab\there",
+                                                   "\tleading",
+                                                   "bell\x01here",
+                                                   "delete\x7Fhere",
+                                                   "high\xC3\xA9"
+                                                   "byte",
+                                                   " ",
+                                                   "carriage\rreturn",
+                                                   "line\nfeed",
+                                                   std::string("nul\0byte", 8)};
+  return samples;
+}
+
+}  // namespace
+
+TEST(NvecdClientValidationTest, PasswordByteRuleMatchesTheWireProtocol) {
+  // The client must not refuse a password the server would have accepted: a
+  // caller cannot see the client-side rule and has no way to work around it.
+  // Both sides are driven from one table, so tightening or loosening either
+  // one alone fails here.
+  NvecdClient client(ClientConfig{});
+  for (const auto& password : BoundaryByteSamples()) {
+    const bool wire_accepts = server::ParseCommand("AUTH " + password).has_value();
+    const bool client_accepts = !ClientRejectsArgument(client.Auth(password));
+    EXPECT_EQ(client_accepts, wire_accepts) << "AUTH password disagreement for sample: " << password;
+  }
+}
+
+TEST(NvecdClientValidationTest, AcceptsEveryIdentifierTheEventLayerAccepts) {
+  // Identifiers are checked again server-side (events::ValidateIdentifier), so
+  // the client only has to avoid being stricter than that rule.
+  NvecdClient client(ClientConfig{});
+  for (const auto& id : BoundaryByteSamples()) {
+    if (!events::ValidateIdentifier("ID", id)) {
+      continue;
+    }
+    EXPECT_FALSE(ClientRejectsArgument(client.Vecset(id, {1.0F, 0.0F, 0.0F})))
+        << "client refused an identifier the server accepts: " << id;
+  }
+}
+
+TEST(NvecdClientMovedFromTest, MovedFromClientIsSafeAndReportsNotConnected) {
+  NvecdClient source(ClientConfig{});
+  NvecdClient moved(std::move(source));
+
+  // NOLINTBEGIN(bugprone-use-after-move,clang-analyzer-cplusplus.Move) - the
+  // moved-from state is exactly what this test pins down.
+  EXPECT_FALSE(source.IsConnected());
+  source.Disconnect();  // Must stay a no-op rather than dereferencing nothing.
+
+  EXPECT_EQ(source.Connect().error().code(), ErrorCode::kClientNotConnected);
+  EXPECT_EQ(source.Event("ctx", "ADD", "item", 1).error().code(), ErrorCode::kClientNotConnected);
+  EXPECT_EQ(source.Vecset("item", {1.0F, 0.0F, 0.0F}).error().code(), ErrorCode::kClientNotConnected);
+  EXPECT_EQ(source.Vecdel("item").error().code(), ErrorCode::kClientNotConnected);
+  EXPECT_EQ(source.Metaset("item", "category:books").error().code(), ErrorCode::kClientNotConnected);
+  EXPECT_EQ(source.Sim("item", 1).error().code(), ErrorCode::kClientNotConnected);
+  EXPECT_EQ(source.Simv({1.0F, 0.0F, 0.0F}, 1).error().code(), ErrorCode::kClientNotConnected);
+  EXPECT_EQ(source.Auth("secret").error().code(), ErrorCode::kClientNotConnected);
+  EXPECT_EQ(source.Info().error().code(), ErrorCode::kClientNotConnected);
+  EXPECT_EQ(source.GetConfig().error().code(), ErrorCode::kClientNotConnected);
+  EXPECT_EQ(source.Save().error().code(), ErrorCode::kClientNotConnected);
+  EXPECT_EQ(source.Load("/tmp/snapshot.dmp").error().code(), ErrorCode::kClientNotConnected);
+  EXPECT_EQ(source.Verify("/tmp/snapshot.dmp").error().code(), ErrorCode::kClientNotConnected);
+  EXPECT_EQ(source.DumpInfo("/tmp/snapshot.dmp").error().code(), ErrorCode::kClientNotConnected);
+  EXPECT_EQ(source.DumpStatus().error().code(), ErrorCode::kClientNotConnected);
+  EXPECT_EQ(source.CacheStats().error().code(), ErrorCode::kClientNotConnected);
+  EXPECT_EQ(source.CacheClear().error().code(), ErrorCode::kClientNotConnected);
+  EXPECT_EQ(source.CacheEnable().error().code(), ErrorCode::kClientNotConnected);
+  EXPECT_EQ(source.CacheDisable().error().code(), ErrorCode::kClientNotConnected);
+  EXPECT_EQ(source.EnableDebug().error().code(), ErrorCode::kClientNotConnected);
+  EXPECT_EQ(source.DisableDebug().error().code(), ErrorCode::kClientNotConnected);
+  EXPECT_EQ(source.SendCommand("INFO").error().code(), ErrorCode::kClientNotConnected);
+
+  // Move assignment leaves the same state, and the target keeps working.
+  NvecdClient target(ClientConfig{});
+  target = std::move(moved);
+  EXPECT_FALSE(moved.IsConnected());
+  EXPECT_EQ(moved.Info().error().code(), ErrorCode::kClientNotConnected);
+  // NOLINTEND(bugprone-use-after-move,clang-analyzer-cplusplus.Move)
+  EXPECT_FALSE(target.IsConnected());
+}
+
+TEST(NvecdClientDebugModeTest, ARefusedDebugCommandDoesNotLatchDebugFraming) {
+  // DEBUG mode changes how the next SIM response is framed: the client waits
+  // for a "# DEBUG <n>" block after the result rows. Latching the mode on a
+  // refused DEBUG ON makes it wait for a block the server never sends, so the
+  // next search stalls until the receive deadline. Every error spelling has to
+  // count as a refusal, not just the one the server happens to emit today.
+  nvecd::testing::CannedResponseServer server({"(error) debug refused\r\n", "OK RESULTS 1\r\nitem 0.9000\r\n"});
+  ASSERT_GT(server.Port(), 0);
+
+  ClientConfig config;
+  config.host = "127.0.0.1";
+  config.port = server.Port();
+  config.timeout_ms = 500;
+
+  NvecdClient client(config);
+  ASSERT_TRUE(client.Connect());
+
+  EXPECT_FALSE(client.EnableDebug());
+
+  // Frames as an ordinary search only if the refusal left debug mode off.
+  auto search = client.Simv({1.0F, 0.0F, 0.0F}, 1, "vectors");
+  ASSERT_TRUE(search) << search.error().message();
+  ASSERT_EQ(search->results.size(), 1U);
+  EXPECT_EQ(search->results[0].id, "item");
+
+  client.Disconnect();
+}
+
+TEST(NvecdClientSaveTest, KeepsStartedSaveDistinctFromCompletedSave) {
+  // A started save names a file that does not exist yet; a completed save
+  // names one that is ready to load. Backup automation cannot tell the
+  // difference if the client reports both the same way.
+  nvecd::testing::CannedResponseServer server(
+      {"OK DUMP_SAVED /tmp/nvecd-complete.dmp\r\n", "OK DUMP_SAVE_STARTED /tmp/nvecd-pending.dmp\r\n"});
+  ASSERT_GT(server.Port(), 0);
+
+  ClientConfig config;
+  config.host = "127.0.0.1";
+  config.port = server.Port();
+  config.timeout_ms = 2000;
+
+  NvecdClient client(config);
+  ASSERT_TRUE(client.Connect());
+
+  auto completed = client.Save();
+  ASSERT_TRUE(completed) << completed.error().message();
+  EXPECT_EQ(completed->filepath, "/tmp/nvecd-complete.dmp");
+  EXPECT_TRUE(completed->completed);
+
+  auto started = client.Save();
+  ASSERT_TRUE(started) << started.error().message();
+  EXPECT_EQ(started->filepath, "/tmp/nvecd-pending.dmp");
+  EXPECT_FALSE(started->completed);
+
+  client.Disconnect();
+}
+
+TEST(NvecdClientErrorParsingTest, EveryMethodSurvivesTheDocumentedErrorShapes) {
+  // A bare "ERROR" is five bytes. Taking the body as substr(6) threw
+  // std::out_of_range straight out of a library whose contract is to report
+  // failures through Expected and never throw - across the C ABI that is
+  // undefined behaviour. The three prefixes the client documents as errors
+  // must all reach the caller as kClientServerError, whichever method parsed
+  // them, so that a non-conforming peer or a corrupted stream cannot make one
+  // method behave differently from another.
+  nvecd::testing::CannedResponseServer server(
+      {"ERROR\r\n", "-ERR unauthorized\r\n", "(error) broken\r\n", "ERROR\r\n", "ERROR Item not found\r\n"});
+  ASSERT_GT(server.Port(), 0);
+
+  ClientConfig config;
+  config.host = "127.0.0.1";
+  config.port = server.Port();
+  config.timeout_ms = 2000;
+
+  NvecdClient client(config);
+  ASSERT_TRUE(client.Connect());
+
+  const auto vecset = client.Vecset("item", {1.0F, 0.0F, 0.0F});
+  ASSERT_FALSE(vecset);
+  EXPECT_EQ(vecset.error().code(), ErrorCode::kClientServerError);
+  EXPECT_EQ(vecset.error().message(), "ERROR") << "a body-less error keeps its text instead of reading past the end";
+
+  const auto info = client.Info();
+  ASSERT_FALSE(info);
+  EXPECT_EQ(info.error().code(), ErrorCode::kClientServerError)
+      << "-ERR is a documented error shape, not a protocol error";
+  EXPECT_EQ(info.error().message(), "-ERR unauthorized");
+
+  const auto get_config = client.GetConfig();
+  ASSERT_FALSE(get_config);
+  EXPECT_EQ(get_config.error().code(), ErrorCode::kClientServerError);
+  EXPECT_EQ(get_config.error().message(), "(error) broken");
+
+  const auto save = client.Save();
+  ASSERT_FALSE(save);
+  EXPECT_EQ(save.error().code(), ErrorCode::kClientServerError);
+  EXPECT_EQ(save.error().message(), "ERROR");
+
+  // The ordinary shape still has its "ERROR " prefix stripped.
+  const auto vecdel = client.Vecdel("item");
+  ASSERT_FALSE(vecdel);
+  EXPECT_EQ(vecdel.error().code(), ErrorCode::kClientServerError);
+  EXPECT_EQ(vecdel.error().message(), "Item not found");
+
+  client.Disconnect();
 }
 
 //
@@ -273,6 +617,43 @@ TEST_F(NvecdClientTest, ConnectInvalidPort) {
   NvecdClient client(config);
   auto result = client.Connect();
   EXPECT_FALSE(result);
+  EXPECT_FALSE(client.IsConnected());
+}
+
+TEST_F(NvecdClientTest, ConnectAcceptsAHostnameAsWellAsANumericAddress) {
+  // The documented host parameter is a hostname or a numeric address, and the
+  // header's own example passes "localhost". Both spellings reach the same
+  // server, so neither can be refused before a connection is attempted.
+  ClientConfig config;
+  config.host = "localhost";
+  config.port = port_;
+
+  NvecdClient client(config);
+  auto result = client.Connect();
+  ASSERT_TRUE(result) << "Connect failed: " << result.error().message();
+  EXPECT_TRUE(client.IsConnected());
+  EXPECT_TRUE(client.Info()) << "A hostname connection must carry commands like a numeric one";
+
+  client.Disconnect();
+}
+
+TEST(NvecdClientConnectTest, UnresolvableHostFailsAsAConnectionFailure) {
+  // The .invalid top-level domain is reserved precisely so it never resolves.
+  ClientConfig config;
+  config.host = "nvecd-no-such-host.invalid";
+  config.port = 11017;
+  config.timeout_ms = 1000;
+
+  NvecdClient client(config);
+  auto result = client.Connect();
+  ASSERT_FALSE(result);
+  EXPECT_EQ(result.error().code(), ErrorCode::kClientConnectionFailed);
+  // The message has to name the resolution failure: a caller that reads
+  // "invalid address" looks for a typo in an address it never supplied.
+  EXPECT_NE(result.error().message().find("Failed to resolve host"), std::string::npos)
+      << "message was: " << result.error().message();
+  EXPECT_EQ(result.error().message().find("Invalid address"), std::string::npos)
+      << "message was: " << result.error().message();
   EXPECT_FALSE(client.IsConnected());
 }
 
@@ -755,16 +1136,18 @@ TEST_F(NvecdClientTest, DumpCommandsBasic) {
   NvecdClient client(config);
   ASSERT_TRUE(client.Connect());
 
-  // Save with default filename
+  // Save with default filename. This fixture runs the server in lock mode, so
+  // the snapshot is complete by the time the command returns.
   auto save_result = client.Save("");
   ASSERT_TRUE(save_result) << "Save failed: " << save_result.error().message();
-  EXPECT_FALSE(save_result->empty());
-  EXPECT_EQ(save_result->find("OK DUMP_SAVED"), std::string::npos);
+  EXPECT_FALSE(save_result->filepath.empty());
+  EXPECT_EQ(save_result->filepath.find("OK DUMP_SAVED"), std::string::npos);
+  EXPECT_TRUE(save_result->completed) << "lock mode finishes the snapshot before replying";
 
   // A returned save path is directly consumable by Load(); both APIs strip
   // their protocol status prefixes rather than leaking them to callers.
-  auto load_result = client.Load(*save_result);
+  auto load_result = client.Load(save_result->filepath);
   ASSERT_TRUE(load_result) << "Load failed: " << load_result.error().message();
   EXPECT_EQ(load_result->find("OK DUMP_LOADED"), std::string::npos);
-  EXPECT_TRUE(std::filesystem::equivalent(*load_result, *save_result));
+  EXPECT_TRUE(std::filesystem::equivalent(*load_result, save_result->filepath));
 }

@@ -101,6 +101,24 @@ struct SearchOptions {
 };
 
 /**
+ * @brief Outcome of a DUMP SAVE request
+ *
+ * The server answers DUMP SAVE differently depending on @c snapshot.mode, and
+ * the two answers carry different durability guarantees:
+ *
+ * - lock mode replies @c "OK DUMP_SAVED <path>": the snapshot is written and
+ *   the file at @c filepath is complete and loadable when Save() returns.
+ * - fork mode (the default) replies @c "OK DUMP_SAVE_STARTED <path>": a child
+ *   process has been started and @c filepath does not exist yet, or still
+ *   holds the previous snapshot. It only becomes loadable once the writer
+ *   finishes; poll DumpStatus() before reading or copying it.
+ */
+struct SaveResult {
+  std::string filepath;   ///< Snapshot path reported by the server
+  bool completed{false};  ///< true if the snapshot is already complete and loadable
+};
+
+/**
  * @brief Server information
  *
  * Field names mirror the keys emitted by the server's INFO command
@@ -125,7 +143,7 @@ struct ServerInfo {
 // NOLINTBEGIN(readability-magic-numbers,cppcoreguidelines-avoid-magic-numbers) - Default nvecd client
 // settings
 struct ClientConfig {
-  std::string host = "127.0.0.1";     ///< Server hostname
+  std::string host = "127.0.0.1";     ///< Server hostname or IPv4 address
   uint16_t port = 11017;              ///< Default port for nvecd protocol
   uint32_t timeout_ms = 5000;         ///< Default timeout in milliseconds
   uint32_t recv_buffer_size = 65536;  ///< Default buffer size (64KB)
@@ -136,8 +154,18 @@ struct ClientConfig {
 /**
  * @brief nvecd client
  *
- * This class provides a thread-safe client for nvecd. Each instance
- * maintains a single TCP connection to the server.
+ * Each instance maintains a single connection to the server.
+ *
+ * Concurrency: concurrent calls on one instance are safe. Every command is a
+ * request/response round trip and the instance serializes them internally, so
+ * sharing one connected instance between threads is supported and does not
+ * require one connection per thread. Concurrent calls do not run in parallel:
+ * a slow command delays the others queued behind it.
+ *
+ * Moved-from state: a moved-from instance stays valid and destructible.
+ * IsConnected() reports false on it, Disconnect() is a no-op, and every
+ * command returns ErrorCode::kClientNotConnected instead of dereferencing the
+ * implementation it gave away.
  *
  * Example usage:
  * @code
@@ -315,10 +343,18 @@ class NvecdClient {
 
   /**
    * @brief Save snapshot to disk (DUMP SAVE command)
+   *
+   * Under the default @c snapshot.mode: "fork" the server writes the snapshot
+   * in a child process and answers as soon as that child exists, so a
+   * successful return does not mean the file is readable. Inspect
+   * SaveResult::completed and poll DumpStatus() until the writer finishes
+   * before loading, copying or uploading the file.
+   *
    * @param filepath Optional filepath (empty for default)
-   * @return Expected<std::string, Error> - saved filepath or error
+   * @return Expected<SaveResult, Error> - snapshot path with its completion
+   *         state, or error
    */
-  nvecd::utils::Expected<std::string, nvecd::utils::Error> Save(const std::string& filepath = "") const;
+  nvecd::utils::Expected<SaveResult, nvecd::utils::Error> Save(const std::string& filepath = "") const;
 
   /**
    * @brief Load snapshot from disk (DUMP LOAD command)
@@ -396,6 +432,8 @@ class NvecdClient {
 
  private:
   class Impl;  // Forward declaration for PIMPL
+  // Null only after this object has been moved from. Every public method has
+  // to tolerate that state; see the moved-from contract above.
   mutable std::unique_ptr<Impl> impl_;
 };
 

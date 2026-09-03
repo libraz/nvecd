@@ -9,8 +9,16 @@
  * This header provides a C-compatible interface for the nvecd client library,
  * suitable for use with FFI bindings (node-gyp, ctypes, cffi, etc.).
  *
- * All functions return 0 on success, non-zero on error.
- * Use nvecdclient_get_last_error() to retrieve error messages.
+ * All functions return 0 on success and a negative value on error, except
+ * nvecdclient_save(), which also reports an asynchronous save with a positive
+ * value. Use nvecdclient_get_last_error() to retrieve error messages.
+ *
+ * Concurrency: a handle may be used from several threads at once. Commands on
+ * one handle are serialized internally (they do not run in parallel), and the
+ * handle's error slot is synchronized, so no call can observe a torn or freed
+ * error message. Sharing one handle avoids paying for one server connection
+ * per thread. Handle creation and destruction are not synchronized: no call
+ * may be in flight when nvecdclient_destroy() runs.
  *
  * Note: This is a C API header, so typedef is used instead of using declarations
  * for C compatibility. The modernize-use-using check is disabled for this file.
@@ -36,7 +44,7 @@ typedef struct NvecdClient_C NvecdClient_C;
  * @brief Client configuration
  */
 typedef struct {
-  const char* host;           ///< Server hostname (default: "127.0.0.1")
+  const char* host;           ///< Server hostname or IPv4 address (default: "127.0.0.1")
   uint16_t port;              ///< Server port (default: 11017)
   uint32_t timeout_ms;        ///< Connection timeout in milliseconds (default: 5000)
   uint32_t recv_buffer_size;  ///< Receive buffer size (default: 65536)
@@ -271,10 +279,18 @@ int nvecdclient_get_config(NvecdClient_C* client, char** config_str);
 /**
  * @brief Save snapshot to disk (DUMP SAVE command)
  *
+ * Under the default snapshot mode "fork" the server writes the snapshot in a
+ * child process and answers as soon as that child exists, so the file named by
+ * @p saved_path is not readable yet: it may be missing, or still hold the
+ * previous snapshot. Poll nvecdclient_dump_status() until the writer finishes
+ * before loading, copying or uploading it.
+ *
  * @param client Client handle
  * @param filepath Optional filepath (NULL for default)
- * @param saved_path Output saved filepath (caller must free with nvecdclient_free_string)
- * @return 0 on success, -1 on error
+ * @param saved_path Output snapshot filepath (caller must free with nvecdclient_free_string).
+ *                   Written for both success codes.
+ * @return 0 when the snapshot is complete and loadable, 1 when a background
+ *         writer was started and the file is not ready yet, -1 on error
  */
 int nvecdclient_save(NvecdClient_C* client, const char* filepath, char** saved_path);
 
@@ -368,6 +384,10 @@ int nvecdclient_debug_off(NvecdClient_C* client);
 
 /**
  * @brief Get last error message
+ *
+ * The returned buffer belongs to the calling thread and stays valid until that
+ * thread calls this function again; copy it if it has to outlive that. Other
+ * threads using the same handle never invalidate it.
  *
  * @param client Client handle
  * @return Error message string (do not free)

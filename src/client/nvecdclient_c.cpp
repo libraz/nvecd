@@ -18,8 +18,10 @@
 #include <atomic>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "client/nvecdclient.h"
@@ -44,11 +46,24 @@ void MaybeFailCAllocationForTest() {
 }  // namespace nvecd::client::testing
 #endif
 
-// Opaque handle structure
+// Opaque handle structure.
+//
+// The C++ client already serializes commands on one instance, so the only
+// mutable state the C wrapper adds is the error slot. Two threads failing at
+// the same time on a shared handle would otherwise write and read one
+// std::string without synchronization, so every access goes through
+// error_mutex.
 struct NvecdClient_C {
   std::unique_ptr<NvecdClient> client;
-  std::string last_error;
+  mutable std::mutex error_mutex;
+  std::string last_error;  ///< Guarded by error_mutex
 };
+
+// Record the message nvecdclient_get_last_error will report for this handle.
+static void set_last_error(NvecdClient_C* client, std::string message) {
+  const std::lock_guard<std::mutex> lock(client->error_mutex);
+  client->last_error = std::move(message);
+}
 
 // Helper: Allocate C string copy
 static char* strdup_safe(const std::string& str) {
@@ -62,10 +77,10 @@ static char* strdup_safe(const std::string& str) {
 // Transfer an owned string to a C out-parameter. Do not report success with a
 // null output when allocation fails: callers otherwise cannot distinguish OOM
 // from a valid empty response.
-static int copy_string_result(const std::string& value, char** out, std::string& last_error) {
+static int copy_string_result(const std::string& value, char** out, NvecdClient_C* client) {
   char* copy = strdup_safe(value);
   if (copy == nullptr) {
-    last_error = "Memory allocation failed";
+    set_last_error(client, "Memory allocation failed");
     return -1;
   }
   *out = copy;
@@ -94,10 +109,10 @@ static SearchOptions to_cpp_options(const NvecdSearchOptions_C* options) {
 // On success *out is set and 0 is returned; on allocation failure last_error is
 // set, *out is left untouched, and -1 is returned. Ownership of the returned
 // struct transfers to the caller (free via nvecdclient_free_sim_response).
-static int build_sim_response(const SimResponse& src, NvecdSimResponse_C** out, std::string& last_error) {
+static int build_sim_response(const SimResponse& src, NvecdSimResponse_C** out, NvecdClient_C* client) {
   auto* c_result = static_cast<NvecdSimResponse_C*>(malloc(sizeof(NvecdSimResponse_C)));
   if (c_result == nullptr) {
-    last_error = "Memory allocation failed";
+    set_last_error(client, "Memory allocation failed");
     return -1;
   }
 
@@ -105,7 +120,7 @@ static int build_sim_response(const SimResponse& src, NvecdSimResponse_C** out, 
   c_result->mode = strdup_safe(src.mode);
   if (c_result->mode == nullptr) {
     free(c_result);
-    last_error = "Memory allocation failed";
+    set_last_error(client, "Memory allocation failed");
     return -1;
   }
 
@@ -114,7 +129,7 @@ static int build_sim_response(const SimResponse& src, NvecdSimResponse_C** out, 
     if (c_result->results == nullptr) {
       free(c_result->mode);
       free(c_result);
-      last_error = "Memory allocation failed";
+      set_last_error(client, "Memory allocation failed");
       return -1;
     }
 
@@ -127,7 +142,7 @@ static int build_sim_response(const SimResponse& src, NvecdSimResponse_C** out, 
         free(c_result->results);
         free(c_result->mode);
         free(c_result);
-        last_error = "Memory allocation failed";
+        set_last_error(client, "Memory allocation failed");
         return -1;
       }
       c_result->results[i].score = src.results[i].score;
@@ -216,7 +231,7 @@ int nvecdclient_connect(NvecdClient_C* client) {
 
   auto result = client->client->Connect();
   if (!result) {
-    client->last_error = result.error().to_string();
+    set_last_error(client, result.error().to_string());
     return -1;
   }
 
@@ -248,7 +263,7 @@ int nvecdclient_event(NvecdClient_C* client, const char* ctx, const char* type, 
 
   auto result = client->client->Event(ctx, type, id, score);
   if (!result) {
-    client->last_error = result.error().to_string();
+    set_last_error(client, result.error().to_string());
     return -1;
   }
 
@@ -263,7 +278,7 @@ int nvecdclient_vecset(NvecdClient_C* client, const char* id, const float* vecto
   std::vector<float> vec(vector, vector + dimension);
   auto result = client->client->Vecset(id, vec);
   if (!result) {
-    client->last_error = result.error().to_string();
+    set_last_error(client, result.error().to_string());
     return -1;
   }
 
@@ -277,7 +292,7 @@ int nvecdclient_vecdel(NvecdClient_C* client, const char* id) {
 
   auto result = client->client->Vecdel(id);
   if (!result) {
-    client->last_error = result.error().to_string();
+    set_last_error(client, result.error().to_string());
     return -1;
   }
   return 0;
@@ -290,7 +305,7 @@ int nvecdclient_metaset(NvecdClient_C* client, const char* id, const char* metad
 
   auto result = client->client->Metaset(id, metadata);
   if (!result) {
-    client->last_error = result.error().to_string();
+    set_last_error(client, result.error().to_string());
     return -1;
   }
 
@@ -311,11 +326,11 @@ int nvecdclient_sim_ex(NvecdClient_C* client, const char* id, uint32_t top_k, co
   std::string mode_str = (mode != nullptr) ? mode : "fusion";
   auto cpp_result = client->client->Sim(id, top_k, mode_str, to_cpp_options(options));
   if (!cpp_result) {
-    client->last_error = cpp_result.error().to_string();
+    set_last_error(client, cpp_result.error().to_string());
     return -1;
   }
 
-  return build_sim_response(*cpp_result, result, client->last_error);
+  return build_sim_response(*cpp_result, result, client);
 }
 
 int nvecdclient_simv(NvecdClient_C* client, const float* vector, size_t dimension, uint32_t top_k, const char* mode,
@@ -333,11 +348,11 @@ int nvecdclient_simv_ex(NvecdClient_C* client, const float* vector, size_t dimen
   std::string mode_str = (mode != nullptr) ? mode : "vectors";
   auto cpp_result = client->client->Simv(vec, top_k, mode_str, to_cpp_options(options));
   if (!cpp_result) {
-    client->last_error = cpp_result.error().to_string();
+    set_last_error(client, cpp_result.error().to_string());
     return -1;
   }
 
-  return build_sim_response(*cpp_result, result, client->last_error);
+  return build_sim_response(*cpp_result, result, client);
 }
 
 //
@@ -351,7 +366,7 @@ int nvecdclient_auth(NvecdClient_C* client, const char* password) {
 
   auto result = client->client->Auth(password);
   if (!result) {
-    client->last_error = result.error().to_string();
+    set_last_error(client, result.error().to_string());
     return -1;
   }
 
@@ -365,21 +380,21 @@ int nvecdclient_info(NvecdClient_C* client, NvecdServerInfo_C** info) {
 
   auto cpp_result = client->client->Info();
   if (!cpp_result) {
-    client->last_error = cpp_result.error().to_string();
+    set_last_error(client, cpp_result.error().to_string());
     return -1;
   }
 
   // Allocate C result structure
   auto* c_info = static_cast<NvecdServerInfo_C*>(malloc(sizeof(NvecdServerInfo_C)));
   if (c_info == nullptr) {
-    client->last_error = "Memory allocation failed";
+    set_last_error(client, "Memory allocation failed");
     return -1;
   }
 
   c_info->version = strdup_safe(cpp_result->version);
   if (c_info->version == nullptr) {
     free(c_info);
-    client->last_error = "Memory allocation failed";
+    set_last_error(client, "Memory allocation failed");
     return -1;
   }
   c_info->uptime_seconds = cpp_result->uptime_seconds;
@@ -403,11 +418,11 @@ int nvecdclient_get_config(NvecdClient_C* client, char** config_str) {
 
   auto result = client->client->GetConfig();
   if (!result) {
-    client->last_error = result.error().to_string();
+    set_last_error(client, result.error().to_string());
     return -1;
   }
 
-  return copy_string_result(*result, config_str, client->last_error);
+  return copy_string_result(*result, config_str, client);
 }
 
 int nvecdclient_save(NvecdClient_C* client, const char* filepath, char** saved_path) {
@@ -418,11 +433,18 @@ int nvecdclient_save(NvecdClient_C* client, const char* filepath, char** saved_p
   std::string filepath_str = (filepath != nullptr) ? filepath : "";
   auto result = client->client->Save(filepath_str);
   if (!result) {
-    client->last_error = result.error().to_string();
+    set_last_error(client, result.error().to_string());
     return -1;
   }
 
-  return copy_string_result(*result, saved_path, client->last_error);
+  const int copy_status = copy_string_result(result->filepath, saved_path, client);
+  if (copy_status != 0) {
+    return copy_status;
+  }
+  // In fork mode the snapshot is still being written when the server answers.
+  // Reporting that as a plain success would tell a backup script to copy a
+  // file that does not exist yet, so it gets its own return code.
+  return result->completed ? 0 : 1;
 }
 
 int nvecdclient_load(NvecdClient_C* client, const char* filepath, char** loaded_path) {
@@ -432,11 +454,11 @@ int nvecdclient_load(NvecdClient_C* client, const char* filepath, char** loaded_
 
   auto result = client->client->Load(filepath);
   if (!result) {
-    client->last_error = result.error().to_string();
+    set_last_error(client, result.error().to_string());
     return -1;
   }
 
-  return copy_string_result(*result, loaded_path, client->last_error);
+  return copy_string_result(*result, loaded_path, client);
 }
 
 int nvecdclient_verify(NvecdClient_C* client, const char* filepath, char** result_str) {
@@ -446,11 +468,11 @@ int nvecdclient_verify(NvecdClient_C* client, const char* filepath, char** resul
 
   auto result = client->client->Verify(filepath);
   if (!result) {
-    client->last_error = result.error().to_string();
+    set_last_error(client, result.error().to_string());
     return -1;
   }
 
-  return copy_string_result(*result, result_str, client->last_error);
+  return copy_string_result(*result, result_str, client);
 }
 
 int nvecdclient_dump_info(NvecdClient_C* client, const char* filepath, char** info_str) {
@@ -460,11 +482,11 @@ int nvecdclient_dump_info(NvecdClient_C* client, const char* filepath, char** in
 
   auto result = client->client->DumpInfo(filepath);
   if (!result) {
-    client->last_error = result.error().to_string();
+    set_last_error(client, result.error().to_string());
     return -1;
   }
 
-  return copy_string_result(*result, info_str, client->last_error);
+  return copy_string_result(*result, info_str, client);
 }
 
 int nvecdclient_dump_status(NvecdClient_C* client, char** status_str) {
@@ -474,11 +496,11 @@ int nvecdclient_dump_status(NvecdClient_C* client, char** status_str) {
 
   auto result = client->client->DumpStatus();
   if (!result) {
-    client->last_error = result.error().to_string();
+    set_last_error(client, result.error().to_string());
     return -1;
   }
 
-  return copy_string_result(*result, status_str, client->last_error);
+  return copy_string_result(*result, status_str, client);
 }
 
 int nvecdclient_cache_stats(NvecdClient_C* client, char** stats_str) {
@@ -488,11 +510,11 @@ int nvecdclient_cache_stats(NvecdClient_C* client, char** stats_str) {
 
   auto result = client->client->CacheStats();
   if (!result) {
-    client->last_error = result.error().to_string();
+    set_last_error(client, result.error().to_string());
     return -1;
   }
 
-  return copy_string_result(*result, stats_str, client->last_error);
+  return copy_string_result(*result, stats_str, client);
 }
 
 int nvecdclient_cache_clear(NvecdClient_C* client) {
@@ -502,7 +524,7 @@ int nvecdclient_cache_clear(NvecdClient_C* client) {
 
   auto result = client->client->CacheClear();
   if (!result) {
-    client->last_error = result.error().to_string();
+    set_last_error(client, result.error().to_string());
     return -1;
   }
 
@@ -516,7 +538,7 @@ int nvecdclient_cache_enable(NvecdClient_C* client) {
 
   auto result = client->client->CacheEnable();
   if (!result) {
-    client->last_error = result.error().to_string();
+    set_last_error(client, result.error().to_string());
     return -1;
   }
 
@@ -530,7 +552,7 @@ int nvecdclient_cache_disable(NvecdClient_C* client) {
 
   auto result = client->client->CacheDisable();
   if (!result) {
-    client->last_error = result.error().to_string();
+    set_last_error(client, result.error().to_string());
     return -1;
   }
 
@@ -544,7 +566,7 @@ int nvecdclient_debug_on(NvecdClient_C* client) {
 
   auto result = client->client->EnableDebug();
   if (!result) {
-    client->last_error = result.error().to_string();
+    set_last_error(client, result.error().to_string());
     return -1;
   }
 
@@ -558,7 +580,7 @@ int nvecdclient_debug_off(NvecdClient_C* client) {
 
   auto result = client->client->DisableDebug();
   if (!result) {
-    client->last_error = result.error().to_string();
+    set_last_error(client, result.error().to_string());
     return -1;
   }
 
@@ -569,7 +591,16 @@ const char* nvecdclient_get_last_error(const NvecdClient_C* client) {
   if (client == nullptr) {
     return "Invalid client handle";
   }
-  return client->last_error.c_str();
+  // Hand back a copy owned by the calling thread rather than a pointer into
+  // the handle: another thread may replace the handle's message at any moment,
+  // and reallocating that std::string would leave the caller holding freed
+  // bytes. The copy stays valid until this thread asks again.
+  static thread_local std::string reported_error;
+  {
+    const std::lock_guard<std::mutex> lock(client->error_mutex);
+    reported_error = client->last_error;
+  }
+  return reported_error.c_str();
 }
 
 //
@@ -642,7 +673,7 @@ static void record_c_api_exception(NvecdClient_C* client) noexcept {
     return;
   }
   try {
-    client->last_error = "Unhandled exception at C API boundary";
+    set_last_error(client, "Unhandled exception at C API boundary");
   } catch (...) {
   }
 }

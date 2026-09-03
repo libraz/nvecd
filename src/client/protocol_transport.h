@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <netdb.h>
 #include <sys/socket.h>
 
 #include <cctype>
@@ -24,6 +25,12 @@ struct ResponseFrame {
   bool debug_similarity = false;
 };
 
+// Upper bound on the bytes a client buffers for one response. A peer that never
+// completes a frame would otherwise grow the buffer without limit, so both the
+// library and the CLI stop at the same point rather than at two limits that can
+// drift apart.
+constexpr size_t kMaxBufferedResponseBytes = 64U * 1024U * 1024U;
+
 inline std::string UpperCommand(std::string_view command) {
   while (!command.empty() && std::isspace(static_cast<unsigned char>(command.front())) != 0) {
     command.remove_prefix(1);
@@ -41,6 +48,20 @@ inline std::string UpperCommand(std::string_view command) {
 inline bool StartsWithCommand(const std::string& command, std::string_view prefix) {
   return command == prefix || (command.size() > prefix.size() && command.compare(0, prefix.size(), prefix) == 0 &&
                                std::isspace(static_cast<unsigned char>(command[prefix.size()])) != 0);
+}
+
+/**
+ * @brief Whether a response line is an error reply.
+ *
+ * The server answers a failure with "ERROR ...", and the Redis-style "-ERR ..."
+ * and "(error) ..." spellings are accepted alongside it; clients also
+ * synthesize "(error) ..." locally for transport failures they report through
+ * the same channel. Response framing, error reporting and the DEBUG mode latch
+ * all have to agree on what counts as an error, so they classify from this one
+ * predicate rather than each spelling out the prefix list.
+ */
+inline bool IsErrorResponse(std::string_view response) {
+  return response.rfind("ERROR", 0) == 0 || response.rfind("-ERR", 0) == 0 || response.rfind("(error)", 0) == 0;
 }
 
 inline ResponseFrame FrameForCommand(std::string_view command, bool debug_mode) {
@@ -151,7 +172,7 @@ inline std::optional<size_t> CompleteResponseLength(const std::string& buffer, R
     return std::nullopt;
   }
   const std::string_view header = LineText(buffer, 0, *first_line_end);
-  const bool error = header.rfind("ERROR", 0) == 0 || header.rfind("-ERR", 0) == 0 || header.rfind("(error)", 0) == 0;
+  const bool error = IsErrorResponse(header);
 
   if (frame.end_terminated && !error) {
     constexpr std::string_view kEndCrLf = "\nEND\r\n";
@@ -209,6 +230,52 @@ inline std::optional<size_t> CompleteResponseLength(const std::string& buffer, R
   }
 
   return CompleteValueLength(buffer, 0);
+}
+
+/**
+ * @brief Resolve a host given as either a hostname or a numeric IPv4 address.
+ *
+ * The host a caller supplies is documented as a hostname or a numeric address,
+ * so resolution goes through getaddrinfo rather than a numeric-only parse:
+ * "localhost" has to reach the server exactly as "127.0.0.1" does. The port
+ * travels as a service string with AI_NUMERICSERV so no name lookup is
+ * attempted for it.
+ *
+ * @param host Hostname or numeric IPv4 address.
+ * @param port TCP port.
+ * @param candidates Receives the resolved address list, which the caller frees
+ *        with freeaddrinfo(). Only written when this function succeeds.
+ * @return std::nullopt on success, otherwise the resolution failure message.
+ */
+inline std::optional<std::string> ResolveHostV4(const std::string& host, uint16_t port, struct addrinfo** candidates) {
+  struct addrinfo hints = {};
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_STREAM;
+  hints.ai_flags = AI_NUMERICSERV;
+
+  const std::string service = std::to_string(port);
+  const int status = ::getaddrinfo(host.c_str(), service.c_str(), &hints, candidates);
+  if (status != 0) {
+    return "Failed to resolve host " + host + ": " + gai_strerror(status);
+  }
+  if (*candidates == nullptr) {
+    return "Failed to resolve host " + host + ": no address returned";
+  }
+  return std::nullopt;
+}
+
+/**
+ * @brief Whether a receive error means the deadline expired rather than the
+ *        connection failing.
+ *
+ * SO_RCVTIMEO expiry surfaces as EAGAIN/EWOULDBLOCK on some platforms and as
+ * ETIMEDOUT on others. All of them leave the connection intact, which is what
+ * separates a retryable timeout from a genuine receive failure. Every client
+ * surface classifies from this one predicate: recognising a different set in
+ * one of them makes them disagree about what happened on the same socket.
+ */
+inline bool IsReceiveTimeout(int error_code) {
+  return error_code == EAGAIN || error_code == EWOULDBLOCK || error_code == ETIMEDOUT;
 }
 
 inline bool ConfigureNoSigpipe(int socket_fd) {

@@ -9,14 +9,14 @@
 
 #include "client/nvecdclient.h"
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
+#include <netdb.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/un.h>
 #include <unistd.h>
 
 #include <cctype>
+#include <cerrno>
 #include <charconv>
 #include <cstring>
 #include <iomanip>
@@ -29,6 +29,7 @@
 #include "client/protocol_transport.h"
 #include "utils/error.h"
 #include "utils/expected.h"
+#include "utils/fd_guard.h"
 
 using namespace nvecd::utils;
 
@@ -69,6 +70,17 @@ uint64_t ParseUint64(const std::string& value, uint64_t fallback = 0) {
 }
 
 /**
+ * @brief Build the timeval that SO_RCVTIMEO/SO_SNDTIMEO expect.
+ */
+struct timeval MakeSocketTimeout(uint32_t timeout_ms) {
+  struct timeval value = {};
+  value.tv_sec = static_cast<decltype(value.tv_sec)>(timeout_ms / kMillisecondsPerSecond);
+  value.tv_usec =
+      static_cast<decltype(value.tv_usec)>((timeout_ms % kMillisecondsPerSecond) * kMicrosecondsPerMillisecond);
+  return value;
+}
+
+/**
  * @brief Serialize a float with full round-trippable precision.
  */
 std::string FormatFloat(float value) {
@@ -93,14 +105,24 @@ void AppendSearchOptions(std::ostringstream& cmd, const SearchOptions& options) 
 }
 
 /**
- * @brief Validate that a string does not contain ASCII control characters
+ * @brief Reject bytes the line protocol cannot carry.
+ *
+ * The wire protocol is the authority on what a command may contain: the server
+ * refuses an embedded NUL and an embedded CR/LF and accepts every other byte
+ * (see ParseCommand in src/server/command_parser.cpp). Rejecting more than
+ * that here - a blanket std::iscntrl test also excludes TAB - makes the shipped
+ * client refuse input the server, the CLI and a hand-written socket client all
+ * accept, which is a difference callers cannot see or work around.
+ *
+ * These three bytes are exactly the ones that would break framing: NUL
+ * terminates the command for the parser, CR/LF splits one command into two.
  */
-std::optional<std::string> ValidateNoControlCharacters(const std::string& value, const char* field_name) {
+std::optional<std::string> ValidateNoFramingBytes(const std::string& value, const char* field_name) {
   for (unsigned char character : value) {
-    if (std::iscntrl(character) != 0) {
+    if (character == '\0' || character == '\r' || character == '\n') {
       std::ostringstream oss;
-      oss << "Input for " << field_name << " contains control character 0x" << std::uppercase << std::hex
-          << std::setw(2) << std::setfill('0') << static_cast<int>(character) << ", which is not allowed";
+      oss << "Input for " << field_name << " contains byte 0x" << std::uppercase << std::hex << std::setw(2)
+          << std::setfill('0') << static_cast<int>(character) << ", which the line protocol cannot carry";
       return oss.str();
     }
   }
@@ -116,7 +138,7 @@ std::optional<std::string> ValidateNoControlCharacters(const std::string& value,
  * deliberately excluded because its password is an opaque suffix.
  */
 std::optional<std::string> ValidateProtocolToken(const std::string& value, const char* field_name) {
-  if (auto error = ValidateNoControlCharacters(value, field_name)) {
+  if (auto error = ValidateNoFramingBytes(value, field_name)) {
     return error;
   }
   for (unsigned char character : value) {
@@ -175,10 +197,7 @@ class NvecdClient::Impl {
       (void)transport::ConfigureNoSigpipe(sock_);
 
       // Set timeouts
-      struct timeval timeout_val = {};
-      timeout_val.tv_sec = static_cast<decltype(timeout_val.tv_sec)>(config_.timeout_ms / kMillisecondsPerSecond);
-      timeout_val.tv_usec = static_cast<decltype(timeout_val.tv_usec)>((config_.timeout_ms % kMillisecondsPerSecond) *
-                                                                       kMicrosecondsPerMillisecond);
+      const struct timeval timeout_val = MakeSocketTimeout(config_.timeout_ms);
       (void)setsockopt(sock_, SOL_SOCKET, SO_RCVTIMEO, &timeout_val, sizeof(timeout_val));
       (void)setsockopt(sock_, SOL_SOCKET, SO_SNDTIMEO, &timeout_val, sizeof(timeout_val));
 
@@ -202,41 +221,39 @@ class NvecdClient::Impl {
       return {};  // Skip TCP connection code
     }
 
-    sock_ = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock_ < 0) {
-      return MakeUnexpected(
-          MakeError(ErrorCode::kClientConnectionFailed, std::string("Failed to create socket: ") + strerror(errno)));
+    struct addrinfo* candidates = nullptr;
+    if (auto resolve_error = transport::ResolveHostV4(config_.host, config_.port, &candidates)) {
+      return MakeUnexpected(MakeError(ErrorCode::kClientConnectionFailed, *resolve_error));
     }
-    (void)transport::ConfigureNoSigpipe(sock_);
+    const ScopeGuard release_candidates([candidates]() { ::freeaddrinfo(candidates); });
 
-    // Set socket timeout
-    struct timeval timeout_val = {};
-    timeout_val.tv_sec = static_cast<decltype(timeout_val.tv_sec)>(config_.timeout_ms / kMillisecondsPerSecond);
-    timeout_val.tv_usec = static_cast<decltype(timeout_val.tv_usec)>((config_.timeout_ms % kMillisecondsPerSecond) *
-                                                                     kMicrosecondsPerMillisecond);
-    // Non-critical: timeout setting failure is acceptable (connection still works, just without timeout)
-    (void)setsockopt(sock_, SOL_SOCKET, SO_RCVTIMEO, &timeout_val, sizeof(timeout_val));
-    (void)setsockopt(sock_, SOL_SOCKET, SO_SNDTIMEO, &timeout_val, sizeof(timeout_val));
+    // Resolution can yield several addresses for one name; try them in order so
+    // an unreachable first candidate does not fail an otherwise usable host.
+    std::string error_msg;
+    for (const struct addrinfo* candidate = candidates; candidate != nullptr; candidate = candidate->ai_next) {
+      const int candidate_sock = socket(candidate->ai_family, candidate->ai_socktype, candidate->ai_protocol);
+      if (candidate_sock < 0) {
+        error_msg = std::string("Failed to create socket: ") + strerror(errno);
+        continue;
+      }
+      (void)transport::ConfigureNoSigpipe(candidate_sock);
 
-    struct sockaddr_in server_addr = {};
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(config_.port);
+      // Non-critical: timeout setting failure is acceptable (connection still works, just without timeout)
+      const struct timeval timeout_val = MakeSocketTimeout(config_.timeout_ms);
+      (void)setsockopt(candidate_sock, SOL_SOCKET, SO_RCVTIMEO, &timeout_val, sizeof(timeout_val));
+      (void)setsockopt(candidate_sock, SOL_SOCKET, SO_SNDTIMEO, &timeout_val, sizeof(timeout_val));
 
-    if (inet_pton(AF_INET, config_.host.c_str(), &server_addr.sin_addr) <= 0) {
-      close(sock_);
-      sock_ = -1;
-      return MakeUnexpected(MakeError(ErrorCode::kClientConnectionFailed, "Invalid address: " + config_.host));
-    }
+      if (connect(candidate_sock, candidate->ai_addr, candidate->ai_addrlen) == 0) {
+        sock_ = candidate_sock;
+        return {};
+      }
 
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) - Required for socket API
-    if (connect(sock_, reinterpret_cast<struct sockaddr*>(&server_addr), sizeof(server_addr)) < 0) {
-      std::string error_msg = std::string("Connection failed: ") + strerror(errno);
-      close(sock_);
-      sock_ = -1;
-      return MakeUnexpected(MakeError(ErrorCode::kClientConnectionFailed, error_msg));
+      // Read errno before close(), which may overwrite it.
+      error_msg = std::string("Connection failed: ") + strerror(errno);
+      close(candidate_sock);
     }
 
-    return {};
+    return MakeUnexpected(MakeError(ErrorCode::kClientConnectionFailed, error_msg));
   }
 
   void Disconnect() const {
@@ -270,7 +287,7 @@ class NvecdClient::Impl {
     if (!transport::SendAll(sock_, msg, &io_error)) {
       DisconnectUnlocked();
       return MakeUnexpected(
-          MakeError(ErrorCode::kClientCommandFailed, std::string("Failed to send command: ") + strerror(io_error)));
+          MakeError(ErrorCode::kClientSendFailed, std::string("Failed to send command: ") + strerror(io_error)));
     }
 
     // Receive response. A single recv() may deliver only part of a multi-line
@@ -292,13 +309,19 @@ class NvecdClient::Impl {
         if (received == 0) {
           return MakeUnexpected(MakeError(ErrorCode::kClientConnectionClosed, "Connection closed by server"));
         }
-        return MakeUnexpected(MakeError(ErrorCode::kClientCommandFailed,
+        // A caller that retries on a timeout but not on a protocol failure needs
+        // these apart, so the deadline case carries its own code rather than
+        // being told from a receive failure by its strerror text.
+        if (transport::IsReceiveTimeout(io_error)) {
+          return MakeUnexpected(MakeError(ErrorCode::kClientTimeout,
+                                          std::string("Timed out waiting for response: ") + strerror(io_error)));
+        }
+        return MakeUnexpected(MakeError(ErrorCode::kClientReceiveFailed,
                                         std::string("Failed to receive response: ") + strerror(io_error)));
       }
 
       response_buffer_.append(buffer.data(), static_cast<size_t>(received));
-      constexpr size_t kMaxBufferedResponseBytes = 64U * 1024U * 1024U;
-      if (response_buffer_.size() > kMaxBufferedResponseBytes) {
+      if (response_buffer_.size() > transport::kMaxBufferedResponseBytes) {
         DisconnectUnlocked();
         return MakeUnexpected(MakeError(ErrorCode::kClientProtocolError, "Response exceeds 64 MiB limit"));
       }
@@ -309,7 +332,9 @@ class NvecdClient::Impl {
       response.pop_back();
     }
 
-    if (!IsErrorResponse(response)) {
+    // A refused DEBUG command must not latch the mode: framing a later SIM
+    // response as a debug block the server never sends stalls the read loop.
+    if (!transport::IsErrorResponse(response)) {
       const std::string upper = transport::UpperCommand(command);
       if (upper == "DEBUG ON") {
         debug_mode_ = true;
@@ -329,7 +354,7 @@ class NvecdClient::Impl {
     if (auto err = ValidateProtocolToken(ctx, "context ID")) {
       return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, *err));
     }
-    if (auto err = ValidateNoControlCharacters(type, "event type")) {
+    if (auto err = ValidateNoFramingBytes(type, "event type")) {
       return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, *err));
     }
     if (auto err = ValidateProtocolToken(id, "document ID")) {
@@ -357,8 +382,8 @@ class NvecdClient::Impl {
       return MakeUnexpected(result.error());
     }
 
-    if (result->find("ERROR") == 0) {
-      return MakeUnexpected(MakeError(ErrorCode::kClientServerError, result->substr(kErrorPrefixLen)));
+    if (transport::IsErrorResponse(*result)) {
+      return MakeUnexpected(MakeError(ErrorCode::kClientServerError, ErrorBody(*result)));
     }
 
     if (result->find("OK") != 0) {
@@ -387,8 +412,8 @@ class NvecdClient::Impl {
       return MakeUnexpected(result.error());
     }
 
-    if (result->find("ERROR") == 0) {
-      return MakeUnexpected(MakeError(ErrorCode::kClientServerError, result->substr(kErrorPrefixLen)));
+    if (transport::IsErrorResponse(*result)) {
+      return MakeUnexpected(MakeError(ErrorCode::kClientServerError, ErrorBody(*result)));
     }
 
     if (result->find("OK") != 0) {
@@ -410,8 +435,8 @@ class NvecdClient::Impl {
     if (!result) {
       return MakeUnexpected(result.error());
     }
-    if (result->find("ERROR") == 0) {
-      return MakeUnexpected(MakeError(ErrorCode::kClientServerError, result->substr(kErrorPrefixLen)));
+    if (transport::IsErrorResponse(*result)) {
+      return MakeUnexpected(MakeError(ErrorCode::kClientServerError, ErrorBody(*result)));
     }
     if (result->find("OK") != 0) {
       return MakeUnexpected(MakeError(ErrorCode::kClientProtocolError, "Unexpected response: " + *result));
@@ -438,8 +463,8 @@ class NvecdClient::Impl {
       return MakeUnexpected(result.error());
     }
 
-    if (result->find("ERROR") == 0) {
-      return MakeUnexpected(MakeError(ErrorCode::kClientServerError, result->substr(kErrorPrefixLen)));
+    if (transport::IsErrorResponse(*result)) {
+      return MakeUnexpected(MakeError(ErrorCode::kClientServerError, ErrorBody(*result)));
     }
 
     if (result->find("OK") != 0) {
@@ -476,8 +501,8 @@ class NvecdClient::Impl {
       return MakeUnexpected(result.error());
     }
 
-    if (result->find("ERROR") == 0) {
-      return MakeUnexpected(MakeError(ErrorCode::kClientServerError, result->substr(kErrorPrefixLen)));
+    if (transport::IsErrorResponse(*result)) {
+      return MakeUnexpected(MakeError(ErrorCode::kClientServerError, ErrorBody(*result)));
     }
 
     // Parse response: OK RESULTS <count> <id1> <score1> <id2> <score2> ...
@@ -529,8 +554,8 @@ class NvecdClient::Impl {
       return MakeUnexpected(result.error());
     }
 
-    if (result->find("ERROR") == 0) {
-      return MakeUnexpected(MakeError(ErrorCode::kClientServerError, result->substr(kErrorPrefixLen)));
+    if (transport::IsErrorResponse(*result)) {
+      return MakeUnexpected(MakeError(ErrorCode::kClientServerError, ErrorBody(*result)));
     }
 
     // Parse response: OK RESULTS <count> <id1> <score1> <id2> <score2> ...
@@ -567,8 +592,8 @@ class NvecdClient::Impl {
       return MakeUnexpected(result.error());
     }
 
-    if (result->find("ERROR") == 0) {
-      return MakeUnexpected(MakeError(ErrorCode::kClientServerError, result->substr(kErrorPrefixLen)));
+    if (transport::IsErrorResponse(*result)) {
+      return MakeUnexpected(MakeError(ErrorCode::kClientServerError, ErrorBody(*result)));
     }
 
     // Parse Redis-style response (key: value lines)
@@ -627,14 +652,14 @@ class NvecdClient::Impl {
       return MakeUnexpected(result.error());
     }
 
-    if (result->find("ERROR") == 0) {
-      return MakeUnexpected(MakeError(ErrorCode::kClientServerError, result->substr(kErrorPrefixLen)));
+    if (transport::IsErrorResponse(*result)) {
+      return MakeUnexpected(MakeError(ErrorCode::kClientServerError, ErrorBody(*result)));
     }
 
     return *result;
   }
 
-  Expected<std::string, Error> Save(const std::string& filepath) const {
+  Expected<SaveResult, Error> Save(const std::string& filepath) const {
     std::ostringstream cmd;
     if (filepath.empty()) {
       cmd << "DUMP SAVE";
@@ -650,17 +675,22 @@ class NvecdClient::Impl {
       return MakeUnexpected(result.error());
     }
 
-    if (result->find("ERROR") == 0) {
-      return MakeUnexpected(MakeError(ErrorCode::kClientServerError, result->substr(kErrorPrefixLen)));
+    if (transport::IsErrorResponse(*result)) {
+      return MakeUnexpected(MakeError(ErrorCode::kClientServerError, ErrorBody(*result)));
     }
 
+    // The two success keywords are different durability guarantees, not two
+    // spellings of the same one: DUMP_SAVED means the file is complete,
+    // DUMP_SAVE_STARTED means a writer child was forked and the file is not
+    // readable yet. Collapsing them would hand backup automation a path to a
+    // missing or stale snapshot.
     constexpr std::string_view kSavedPrefix = "OK DUMP_SAVED ";
     constexpr std::string_view kSaveStartedPrefix = "OK DUMP_SAVE_STARTED ";
-    const std::string_view prefix = result->rfind(kSavedPrefix, 0) == 0 ? kSavedPrefix : kSaveStartedPrefix;
-    if (result->rfind(prefix, 0) == 0) {
-      std::string path = result->substr(prefix.size());
-      path.erase(path.find_last_not_of("\r\n") + 1);
-      return path;
+    if (result->rfind(kSavedPrefix, 0) == 0) {
+      return MakeSaveResult(*result, kSavedPrefix.size(), true);
+    }
+    if (result->rfind(kSaveStartedPrefix, 0) == 0) {
+      return MakeSaveResult(*result, kSaveStartedPrefix.size(), false);
     }
 
     return MakeUnexpected(MakeError(ErrorCode::kClientProtocolError, "Unexpected DUMP SAVE response: " + *result));
@@ -682,8 +712,8 @@ class NvecdClient::Impl {
       return MakeUnexpected(result.error());
     }
 
-    if (result->find("ERROR") == 0) {
-      return MakeUnexpected(MakeError(ErrorCode::kClientServerError, result->substr(kErrorPrefixLen)));
+    if (transport::IsErrorResponse(*result)) {
+      return MakeUnexpected(MakeError(ErrorCode::kClientServerError, ErrorBody(*result)));
     }
 
     constexpr std::string_view kLoadedPrefix = "OK DUMP_LOADED ";
@@ -712,8 +742,8 @@ class NvecdClient::Impl {
       return MakeUnexpected(result.error());
     }
 
-    if (result->find("ERROR") == 0) {
-      return MakeUnexpected(MakeError(ErrorCode::kClientServerError, result->substr(kErrorPrefixLen)));
+    if (transport::IsErrorResponse(*result)) {
+      return MakeUnexpected(MakeError(ErrorCode::kClientServerError, ErrorBody(*result)));
     }
 
     return *result;
@@ -735,8 +765,8 @@ class NvecdClient::Impl {
       return MakeUnexpected(result.error());
     }
 
-    if (result->find("ERROR") == 0) {
-      return MakeUnexpected(MakeError(ErrorCode::kClientServerError, result->substr(kErrorPrefixLen)));
+    if (transport::IsErrorResponse(*result)) {
+      return MakeUnexpected(MakeError(ErrorCode::kClientServerError, ErrorBody(*result)));
     }
 
     return *result;
@@ -748,8 +778,8 @@ class NvecdClient::Impl {
       return MakeUnexpected(result.error());
     }
 
-    if (result->find("ERROR") == 0) {
-      return MakeUnexpected(MakeError(ErrorCode::kClientServerError, result->substr(kErrorPrefixLen)));
+    if (transport::IsErrorResponse(*result)) {
+      return MakeUnexpected(MakeError(ErrorCode::kClientServerError, ErrorBody(*result)));
     }
 
     if (result->find("OK") != 0) {
@@ -765,8 +795,8 @@ class NvecdClient::Impl {
       return MakeUnexpected(result.error());
     }
 
-    if (result->find("ERROR") == 0) {
-      return MakeUnexpected(MakeError(ErrorCode::kClientServerError, result->substr(kErrorPrefixLen)));
+    if (transport::IsErrorResponse(*result)) {
+      return MakeUnexpected(MakeError(ErrorCode::kClientServerError, ErrorBody(*result)));
     }
 
     if (result->find("OK") != 0) {
@@ -777,7 +807,7 @@ class NvecdClient::Impl {
   }
 
   Expected<void, Error> Auth(const std::string& password) const {
-    if (auto err = ValidateNoControlCharacters(password, "password")) {
+    if (auto err = ValidateNoFramingBytes(password, "password")) {
       return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, *err));
     }
 
@@ -802,7 +832,7 @@ class NvecdClient::Impl {
       return MakeUnexpected(result.error());
     }
 
-    if (IsErrorResponse(*result)) {
+    if (transport::IsErrorResponse(*result)) {
       return MakeUnexpected(MakeError(ErrorCode::kClientServerError, ErrorBody(*result)));
     }
 
@@ -815,7 +845,7 @@ class NvecdClient::Impl {
       return MakeUnexpected(result.error());
     }
 
-    if (IsErrorResponse(*result)) {
+    if (transport::IsErrorResponse(*result)) {
       return MakeUnexpected(MakeError(ErrorCode::kClientServerError, ErrorBody(*result)));
     }
 
@@ -829,10 +859,14 @@ class NvecdClient::Impl {
   Expected<void, Error> CacheDisable() const { return SimpleCacheCommand("CACHE DISABLE"); }
 
  private:
-  // Whether a response is an error, accepting both "ERROR ..." and Redis-style
-  // "-ERR ..." / "(error) ..." prefixes the server may emit.
-  static bool IsErrorResponse(const std::string& response) {
-    return response.find("ERROR") == 0 || response.find("-ERR") == 0 || response.find("(error)") == 0;
+  // Build a SaveResult from a DUMP SAVE response whose status keyword has
+  // already been matched.
+  static SaveResult MakeSaveResult(const std::string& response, size_t prefix_length, bool completed) {
+    SaveResult result;
+    result.filepath = response.substr(prefix_length);
+    result.filepath.erase(result.filepath.find_last_not_of("\r\n") + 1);
+    result.completed = completed;
+    return result;
   }
 
   // Extract the human-readable body of an error response for the Error message.
@@ -846,7 +880,7 @@ class NvecdClient::Impl {
   // Validate a generic success response, accepting both "OK ..." and the
   // Redis-style "+OK ..." prefix (AUTH returns "+OK").
   static Expected<void, Error> CheckOkResponse(const std::string& response) {
-    if (IsErrorResponse(response)) {
+    if (transport::IsErrorResponse(response)) {
       return MakeUnexpected(MakeError(ErrorCode::kClientServerError, ErrorBody(response)));
     }
     if (response.find("OK") != 0 && response.find("+OK") != 0) {
@@ -875,6 +909,26 @@ class NvecdClient::Impl {
 // NvecdClient public interface implementation
 //
 
+namespace {
+
+/**
+ * @brief Forward a call to the implementation, tolerating a moved-from client.
+ *
+ * Moving a NvecdClient transfers the implementation and leaves the source
+ * holding nothing. Routing every command through this helper gives that state
+ * one behaviour for the whole class - the documented kClientNotConnected error
+ * - instead of leaving each method to remember its own null check.
+ */
+template <typename Impl, typename Callable>
+auto WithImpl(const std::unique_ptr<Impl>& impl, Callable&& call) -> decltype(call(*impl)) {
+  if (impl == nullptr) {
+    return MakeUnexpected(MakeError(ErrorCode::kClientNotConnected, "Client has been moved from"));
+  }
+  return call(*impl);
+}
+
+}  // namespace
+
 NvecdClient::NvecdClient(ClientConfig config) : impl_(std::make_unique<Impl>(std::move(config))) {}
 
 NvecdClient::~NvecdClient() = default;
@@ -884,102 +938,104 @@ NvecdClient::NvecdClient(NvecdClient&&) noexcept = default;
 NvecdClient& NvecdClient::operator=(NvecdClient&&) noexcept = default;
 
 Expected<void, Error> NvecdClient::Connect() {
-  return impl_->Connect();
+  return WithImpl(impl_, [](Impl& impl) { return impl.Connect(); });
 }
 
 void NvecdClient::Disconnect() {
-  impl_->Disconnect();
+  if (impl_ != nullptr) {
+    impl_->Disconnect();
+  }
 }
 
 bool NvecdClient::IsConnected() const {
-  return impl_->IsConnected();
+  return impl_ != nullptr && impl_->IsConnected();
 }
 
 Expected<void, Error> NvecdClient::Event(const std::string& ctx, const std::string& type, const std::string& id,
                                          int score) const {
-  return impl_->Event(ctx, type, id, score);
+  return WithImpl(impl_, [&](Impl& impl) { return impl.Event(ctx, type, id, score); });
 }
 
 Expected<void, Error> NvecdClient::Vecset(const std::string& id, const std::vector<float>& vector) const {
-  return impl_->Vecset(id, vector);
+  return WithImpl(impl_, [&](Impl& impl) { return impl.Vecset(id, vector); });
 }
 
 Expected<void, Error> NvecdClient::Vecdel(const std::string& id) const {
-  return impl_->Vecdel(id);
+  return WithImpl(impl_, [&](Impl& impl) { return impl.Vecdel(id); });
 }
 
 Expected<void, Error> NvecdClient::Metaset(const std::string& id, const std::string& metadata) const {
-  return impl_->Metaset(id, metadata);
+  return WithImpl(impl_, [&](Impl& impl) { return impl.Metaset(id, metadata); });
 }
 
 Expected<SimResponse, Error> NvecdClient::Sim(const std::string& id, uint32_t top_k, const std::string& mode,
                                               const SearchOptions& options) const {
-  return impl_->Sim(id, top_k, mode, options);
+  return WithImpl(impl_, [&](Impl& impl) { return impl.Sim(id, top_k, mode, options); });
 }
 
 Expected<SimResponse, Error> NvecdClient::Simv(const std::vector<float>& vector, uint32_t top_k,
                                                const std::string& mode, const SearchOptions& options) const {
-  return impl_->Simv(vector, top_k, mode, options);
+  return WithImpl(impl_, [&](Impl& impl) { return impl.Simv(vector, top_k, mode, options); });
 }
 
 Expected<void, Error> NvecdClient::Auth(const std::string& password) const {
-  return impl_->Auth(password);
+  return WithImpl(impl_, [&](Impl& impl) { return impl.Auth(password); });
 }
 
 Expected<ServerInfo, Error> NvecdClient::Info() const {
-  return impl_->Info();
+  return WithImpl(impl_, [](Impl& impl) { return impl.Info(); });
 }
 
 Expected<std::string, Error> NvecdClient::GetConfig() const {
-  return impl_->GetConfig();
+  return WithImpl(impl_, [](Impl& impl) { return impl.GetConfig(); });
 }
 
-Expected<std::string, Error> NvecdClient::Save(const std::string& filepath) const {
-  return impl_->Save(filepath);
+Expected<SaveResult, Error> NvecdClient::Save(const std::string& filepath) const {
+  return WithImpl(impl_, [&](Impl& impl) { return impl.Save(filepath); });
 }
 
 Expected<std::string, Error> NvecdClient::Load(const std::string& filepath) const {
-  return impl_->Load(filepath);
+  return WithImpl(impl_, [&](Impl& impl) { return impl.Load(filepath); });
 }
 
 Expected<std::string, Error> NvecdClient::Verify(const std::string& filepath) const {
-  return impl_->Verify(filepath);
+  return WithImpl(impl_, [&](Impl& impl) { return impl.Verify(filepath); });
 }
 
 Expected<std::string, Error> NvecdClient::DumpInfo(const std::string& filepath) const {
-  return impl_->DumpInfo(filepath);
+  return WithImpl(impl_, [&](Impl& impl) { return impl.DumpInfo(filepath); });
 }
 
 Expected<std::string, Error> NvecdClient::DumpStatus() const {
-  return impl_->DumpStatus();
+  return WithImpl(impl_, [](Impl& impl) { return impl.DumpStatus(); });
 }
 
 Expected<std::string, Error> NvecdClient::CacheStats() const {
-  return impl_->CacheStats();
+  return WithImpl(impl_, [](Impl& impl) { return impl.CacheStats(); });
 }
 
 Expected<void, Error> NvecdClient::CacheClear() const {
-  return impl_->CacheClear();
+  return WithImpl(impl_, [](Impl& impl) { return impl.CacheClear(); });
 }
 
 Expected<void, Error> NvecdClient::CacheEnable() const {
-  return impl_->CacheEnable();
+  return WithImpl(impl_, [](Impl& impl) { return impl.CacheEnable(); });
 }
 
 Expected<void, Error> NvecdClient::CacheDisable() const {
-  return impl_->CacheDisable();
+  return WithImpl(impl_, [](Impl& impl) { return impl.CacheDisable(); });
 }
 
 Expected<void, Error> NvecdClient::EnableDebug() const {
-  return impl_->EnableDebug();
+  return WithImpl(impl_, [](Impl& impl) { return impl.EnableDebug(); });
 }
 
 Expected<void, Error> NvecdClient::DisableDebug() const {
-  return impl_->DisableDebug();
+  return WithImpl(impl_, [](Impl& impl) { return impl.DisableDebug(); });
 }
 
 Expected<std::string, Error> NvecdClient::SendCommand(const std::string& command) const {
-  return impl_->SendCommand(command);
+  return WithImpl(impl_, [&](Impl& impl) { return impl.SendCommand(command); });
 }
 
 }  // namespace nvecd::client
