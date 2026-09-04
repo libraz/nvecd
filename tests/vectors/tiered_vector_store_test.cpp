@@ -8,7 +8,9 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <mutex>
 #include <random>
+#include <string>
 #include <thread>
 #include <unordered_set>
 #include <vector>
@@ -769,16 +771,34 @@ TEST(MergeSchedulerTest, SearchesStayConsistentWhileTheSchedulerMerges) {
   constexpr uint32_t kWriteRounds = 3;
   constexpr uint32_t kWritesPerRound = 15;
 
+  auto seed_id = [](uint32_t i) { return "seed" + std::to_string(i); };
+  auto round_id = [](uint32_t round, uint32_t i) { return "round" + std::to_string(round) + "_" + std::to_string(i); };
+
+  // Every ID this test will ever write, named up front so the set is const for
+  // as long as more than one thread can reach it. The readers only look IDs up,
+  // but an unordered_set gives no such guarantee while it grows: an insert that
+  // rehashes moves the buckets a concurrent count() is walking, and the lookup
+  // may then miss an element that is present.
+  const std::unordered_set<std::string> known_ids = [&] {
+    std::unordered_set<std::string> ids;
+    for (uint32_t i = 0; i < kSeedCount; ++i) {
+      ids.insert(seed_id(i));
+    }
+    for (uint32_t round = 0; round < kWriteRounds; ++round) {
+      for (uint32_t i = 0; i < kWritesPerRound; ++i) {
+        ids.insert(round_id(round, i));
+      }
+    }
+    return ids;
+  }();
+
   TieredVectorStore::Config cfg = DefaultConfig();
   cfg.delta_merge_threshold = 10;
   TieredVectorStore store(cfg);
 
   std::mt19937 rng(7);
-  std::unordered_set<std::string> known_ids;
   for (uint32_t i = 0; i < kSeedCount; ++i) {
-    const std::string id = "seed" + std::to_string(i);
-    ASSERT_TRUE(store.Add(id, MakeRandomVector(kDim, rng)).has_value());
-    known_ids.insert(id);
+    ASSERT_TRUE(store.Add(seed_id(i), MakeRandomVector(kDim, rng)).has_value());
   }
 
   MergeScheduler scheduler(FastSchedulerConfig());
@@ -803,6 +823,12 @@ TEST(MergeSchedulerTest, SearchesStayConsistentWhileTheSchedulerMerges) {
   std::atomic<int> unknown_ids{0};
   std::atomic<int> unordered_scores{0};
 
+  // Naming the first offending ID separates a store that returned something it
+  // never held from a lookup that went wrong, which the counter alone cannot
+  // tell apart. Only a failing search takes this lock.
+  std::mutex unknown_id_mutex;
+  std::string first_unknown_id;
+
   std::vector<std::thread> readers;
   readers.reserve(kReaders);
   for (int reader = 0; reader < kReaders; ++reader) {
@@ -823,6 +849,10 @@ TEST(MergeSchedulerTest, SearchesStayConsistentWhileTheSchedulerMerges) {
           }
           if (known_ids.count(results[i].id) == 0) {
             unknown_ids.fetch_add(1, std::memory_order_relaxed);
+            const std::lock_guard<std::mutex> lock(unknown_id_mutex);
+            if (first_unknown_id.empty()) {
+              first_unknown_id = results[i].id;
+            }
           }
           if (i > 0 && results[i].score > results[i - 1].score) {
             unordered_scores.fetch_add(1, std::memory_order_relaxed);
@@ -833,14 +863,12 @@ TEST(MergeSchedulerTest, SearchesStayConsistentWhileTheSchedulerMerges) {
   }
 
   // Keep the delta above the merge threshold so the scheduler keeps working
-  // underneath the readers rather than idling after a single merge. New IDs
-  // are published to known_ids before the store so a reader can never see an
-  // ID that is not yet in the set.
+  // underneath the readers rather than idling after a single merge. Every ID
+  // written here is already in known_ids, so a reader can only ever see one of
+  // them or one of the seeds.
   for (uint32_t round = 0; round < kWriteRounds; ++round) {
     for (uint32_t i = 0; i < kWritesPerRound; ++i) {
-      const std::string id = "round" + std::to_string(round) + "_" + std::to_string(i);
-      known_ids.insert(id);
-      store.Add(id, MakeRandomVector(kDim, rng));
+      store.Add(round_id(round, i), MakeRandomVector(kDim, rng));
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(400));
   }
@@ -854,7 +882,7 @@ TEST(MergeSchedulerTest, SearchesStayConsistentWhileTheSchedulerMerges) {
   EXPECT_GT(searches.load(), 0);
   EXPECT_EQ(short_pages.load(), 0) << "a search returned fewer than top_k results from an always-growing store";
   EXPECT_EQ(duplicate_ids.load(), 0) << "an entry in flight from delta to main was returned twice";
-  EXPECT_EQ(unknown_ids.load(), 0) << "a search returned an ID that was never stored";
+  EXPECT_EQ(unknown_ids.load(), 0) << "a search returned an ID that was never stored: " << first_unknown_id;
   EXPECT_EQ(unordered_scores.load(), 0) << "merged results were not ordered by descending score";
   EXPECT_EQ(store.MainSize() + store.DeltaSize(), known_ids.size());
 }
