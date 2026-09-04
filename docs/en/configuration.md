@@ -1,46 +1,41 @@
-# Configuration Guide
+# Configuration
 
-This guide explains all configuration options available in Nvecd.
+nvecd reads a single YAML file at startup. This page lists every key the parser accepts, section by section, and describes the cross-key rules and operational consequences the option tables do not carry.
 
-The option tables below and `examples/config.yaml` are generated from
-`src/config/config-schema.json`, which is the authority for every type, default
-and range stated here. Edit the schema and run
-`python3 support/generate_config_docs.py`; do not edit the tables by hand.
+The option tables below are rendered from `src/config/config-schema.json`, which is the authority for every type, default, range and description. Editing a table by hand has no effect; correct the schema and regenerate.
 
-## Configuration File
-
-Nvecd uses YAML format for configuration. The example configuration file is located at `examples/config.yaml`.
-
-## Basic Usage
+## Supplying a configuration file
 
 ```bash
-# Start nvecd with configuration file
-nvecd -c /path/to/config.yaml
+nvecd -c /etc/nvecd/config.yaml
+nvecd /etc/nvecd/config.yaml
+nvecd -t -c /etc/nvecd/config.yaml
 ```
 
----
+| Flag | Meaning |
+|---|---|
+| `-c`, `--config <file>` | configuration file path |
+| `-t`, `--config-test` | validate the file, print a summary and exit |
+| `-h`, `--help` | print usage and exit |
+| `-v`, `--version` | print the version and exit |
 
-## Configuration Sections
+The path may also be given as a positional argument; giving two config files is an error. Started with no file at all, the server runs entirely on the built-in defaults shown in the tables below, and `--config-test` without a file is an error.
 
-### Event Store Configuration
+`examples/config.yaml` is rendered from the same schema and carries every key at its default.
 
-Controls event tracking and co-occurrence index behavior.
+## How a file is validated
 
-```yaml
-events:
-  ctx_buffer_size: 50          # Ring buffer size per context
-  max_contexts: 0              # Active contexts retained (0 = unlimited)
-  max_neighbors_per_item: 0    # Co-occurrence edges retained per item (0 = unlimited)
-  min_support: 0.0             # Prune edges below this score (0 = disabled)
-  decay_interval_sec: 3600     # Decay interval (seconds)
-  decay_alpha: 0.99            # Decay factor (0.0 - 1.0)
-  dedup_window_sec: 60         # Deduplication time window (seconds)
-  dedup_cache_size: 10000      # Deduplication cache size (LRU)
-  temporal_cooccurrence: false # Apply time decay while updating co-occurrence
-  temporal_half_life_sec: 86400
-  negative_signals: false      # Apply DEL events as negative feedback
-  negative_weight: 0.5
-```
+Loading happens in three stages, and the first failure aborts startup.
+
+1. The YAML is parsed and converted to JSON.
+2. The JSON is checked against the embedded schema: types, enumerations and per-key numeric ranges.
+3. The parsed structure is checked semantically, which is where the cross-key rules listed under each section live.
+
+The schema sets `additionalProperties: false` at the root and in every section, so a misspelled key is rejected rather than silently ignored. Sections are optional; an absent section takes its defaults in full. A value that is well-formed YAML but does not fit the type it is read into is reported against its key, for example `Invalid value for events.ctx_buffer_size: '...' is out of range for this setting`.
+
+## `events`
+
+Event ingestion and the co-occurrence graph. See [events-and-co-occurrence.md](./events-and-co-occurrence.md).
 
 <!-- BEGIN GENERATED: options events -->
 | Option | Type | Default | Description |
@@ -59,29 +54,11 @@ events:
 | `negative_weight` | float | 0.5 | Reduction weight applied for negative signals (0.0-1.0) |
 <!-- END GENERATED: options events -->
 
-**Deduplication Behavior:**
+Semantic rules beyond the ranges above: `ctx_buffer_size` must be greater than zero, `min_support` must not be negative, `decay_alpha` must lie in 0.0–1.0, `temporal_half_life_sec` must be greater than zero, and `negative_weight` must lie in 0.0–1.0.
 
-Duplicate events are detected when the same `(ctx, id, score)` tuple is received within `dedup_window_sec`. This prevents:
-- Retry bugs from inflating statistics
-- Network re-transmissions from creating duplicate entries
-- Client-side bugs from affecting co-occurrence data
+`temporal_half_life_sec` has no effect unless `temporal_cooccurrence` is true, and `negative_weight` none unless `negative_signals` is. `max_contexts`, `max_neighbors_per_item` and `min_support` are the three bounds on graph growth; left at their defaults the graph is unbounded and grows with the data.
 
-Statistics tracking:
-- `total_events`: Total EVENT commands received (including duplicates)
-- `deduped_events`: Number of duplicate events ignored
-- `stored_events`: Actual events stored in ring buffers (total_events - deduped_events)
-
----
-
-### Vector Store Configuration
-
-Controls vector storage and search behavior.
-
-```yaml
-vectors:
-  default_dimension: 768       # Default vector dimension
-  distance_metric: "cosine"    # Distance metric: cosine, dot, l2
-```
+## `vectors`
 
 <!-- BEGIN GENERATED: options vectors -->
 | Option | Type | Default | Description |
@@ -90,25 +67,11 @@ vectors:
 | `distance_metric` | string | "cosine" | Distance metric for similarity search (`cosine` `dot` `l2`) |
 <!-- END GENERATED: options vectors -->
 
-Common embedding dimensions are 768 (BERT), 1536 (OpenAI) and 384 (MiniLM).
+`default_dimension` must be greater than zero. It fixes the accepted dimension: a `VECSET` whose vector has a different length is rejected with a dimension mismatch. Changing it after data exists means the existing snapshot no longer matches the configuration, so it is a rebuild rather than a tuning change. See [vector-search.md](./vector-search.md).
 
----
+## `similarity`
 
-### Similarity Search Configuration
-
-Controls similarity search and fusion algorithm parameters.
-
-```yaml
-similarity:
-  default_top_k: 100           # Default number of results
-  max_top_k: 1000              # Maximum allowed top_k
-  fusion_alpha: 0.6            # Vector similarity weight (fusion mode)
-  fusion_beta: 0.4             # Co-occurrence weight (fusion mode)
-  adaptive_fusion: false       # Adjust vector weight by item maturity
-  adaptive_min_alpha: 0.2
-  adaptive_max_alpha: 0.9
-  adaptive_maturity_threshold: 50
-```
+Search behaviour, fusion weights and the ANN index. See [vector-search.md](./vector-search.md) and [fusion.md](./fusion.md).
 
 <!-- BEGIN GENERATED: options similarity -->
 | Option | Type | Default | Description |
@@ -134,196 +97,38 @@ similarity:
 | `hnsw_max_elements` | int | 0 | HNSW pre-allocated capacity (0 = dynamic growth); the value is reserved at startup and the maximum is the largest index the snapshot loader accepts, so reserving beyond it produces an index that cannot be reloaded (0-10000000) |
 <!-- END GENERATED: options similarity -->
 
-**Note**: Higher `fusion_beta` gives more weight to event-based signals.
+Cross-key rules:
 
-#### ANN Index Selection and Tuning
+- `default_top_k` must be greater than zero and `max_top_k` must be at least `default_top_k`.
+- `adaptive_min_alpha` must not exceed `adaptive_max_alpha`, and `adaptive_maturity_threshold` must be greater than zero. The three take effect only when `adaptive_fusion` is true or a request passes `adaptive=on`.
+- The IVF keys are validated only when the index is IVF, that is when `index_type: ivf` or `ivf_enabled: true`. `ivf_nprobe` and `ivf_train_threshold` must be greater than zero, and `ivf_nprobe` must not exceed `ivf_nlist` unless `ivf_nlist` is `0`.
+- The HNSW keys are validated only when `index_type: hnsw`. `hnsw_m` must be at least 2, and both `ef` values greater than zero.
+- `ivf_enabled` is the older spelling of `index_type: ivf`. It is applied only when `index_type` is still `flat`; with `index_type` set to `hnsw` or `ivf`, the flag has no effect even though the IVF keys are still range-checked.
+- `fusion_alpha` and `fusion_beta` are independent numbers, not two halves of one budget; they are not required to sum to 1.
 
-`similarity.index_type` selects the active vector index: `flat` (the default),
-`hnsw`, or `ivf`. Exactly one of these implementations is used by the server;
-TieredVectorStore, MergeScheduler, and ScalarQuantizer are not runtime features.
+`hnsw_max_elements` is reserved at startup, and its maximum is the largest index the snapshot loader accepts — reserving beyond it produces an index that cannot be reloaded.
 
-```yaml
-similarity:
-  index_type: hnsw
-  hnsw_m: 16
-  hnsw_ef_construction: 200
-  hnsw_ef_search: 50
-  hnsw_max_elements: 0       # 0 = grow dynamically
-```
+## `snapshot`
 
-Raising `hnsw_m` or `hnsw_ef_construction` costs memory and ingest time;
-raising `hnsw_ef_search` or `ivf_nprobe` costs query latency. All four buy
-recall. The table above lists their types, defaults and accepted ranges.
-
-`ivf_enabled` remains a legacy compatibility option; prefer
-`index_type: ivf` for new configurations.
-
-##### What the tuning knobs buy
-
-An approximate index is only meaningful as a trade: any of them can be made
-faster by returning worse answers. The table below pairs recall against
-latency at each setting so the trade is visible rather than implied.
-
-Measured on 50,000 vectors drawn around 200 latent centroids — the shape
-embeddings actually have — with an exhaustive scan over the same vectors as
-ground truth, `top_k=10`, 200 queries per point. Reproduce with:
-
-```bash
-cmake --build build --target ann_recall_benchmark
-./build/bin/ann_recall_benchmark --gtest_also_run_disabled_tests
-```
-
-Hardware, SIMD configuration and build flags are the same as the
-[Benchmark Environment](benchmarks.md#benchmark-environment): Apple M5 Max
-(arm64) with NEON, Release (`-O3 -march=native`), Apple Clang. The corpus is
-generated from a fixed seed, so a rerun on the same build reproduces the same
-recall figures.
-
-**These tables measure the index in isolation.** Each `vs exact scan` figure is
-the p50 of 200 calls into the index, divided by the p50 of an exhaustive scan
-over the same vectors using the same distance computation. A query arriving over
-the wire does more than that: it goes through the engine, which adds metadata
-filtering, result assembly and a cache lookup on every query, and that cost does
-not shrink as the index gets faster. The ratio you observe end to end is
-therefore not the ratio below. On this data at the default `ivf_nprobe: 8`,
-dim 128, the engine path measures 9.3x against the engine's own brute-force path
-where the index in isolation measures 7.5x — the engine overhead applies to both
-sides of that comparison. Treat these tables as the shape of the trade, not as a
-throughput prediction for your deployment.
-
-The ratios were taken on a shared machine under other load, with numerator and
-denominator measured inside the same run so both see the same conditions. The
-benchmark also prints p99, which is not reproduced here.
-
-HNSW, `hnsw_m: 16`, `hnsw_ef_construction: 200`:
-
-| `hnsw_ef_search` | recall@10 (dim 128) | vs exact scan | recall@10 (dim 768) | vs exact scan |
-|---|---|---|---|---|
-| 10 | 0.996 | 21x | 0.985 | 55x |
-| 16 | 1.000 | 17x | 0.997 | 48x |
-| 32 | 1.000 | 13x | 1.000 | 38x |
-| 64 | 1.000 | 8x | 1.000 | 30x |
-
-IVF, `ivf_nlist: 256`:
-
-| `ivf_nprobe` | recall@10 (dim 128) | vs exact scan | recall@10 (dim 768) | vs exact scan |
-|---|---|---|---|---|
-| 1 | 0.962 | 32x | 0.981 | 42x |
-| 2 | 0.996 | 21x | 0.998 | 27x |
-| 4 | 1.000 | 15x | 1.000 | 14x |
-| 8 | 1.000 | 8x | 1.000 | 8x |
-
-The defaults (`hnsw_ef_search: 50`, `ivf_nprobe: 8`) sit past the point where
-recall has already reached 1.0 on this data, so they are conservative rather
-than tuned for throughput. Lowering them is the first thing to try if query
-latency matters more than the last fraction of recall.
-
-::: warning Recall depends on how your vectors are distributed
-These figures come from data with cluster structure. Vectors spread evenly
-across the space — random directions with no grouping — are the worst case
-for every approximate index, and recall there is far lower at the same
-settings: HNSW reaches only 0.39 at `ef_search: 64` and needs `512` to pass
-0.93, by which point it is several times slower than scanning everything.
-
-If your embeddings have little structure, an approximate index will not help.
-Measure with the benchmark above against your own vectors before switching
-`index_type` away from `flat`.
-:::
-
----
-
-### Snapshot Persistence Configuration
-
-Controls snapshot save/load behavior.
-
-```yaml
-snapshot:
-  dir: "/var/lib/nvecd/snapshots"  # Snapshot directory
-  default_filename: "nvecd.snapshot" # Default filename
-  interval_sec: 0                   # Auto-snapshot interval (0 = disabled)
-  retain: 3                         # Number of snapshots to retain
-  mode: "fork"                     # Snapshot mode: "fork" (COW) or "lock"
-```
+See [persistence.md](./persistence.md).
 
 <!-- BEGIN GENERATED: options snapshot -->
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `dir` | string | "/var/lib/nvecd/snapshots" | Snapshot directory path |
-| `default_filename` | string | "nvecd.snapshot" | Filename an argument-less DUMP SAVE writes inside the snapshot directory; validated like a client-supplied path, so an absolute or escaping name is refused (empty = fall back to a timestamped name) |
+| `default_filename` | string | "nvecd.nvec" | Filename an argument-less DUMP SAVE writes inside the snapshot directory; validated like a client-supplied path, so an absolute or escaping name is refused (empty = fall back to a timestamped name). Must end in .nvec or .dmp, or startup will not treat the file as a recovery candidate |
 | `interval_sec` | int | 0 | Snapshot interval in seconds (0 = disabled) (0-86400) |
 | `retain` | int | 3 | Number of automatic snapshots to retain; manual snapshots are never removed (0 = keep every file) (0-100) |
 | `mode` | string | "fork" | Snapshot consistency mode: fork (COW, non-blocking) or lock (global write lock, blocking) (`fork` `lock`) |
 <!-- END GENERATED: options snapshot -->
 
-`snapshot.dir` is created if it does not exist.
+`interval_sec` and `retain` must not be negative, and `mode` must be one of the two values.
 
-**Auto-snapshot filenames**: `auto_YYYYMMDD_HHMMSS.nvec`
+`default_filename` is validated exactly like a client-supplied path, so an absolute or escaping name is refused rather than resolved against `dir`; an empty value falls back to a timestamped name. `retain` prunes only snapshots the scheduler wrote — a file produced by an explicit `DUMP SAVE` is never removed.
 
-**Security requirement**: On POSIX systems, `snapshot.dir` must be owned by the
-user running nvecd and must not be writable by its group or by other users.
-Snapshot files are created with mode `0600`; use a service-private directory
-(normally mode `0700`).
+`mode: fork` writes in a forked child over a copy-on-write image and does not block writers, at the cost of a memory spike. `mode: lock` blocks writes for the duration and reports the finished file synchronously. The mode changes what `DUMP SAVE` answers: `OK DUMP_SAVE_STARTED` for `fork`, `OK DUMP_SAVED` for `lock`.
 
----
-
-### Write-Ahead Log Configuration
-
-Use WAL to replay writes made after the most recent snapshot following a restart.
-`include_vectors: false` reduces log size, but VECSET payloads then require a
-subsequent snapshot to survive a crash.
-
-```yaml
-wal:
-  enabled: false
-  dir: "/var/lib/nvecd/wal"
-  max_file_size: 67108864
-  sync_on_write: false
-  sync_interval_ms: 100
-  include_vectors: true
-```
-
-<!-- BEGIN GENERATED: options wal -->
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `enabled` | bool | false | Enable WAL-based crash recovery |
-| `dir` | string | "/var/lib/nvecd/wal" | Directory holding WAL segment files |
-| `max_file_size` | int | 67108864 | Maximum size per WAL file in bytes; the maximum is the largest integer the configuration reader carries, not a tuning limit (1-9223372036854775807) |
-| `sync_on_write` | bool | false | fsync after every append (high durability, lower throughput); sync_interval_ms selects the batch interval when this is false |
-| `sync_interval_ms` | int | 100 | Batch fsync interval in milliseconds when sync_on_write is false (0 = fsync on every append); the maximum is the range of the type it is read into, not a tuning limit (0-4294967295) |
-| `include_vectors` | bool | true | Persist vector bodies in VECSET WAL records; disable only when snapshots provide the required vector durability |
-<!-- END GENERATED: options wal -->
-
-`wal.dir` must not be empty when `wal.enabled` is true.
-
-Durability is never off: every accepted record reaches the platter in bounded
-time under any schema-valid pair of settings. `sync_on_write: true` fsyncs each
-append. With `sync_on_write: false`, `sync_interval_ms` sets the batch interval,
-and `sync_interval_ms: 0` fsyncs each append as well, because a zero interval
-would otherwise leave nothing to flush the batch.
-
-Segments are named `wal-NNNNNN.log` with a fixed six-digit number, so the
-segment number space ends at `wal-999999.log`. Rotation past that point fails
-rather than writing a wider name, which recovery and truncation would not match.
-A deployment reaches the cap only by rotating a million times without ever
-taking a snapshot; a snapshot checkpoint truncates the log and reclaims the
-numbers.
-
-The same ownership and non-shared-write requirement applies to `wal.dir`.
-WAL directories and segment files are created with modes `0700` and `0600`.
-
----
-
-### Performance Configuration
-
-Controls server performance and resource limits.
-
-```yaml
-performance:
-  thread_pool_size: 8          # Worker thread pool size
-  max_connections: 1000        # Maximum concurrent connections
-  connection_timeout_sec: 300  # Connection timeout (seconds)
-  reactor_max_total_buffered_bytes: 268435456  # Aggregate buffered-data cap (256 MiB)
-```
+## `performance`
 
 <!-- BEGIN GENERATED: options performance -->
 | Option | Type | Default | Description |
@@ -339,23 +144,13 @@ performance:
 | `reactor_max_total_buffered_bytes` | int | 268435456 | Process-wide cap for bytes buffered by the TCP reactor (1048576-1073741824) |
 <!-- END GENERATED: options performance -->
 
-Set `thread_pool_size` to the number of CPU cores, and `max_connections` from
-the process file-descriptor limit and available memory.
+`thread_pool_size` must not be negative, and `max_connections` and `connection_timeout_sec` must be greater than zero.
 
----
+These keys are not TCP-only. The HTTP server derives its own limits from them: `thread_pool_size` becomes its worker count, `max_connections` and `max_connections_per_ip` its admission limits, `max_query_length` its maximum request body, and its listen queue is `max_connections − thread_pool_size`, with a floor of one. A request body above `max_query_length` is refused on both surfaces.
 
-### API Server Configuration
+## `api`
 
-Controls TCP and HTTP API server settings.
-
-#### TCP API (Always Enabled)
-
-```yaml
-api:
-  tcp:
-    bind: "127.0.0.1"          # TCP bind address
-    port: 11017                # TCP port
-```
+### `api.tcp`
 
 <!-- BEGIN GENERATED: options api.tcp -->
 | Option | Type | Default | Description |
@@ -364,20 +159,9 @@ api:
 | `port` | int | 11017 | TCP port (1-65535) |
 <!-- END GENERATED: options api.tcp -->
 
-Binding to `0.0.0.0` exposes the server to every reachable network; pair it
-with `network.allow_cidrs` and `security.requirepass`.
+The TCP listener is always started; there is no key that disables it.
 
-#### HTTP API (Optional)
-
-```yaml
-api:
-  http:
-    enable: false              # Enable HTTP/JSON API
-    bind: "127.0.0.1"          # HTTP bind address
-    port: 8080                 # HTTP port
-    enable_cors: false         # Enable CORS headers
-    cors_allow_origin: ""      # Allowed origin
-```
+### `api.http`
 
 <!-- BEGIN GENERATED: options api.http -->
 | Option | Type | Default | Description |
@@ -390,13 +174,9 @@ api:
 | `timeout_sec` | int | 5 | HTTP read/write timeout in seconds (1-300) |
 <!-- END GENERATED: options api.http -->
 
-#### Unix Domain Socket (Optional)
+`port` is range-checked only when `enable` is true; `timeout_sec` is checked either way. An empty `cors_allow_origin` omits the header rather than sending `null`, so `enable_cors` alone does not permit any origin. A failed HTTP bind is logged and the server keeps running on TCP alone. See [http-api.md](./http-api.md).
 
-```yaml
-api:
-  unix_socket:
-    path: ""                     # Unix socket path (empty = disabled)
-```
+### `api.unix_socket`
 
 <!-- BEGIN GENERATED: options api.unix_socket -->
 | Option | Type | Default | Description |
@@ -404,18 +184,9 @@ api:
 | `path` | string | "" | Unix socket path (empty string = disabled) |
 <!-- END GENERATED: options api.unix_socket -->
 
-**Note**: Unix domain sockets provide lower-latency local connections. They bypass TCP/IP overhead and are ideal for co-located services.
+The Unix socket serves the same protocol as the TCP port, but bypasses `network.allow_cidrs`, `performance.max_connections_per_ip` and rate limiting — filesystem permissions on the socket file are its access control. A failed Unix-socket bind is logged as a warning and does not stop the server.
 
-#### Rate Limiting (Optional)
-
-```yaml
-api:
-  rate_limiting:
-    enable: false              # Enable rate limiting
-    capacity: 100              # Max burst tokens
-    refill_rate: 10            # Tokens per second
-    max_clients: 10000         # Max tracked clients
-```
+### `api.rate_limiting`
 
 <!-- BEGIN GENERATED: options api.rate_limiting -->
 | Option | Type | Default | Description |
@@ -426,19 +197,9 @@ api:
 | `max_clients` | int | 10000 | Maximum number of tracked clients (for memory management) (10-100000) |
 <!-- END GENERATED: options api.rate_limiting -->
 
----
+The three numeric keys are checked for positivity only when `enable` is true. Rate limiting keys on the client address, so it does not apply to Unix-socket connections. An HTTP request over the limit is answered `429`.
 
-### Network Security Configuration
-
-Controls IP address access control (CIDR-based).
-
-```yaml
-network:
-  allow_cidrs:
-    - "127.0.0.1/32"           # Localhost only (recommended)
-    # - "192.168.1.0/24"       # Example: Local network
-    # - "0.0.0.0/0"            # WARNING: Allow all (not recommended)
-```
+## `network`
 
 <!-- BEGIN GENERATED: options network -->
 | Option | Type | Default | Description |
@@ -446,23 +207,16 @@ network:
 | `allow_cidrs` | list | [] | Allow CIDR list (empty = deny all) |
 <!-- END GENERATED: options network -->
 
-**Security Note**: `allow_cidrs` is fail-closed. An empty or absent list
-**denies every connection**; you must configure the allowed IP ranges
-explicitly. Starting nvecd with no configuration file at all is the one
-exception: that path restricts access to `127.0.0.1/32`.
-
----
-
-### Logging Configuration
-
-Controls logging output format and destination.
+The list is fail-closed: an empty list denies every address, so a deployment that omits it accepts no TCP or HTTP traffic at all. An entry that does not parse as a CIDR is logged and skipped, leaving the remaining entries in force. The check applies to the TCP listener and to every HTTP route, and does not apply to the Unix socket.
 
 ```yaml
-logging:
-  level: "info"                # Log level
-  json: true                   # JSON format output
-  file: ""                     # Log file path (empty = stdout)
+network:
+  allow_cidrs:
+    - "127.0.0.1/32"
+    - "10.0.0.0/8"
 ```
+
+## `logging`
 
 <!-- BEGIN GENERATED: options logging -->
 | Option | Type | Default | Description |
@@ -472,50 +226,11 @@ logging:
 | `file` | string | "" | Log file path (empty string = stdout, path = file output) |
 <!-- END GENERATED: options logging -->
 
----
+`level` and `json` are both changeable at runtime; `file` is not, because reopening the handle is a restart-level change.
 
-### Security Configuration
+## `cache`
 
-Controls authentication for write and admin commands.
-
-```yaml
-security:
-  requirepass: ""                # Required password (empty = no auth)
-```
-
-<!-- BEGIN GENERATED: options security -->
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `requirepass` | string | "" | Required password for write/admin commands (empty = no auth) |
-<!-- END GENERATED: options security -->
-
-When `requirepass` is set, clients must authenticate with `AUTH <password>`
-before executing a write or admin command. The classification is:
-
-- **Write**: `EVENT`, `VECSET`, `VECDEL`, `METASET`, `SET`, `CACHE CLEAR`,
-  `CACHE ENABLE`, `CACHE DISABLE`
-- **Admin**: `DUMP SAVE`, `DUMP LOAD`, `DUMP VERIFY`, `DUMP INFO`,
-  `DUMP STATUS`, `CONFIG VERIFY`
-- **Read** (never gated): `SIM`, `SIMV`, `INFO`, `CONFIG SHOW`, `CONFIG HELP`,
-  `CACHE STATS`, `GET`, `SHOW VARIABLES`, `DEBUG ON`, `DEBUG OFF`
-
-Over HTTP, `Authorization: Bearer <password>` and `Authorization: Basic` (the
-username is ignored) authenticate the same command set; gated endpoints answer
-`401` when the header is missing or wrong.
-
----
-
-### Query Result Cache Configuration (Optional)
-
-```yaml
-cache:
-  enabled: true                # Enable query result cache
-  max_memory_mb: 32            # Maximum cache memory (MB)
-  min_query_cost_ms: 10.0      # Minimum query cost to cache (ms)
-  ttl_seconds: 3600            # Cache entry TTL (seconds)
-  compression_enabled: true    # Enable LZ4 compression
-  eviction_batch_size: 10      # Eviction batch size
-```
+The query cache. See [caching.md](./caching.md).
 
 <!-- BEGIN GENERATED: options cache -->
 | Option | Type | Default | Description |
@@ -528,17 +243,50 @@ cache:
 | `eviction_batch_size` | int | 10 | Number of entries to evict at once; the maximum is the range of the type it is read into, not a tuning limit (1-2147483647) |
 <!-- END GENERATED: options cache -->
 
----
+`max_memory_mb` must be greater than zero when `enabled` is true, `ttl_seconds` must not be negative, `min_query_cost_ms` must not be negative, and `eviction_batch_size` must be greater than zero.
 
-## Minimal Configuration Example
+`enabled`, `min_query_cost_ms` and `ttl_seconds` are changeable at runtime; the other three are fixed at startup because they decide an allocation or a stored representation.
+
+`min_query_cost_ms` is the reason a cache can show a low hit rate on a small corpus: a search that finishes faster than the threshold is never stored, so there is nothing to hit.
+
+## `security`
+
+<!-- BEGIN GENERATED: options security -->
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `requirepass` | string | "" | Required password for write/admin commands (empty = no auth) |
+<!-- END GENERATED: options security -->
+
+Setting `requirepass` closes both surfaces at once: TCP connections must issue `AUTH` before a write or admin command, and gated HTTP routes require `Authorization: Bearer <password>` or a `Basic` credential whose password matches. Read commands and the health probes stay open on both. The value is redacted to `***` by `CONFIG SHOW` and by the `security.requirepass` runtime variable.
+
+Because the password sits in a plain YAML file, the file's permissions are what protects it.
+
+## `wal`
+
+The write-ahead log. See [persistence.md](./persistence.md).
+
+<!-- BEGIN GENERATED: options wal -->
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `enabled` | bool | false | Enable WAL-based crash recovery |
+| `dir` | string | "/var/lib/nvecd/wal" | Directory holding WAL segment files |
+| `max_file_size` | int | 67108864 | Maximum size per WAL file in bytes; the maximum is the largest integer the configuration reader carries, not a tuning limit (1-9223372036854775807) |
+| `sync_on_write` | bool | false | fsync after every append (high durability, lower throughput); sync_interval_ms selects the batch interval when this is false |
+| `sync_interval_ms` | int | 100 | Batch fsync interval in milliseconds when sync_on_write is false (0 = fsync on every append); the maximum is the range of the type it is read into, not a tuning limit (0-4294967295) |
+| `include_vectors` | bool | true | Persist vector bodies in VECSET WAL records; disable only when snapshots provide the required vector durability |
+<!-- END GENERATED: options wal -->
+
+`dir` must not be empty when `enabled` is true. `sync_interval_ms` has no effect while `sync_on_write` is true, which is the trade of durability against write throughput.
+
+`include_vectors` interacts directly with recovery. With it false, `VECSET` records carry no vector body and are not written at all, so a restart restores vectors only as far as the last snapshot; any `VECDEL` or `METASET` in the log that refers to a vector the snapshot does not contain is skipped, counted, and reported by `INFO` as `wal_replay_records_skipped`. Turning it off is a decision to make snapshots the durability boundary for vector data, and it keeps the server startable rather than failing recovery on the resulting gap.
+
+## A minimal configuration
+
+Enough to run and be reachable from the local host:
 
 ```yaml
-# Minimal config for local testing
-events:
-  ctx_buffer_size: 50
-
 vectors:
-  default_dimension: 768
+  default_dimension: 384
 
 api:
   tcp:
@@ -548,81 +296,155 @@ api:
 network:
   allow_cidrs:
     - "127.0.0.1/32"
+```
+
+Everything else takes its default. Without the `network` section the server starts but refuses every connection.
+
+## A hardened configuration
+
+Authentication on, both surfaces bound to a private interface, rate limiting on, WAL and periodic snapshots on, and the graph bounded:
+
+```yaml
+events:
+  ctx_buffer_size: 100
+  max_contexts: 500000
+  max_neighbors_per_item: 200
+  min_support: 0.5
+  decay_interval_sec: 3600
+  decay_alpha: 0.99
+
+vectors:
+  default_dimension: 768
+  distance_metric: "cosine"
+
+similarity:
+  default_top_k: 20
+  max_top_k: 200
+  index_type: "hnsw"
+  hnsw_m: 32
+  hnsw_ef_construction: 400
+  hnsw_ef_search: 100
+  adaptive_fusion: true
+  adaptive_min_alpha: 0.2
+  adaptive_max_alpha: 0.9
+  adaptive_maturity_threshold: 50
+
+snapshot:
+  dir: "/var/lib/nvecd/snapshots"
+  default_filename: "nvecd.nvec"
+  interval_sec: 900
+  retain: 12
+  mode: "fork"
+
+wal:
+  enabled: true
+  dir: "/var/lib/nvecd/wal"
+  max_file_size: 134217728
+  sync_on_write: false
+  sync_interval_ms: 100
+  include_vectors: true
+
+performance:
+  thread_pool_size: 0
+  max_connections: 2000
+  max_connections_per_ip: 50
+  connection_timeout_sec: 120
+  max_query_length: 1048576
+
+api:
+  tcp:
+    bind: "10.0.1.5"
+    port: 11017
+  http:
+    enable: true
+    bind: "10.0.1.5"
+    port: 8080
+    timeout_sec: 10
+  rate_limiting:
+    enable: true
+    capacity: 200
+    refill_rate: 50
+    max_clients: 20000
+
+network:
+  allow_cidrs:
+    - "10.0.1.0/24"
+
+security:
+  requirepass: "replace-this"
+
+cache:
+  enabled: true
+  max_memory_mb: 512
+  min_query_cost_ms: 5.0
+  ttl_seconds: 600
 
 logging:
   level: "info"
   json: true
-```
-
----
-
-## Production Configuration Example
-
-```yaml
-# Production config with security hardening
-events:
-  ctx_buffer_size: 100
-  decay_interval_sec: 7200     # 2 hours
-  decay_alpha: 0.95
-
-vectors:
-  default_dimension: 768
-
-similarity:
-  max_top_k: 500
-  fusion_alpha: 0.7
-  fusion_beta: 0.3
-
-snapshot:
-  dir: "/var/lib/nvecd/snapshots"
-  interval_sec: 14400          # 4 hours
-  retain: 5
-
-performance:
-  thread_pool_size: 16         # 16-core server
-  max_connections: 5000
-  connection_timeout_sec: 600
-
-api:
-  tcp:
-    bind: "0.0.0.0"            # All interfaces (use allow_cidrs for security)
-    port: 11017
-
-network:
-  allow_cidrs:
-    - "10.0.0.0/8"             # Private network only
-    - "172.16.0.0/12"
-
-logging:
-  level: "warn"
-  json: true
   file: "/var/log/nvecd/nvecd.log"
 ```
 
----
-
-## Verifying Configuration
-
-Use `CONFIG VERIFY` command to check configuration file syntax:
+Check it before restarting:
 
 ```bash
-# Connect to server
-nc localhost 11017
+$ nvecd -t -c /etc/nvecd/config.yaml
+Configuration file is valid
 
-# Verify configuration
-CONFIG VERIFY
+Configuration summary:
+  Events:
+    ctx_buffer_size: 100
+...
 ```
 
-Or use `CONFIG SHOW` to display current configuration:
+## Inspecting configuration at runtime
 
-```bash
-CONFIG SHOW
+`CONFIG SHOW` over TCP prints the running configuration as YAML, optionally narrowed to a section:
+
+```text
+> CONFIG SHOW cache
++OK
+compression_enabled: true
+enabled: true
+eviction_batch_size: 10
+max_memory_mb: 32
+min_query_cost_ms: 10.0
+ttl_seconds: 3600
+END
 ```
 
----
+`requirepass` appears as `***`, alongside a derived `auth_enabled` flag that has no counterpart in the file or the schema. `CONFIG HELP <path>` prints the type, default, allowed values and description of one key, read from the same schema the loader validates against.
 
-## Next Steps
+`GET /config` over HTTP returns a much narrower summary — bind addresses, ports, the password and the CIDR list itself are all withheld — so operational introspection belongs on the TCP surface. Both are described in [protocol.md](./protocol.md) and [http-api.md](./http-api.md).
 
-- See [Protocol Reference](protocol.md) for available commands
-- See [Snapshot Management](snapshot.md) for persistence details
-- See [Installation Guide](installation.md) for deployment instructions
+`CONFIG VERIFY <file>` validates another file without applying it. The path is resolved inside the directory the running configuration came from, or inside `snapshot.dir` for a server started without a configuration file, and anything outside that root is refused.
+
+## Changing configuration at runtime
+
+Five variables can be changed on a running server:
+
+| Variable | Effect of a change |
+|---|---|
+| `logging.level` | takes effect on the next log record |
+| `logging.json` | switches the record format |
+| `cache.enabled` | enables or disables the query cache |
+| `cache.min_query_cost_ms` | changes which searches are worth caching |
+| `cache.ttl_seconds` | changes entry lifetime |
+
+Every other key on this page is readable through `GET` and `SHOW VARIABLES` but rejects a write with `Variable '<name>' is immutable (requires restart)`.
+
+```text
+> SET cache.ttl_seconds 600
++OK
+
+> SET logging.level debug
++OK
+
+> GET cache.enabled
+$4
+true
+```
+
+Booleans accept `true`/`false`, `on`/`off`, `1`/`0` and `yes`/`no`, and are stored canonically as `true` or `false`, so a value written with an alias reads back in the canonical spelling. `SHOW VARIABLES LIKE <prefix>%` lists names with their values and mutability. The `performance.` prefix is also accepted as `perf.` on input, but introspection always reports `performance.`.
+
+A runtime change is not written back to the file, so a restart returns to the configured value. `CACHE ENABLE` and `CACHE DISABLE` are shorthands for setting `cache.enabled`, and the HTTP `/cache/enable` and `/cache/disable` routes do the same.

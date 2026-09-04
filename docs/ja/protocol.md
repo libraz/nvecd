@@ -1,930 +1,687 @@
-# プロトコルリファレンス
+# TCP プロトコル
 
-Nvecd はシンプルなテキストベースのプロトコルを TCP 経由で使用します（Redis/Memcached と同様）。MygramDB 互換の管理コマンドも備えています。
+nvecd は TCP ポート上で行区切りのテキストプロトコルを提供し、設定した場合は Unix ドメインソケット上でも同じものを提供します。このページは全コマンドのリファレンスです。引数の個数、オプショントークン、サーバーが返す正確なバイト列、そして必要な権限を扱います。
 
-**プロトコル形式**: テキストベース、行区切り、UTF-8 エンコーディング
+## 接続する
 
-## 接続
+TCP リスナーは `api.tcp.bind`（既定値 `127.0.0.1`）の `api.tcp.port`（既定値 `11017`）にバインドします。`network.allow_cidrs` に一致しないアドレスからの接続は応答を返さず切断され、`network.allow_cidrs` が空の場合はすべてのアドレスを拒否するため、到達可能な構成では最低ひとつの CIDR を列挙します。[configuration.md](./configuration.md) を参照してください。
 
-TCP 経由で nvecd に接続：
-
-```bash
-# netcat を使用
-nc localhost 11017
-
-# telnet を使用
-telnet localhost 11017
-
-# Unix ドメインソケットを使用（設定されている場合）
-nc -U /var/run/nvecd.sock
-```
-
----
-
-## プロトコル形式
-
-- **トランスポート**: テキストベースの行プロトコル（UTF-8）
-- **リクエスト**: `COMMAND args...\r\n`（`\r\n` と `\n` の両方を受け付けます）
-- **レスポンス**: `OK data...\r\n` または `ERROR message\r\n`
-- **最大リクエストサイズ**: `performance.max_query_length` バイト（既定 1 MiB、上限 16 MiB）
-
-### レスポンス形式
-
-**成功**:
-```
-OK [data]\r\n
-```
-
-応答が受理の合図だけであるコマンドは、自身のコマンド名を返します（例: `OK VECSET`）。
-唯一の例外は `AUTH` で、`+OK\r\n` を返します。
-
-**エラー**:
-```
-ERROR <message>\r\n
-```
-
-ワイヤ上のエラー形式はこれだけです。Redis スタイルの変種は出力されません。
-
----
-
-## コマンドカテゴリ
-
-- **コアコマンド**: EVENT, VECSET, SIM, SIMV（nvecd 固有）
-- **管理コマンド**: AUTH, INFO, CONFIG, DUMP, DEBUG（MygramDB 互換）
-- **キャッシュコマンド**: CACHE（クエリ結果キャッシュ管理）
-- **ランタイム変数**: SET, GET, SHOW VARIABLES
-
----
-
-## コアコマンド
-
-### EVENT — 共起イベントの取り込み
-
-コンテキストと ID を関連付けるイベントを記録します。3 種類のイベントタイプをサポート：
-- **ADD**: ストリーム型イベント（クリック、閲覧）- 時間窓ベースの重複排除
-- **SET**: 状態型イベント（いいね、ブックマーク、評価）- 冪等な更新
-- **DEL**: 削除型イベント（いいね解除、ブックマーク削除）- 冪等な削除
-
-**構文**:
-```
-EVENT <ctx> ADD <id> <score>
-EVENT <ctx> SET <id> <score>
-EVENT <ctx> DEL <id>
-```
-
-**パラメータ**:
-- `<ctx>`: コンテキスト識別子（文字列、例: ユーザーID、セッションID）
-- `<type>`: イベントタイプ: `ADD`, `SET`, `DEL`
-- `<id>`: アイテム識別子（文字列、例: アイテムID、アクションID）
-- `<score>`: イベントスコア（整数、0-100）— ADD/SET では必須、DEL では無視
-
-**例**:
+行単位で扱えるクライアントであれば何でも使えます。`nc` の場合は次のようになります。
 
 ```bash
-# ストリーム型イベント（クリック追跡）
-EVENT user123 ADD view:item456 95
-→ OK EVENT
-
-# 状態型イベント（いいね ON）
-EVENT user123 SET like:item456 100
-→ OK EVENT
-
-# 状態型イベント（いいね OFF）
-EVENT user123 SET like:item456 0
-→ OK EVENT
-
-# 重み付きブックマーク（重要度: 高）
-EVENT user123 SET bookmark:item789 100
-→ OK EVENT
-
-# ブックマーク重要度変更（中）
-EVENT user123 SET bookmark:item789 50
-→ OK EVENT
-
-# ブックマーク削除
-EVENT user123 DEL bookmark:item789
-→ OK EVENT
+$ printf 'VECSET item1 0.1 0.2 0.3 0.4\nSIM item1 5 using=vectors\n' | nc 127.0.0.1 11017
+OK VECSET
+OK RESULTS 1
+item2 0.9940
 ```
 
-**イベントタイプの動作**:
-
-| タイプ | 用途 | 重複排除 | 例 |
-|--------|------|---------|-----|
-| **ADD** | ストリーム型イベント（クリック、閲覧、再生） | 時間窓ベース（デフォルト: 60秒） | `EVENT user1 ADD view:item1 100` |
-| **SET** | 状態型イベント（いいね、ブックマーク、評価） | 同じ値 = 重複（冪等） | `EVENT user1 SET like:item1 100` |
-| **DEL** | 削除型イベント | 既に削除済み = 重複（冪等） | `EVENT user1 DEL like:item1` |
-
-**冪等性の保証**:
+対話的に操作する場合は `telnet` を使います。
 
 ```bash
-# SET は同じ値に対して冪等
-EVENT user1 SET like:item1 100
-EVENT user1 SET like:item1 100  # 重複、無視される
-→ OK（両方成功、2回目は重複排除）
-
-# SET は状態遷移を許可
-EVENT user1 SET bookmark:item1 100  # 重要度: 高
-EVENT user1 SET bookmark:item1 50   # 重要度: 中（格納）
-EVENT user1 SET bookmark:item1 50   # 重複（無視）
-→ OK EVENT
-
-# DEL は冪等
-EVENT user1 DEL like:item1
-EVENT user1 DEL like:item1  # 既に削除済み、無視される
-→ OK EVENT
-```
-
-**エラーレスポンス**:
-- `ERROR Invalid EVENT type: <type> (must be ADD, SET, or DEL)`
-- `ERROR EVENT ADD requires 4 arguments: <ctx> ADD <id> <score>`
-- `ERROR EVENT SET requires 4 arguments: <ctx> SET <id> <score>`
-- `ERROR EVENT DEL requires 3 arguments: <ctx> DEL <id>`
-- `ERROR Invalid score: must be integer`
-- `ERROR Context cannot be empty`
-- `ERROR ID cannot be empty`
-
-**注意事項**:
-- イベントはコンテキストごとのリングバッファに格納されます（サイズ: `events.ctx_buffer_size`）
-- 重複排除キャッシュサイズ: `events.dedup_cache_size`（デフォルト: 10,000 エントリ）
-- ADD タイプの時間窓: `events.dedup_window_sec`（デフォルト: 60秒）
-- SET/DEL は最後の値を追跡して冪等性を保証（時間窓なし）
-- 同じコンテキスト内の ID 間で共起スコアが自動的に追跡されます
-- スコアは `events.decay_interval_sec` と `events.decay_alpha` に基づいて減衰します
-
----
-
-### VECSET — ベクトルの登録
-
-アイテムのベクトルを登録または更新します。
-
-**構文**:
-```
-VECSET <id> <f1> <f2> ... <fN>
-```
-
-**パラメータ**:
-- `<id>`: アイテム識別子（文字列）
-- `<f1> <f2> ... <fN>`: ベクトル成分（浮動小数点数）
-
-**例**:
-```
-VECSET item456 0.1 0.5 0.8
-→ OK VECSET
-```
-
-**768 次元ベクトルの例**:
-```
-VECSET item789 0.11 0.98 -0.22 0.44 ... (768 個の値)
-→ OK VECSET
-```
-
-**エラーレスポンス**:
-- `ERROR Dimension mismatch: expected 768, got 512`
-- `ERROR Invalid vector format`
-- `ERROR Invalid argument count`
-
-**注意事項**:
-- 次元数は値の数から自動検出されます
-- すべてのベクトルは同じ次元数である必要があります（デフォルト: 768、`vectors.default_dimension` で設定変更可能）
-- ベクトルは `vectors.distance_metric` の設定に基づいて自動的に正規化されます
-
----
-
-### VECDEL — ベクトルの削除
-
-アイテムのベクトル、そのメタデータ、キャッシュ済みの結果を削除します。
-
-**構文**:
-```
-VECDEL <id>
-```
-
-**パラメータ**:
-- `<id>`: アイテム識別子（文字列）
-
-**例**:
-```
-VECDEL item456
-→ OK VECDEL
-```
-
-**エラーレスポンス**:
-- `ERROR VECDEL requires 1 argument: <id>`
-- `ERROR Vector not found: item456`
-
-**注意**:
-- `security.requirepass` が設定されている場合は認証が必要です
-- `METASET` で登録したメタデータもベクトルと一緒に削除されます
-- 有効な ANN インデックスが再構築されるため、削除は書き込みより高コストです
-- `EVENT` が記録した共起エッジは影響を受けません
-
-### METASET — アイテムメタデータの登録
-
-`filter=` クエリで使うメタデータを既存のベクトルアイテムに付与します。
-
-**構文**:
-```
-METASET <id> <key:value[,key:value...]>
-```
-
-**例**:
-```
-METASET product456 category:electronics,active:true,rank:10
-SIM product123 10 using=vectors filter=category:electronics
-```
-
-値は `filter=` と同じく、文字列、整数、浮動小数点、真偽値として自動型判定されます。対象アイテムは先に `VECSET` で `VectorStore` に登録されている必要があります。
-
----
-
-### SIM — ID による類似度検索
-
-既存アイテムのベクトルと共起データに基づいて類似アイテムを検索します。
-
-**構文**:
-```
-SIM <id> <top_k> [using=events|vectors|fusion] [filter=<expr>] [min_score=<float>] [adaptive=on|off]
-```
-
-**パラメータ**:
-- `<id>`: アイテム識別子（文字列）
-- `<top_k>`: 返す結果数（整数、最大: `similarity.max_top_k`）
-- `using=`（省略可能）: 検索モード
-  - `events`: 共起ベース（イベントデータのみ）
-  - `vectors`: ベクトル距離ベース（ベクトルデータのみ）
-  - `fusion`（デフォルト）: 共起 x ベクトルのハイブリッド
-- `filter=`（省略可能）: メタデータフィルタ式。等価は `key:value`（または `key=value`）、比較は `!=`、`>`、`>=`、`<`、`<=`、集合所属は `key=in(value1|value2)` を使います。カンマ区切りの条件は AND 結合です。値は文字列、整数、浮動小数点、真偽値へ自動型判定されます。
-- `min_score=`（省略可能、デフォルト: 0.0）: 最小スコア閾値。score < min_score の結果はレスポンスから除外されます。
-- `adaptive=`（省略可能）: 適応型 fusion モード。`on` にすると、アイテムのデータ密度に基づいてベクトル/共起の重みバランスを自動調整します。fusion モードでのみ有効。`similarity.adaptive_*` 設定で調整可能。
-
-**レスポンス形式**:
-```
-OK RESULTS <count>
-<id1> <score1>
-<id2> <score2>
+$ telnet 127.0.0.1 11017
+Trying 127.0.0.1...
+Connected to localhost.
+Escape character is '^]'.
+INFO
+OK INFO
 ...
+END
 ```
 
-**例（fusion モード）**:
-```
-SIM item456 10 using=fusion
-→ OK RESULTS 3
-item789 0.9245
-item101 0.8932
-item202 0.8567
-```
+サーバーは接続時にバナーを送りません。クライアントが最初に受け取るバイト列は、最初のコマンドに対する応答です。
 
-**例（events のみ）**:
-```
-SIM item456 10 using=events
-→ OK RESULTS 2
-item101 0.9500
-item789 0.8700
+`api.unix_socket.path` を設定すると、同じプロトコルがそのソケット上でも提供されます。このソケットは CIDR チェックを完全に迂回し（ソケットファイルのファイルシステム権限がアクセス制御になります）、IP 単位の接続数上限とレート制限も適用されません。
+
+```bash
+$ printf 'INFO\n' | nc -U /var/run/nvecd.sock
 ```
 
-**例（vectors のみ）**:
-```
-SIM item456 10 using=vectors
-→ OK RESULTS 3
-item789 0.9245
-item202 0.8932
-item555 0.8567
-```
+同梱の[クライアントライブラリ](./client-library.md)と `nvecd-cli` はこのプロトコルを話します。`nvecd-cli` については後述します。
 
-**例（フィルタ付き）**:
-```
-SIM item456 10 filter=category:electronics
-→ OK RESULTS 2
-item789 0.9245
-item101 0.8932
-```
+## フレーミング
 
-**例（min_score 付き）**:
-```
-SIM item456 10 min_score=0.85
-→ OK RESULTS 2
-item789 0.9245
-item101 0.8932
-```
+リクエストは `\n` または `\r\n` で終端された 1 行です。コマンドが複数行にまたがることはできません。行中に改行や NUL バイトが含まれる場合は、黙って切り詰めるのではなく拒否します。複数のコマンドを 1 回の書き込みにパイプラインで詰め込むことができ、サーバーは順番に応答します。
 
-**例（adaptive fusion）**:
-```
-SIM new_item 10 using=fusion adaptive=on
-→ OK RESULTS 3
-item789 0.9245
-item101 0.8932
-item202 0.8567
-```
+応答は CRLF で終端された行の並びで、末尾の CRLF はちょうど 1 個です。ハンドラ本体が素の `\n` で組み立てたテキストもソケットに出る前に正規化されるため、クライアントは常に `\r\n` で分割できます。
 
-**エラーレスポンス**:
-- `ERROR Item not found: item456`
-- `ERROR Invalid mode: must be events, vectors, or fusion`
-- `ERROR Invalid top_k: must be > 0 and <= 1000`
+`performance.max_query_length`（既定値 1 MiB）を超えるリクエストには `ERROR Request too large` を返し、上限に達するまで改行が届かなかった場合は `ERROR Request too large (no newline detected)` を返します。同じ `ERROR Request too large` は、リアクタのプロセス全体のバッファ予算 `performance.reactor_max_total_buffered_bytes` を使い切った接続にも返されます。ワーカープールがリクエストを受け付けられない場合の応答は `ERROR Server busy` です。どちらの条件でも、応答を送り出したあとに接続を閉じます。
 
-**注意事項**:
-- fusion モードはベクトル類似度（重み: `similarity.fusion_alpha`）と共起スコア（重み: `similarity.fusion_beta`）を組み合わせます
-- クエリコストが `cache.min_query_cost_ms` を超えた場合、結果がキャッシュされます（キャッシュが有効な場合）
-- キャッシュは VECSET（vectors モード向け）または EVENT（fusion モード向け）で無効化されます
+応答の形は 5 種類です。
 
----
+| 形 | 例 | 使うコマンド |
+|---|---|---|
+| ステータス行 | `OK VECSET` | 書き込み系、`CACHE`、`DEBUG` |
+| 結果セット | `OK RESULTS <n>` に続く `<id> <score>` 行 | `SIM`、`SIMV` |
+| ブロック | `+OK` または `OK <VERB>`、本文行、`END` | `INFO`、`CONFIG`、`DUMP INFO`、`DUMP STATUS`、`CACHE STATS` |
+| RESP バルク／配列 | `$<len>` と値、`*<n>` と `$<len>`／値の組 | `GET`、`SHOW VARIABLES` |
+| エラー | `ERROR <message>` | すべての失敗 |
 
-### SIMV — ベクトルによる類似度検索
+スコアは小数点以下ちょうど 4 桁で描画されます（`0.9940`）。HTTP 面も同じ精度に丸めるため、同一のクエリに対して両者は同じ数値を報告します。
 
-クエリベクトルに基づいて類似アイテムを検索します。
+## 認証と権限
 
-**構文**:
-```
-SIMV <top_k> [filter=<expr>] [min_score=<float>] <f1> <f2> ... <fN>
-```
+各コマンドは 3 段階の権限のいずれかを持ちます。`security.requirepass` が空の場合、3 段階すべてが開放されています。設定されている場合、未認証の接続で提供されるのは読み取りコマンドだけで、書き込みコマンドと管理コマンドは、その接続で `AUTH` が成功するまで `ERROR NOAUTH Authentication required` で拒否されます。
 
-**パラメータ**:
-- `<top_k>`: 返す結果数（整数）
-- `filter=`（省略可能）: SIM と同じメタデータフィルタ式。
-- `min_score=`（省略可能、デフォルト: 0.0）: 最小スコア閾値。
-- `<f1> <f2> ... <fN>`: クエリベクトル成分（浮動小数点数）
+| 権限 | コマンド |
+|---|---|
+| 読み取り | `SIM`、`SIMV`、`INFO`、`CONFIG HELP`、`CONFIG SHOW`、`CACHE STATS`、`DEBUG ON`、`DEBUG OFF`、`GET`、`SHOW VARIABLES` |
+| 書き込み | `EVENT`、`VECSET`、`VECDEL`、`METASET`、`SET`、`CACHE CLEAR`、`CACHE ENABLE`、`CACHE DISABLE` |
+| 管理 | `DUMP SAVE`、`DUMP LOAD`、`DUMP VERIFY`、`DUMP INFO`、`DUMP STATUS`、`CONFIG VERIFY` |
 
-**レスポンス形式**:
-```
-OK RESULTS <count>
-<id1> <score1>
-<id2> <score2>
-...
-```
+認証は接続単位であり、再接続には引き継がれません。
 
-**例**:
-```
-SIMV 5 0.1 0.9 -0.2 0.5
-→ OK RESULTS 2
-item789 0.9800
-item101 0.8200
-```
+### `AUTH <password>`
 
-**例（フィルタと min_score 付き）**:
-```
-SIMV 5 filter=type:article min_score=0.7 0.1 0.9 -0.2 0.5
-→ OK RESULTS 1
-item789 0.9800
-```
-
-**エラーレスポンス**:
-- `ERROR Dimension mismatch: expected 768, got 512`
-- `ERROR Invalid vector format`
-- `ERROR Invalid top_k`
-
-**注意事項**:
-- 次元数は値の数から自動検出されます
-- ベクトル類似度のみが使用されます（クエリベクトルでは fusion モードは非対応）
-- クエリコストが `cache.min_query_cost_ms` を超えた場合、結果がキャッシュされます
-
----
-
-## 管理コマンド（MygramDB 互換）
-
-### AUTH — 接続の認証
-
-現在の接続をパスワードで認証します。`security.requirepass` が設定されている場合に必要です。
-
-**構文**:
-```
+```text
 AUTH <password>
 ```
 
-**パラメータ**:
-- `<password>`: サーバーパスワード（設定ファイルの `security.requirepass` と一致する必要があります）
+パスワードは最初の空白またはタブ以降のすべてで、不透明なバイト列として扱われます。トリムも分割も大文字化もしないため、空白を含むパスワードも設定どおりに認証できます。比較は定数時間です。
 
-**例**:
-```bash
-AUTH mysecretpassword
-→ +OK
+```text
+> AUTH s3cret
++OK
 
-# 認証なしの場合、書き込みコマンドは拒否されます:
-VECSET item1 0.1 0.2 0.3
-→ ERROR NOAUTH Authentication required
+> AUTH wrong
+ERROR ERR invalid password
 ```
 
-**注意事項**:
-- 認証は接続ごとに適用されます（切断時にリセット）
-- 読み取りコマンド（SIM, SIMV, INFO, CONFIG SHOW）は認証なしで実行可能です
-- 書き込み/管理コマンド（VECSET, DUMP SAVE/LOAD, SET）は `requirepass` が設定されている場合に認証が必要です
-- `requirepass` が空の場合（デフォルト）、AUTH は不要です
+パスワードが設定されていないサーバーでは、`AUTH` は成功し、その旨を返します。
 
----
-
-### INFO — サーバー統計
-
-包括的なサーバー情報と統計を取得します（Redis スタイル形式）。
-
-**構文**:
+```text
+> AUTH anything
++OK (no password required)
 ```
+
+## 書き込みコマンド
+
+### `EVENT`
+
+```text
+EVENT <ctx> ADD <id> <score> [timestamp=<epoch_sec>]
+EVENT <ctx> SET <id> <score> [timestamp=<epoch_sec>]
+EVENT <ctx> DEL <id> [timestamp=<epoch_sec>]
+```
+
+アイテム `<id>` がコンテキスト `<ctx>` に現れたことを記録します。`ADD` と `SET` はスコアを取り、`DEL` は取りません。スコアは 0〜100 の範囲の整数（両端を含む）で、サブコマンドのキーワードは大文字小文字を区別しません。`timestamp=` は符号なしの epoch 秒を取り、省略した場合はサーバー自身の時計で刻印します。3 つの形すべてが `OK EVENT` を返します。これは何も変えない重複排除済みの再送でも同じです。
+
+```text
+> EVENT user_alice ADD item1 100
+OK EVENT
+
+> EVENT user_alice SET item2 90 timestamp=1730000000
+OK EVENT
+
+> EVENT user_alice DEL item2
+OK EVENT
+```
+
+`ADD` は加算し、`SET` はそのコンテキストにおけるそのアイテムの保存済みスコアを置き換え、`DEL` は取り除きます。それぞれが共起グラフに何をするかは [events-and-co-occurrence.md](./events-and-co-occurrence.md) で説明します。
+
+2 つの識別子はどちらも検証されます。空であってはならず、`0x20` 以下のバイトと `0x7F` の削除バイトを含んでもなりません。ID にそうしたバイトが入ると、ある取り込み面が別の面のフレーミングを壊せてしまうためです。`0x80` 以上のバイトはそのまま通すので、マルチバイトの UTF-8 識別子は使えます。空白区切りのコマンドではどちらの違反も送れないため、これらの拒否に届くのは JSON 面からです。
+
+### `VECSET`
+
+```text
+VECSET <id> <f1> <f2> ... <fN>
+```
+
+`<id>` のベクトルを登録または置換します。次元は浮動小数点トークンの個数から決まり、ストアがすでに使っている次元と一致しなければなりません。最初のベクトルが次元を確定するまでは、その値は `vectors.default_dimension` です。
+
+```text
+> VECSET item1 0.1 0.2 0.3 0.4
+OK VECSET
+
+> VECSET item1 0.1 0.2 0.3
+ERROR Vector dimension mismatch: expected 4, got 3
+```
+
+TCP の形はメタデータを運びません。メタデータには `METASET` を使います。
+
+### `VECDEL`
+
+```text
+VECDEL <id>
+```
+
+ベクトルとそのメタデータを削除します。未知の ID は黙って成功するのではなくエラーになります。
+
+```text
+> VECDEL item2
+OK VECDEL
+
+> VECDEL nope
+ERROR Vector not found: nope
+```
+
+### `METASET`
+
+```text
+METASET <id> <key:value[,key:value...]>
+```
+
+すでにベクトルを持つアイテムにメタデータを付けます。組は空白を含まない 1 トークンで、`filter=` と同じ式の文法をここでも受け付け、各条件のフィールドと値がメタデータの 1 エントリになります。値は綴りから型付けされます。`true`／`false` は真偽値、裸の整数は整数、裸の小数は倍精度浮動小数点、それ以外は文字列のままです。
+
+```text
+> METASET item1 category:books,price:12,active:true
+OK METASET
+
+> METASET nope category:books
+ERROR Vector not found for metadata: nope
+```
+
+メタデータは絞り込み結果に広く影響するため、`METASET` が成功するとクエリキャッシュ全体が消去されます。
+
+## 検索コマンド
+
+### `SIM`
+
+```text
+SIM <id> <top_k> [using=events|vectors|fusion] [adaptive=on|off] [filter=<expr>] [min_score=<float>]
+```
+
+`<id>` に似たアイテムを検索します。`top_k` は正の整数で、`similarity.max_top_k` を超えてはなりません。オプションは `top_k` の後ろであれば任意の順に書けます。認識できないトークンは無視されるのではなく拒否されます。
+
+| オプション | 値 | 既定値 |
+|---|---|---|
+| `using=` | `events`、`vectors`、`fusion` | `fusion` |
+| `adaptive=` | `on`、`off` | サーバーの `similarity.adaptive_fusion` |
+| `filter=` | フィルタ式（後述） | フィルタなし |
+| `min_score=` | 有限の浮動小数点数 | `0.0` |
+
+`adaptive=` は統合検索にのみ適用されます。`min_score=` は検索後に適用されるため、結果集合を広げるのではなく削ります。
+
+```text
+> SIM item1 5 using=vectors
+OK RESULTS 1
+item2 0.9940
+
+> SIM item1 5 using=fusion adaptive=on min_score=0.5
+OK RESULTS 1
+item2 0.9947
+```
+
+2 つのオプショントークンは認識したうえで明示的に拒否されます。これらを使うクライアントは、絞り込まれていない答えを受け取るのではなく、はっきり失敗します。
+
+```text
+> SIM item1 5 candidate_limit=100
+ERROR candidate_limit option is not supported
+
+> SIM item1 5 explain=1
+ERROR explain option is not supported
+```
+
+その他の未知のトークンは構文エラーです。
+
+```text
+> SIM item1 5 bogus=1
+ERROR Invalid SIM option: bogus=1
+```
+
+ベクトルを持たない ID はベクトル検索や統合検索の起点になれません。
+
+```text
+> SIM nosuch 5
+ERROR Query vector not found: nosuch
+```
+
+3 つのモードについては [vector-search.md](./vector-search.md) と [fusion.md](./fusion.md) で説明します。
+
+### `SIMV`
+
+```text
+SIMV <top_k> [filter=<expr>] [min_score=<float>] <f1> <f2> ... <fN>
+```
+
+既存の ID ではなくクエリベクトルで検索します。すべてのオプショントークンはベクトルより前に置きます。パーサーは `=` を含まない最初のトークンでオプションの解釈をやめ、それ以降を浮動小数点数として読みます。`SIMV` は `using=` も `adaptive=` も受け付けず、常にベクトル検索を行います。
+
+```text
+> SIMV 3 0.1 0.2 0.3 0.4
+OK RESULTS 2
+item1 1.0000
+item2 0.9940
+
+> SIMV 3 filter=active:true 0.1 0.2 0.3 0.4
+OK RESULTS 1
+item1 1.0000
+```
+
+クエリベクトルの次元はストアの次元と一致しなければなりません。
+
+```text
+> SIMV 3 1 2 3
+ERROR Query vector dimension mismatch: expected 4, got 3
+```
+
+### `filter=` の文法
+
+フィルタ式はカンマ区切りの条件の並びで、そのすべてが一致する必要があります。各条件は `<field><operator><value>` で、トークン内のどこにも空白を置けません。フィールドは空であってはならず、値も空であってはなりません。値の型付けは `METASET` と同じです。
+
+| 演算子 | 意味 | 例 |
+|---|---|---|
+| `=` | 等しい | `filter=category=books` |
+| `:` | 等しい（`=` の別名） | `filter=category:books` |
+| `!=` | 等しくない | `filter=category!=books` |
+| `>` | より大きい | `filter=price>10` |
+| `<` | より小さい | `filter=price<10` |
+| `>=` | 以上 | `filter=price>=20` |
+| `<=` | 以下 | `filter=price<=5` |
+| `in(a\|b\|c)` | 列挙のいずれか | `filter=category=in(books\|music)` |
+
+`in(...)` は `=` または `:` の後ろの値として書き、要素を `|` で区切ります。空の要素があると式全体が無効になります。条件は `,` で連言として結合され、条件どうしの選言もグループ化もありません。集合を表現する手段が `in(...)` です。
+
+```text
+> SIM item1 5 using=vectors filter=active:true,price>10
+OK RESULTS 1
+item2 0.9940
+
+> SIM item1 5 using=vectors filter=bogus
+ERROR Invalid filter condition: 'bogus'
+```
+
+メタデータを持たないアイテムはどの条件にも一致しないため、フィルタは `METASET` または HTTP の `/metaset` と `/vecset` を通ったアイテムに結果を絞り込みます。
+
+## 管理コマンド
+
+### `INFO`
+
+```text
 INFO
 ```
 
-**レスポンス**:
-```
+サーバー、トラフィック、メモリ、キャッシュ、データの各カウンタを `END` 終端のブロックで報告します。
+
+```text
+> INFO
 OK INFO
 
 # Server
 version: 0.1.0
-uptime_seconds: 3600
+uptime_seconds: 29
 
 # Stats
-total_commands_processed: 100000
-total_connections_received: 150
+total_commands_processed: 29
+failed_commands: 8
+total_connections_received: 3
+active_connections: 1
+event_commands: 4
+sim_commands: 10
+vecset_commands: 2
+wal_replay_records_skipped: 0
 
 # Memory
-used_memory_bytes: 536870912
-used_memory_human: 512.00 MB
+used_memory_bytes: 16
+used_memory_human: 0.00 MB
 memory_health: HEALTHY
 
+# Cache
+cache_entries: 0
+cache_hits: 0
+cache_misses: 9
+cache_hit_rate: 0.0000
+
 # Data
-id_count: 12345
-ctx_count: 6789
-vector_count: 12000
-event_count: 987654
-
-# Commandstats
-cmd_event: 50000
-cmd_vecset: 20000
-cmd_sim: 25000
-cmd_simv: 5000
+id_count: 2
+ctx_count: 1
+vector_count: 1
+event_count: 4
+END
 ```
 
-**Memory Health**:
-- `HEALTHY`: システムメモリの空き容量が 20% 以上
-- `WARNING`: 空き容量が 10-20%
-- `CRITICAL`: 空き容量が 10% 未満
+`used_memory_bytes` が数えるのはベクトル行列だけです（`vector_count × dimension × 4`）。HTTP の `/info` はストアごとの合計とプロセスの RSS も報告します。`wal_replay_records_skipped` は復旧が復元できなかった WAL レコードの累計で、[persistence.md](./persistence.md) で説明します。
 
----
+### `CONFIG`
 
-### CONFIG — 設定管理
-
-**コマンド**:
-```
+```text
 CONFIG HELP [path]
 CONFIG SHOW [path]
-CONFIG VERIFY
+CONFIG VERIFY <filepath>
 ```
 
-#### CONFIG HELP
+`CONFIG HELP` はパスなしで設定セクションの一覧を、パスありでそのキーの型、既定値、許容値、説明を表示します。
 
-設定ドキュメントを表示します。
+```text
+> CONFIG HELP similarity.index_type
++OK
+similarity.index_type
 
-**例**:
-```
-CONFIG HELP events
-→ +OK
-Available paths under 'events':
-  ctx_buffer_size  - Number of events to track per context (ring buffer size)
-  decay_alpha      - Decay factor
-  ...
+Type: string (enum)
+Default: "flat"
+Allowed values:
+  - "hnsw"
+  - "ivf"
+  - "flat"
+Description: ANN index type: hnsw, ivf, or flat (brute-force)
 END
 ```
 
-`CONFIG HELP`、`CONFIG SHOW`、`CONFIG VERIFY` は `+OK` に続けて複数行の本文を返し、
-最後に終端トークン `END` を出力します。最初の空行までではなく `END` まで読んでください。
+`CONFIG SHOW` は稼働中の設定を YAML で表示し、1 セクションに絞ることもできます。`security.requirepass` は `***` に伏せられ、その隣に派生値の `security.auth_enabled` フラグが表示されます。
 
-#### CONFIG SHOW
-
-現在の設定を表示します（パスワードはマスクされます）。
-
-**例**:
-```
-CONFIG SHOW events.ctx_buffer_size
-→ +OK
-50
+```text
+> CONFIG SHOW cache
++OK
+compression_enabled: true
+enabled: true
+eviction_batch_size: 10
+max_memory_mb: 32
+min_query_cost_ms: 10.0
+ttl_seconds: 3600
 END
 ```
 
-#### CONFIG VERIFY
+`CONFIG VERIFY` は設定ファイルを適用せずに読み込んで検証します。パスは稼働中の設定ファイルがあったディレクトリの内側で解決され、設定ファイルなしで起動したサーバーの場合はスナップショットディレクトリの内側で解決されます。そのルートの外側に解決されるパス、存在しないパス、開けないパスはすべて同じメッセージで拒否されるため、このコマンドは周囲のファイルシステムについて何も答えません。
 
-設定ファイルを検証します（サーバー起動前にも使用可能）。
-
-`CONFIG VERIFY` はファイルパスを必須とし、解析した内容の要約を返します。
-
-**レスポンス**:
-```
-CONFIG VERIFY /etc/nvecd/config.yaml
-→ +OK
-Configuration is valid
-  Vectors:
-    dimension: 768
-    distance_metric: cosine
-  Events:
-    ctx_buffer_size: 50
-    decay_interval_sec: 3600
-  API:
-    tcp: 127.0.0.1:11017
-END
+```text
+> CONFIG VERIFY /etc/passwd
+ERROR Configuration file is not accessible
 ```
 
-**エラーレスポンス**:
-- `ERROR CONFIG VERIFY requires a filepath`
-- `ERROR Configuration validation failed: <reason>`
+### `DUMP`
 
----
-
-### DUMP — スナップショット管理
-
-**コマンド**:
-```
-DUMP SAVE [<filepath>]
-DUMP LOAD [<filepath>]
-DUMP VERIFY [<filepath>]
-DUMP INFO [<filepath>]
-```
-
-単一バイナリの `.dmp` 形式、MygramDB 互換。
-
-#### DUMP SAVE
-
-完全なスナップショットをディスクに保存します。レスポンスは `snapshot.mode` によって変わります。
-
-**例（`snapshot.mode: lock`）**:
-```
-DUMP SAVE /data/nvecd.nvec
-→ OK DUMP_SAVED /data/nvecd.nvec
-```
-
-`OK DUMP_SAVED` は耐久性ハンドシェイクが最後まで完了したことを意味します。すなわち、
-スナップショットが書き出され、その sidecar が永続化され、WAL がチェックポイントされて
-切り詰められた状態です。いずれかの段階が失敗した場合は、OK レスポンスの下にログ行を
-残すのではなくエラーとして報告されるため、受理の返答がデータを追い越すことはありません。
-
-**例（`snapshot.mode: fork`）**:
-```
-DUMP SAVE /data/nvecd.nvec
-→ OK DUMP_SAVE_STARTED /data/nvecd.nvec
-```
-
-fork モードが返すのはバックグラウンドの子プロセスが開始したという合図であって、完了の
-合図ではありません。結果は `DUMP STATUS` で確認してください。
-
-**ファイルパスを省略した場合**:
-```
-DUMP SAVE
-→ OK DUMP_SAVED /var/lib/nvecd/snapshots/nvecd.snapshot
-```
-
-引数なしの保存は `snapshot.default_filename` に書き込みます。クライアントが指定した名前と
-同じパス検証を通し、スナップショットディレクトリ内に解決されます。この設定が空の場合は
-`snapshot_YYYYMMDD_HHMMSS.dmp` 形式の名前にフォールバックします。
-
-**エラーレスポンス**:
-- `ERROR Another snapshot save is already in progress`
-- `ERROR Cannot save snapshot while a snapshot load is in progress`
-- `ERROR Failed to save snapshot to /data/nvecd.nvec: <reason>`
-
-#### DUMP LOAD
-
-スナップショットをディスクから読み込みます（読み込み中はサーバーが読み取り専用になります）。
-
-**例**:
-```
-DUMP LOAD /data/nvecd.nvec
-→ OK DUMP_LOADED /data/nvecd.nvec
-```
-
-読み込みは、そのスナップショットを永続的な復旧基点にし、読み込み前の WAL 末尾を破棄します。
-これにより、オペレーターが巻き戻した変更を後の再起動が再生してしまうことはありません。
-
-**エラーレスポンス**:
-- `ERROR File not found: /data/nvecd.nvec`
-- `ERROR CRC mismatch: file may be corrupted`
-- `ERROR Unsupported snapshot version`
-
-#### DUMP VERIFY
-
-スナップショットの整合性を読み込みなしで検証します。
-
-**例**:
-```
-DUMP VERIFY /data/nvecd.nvec
-→ OK DUMP_VERIFIED /data/nvecd.nvec
-```
-
-**エラーレスポンス**:
-- `ERROR Snapshot verification failed for /data/nvecd.nvec: <reason>`
-
-#### DUMP INFO
-
-スナップショットのメタデータを表示します。
-
-**例**:
-```
-DUMP INFO /data/nvecd.nvec
-→ OK DUMP_INFO /data/nvecd.nvec
-version: 1
-stores: 3
-flags: 0
-file_size: 536870912
-timestamp: 1705564800
-has_statistics: true
-END
-```
-
-#### DUMP STATUS
-
-バックグラウンドスナップショット操作（fork ベース）のステータスを確認します。
-
-**構文**:
-```
+```text
+DUMP SAVE [filename]
+DUMP LOAD <filename>
+DUMP VERIFY <filename>
+DUMP INFO <filename>
 DUMP STATUS
 ```
 
-**レスポンス**:
+ファイル名はすべて `snapshot.dir` の内側で解決され、そこから逃げ出すパスは `ERROR Invalid filepath: path traversal detected` で拒否されます。ファイル名を省略できるのは `DUMP SAVE` だけで、その場合は `snapshot.default_filename` に書き込み、これも同じ検証を通ります。`LOAD`、`VERIFY`、`INFO` は空のパスをそれぞれ固有のメッセージで拒否します。
+
+`DUMP LOAD`、`DUMP VERIFY`、`DUMP INFO` は下層で起きたことを解決済みのパスを含む 1 つのメッセージに包むため、ファイルが存在しない場合と壊れている場合はメッセージの形ではなく理由の側で区別します。
+
+`DUMP SAVE` の応答は `snapshot.mode` によって異なり、その違いは言い回しではなく永続性の保証そのものです。`fork` モードではファイルはまだ読めません。
+
+```text
+> DUMP SAVE
+OK DUMP_SAVE_STARTED /var/lib/nvecd/snapshots/nvecd.nvec
 ```
+
+`lock` モードでは応答が届いた時点でファイルは完成しています。
+
+```text
+> DUMP SAVE
+OK DUMP_SAVED /var/lib/nvecd/snapshots/nvecd.nvec
+```
+
+`DUMP STATUS` はバックグラウンドの書き込みプロセスを報告します。まだ何も動いていないときのフィールドは `status: idle` だけで、他の 3 状態はパスと時刻を、失敗はさらにメッセージを運びます。
+
+```text
+> DUMP STATUS
 OK DUMP_STATUS
-status: idle|in_progress|completed|failed
-filepath: <path>
-pid: <pid>
-start_time: <timestamp>
-end_time: <timestamp>
-error: <message>
-END
-```
-
-`status:` に続くフィールドはステータスによって変わります。`idle` は何も伴わず、
-`in_progress` は `filepath`、`pid`、`start_time` を、`completed` は `pid` の代わりに
-`end_time` を、`failed` はさらに `error` を伴います。`END` まで読んでください。
-
-**例**:
-```bash
-DUMP STATUS
-→ OK DUMP_STATUS
 status: completed
-filepath: /var/lib/nvecd/snapshots/dump_20250325_120000.nvec
-start_time: 1711360800
-end_time: 1711360802
+filepath: /var/lib/nvecd/snapshots/nvecd.nvec
+start_time: 1788427643
+end_time: 1788427643
 END
 ```
 
-**注意事項**:
-- 最新のバックグラウンドスナップショットの状態を表示します
-- `in_progress`: fork された子プロセスがスナップショットを書き込み中
-- `completed`: 最後のスナップショットが正常に保存されました
-- `failed`: 最後のスナップショットでエラーが発生しました
-- `idle`: スナップショットがまだ開始されていません
+`in_progress` 状態は `pid` を、`failed` 状態は `error` を追加します。
 
----
+`DUMP LOAD` は稼働中のストアをスナップショットの内容で置き換え、ANN 索引を再構築し、キャッシュを消去し、そのスナップショットを復旧の基点にします。`DUMP VERIFY` は読み込まずに整合性を検査します。`DUMP INFO` はヘッダを読みます。
 
-### DEBUG — デバッグモード
-
-接続ごとのデバッグモードです。SIM コマンドの詳細な実行情報を表示します。
-
-**コマンド**:
-```
-DEBUG ON
-DEBUG OFF
+```text
+> DUMP INFO nvecd.nvec
+OK DUMP_INFO /var/lib/nvecd/snapshots/nvecd.nvec
+version: 1
+stores: 4
+flags: 16
+file_size: 476
+timestamp: 1788427643
+has_statistics: false
+END
 ```
 
-#### DEBUG ON
+保存や読み込みの実行中は、ストアに触れるコマンドが `ERROR READONLY Snapshot in progress` または `ERROR LOADING Snapshot load in progress` で拒否されます。仕組みは [persistence.md](./persistence.md) で扱います。
 
-この接続のデバッグログを有効化します。
+### `CACHE`
 
-**例**:
-```
-DEBUG ON
-→ OK DEBUG_ON
-```
-
-#### DEBUG OFF
-
-この接続のデバッグログを無効化します。
-
-**例**:
-```
-DEBUG OFF
-→ OK DEBUG_OFF
-```
-
-**デバッグ出力例**（DEBUG ON 時）:
-```
-SIM item456 10 using=fusion
-→ OK RESULTS 3
-item789 0.9245
-item101 0.8932
-item202 0.8567
-
-# DEBUG 4
-mode: fusion
-query_time_us: 850
-candidates: 15
-results: 3
-```
-
-デバッグブロックは、DEBUG モードが有効な接続に対して通常の SIM/SIMV の結果の後ろに
-付加されます。`# DEBUG` ヘッダーは後続のフィールド数を持つため、ステートフルな
-クライアントは中身を解釈せずにブロックを切り出せます。フィールド:
-- `mode`: 検索モード（`events`、`vectors`、`fusion`、SIMV では `vector`）
-- `query_time_us`: クエリ実行時間の合計（マイクロ秒）
-- `candidates`: `min_score` による絞り込み前の候補数
-- `results`: クライアントに返した結果数
-
----
-
-## キャッシュコマンド
-
-### CACHE — キャッシュ管理
-
-クエリ結果キャッシュの管理コマンドです。
-
-**コマンド**:
-```
+```text
 CACHE STATS
 CACHE CLEAR
 CACHE ENABLE
 CACHE DISABLE
 ```
 
-#### CACHE STATS
+`CACHE ENABLE` と `CACHE DISABLE` は実行時変数 `cache.enabled` を設定する短縮形です。この 2 つは `CACHE CLEAR` と同じく書き込み権限を必要とします。
 
-詳細なキャッシュ統計を返します。
+4 つのいずれも、依存先が欠けているときに黙って縮退することはありません。`CACHE STATS` と `CACHE CLEAR` はキャッシュコントローラに触れ、それがない場合は `Cache controller is not initialized` で失敗します。`CACHE ENABLE` と `CACHE DISABLE` はコントローラをまったく参照せず、実行時変数マネージャを経由するため、それがない場合は `Runtime variable manager is not initialized` で失敗します。
 
-**レスポンス**:
-```
-OK CACHE_STATS
-cache_enabled: true
-cache_entries: 342
-cache_memory_bytes: 12845632
-current_memory_mb: 12.25
-total_queries: 1250
-cache_hits: 985
-cache_misses: 265
-cache_misses_invalidated: 45
-cache_misses_not_found: 220
-cache_hit_rate: 0.7880
-evictions: 15
-ttl_expirations: 8
-avg_hit_latency_ms: 0.125
-avg_miss_latency_ms: 2.450
-total_time_saved_ms: 2418.75
-END
-```
-
-キャッシュインスタンスが構成されていない場合は、有効フラグとエントリ数のみが返されます:
-```
-OK CACHE_STATS
-cache_enabled: false
-cache_entries: 0
-END
-```
-
-**統計フィールド**:
-- `cache_enabled`: キャッシュが現在有効かどうか（`true`/`false`）
-- `cache_entries`: キャッシュされたエントリ数
-- `cache_memory_bytes`: 現在のキャッシュメモリ使用量（バイト）
-- `current_memory_mb`: 現在のキャッシュメモリ使用量（メビバイト）
-- `total_queries`: キャッシュルックアップの総数
-- `cache_hits`: キャッシュヒット数
-- `cache_misses`: ミスの合計（invalidated + not found）
-- `cache_misses_invalidated`: 無効化（VECSET/EVENT）によるミス
-- `cache_misses_not_found`: キーがキャッシュにない、TTL 期限切れ、またはデコンプレッション失敗によるミス
-- `cache_hit_rate`: キャッシュヒット率（0.0 ~ 1.0）
-- `evictions`: LRU エビクション数
-- `ttl_expirations`: TTL 期限切れにより削除されたエントリ数
-- `avg_hit_latency_ms`: ヒット時の平均キャッシュルックアップレイテンシ
-- `avg_miss_latency_ms`: ミス時の平均キャッシュルックアップレイテンシ
-- `total_time_saved_ms`: キャッシュヒットにより節約されたクエリ時間の合計
-
-#### CACHE CLEAR
-
-すべてのキャッシュエントリをクリアします。
-
-**レスポンス**:
-```
+```text
+> CACHE CLEAR
 OK CACHE_CLEARED
-```
 
-キャッシュインスタンスが構成されていない場合は、クリア対象がないことが示されます:
-```
-OK CACHE_CLEARED (no cache)
-```
+> CACHE DISABLE
+OK CACHE_DISABLED
 
-#### CACHE ENABLE
-
-ランタイムでキャッシュを有効化します。
-
-**レスポンス**:
-```
+> CACHE ENABLE
 OK CACHE_ENABLED
 ```
 
-起動時にキャッシュインスタンスが構成されていない場合、コマンドは受理されますが効果はありません:
-```
-OK CACHE_ENABLED (no cache instance)
-```
+`CACHE STATS` は `END` 終端のブロックです。
 
-**注意**: キャッシュインスタンスは起動時に `config.yaml` で構成されている必要があります。インスタンスが存在しない場合、ランタイムでの有効化は効果がありません。
-
-#### CACHE DISABLE
-
-ランタイムでキャッシュを無効化します。既存のエントリは保持されますが、`CACHE ENABLE` で再度有効化するまで、新しいルックアップや挿入は処理されません。
-
-**レスポンス**:
-```
-OK CACHE_DISABLED
-```
-
-起動時にキャッシュインスタンスが構成されていない場合、コマンドは受理されますが効果はありません:
-```
-OK CACHE_DISABLED (no cache instance)
-```
-
-**キャッシュの動作**:
-- SIM/SIMV のクエリ結果は `query_cost_ms >= min_query_cost_ms` の場合にキャッシュされます
-- キャッシュエントリは VECSET（SIM クエリ向け）および EVENT（fusion クエリ向け）で無効化されます
-- `current_memory_bytes >= max_memory_bytes` に達すると LRU エビクションが発生します
-- メモリ使用量を削減するため、結果は LZ4 で圧縮されます
-
-**設定**（`config.yaml`）:
-```yaml
-cache:
-  enabled: true               # キャッシュの有効化/無効化
-  max_memory_mb: 32           # キャッシュの最大メモリ
-  min_query_cost_ms: 10.0     # キャッシュする最小クエリコスト
-  ttl_seconds: 3600           # キャッシュエントリの TTL（0 = TTL なし）
-  compression_enabled: true   # LZ4 圧縮の有効化
+```text
+> CACHE STATS
+OK CACHE_STATS
+cache_enabled: true
+cache_entries: 0
+cache_memory_bytes: 0
+current_memory_mb: 0.00
+min_query_cost_ms: 10.00
+ttl_seconds: 3600
+compression_enabled: true
+eviction_batch_size: 10
+total_queries: 9
+cache_hits: 0
+cache_misses: 9
+cache_misses_invalidated: 0
+cache_misses_not_found: 9
+cache_hit_rate: 0.0000
+evictions: 0
+ttl_expirations: 0
+avg_hit_latency_ms: 0.000
+avg_miss_latency_ms: 0.000
+total_time_saved_ms: 0.00
+END
 ```
 
----
+各カウンタの意味は [caching.md](./caching.md) で説明します。
 
-## エラーレスポンス
+### `DEBUG`
 
-すべてのエラーは一貫した形式に従います：
-
-```
-ERROR <error_message>
-```
-
-**一般的なエラー例**:
-- `ERROR Unknown command: FOO`
-- `ERROR Invalid argument count`
-- `ERROR Item not found: item123`
-- `ERROR Dimension mismatch: expected 768, got 512`
-- `ERROR Invalid score: must be 0-100`
-- `ERROR File not found: /data/dump.dmp`
-- `ERROR CRC mismatch: file may be corrupted`
-
----
-
-## 類似度モード
-
-### `events` - イベントベース（共起）
-
-イベントデータの共起スコアのみを使用します。コンテンツ特徴量なしの協調フィルタリングに最適です。
-
-**ユースケース**: 「このアイテムに対してインタラクションしたユーザーは、こちらにもインタラクションしています...」
-
-### `vectors` - ベクトルベース
-
-ベクトル類似度（内積またはコサイン）のみを使用します。コンテンツベースの推薦に最適です。
-
-**ユースケース**: 「類似したコンテンツ/特徴量を持つアイテム...」
-
-### `fusion` - フュージョン検索（SIM のみ）
-
-ベクトル類似度（重み: `similarity.fusion_alpha`）と共起スコア（重み: `similarity.fusion_beta`）を組み合わせます。
-
-**ユースケース**: コンテンツ類似度 + ユーザー行動を組み合わせたハイブリッド推薦。
-
-**計算式**:
-```
-fusion_score = (alpha x vector_similarity) + (beta x co_occurrence_score)
-ここで alpha + beta = 1.0
+```text
+DEBUG ON
+DEBUG OFF
 ```
 
-**注意**: `fusion` モードは `SIM` コマンドでのみ利用可能です（`SIMV` では不可）。
+デバッグモードはそれを発行した接続の性質であってサーバーの性質ではなく、接続が閉じると失われます。
 
----
+```text
+> DEBUG ON
+OK DEBUG_ON
+```
 
-## ベストプラクティス
+有効な間は、すべての `SIM` と `SIMV` の応答が結果の後ろに追加のブロックを運びます。
 
-### パフォーマンスのヒント
+```text
+> SIM item1 3 using=vectors
+OK RESULTS 0
+# DEBUG 4
+mode: vectors
+query_time_us: 2
+candidates: 0
+results: 0
+```
 
-1. **適切な top_k を使用する**: 値が小さいほど高速です
-2. **キャッシュを有効化する**: 繰り返しクエリには `cache.enabled=true` を設定してください
-3. **fusion の重みを調整する**: ユースケースに応じて `fusion_alpha` と `fusion_beta` を調整してください
-4. **コールドアイテムには events モードを使用する**: ベクトルのないアイテムでもイベント経由で推薦可能です
-5. **キャッシュヒット率を監視する**: `CACHE STATS` でパフォーマンスを確認してください
+`# DEBUG 4` は続くフィールド数を表し、状態を持つクライアントがこのブロックを枠付けできるようにします。`mode` は検索モード（`SIMV` では `vector`）、`candidates` は `min_score=` を適用する前の結果数、`results` は適用後の数です。キャッシュヒット時の `query_time_us` は `0` です。この計測が対象とするのは、ヒットが置き換えた検索そのものだからです。
 
-### データ管理
+### 実行時変数
 
-1. **定期的なスナップショット**: バックアップには `DUMP SAVE` を使用してください
-2. **スナップショットの検証**: 読み込み前に `DUMP VERIFY` を使用してください
-3. **メモリの監視**: `INFO` でメモリ使用量を追跡してください
-4. **減衰の設定**: データの鮮度要件に応じて `decay_interval_sec` を調整してください
+```text
+SET <variable> <value>
+GET <variable>
+SHOW VARIABLES [LIKE <pattern>]
+```
 
-### デバッグ
+`SET` は `+OK` を返し、`GET` は RESP のバルク文字列を返します。変更可能な変数は `logging.level`、`logging.json`、`cache.enabled`、`cache.min_query_cost_ms`、`cache.ttl_seconds` の 5 つだけで、既知のその他の変数は読み取れますが書き込みは拒否されます。
 
-1. **DEBUG モードを有効化する**: `DEBUG ON` でクエリ実行の詳細を確認できます
-2. **INFO の統計を確認する**: コマンド数とパフォーマンスを監視してください
-3. **小さなデータセットでテストする**: スケールアップ前に動作を検証してください
+```text
+> SET cache.ttl_seconds 600
++OK
 
----
+> GET cache.enabled
+$4
+true
 
-## 次のステップ
+> SET vectors.default_dimension 8
+ERROR Variable 'vectors.default_dimension' is immutable (requires restart)
 
-- 設定オプションについては [設定ガイド](configuration.md) を参照
-- 永続化の詳細については [スナップショット管理](snapshot.md) を参照
-- プログラムからのアクセスについては [クライアントライブラリガイド](libnvecdclient.md) を参照
-- 最適化のヒントについては [パフォーマンスガイド](performance.md) を参照
+> GET nosuch
+ERROR Unknown variable: nosuch
+```
+
+真偽値は `true`／`false`、`on`／`off`、`1`／`0`、`yes`／`no` を受け付け、`true` または `false` の正規形で保存されます。
+
+`SHOW VARIABLES` は `<name>=<value> (mutable|immutable)` 行の RESP 配列を返します。`LIKE` は前方一致のパターンを取り、末尾の `%` は取り除かれて残りが接頭辞になります。
+
+```text
+> SHOW VARIABLES LIKE cache.%
+*6
+$42
+cache.compression_enabled=true (immutable)
+$28
+cache.enabled=true (mutable)
+$40
+cache.eviction_batch_size=10 (immutable)
+$34
+cache.max_memory_mb=32 (immutable)
+$43
+cache.min_query_cost_ms=10.000000 (mutable)
+$31
+cache.ttl_seconds=600 (mutable)
+```
+
+入力では `performance.` の接頭辞を `perf.` と綴ることもできますが、内省は常に `performance.` の綴りで報告します。変数の一覧と可変性は [configuration.md](./configuration.md) にあります。
+
+## エラー応答
+
+すべての失敗は `ERROR <message>` の 1 行です。拒否されたコマンドも `total_commands_processed` と `failed_commands` の両方に計上されるため、運用者がアラートを設定する失敗率が 1 を超えることはありません。
+
+| メッセージ | 原因 |
+|---|---|
+| `Empty command` | 空行 |
+| `Command must be a single line` | CR または LF が行中にある |
+| `Command must not contain embedded NUL bytes` | リクエストに NUL バイトがある |
+| `Unknown command: <NAME>` | 先頭トークンが未知 |
+| `Request too large` | `performance.max_query_length` 超過、またはリアクタの共有バッファ予算の枯渇 |
+| `Request too large (no newline detected)` | 改行が届く前に上限に達した |
+| `Server busy` | ワーカープールがリクエストを受け付けられなかった |
+| `NOAUTH Authentication required` | 未認証接続での書き込み／管理コマンド |
+| `ERR invalid password` | `AUTH` のパスワード誤り |
+| `LOADING Snapshot load in progress` | `DUMP LOAD` が反映中 |
+| `READONLY Snapshot in progress` | `lock` モードの `DUMP SAVE` が実行中 |
+| `EVENT requires at least 3 arguments: <ctx> <type> <id> [<score>]` | `EVENT` の引数個数 |
+| `EVENT ADD requires 4-5 arguments: <ctx> ADD <id> <score> [timestamp=<value>]` | `EVENT ADD` の引数個数 |
+| `Invalid EVENT type: <T> (must be ADD, SET, or DEL)` | `EVENT` のサブコマンドが未知 |
+| `Score must be in range [0, 100], got <n>` | イベントスコアが範囲外 |
+| `Invalid integer: <t>` | 末尾に余分な文字が付いた整数トークン（小数のスコアや `top_k` など） |
+| `Failed to parse integer: <t>` | そもそも数値でない整数トークン |
+| `Failed to parse timestamp: <v>` | `timestamp=` が数値でない |
+| `Context cannot be empty` ／ `ID cannot be empty` | `EVENT` のコンテキストまたはアイテム ID が空 |
+| `Context must not contain whitespace or control characters` | `EVENT` のコンテキストに `0x20` 以下または `0x7F` のバイトがある |
+| `ID must not contain whitespace or control characters` | `EVENT` のアイテム ID に対する同じ規則 |
+| `VECSET requires at least 2 arguments: <id> <floats>` | `VECSET` の引数個数 |
+| `Invalid float: <t>` | 末尾に余分な文字が付いた浮動小数点トークン、または `nan` や `inf` などの非有限の綴り |
+| `Failed to parse float: <t>` | そもそも数値でない浮動小数点トークン |
+| `ID cannot be empty` | アイテム ID が空の `VECSET` |
+| `Vector cannot be empty` | 成分のない `VECSET` |
+| `Vector dimension exceeds maximum of <n>` | ストアの上限を超える `VECSET` |
+| `Vector dimension mismatch: expected <n>, got <m>` | `VECSET` の次元 |
+| `Query vector cannot be empty` | 成分のない `SIMV` |
+| `Query vector components must be finite` | `SIMV` のクエリベクトルに非有限の成分がある |
+| `Query vector norm must be finite and non-zero` | `SIMV` のクエリベクトルのノルムが使えない |
+| `Query vector dimension mismatch: expected <n>, got <m>` | `SIMV` の次元 |
+| `VECDEL requires 1 argument: <id>` | `VECDEL` の引数個数 |
+| `Vector not found: <id>` | 未知の ID への `VECDEL` |
+| `Vector not found for metadata: <id>` | ベクトルのないアイテムへの `METASET` |
+| `METASET requires 2 arguments: <id> <key:value[,key:value...]>` | `METASET` の引数個数 |
+| `SIM requires at least 2 arguments: <id> <top_k>` | `SIM` の引数個数 |
+| `SIMV requires at least 2 arguments: <top_k> <floats>` | `SIMV` の引数個数 |
+| `SIMV requires at least one vector float` | トークンがすべてオプションだった `SIMV` |
+| `top_k must be positive, got <n>` | `top_k` が正でない |
+| `top_k <n> exceeds maximum allowed: <m>` | `top_k` が `similarity.max_top_k` 超過 |
+| `Invalid using value: <v> (must be events, vectors, or fusion)` | モードが未知 |
+| `Invalid adaptive value: <v> (must be on or off)` | `adaptive=` の値が未知 |
+| `Invalid SIM option: <t>` ／ `Invalid SIMV option: <t>` | オプショントークンが未知 |
+| `candidate_limit option is not supported` | `candidate_limit=` |
+| `explain option is not supported` | `explain=` |
+| `Invalid filter condition: '<pair>'` | `filter=` の条件が不正 |
+| `Query vector not found: <id>` | ベクトルのない ID への `SIM` |
+| `CONFIG requires subcommand: HELP\|SHOW\|VERIFY` | `CONFIG` の引数個数 |
+| `Unknown CONFIG subcommand: <S>` | `CONFIG` のサブコマンドが未知 |
+| `Configuration file is not accessible` | `CONFIG VERIFY` のパスが許可ルート外 |
+| `DUMP requires subcommand: SAVE\|LOAD\|VERIFY\|INFO\|STATUS` | `DUMP` の引数個数 |
+| `DUMP LOAD requires a filepath` | 引数のない `DUMP LOAD` |
+| `DUMP VERIFY requires a filepath` | 引数のない `DUMP VERIFY` |
+| `DUMP INFO requires a filepath` | 引数のない `DUMP INFO` |
+| `Invalid filepath: path traversal detected` | スナップショットパスが `snapshot.dir` から逃げている |
+| `Failed to load snapshot from <path>: <reason>` | `DUMP LOAD` のすべての失敗。整合性の詳細がある場合は括弧で追記される |
+| `Snapshot verification failed for <path>: <reason>` | `DUMP VERIFY` のすべての失敗。同じ詳細が付くことがある |
+| `Failed to read snapshot info from <path>: <reason>` | `DUMP INFO` がヘッダを読めなかった |
+| `Another snapshot load is already in progress` | 2 つ目の `DUMP LOAD` が同時に来た |
+| `Another snapshot save is already in progress` | 2 つ目の `lock` モード `DUMP SAVE` が同時に来た |
+| `A snapshot save is already in progress` | 保存がストアを掴んでいる間の `DUMP LOAD` |
+| `Cannot save snapshot while a snapshot load is in progress` | 読み込み中の `DUMP SAVE` |
+| `CACHE requires subcommand: STATS\|CLEAR\|ENABLE\|DISABLE` | `CACHE` の引数個数 |
+| `Cache controller is not initialized` | キャッシュコントローラのないサーバーでの `CACHE STATS` または `CACHE CLEAR` |
+| `Runtime variable manager is not initialized` | 変数マネージャがない状態での `CACHE ENABLE` または `CACHE DISABLE` |
+| `DEBUG requires exactly one argument: ON\|OFF` | `DEBUG` の引数個数 |
+| `SET requires 2 arguments: <variable_name> <value>` | `SET` の引数個数 |
+| `Unknown variable: <name>` | 実行時変数が未知 |
+| `Variable '<name>' is immutable (requires restart)` | 変更不可の変数への書き込み |
+
+エラーコードはモジュールごとに区切られています。1000〜1999 は設定、2000〜2999 はイベント処理、3000〜3999 はコマンド解析、4000〜4999 はベクトルと類似度、5000〜5999 はストレージとスナップショット、6000〜6999 はネットワークとサーバー、7000〜7999 はクライアント、8000〜8999 はキャッシュです。TCP 面が報告するのはメッセージだけで、[HTTP 面](./http-api.md)はコードをステータスに対応付けます。
+
+## nvecd-cli
+
+`nvecd-cli` は同じプロトコルを話す REPL であり、単発コマンドの実行環境でもあります。接続は TCP のみで、Unix ソケットのオプションはありません。
+
+```text
+Usage: nvecd-cli [OPTIONS] [COMMAND]
+```
+
+| フラグ | 意味 |
+|---|---|
+| `-h HOST` | サーバーのホスト名または IPv4 アドレス（既定値 `127.0.0.1`） |
+| `-p PORT` | サーバーのポート（既定値 `11017`） |
+| `--retry N` | 接続を拒否されたとき N 回再試行する（既定値 `0`） |
+| `--wait-ready` | サーバーが受け付けるまで最大 100 回再試行する |
+| `--password-file FILE` | `AUTH` のパスワードを専用ファイルから読む |
+| `--password-env NAME` | `AUTH` のパスワードを環境変数から読む |
+| `--help` | 使い方を表示して終了する |
+
+既知のフラグでない最初の引数からコマンドが始まります。そこから先はすべて半角空白 1 個で連結されて 1 つのコマンドとして送られ、プロセスは終了します。コマンドを与えない場合は対話モードに入り、`help` でコマンド一覧を表示し、`quit` または `exit` で抜けます。
+
+```bash
+$ nvecd-cli -p 11017 INFO
+INFO
+
+# Server
+version: 0.1.0
+...
+
+$ nvecd-cli -p 11017 BOGUS; echo "exit=$?"
+(error) Unknown command: BOGUS
+exit=1
+```
+
+エラー応答は非ゼロで終了するため、単発の形はスクリプトで使えます。再試行が効くのは接続を拒否された場合だけです。名前解決に失敗した場合やその他の接続エラーは即座に失敗します。
+
+`--password-file` と `--password-env` は排他で、どちらか一方だけを指定できます。パスワードファイルは実行ユーザーが所有するモード `0600` 以下の通常ファイルであり、4096 バイトを超えず、CR、LF、NUL を含まないことが必要です。末尾の改行 1 個は取り除かれます。パスワードは接続直後に `AUTH` で送られ、拒否された場合はコマンドを 1 つも実行せずに中断します。
+
+```bash
+$ NVECD_PASSWORD=s3cret nvecd-cli --password-env NVECD_PASSWORD VECSET item1 0.1 0.2 0.3 0.4
+VECSET
+```
+
+readline が利用できる環境でビルドした場合、対話モードには履歴と、コマンド名・サブコマンド・`using=` の値に対する文脈依存のタブ補完が付きます。

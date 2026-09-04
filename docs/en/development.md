@@ -1,380 +1,255 @@
-# Getting Started with Nvecd
+# Development
 
-This guide helps you get started using Nvecd in your applications.
+This page covers working on nvecd itself: where code lives, the build-and-iterate loop, the test tiers, the sanitizer and coverage builds, formatting and linting, what continuous integration does, and the conventions a change has to follow.
 
-## Quick Start
+Building the project for the first time is covered in [Installation](./installation.md); everything below assumes a configured `build/` directory.
 
-### 1. Start the Server
+## Repository layout
 
-```bash
-# Start nvecd with configuration
-nvecd -c config.yaml
-```
+Source is split by concern under `src/`, and each subdirectory becomes one static library.
 
-### 2. Connect to the Server
+| Directory | Contents |
+|---|---|
+| `src/utils/` | `Expected`, `Error`, structured logging, string, memory, path and network helpers, RAII guards for file descriptors and flags |
+| `src/config/` | The YAML parser, the JSON schema it validates against, the embedded copy of that schema generated at build time, `CONFIG SHOW` rendering, and the runtime variable manager |
+| `src/events/` | The event ring buffers, the co-occurrence index, the deduplication cache and the state cache |
+| `src/vectors/` | The vector store, the HNSW and IVF indexes, the metadata store and filter, CPU feature detection and the scalar, AVX2 and NEON distance kernels |
+| `src/similarity/` | The search engine that owns the ANN index and combines the vector and co-occurrence signals |
+| `src/cache/` | The query cache, its key generation and MD5, LZ4 result compression, and the controller that enables and disables it at runtime |
+| `src/storage/` | The snapshot format, the fork-based and lock-based snapshot sessions, and the write-ahead log with its checkpoint sidecar |
+| `src/server/` | The connection acceptor, the I/O reactor and its multiplexer backends, the thread pool, the command parser and dispatcher, the per-command handlers, the HTTP server, rate limiting and the background schedulers |
+| `src/client/` | The C++ and C client libraries, built as one shared library |
+| `src/cli/` | `nvecd-cli` |
 
-```bash
-# Using telnet
-telnet localhost 11017
+`src/main.cpp` is the server entry point and does nothing but parse arguments, apply logging configuration and drive start and stop.
 
-# Or using nc
-nc localhost 11017
-```
+Outside `src/`: `tests/` holds the CTest tree, `e2e/` the Python end-to-end suite, `examples/` the annotated configuration file, `support/` the developer scripts and the configuration documentation generator, `third_party/` the `FetchContent` declarations, and `cmake/` the package configuration and uninstall templates.
 
-### 3. Register Vectors
+A new module gets its own subdirectory, its own static library in `src/CMakeLists.txt`, and an entry in the `-Werror=switch` target list at the bottom of that file. Dependencies point inward: `nvecd_utils` depends on nothing of nvecd's, and `nvecd_server` may depend on everything.
 
-```bash
-# Register a vector for item "item1"
-VECSET item1 0.1 0.5 0.8
-# Response: OK
-
-# Register more vectors
-VECSET item2 0.2 0.4 0.9
-VECSET item3 0.1 0.6 0.7
-```
-
-### 4. Record Events
+## Building and iterating
 
 ```bash
-# Record event: user "user123" interacted with "item1" with score 95
-EVENT user123 ADD item1 95
-# Response: OK
-
-EVENT user123 ADD item2 80
-EVENT user456 ADD item1 90
-EVENT user456 ADD item3 85
+make            # configure if needed, then build with one job per core
+make test       # build, then run CTest
+make rebuild    # delete build/ and build from scratch
+make run        # build, then start the server on examples/config.yaml
 ```
 
-### 5. Search for Similar Items
+`make` reuses the existing CMake cache. Changing a CMake option means re-running the configure step with the new value:
 
 ```bash
-# Find similar items to "item1" using fusion mode
-SIM item1 10 using=fusion
-# Response:
-# OK RESULTS 2
-# item2 0.8523
-# item3 0.7891
+make CMAKE_OPTIONS="-DENABLE_ASAN=ON" configure
+make
 ```
 
----
-
-## Common Use Cases
-
-### Use Case 1: Content Recommendation
-
-Build a recommendation system combining content similarity and user behavior.
+Test runs are tuned with three variables:
 
 ```bash
-# 1. Register content vectors (from embeddings)
-VECSET article123 0.123 0.456 ... (768 floats)
-VECSET article456 0.789 0.234 ...
-
-# 2. Track user engagement
-EVENT user_alice ADD article123 95  # Alice highly engaged with article123
-EVENT user_alice ADD article456 80
-EVENT user_bob ADD article123 90
-
-# 3. Find similar articles (fusion mode combines vectors + engagement)
-SIM article123 10 using=fusion
-# Returns articles similar in content AND popular with similar users
+make test TEST_JOBS=1                  # sequential
+make test TEST_JOBS=2 TEST_VERBOSE=1   # two jobs, verbose
+make test TEST_DEBUG=1                 # pass --debug to CTest
 ```
 
-### Use Case 2: Semantic Search
+`TEST_JOBS` defaults to 4. `TEST_VERBOSE` and `TEST_DEBUG` default to 0 and add `--verbose` and `--debug` respectively.
 
-Pure vector-based similarity search.
+## Makefile targets
+
+| Target | What it does |
+|---|---|
+| `help` | Prints the target list and the test variables |
+| `configure` | Runs CMake into `build/` with `CMAKE_INSTALL_PREFIX` from `PREFIX` and any `CMAKE_OPTIONS` |
+| `build` | The default target; configures, then builds in parallel |
+| `test` | Builds, then runs CTest with `TEST_JOBS`, `TEST_VERBOSE` and `TEST_DEBUG` applied |
+| `test-full` | `test` with one job per core |
+| `test-sequential` | `test` with a single job, for diagnosing a test that only fails under contention |
+| `test-verbose` | `test` with CTest's verbose output |
+| `quick-test` | Builds, then runs only the tests whose names match the event store or vector store, as a fast inner loop |
+| `clean` | Removes `build/` |
+| `rebuild` | `clean` followed by `build` |
+| `install` | Builds, then installs into `PREFIX` |
+| `uninstall` | Removes the files listed in the build's install manifest |
+| `format` | Rewrites every `.cpp` and `.h` under `src/` and `tests/` with `clang-format` |
+| `format-check` | The same file set in check-only mode; fails on the first file that would change |
+| `lint` | Formats, builds, then runs `clang-tidy` over every source file |
+| `lint-diff` | The same, restricted to the `.cpp` files under `src/` that the working tree has changed |
+| `lint-diff-main` | The same, restricted to the files changed relative to `main` |
+| `run` | Builds, then runs the server against `examples/config.yaml`, failing if that file is absent |
+| `e2e-test` | Builds, then runs the whole Python suite |
+| `e2e-test-smoke` | Builds, then runs the Python smoke tests only |
+| `e2e-test-commands` | Builds, then runs the Python per-command tests only |
+
+Three variables override defaults: `PREFIX` for the install prefix, `CLANG_FORMAT` for the formatter binary, and `CMAKE_OPTIONS` for extra configure arguments.
+
+## Test tiers
+
+Three tiers exist, and only the first runs by default.
+
+### CTest unit tests
+
+The bulk of the suite is GoogleTest binaries registered with `gtest_discover_tests`, one executable per area, mirroring the `src/` layout under `tests/`. Run them all through CTest:
 
 ```bash
-# Register document vectors
-VECSET doc1 0.1 0.2 ... (384 floats)
-VECSET doc2 0.3 0.4 ...
-
-# Search with query vector (from user's search)
-SIMV 10 0.15 0.25 0.35 0.45 0.55
-# Returns documents semantically similar to the query
+ctest --test-dir build --output-on-failure
 ```
 
-### Use Case 3: Collaborative Filtering
-
-Recommend based on user behavior patterns.
+or run one binary directly, which is faster and gives GoogleTest's own filtering:
 
 ```bash
-# Track user interactions
-EVENT user1 ADD movie123 95
-EVENT user1 ADD movie456 80
-EVENT user2 ADD movie123 90
-EVENT user2 ADD movie789 85
-
-# Register movie vectors (metadata embeddings)
-VECSET movie123 0.12 0.34 ...
-VECSET movie456 0.23 0.45 ...
-VECSET movie789 0.34 0.56 ...
-
-# Find movies similar to movie123 (fusion mode)
-SIM movie123 10 using=fusion
-# Recommends movies liked by users with similar taste
+./build/bin/event_store_test
+./build/bin/event_store_test --gtest_filter="EventStoreTest.*"
 ```
 
----
+Two tests in this tier are not GoogleTest binaries. `docs_contract_test`, carrying the label `docs`, checks the documentation against the source: that the generated configuration reference and example file are current, that every schema key is parsed and readable and actually consumed outside `src/config/`, that every field name and status word the protocol pages promise exists verbatim in the source, that the English and Japanese pages state the same set of facts, and that every error code has a construction site. A documentation change that invents a response field fails here. `install_consumer_smoke`, carrying the label `install`, installs the project into a scratch prefix and builds a small consumer against the exported CMake package.
 
-## Search Modes
+Tests carry labels beyond those two: `integration`, `benchmark`, `http`, `client`, `e2e`, `sanitizer`, `concurrency` and `crash`. Select or exclude with `ctest -L` and `ctest --label-exclude`.
 
-`SIM` takes one of three modes through `using=`: `events`, `vectors` or `fusion`.
-Any other value is rejected. `SIMV` always searches by the query vector you
-supply and takes no mode.
+### Integration-labelled tests
 
-The arithmetic behind a vector comparison — dot product, cosine or L2 — is not a
-query mode. It is chosen once for the whole store by `vectors.distance_metric`
-in `config.yaml` and is fixed while the server runs:
-
-```yaml
-vectors:
-  distance_metric: cosine  # cosine, dot or l2
-```
-
-### Vector Similarity (`vectors`)
-
-Ranks purely by the distance between vectors, ignoring recorded events. Use for
-semantic search over embeddings.
+`tests/integration/` holds tests that start a real server on a real socket, or fork for a snapshot, and take seconds rather than milliseconds: end-to-end command coverage, reactor behaviour under load, concurrency, adversarial input, cache behaviour, metrics, scale scenarios, and write-ahead log recovery including a crash case. They register with the `integration` label and are part of a default `ctest` run locally.
 
 ```bash
-SIM item1 10 using=vectors
-SIMV 10 0.1 0.2 0.3 0.4 0.5
+ctest --test-dir build -L integration --output-on-failure
+ctest --test-dir build --label-exclude integration --output-on-failure
 ```
 
-### Co-occurrence (`events`)
+The second form is what continuous integration runs, so these tests are verified only by whoever runs them locally.
 
-Ranks purely by co-occurrence built from events, ignoring vectors. Use when
-behaviour matters more than content, or for items whose vectors are missing.
+### The Python end-to-end suite
+
+`e2e/` is a separate tier that CTest does not know about. It drives the built server over its real TCP and HTTP surfaces from `pytest`, and it is reachable only through the `e2e-test` targets:
 
 ```bash
-SIM item1 10 using=events
+make e2e-test
+make e2e-test-smoke
+make e2e-test-commands
 ```
 
-### Fusion Search (`fusion`) - Recommended
+The suite needs a Python 3 interpreter with `pytest` and `pytest-timeout` installed; `e2e/pyproject.toml` records the interpreter version it requires. Its tests are grouped into `smoke`, `commands`, `edge_cases` and `workflows`, registered as pytest markers, so a subset can also be selected with `-m`. The fixtures start one server per session on ports chosen at run time, with its own temporary snapshot directory and a password of their own, and they expect the binary at `build/bin/nvecd`. Set `NVECD_E2E_BINARY` to point at a binary from a different build tree — a sanitizer build, for instance.
 
-Combines vector similarity + co-occurrence from events. Use for hybrid recommendation systems.
+### Benchmarks
+
+`tests/benchmark/` holds two measurement binaries. Their tests are prefixed `DISABLED_`, so a normal run skips them and they cost nothing. [Benchmarks](./benchmarks.md) covers what they measure and how to run them.
+
+## Sanitizer builds
+
+Sanitizers are configure-time options, so each needs its own build directory rather than a reconfigure of the one in use:
 
 ```bash
-SIM item1 10 using=fusion
-# Note: Only available for SIM, not SIMV
+cmake -B build-asan -DCMAKE_BUILD_TYPE=Debug -DENABLE_ASAN=ON
+cmake --build build-asan --parallel
+ctest --test-dir build-asan --output-on-failure
+
+cmake -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DENABLE_TSAN=ON
+cmake --build build-tsan --parallel
+ctest --test-dir build-tsan -L concurrency --output-on-failure
 ```
 
-**Fusion formula**: `score = alpha * vector_sim + beta * co_occurrence`
+The two cannot be combined in one build. The tests most worth running under ThreadSanitizer carry the `sanitizer` and `concurrency` labels: the ANN index tests, the shared index contract tests, the tiered store tests and the similarity concurrency stress test.
 
-Configure weights in `config.yaml`:
-```yaml
-similarity:
-  fusion_alpha: 0.6  # Vector similarity weight
-  fusion_beta: 0.4   # Co-occurrence weight
-```
+## Coverage
 
----
-
-## Best Practices
-
-### 1. Vector Dimensions
-
-Choose appropriate dimensions for your use case:
-- **384**: MiniLM embeddings (lightweight)
-- **768**: BERT embeddings (balanced)
-- **1536**: OpenAI embeddings (high quality)
-
-Set default dimension in config:
-```yaml
-vectors:
-  default_dimension: 768
-```
-
-### 2. Event Scoring
-
-Use consistent scoring (0-100):
-- **90-100**: High engagement (purchase, long view time, high rating)
-- **70-89**: Medium engagement (click, short view, moderate rating)
-- **50-69**: Low engagement (impression, quick bounce)
-- **Below 50**: Negative signals (if applicable)
-
-### 3. Context Design
-
-Design contexts based on your use case:
-- **User-based**: `user_{id}` (track per-user behavior)
-- **Session-based**: `session_{id}` (track per-session behavior)
-- **Time-based**: `hourly_{timestamp}` (track time-windowed patterns)
-
-### 4. Decay Configuration
-
-Configure decay to handle evolving preferences:
-
-```yaml
-events:
-  decay_interval_sec: 7200  # Decay every 2 hours
-  decay_alpha: 0.95         # 5% decay per interval
-```
-
-- **Short decay**: Capture recent trends (news, trending topics)
-- **Long decay**: Stable preferences (product recommendations)
-- **No decay**: Historical analysis (`decay_interval_sec: 0`)
-
----
-
-## Integration Examples
-
-### Python Integration
-
-> ⚠️ **Not Implemented Yet** - Python client library is planned for future releases.
-
-Future usage:
-```python
-from nvecdclient import NvecdClient
-
-client = NvecdClient(host='localhost', port=11017)
-client.connect()
-
-# Register vector
-client.vecset('item1', [0.1, 0.5, 0.8])
-
-# Record event
-client.event('user123', 'add', 'item1', 95)
-
-# Search
-results = client.sim('item1', top_k=10, mode='fusion')
-for item_id, score in results:
-    print(f"{item_id}: {score}")
-```
-
-### Node.js Integration
-
-> ⚠️ **Not Implemented Yet** - Node.js client library is planned for future releases.
-
-Future usage:
-```javascript
-const NvecdClient = require('nvecdclient');
-
-const client = new NvecdClient({ host: 'localhost', port: 11017 });
-await client.connect();
-
-// Register vector
-await client.vecset('item1', [0.1, 0.5, 0.8]);
-
-// Record event
-await client.event('user123', 'add', 'item1', 95);
-
-// Search
-const results = await client.sim('item1', { topK: 10, mode: 'fusion' });
-results.forEach(({ id, score }) => console.log(`${id}: ${score}`));
-```
-
-### Raw TCP Integration
-
-Current method (any language with TCP sockets):
-
-```python
-import socket
-
-sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-sock.connect(('localhost', 11017))
-
-# Send command
-sock.sendall(b'VECSET item1 0.1 0.5 0.8\n')
-response = sock.recv(1024).decode().strip()
-print(response)  # "OK"
-
-# Record event
-sock.sendall(b'EVENT user123 ADD item1 95\n')
-response = sock.recv(1024).decode().strip()
-print(response)  # "OK"
-
-# Search
-sock.sendall(b'SIM item1 10 using=fusion\n')
-response = sock.recv(4096).decode().strip()
-print(response)  # "OK RESULTS 2\nitem2 0.8523\nitem3 0.7891"
-
-sock.close()
-```
-
----
-
-## Monitoring and Debugging
-
-### Server Status
-
-Check server statistics:
 ```bash
-INFO
+cmake -B build-coverage -DENABLE_COVERAGE=ON
+cmake --build build-coverage --parallel
+cmake --build build-coverage --target coverage
 ```
 
-Response includes:
-- Uptime
-- Total commands processed
-- Memory usage
-- Store sizes (contexts, vectors, co-occurrence pairs)
+The `coverage` target zeroes the counters, runs the whole suite in parallel, captures the data, filters it down to `src/` and renders HTML into `build-coverage/coverage/html/`. It exists only when `lcov` and `genhtml` are both on the path; without them CMake warns at configure time and the target is not defined. `coverage-clean` zeroes the counters and removes the output directory.
 
-### Debug Mode
+## Formatting
 
-Enable debug logging for a connection:
+Formatting is `clang-format` driven by a repository-root `.clang-format`: Google style, C++17, 120-column lines, two-space indent, pointers bound to the type, includes sorted and regrouped.
+
 ```bash
-DEBUG ON
-# Now all commands will show additional debug information
-
-DEBUG OFF
-# Disable debug logging
+make format
+make format-check
 ```
 
-### Configuration Verification
+`format` rewrites files in place. `format-check` is its check-only counterpart, running the same file set with `--dry-run --Werror`, and is what a pre-merge check would use — continuous integration does not currently run it.
 
-Verify configuration is valid:
+Both cover every `.cpp` and `.h` under `src/` and `tests/`. Use `CLANG_FORMAT` when the binary is not called `clang-format` on the machine:
+
 ```bash
-CONFIG VERIFY
+make CLANG_FORMAT=clang-format-18 format
 ```
 
-Show current configuration:
+## Linting
+
 ```bash
-CONFIG SHOW
+make lint
+make lint-diff
+make lint-diff-main
 ```
 
----
+Each target delegates to `support/dev/run-clang-tidy.sh`. Two things follow from how that script works.
 
-## Production Deployment
+It needs a compiled build: it reads `build/compile_commands.json` for the exact flags each translation unit was compiled with, and stops with an error if the build directory or that file is missing. Running `clang-tidy` over the sources directly, without a compilation database, does not work — the sources include generated and fetched headers whose locations only the build knows.
 
-### 1. Security
+It applies one configuration to every file, the `.clang-tidy` at the repository root, passed explicitly with `--config-file`. That configuration enables the `cppcoreguidelines`, `modernize`, `performance` and `readability` families along with the compiler and analyzer diagnostics, and restricts header diagnostics to `src/`. Warnings are advisory: the script prints them, reports a count, and exits successfully either way, so lint output has to be read rather than relied on to fail.
 
-Configure network access in `config.yaml`:
-```yaml
-network:
-  allow_cidrs:
-    - "10.0.0.0/8"      # Allow private network
-    - "172.16.0.0/12"   # Allow Docker network
-```
+`lint-diff` selects the `.cpp` files under `src/` that differ from `HEAD`, staged or not; `lint-diff-main` selects those that differ from `main`. Both fall back to serial execution, while a full `make lint` uses `run-clang-tidy` in parallel when it is available. All three depend on `format` and `build`, so they rewrite files and compile before checking.
 
-### 2. Persistence
+## Generated documentation
 
-Enable automatic snapshots:
-```yaml
-snapshot:
-  dir: "/var/lib/nvecd/snapshots"
-  interval_sec: 7200  # Snapshot every 2 hours
-  retain: 5           # Keep 5 snapshots
-```
+Part of the documentation is rendered rather than written. `src/config/config-schema.json` is the single authority for every configuration option — its type, default, accepted range, and its prose description in both languages — and `support/generate_config_docs.py` renders that authority into three artefacts:
 
-Manual snapshot before maintenance:
+- `examples/config.yaml`, rendered in full, header comment included.
+- The option tables in `docs/en/configuration.md`, one per schema section.
+- The option tables in `docs/ja/configuration.md`, the same set.
+
+In the two configuration guides the generator does not own the whole file, only the regions delimited by `<!-- BEGIN GENERATED: options <section> -->` and `<!-- END GENERATED: options <section> -->`, one pair per schema section that owns leaf keys. Everything outside those markers is hand-written prose and the generator leaves it alone; everything between them is overwritten on every run.
+
+Adding or changing a configuration option therefore means editing the schema and re-running the generator:
+
 ```bash
-DUMP SAVE before_maintenance.nvec
+python3 support/generate_config_docs.py
 ```
 
-### 3. Performance Tuning
+It prints each artefact it rewrote, and rewrites nothing that is already current. Never edit a rendered table or `examples/config.yaml` by hand — the next run discards the edit. This includes the Japanese wording: the Japanese table takes its text from each key's `description_ja` in the schema, falling back to `description` when that field is absent, so translating an option means adding `description_ja` to the schema rather than editing the Japanese table.
 
-Configure thread pool:
-```yaml
-performance:
-  thread_pool_size: 16        # Match CPU cores
-  max_connections: 5000       # Based on system limits
-  connection_timeout_sec: 600
+The markers are part of the contract in both directions. A region naming a section the schema does not define stops the generator with an error, so renaming a schema section means renaming its region; and a section whose markers are missing from a guide is silently not rendered there, which leaves that language's table to drift by hand.
+
+Check mode writes nothing and reports instead:
+
+```bash
+python3 support/generate_config_docs.py --check
 ```
 
----
+It exits non-zero and names every artefact that has fallen out of date with the schema. `--source-root` points it at a checkout other than the one the script lives in.
 
-## Next Steps
+Nothing in the `Makefile` and no step in the workflow file runs the generator. Its only automatic invocation is from `docs_contract_test`, which runs it in check mode as the first of its checks. That test carries the `docs` label rather than `integration`, so it is one of the tests continuous integration does run — a schema change committed without regenerating fails there.
 
-- See [Protocol Reference](protocol.md) for all available commands
-- See [Configuration Guide](configuration.md) for tuning options
-- See [Performance Guide](performance.md) for optimization tips
-- See [HTTP API Reference](http-api.md) for REST API usage
+## Continuous integration
+
+The workflow in `.github/workflows/ci.yml` runs on pushes to `main` and on pull requests against it, skipping runs whose changes are confined to Markdown, `docs/` or the licence. What it does, stated plainly so nobody assumes wider coverage than exists:
+
+- It runs on Ubuntu only. macOS is a supported platform with no automated coverage.
+- It configures a `Debug` build with `NVECD_PORTABLE_BUILD=ON`, so the binary it tests is built for the baseline architecture rather than the runner's own.
+- It enables coverage by adding `--coverage` to `CMAKE_CXX_FLAGS` and `CMAKE_C_FLAGS` by hand, not through the `ENABLE_COVERAGE` option, so the `coverage` target and its `lcov` filtering are not involved; the raw `gcov` data is uploaded instead.
+- It runs `ctest --label-exclude integration`, so no `integration`-labelled test runs there. The snapshot, fork and write-ahead log recovery tests are verified locally or not at all.
+- It does not run `lint`, `format-check`, either sanitizer, or the Python end-to-end suite.
+
+Anything in those last two points is the contributor's responsibility before opening a change.
+
+## Conventions
+
+Commit subjects use Conventional Commits with one of six scopes, matching the areas above: `cache`, `server`, `events`, `vectors`, `similarity`, `client`.
+
+Error codes are partitioned by module, and a new module takes an unused band rather than extending someone else's:
+
+| Range | Module |
+|---|---|
+| 0-999 | General |
+| 1000-1999 | Configuration |
+| 2000-2999 | Event processing |
+| 3000-3999 | Command parsing |
+| 4000-4999 | Vector and similarity |
+| 5000-5999 | Storage and snapshot |
+| 6000-6999 | Network and server |
+| 7000-7999 | Client |
+| 8000-8999 | Cache |
+
+Every new code in the enumeration must have at least one construction site. `docs_contract_test` fails on a code that nothing can produce, apart from a fixed list of codes it carries that may only shrink, so a code added ahead of the code path that raises it breaks the suite.
+
+Comments and identifiers are English. Failures propagate as `Expected<T, Error>` rather than exceptions, so a new function that can fail returns one rather than signalling out of band.

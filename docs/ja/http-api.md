@@ -1,1142 +1,621 @@
-# HTTP API ガイド
+# HTTP API
 
-Nvecd は、Web アプリケーションや HTTP クライアントから容易に統合できる RESTful な JSON API を提供します。
+HTTP サーバーは [TCP プロトコル](./protocol.md)と同じ操作を JSON のルートとして公開し、加えてヘルスチェックと Prometheus 用のスクレイプエンドポイントを提供します。既定では無効で、`api.http.enable` で有効にします。
 
-## 設定
-
-`config.yaml` で HTTP サーバーを有効にします。
+## サーバーを有効にする
 
 ```yaml
 api:
-  tcp:
-    bind: "127.0.0.1"
-    port: 11017
   http:
-    enable: true          # Enable HTTP server
-    bind: "127.0.0.1"     # Bind address (default: localhost only)
-    port: 8080            # HTTP port (default: 8080)
-    enable_cors: false    # Optional: enable only when exposing to browsers
-    cors_allow_origin: "" # Optional origin allowed when CORS is enabled
+    enable: true
+    bind: "127.0.0.1"
+    port: 8080
+    timeout_sec: 5
+network:
+  allow_cidrs:
+    - "127.0.0.1/32"
 ```
 
-**セキュリティ注意**: HTTP サーバーは既定でループバックにバインドします。外部に公開する必要がある場合は、`network.allow_cidrs` で信頼できる IP 範囲に限定し、TLS と認証を備えたリバースプロキシを前段に置いてください。
+リスナーはルーティングの前に `network.allow_cidrs` を適用するため、リストの外側のアドレスにはルートを問わず `403` を返します。空のリストはすべてのアドレスを拒否します。リクエストボディは `performance.max_query_length` で、同時接続は `performance.max_connections` と `performance.max_connections_per_ip` で上限が決まり、`api.rate_limiting.enable` を設定した場合はクライアントアドレスごとにトークンバケットで制限されます。
+
+リクエストボディはすべて JSON です。サーバーは `Content-Type` ヘッダを要求せず、`/metrics` を除くすべての JSON 応答を `application/json` として返します。
+
+## ルート一覧
+
+| メソッド | パス | 対応する TCP コマンド | 権限 |
+|---|---|---|---|
+| `POST` | `/event` | `EVENT` | 書き込み |
+| `POST` | `/vecset` | `VECSET` | 書き込み |
+| `DELETE` | `/vecset` | `VECDEL` | 書き込み |
+| `POST` | `/metaset` | `METASET` | 書き込み |
+| `POST` | `/sim` | `SIM` | 読み取り |
+| `POST` | `/simv` | `SIMV` | 読み取り |
+| `GET` | `/info` | `INFO` | 読み取り |
+| `GET` | `/config` | `CONFIG SHOW` | 読み取り |
+| `GET` | `/cache/stats` | `CACHE STATS` | 読み取り |
+| `POST` | `/cache/clear` | `CACHE CLEAR` | 書き込み |
+| `POST` | `/cache/enable` | `CACHE ENABLE` | 書き込み |
+| `POST` | `/cache/disable` | `CACHE DISABLE` | 書き込み |
+| `POST` | `/dump/save` | `DUMP SAVE` | 管理 |
+| `POST` | `/dump/load` | `DUMP LOAD` | 管理 |
+| `POST` | `/dump/verify` | `DUMP VERIFY` | 管理 |
+| `POST` | `/dump/info` | `DUMP INFO` | 管理 |
+| `GET` | `/dump/status` | `DUMP STATUS` | 管理 |
+| `POST` | `/debug/on` | `DEBUG ON` | 読み取り |
+| `POST` | `/debug/off` | `DEBUG OFF` | 読み取り |
+| `GET` | `/health` | — | なし |
+| `GET` | `/health/live` | — | なし |
+| `GET` | `/health/ready` | — | なし |
+| `GET` | `/health/detail` | — | なし |
+| `GET` | `/metrics` | — | なし |
+
+この表にないパス、および登録済みのパスに誤ったメソッドで到達した場合は `404` を返します。
+
+各ルートは自分がどの TCP コマンドの HTTP 形であるかを宣言し、その 1 つの宣言が権限とリクエストの計上先カウンタの両方を決めます。そのため 2 つの面がどちらの点でも食い違うことはありません。
 
 ## 認証
 
-`security.requirepass` が設定されている場合、HTTP サーバーは TCP の `AUTH` ゲートと同じ範囲で、すべての変更系および管理系エンドポイントに認証を要求します。読み取り専用のエンドポイント（health、`/info`、`/config`、`/metrics`、`/cache/stats`、`/sim`、`/simv`）は開いたままです。`/dump/status` は管理系エンドポイントであり、認証が必要です。
+`security.requirepass` が空の場合、すべてのルートが開放されています。設定した場合、書き込みルートと管理ルートはリクエストごとに資格情報を要求し、読み取りルートとヘルスチェックは開放されたままです。これは TCP の権限区分と一致します。
 
-パスワードは `Authorization` リクエストヘッダーで渡します。次のどちらの方式も使えます。
+対象となるのは `POST /event`、`POST /vecset`、`DELETE /vecset`、`POST /metaset`、`POST /cache/clear`、`POST /cache/enable`、`POST /cache/disable`、`POST /dump/save`、`POST /dump/load`、`POST /dump/verify`、`POST /dump/info`、`GET /dump/status` です。
 
-- `Authorization: Bearer <password>`
-- `Authorization: Basic base64(<user>:<password>)` — ユーザー名は無視され、パスワードのみが比較されます（TCP の `AUTH` と同じ挙動）。
+資格情報の形は 2 つ受け付けます。
 
-ゲート対象のエンドポイント: `POST /event`、`POST /vecset`、`DELETE /vecset`、`POST /metaset`、`POST /cache/clear`、`POST /cache/enable`、`POST /cache/disable`、`POST /dump/save`、`POST /dump/load`、`POST /dump/verify`、`POST /dump/info`、`GET /dump/status`。
+```bash
+curl -X POST http://127.0.0.1:8080/vecset \
+  -H 'Authorization: Bearer s3cret' \
+  -d '{"id":"item1","vector":[0.1,0.2,0.3,0.4]}'
 
-有効な資格情報を持たないリクエストは `401 Unauthorized` を受け取ります。
+curl -X POST http://127.0.0.1:8080/vecset \
+  -u ignored:s3cret \
+  -d '{"id":"item1","vector":[0.1,0.2,0.3,0.4]}'
+```
+
+`Basic` ではユーザー名は無視され、パスワードだけが比較されます。これはパスワードのみを検証する TCP の `AUTH` に合わせたものです。どちらの比較も定数時間です。資格情報がない、または誤っている場合は次を返します。
 
 ```json
-{
-  "error": "Authentication required"
-}
+{"error":"Authentication required"}
 ```
 
-`security.requirepass` が空（既定）の場合、認証は不要です。
+ステータスは `401` です。この検査はハンドラが状態を読む前、応答本文を組み立てる前に走ります。
 
-## API エンドポイント
+## ステータスコード
 
-すべてのレスポンスは `Content-Type: application/json` の JSON 形式です。
+| ステータス | 条件 |
+|---|---|
+| `200` | 成功 |
+| `204` | CORS プリフライト（`OPTIONS`） |
+| `400` | JSON の不正、フィールドの欠落や型違い、`top_k` の不正、次元不一致、フィルタの不正、イベントスコアの不正、スナップショットパスのトラバーサル、未対応のキャッシュスコープ |
+| `401` | 対象ルートで資格情報がない、または誤っている |
+| `403` | 送信元アドレスが `network.allow_cidrs` の外側、またはハンドラからの権限エラー |
+| `404` | 未知のルートまたはメソッド、未知のアイテム ID、スナップショットや設定ファイルが見つからない |
+| `410` | `/debug/on` と `/debug/off` |
+| `429` | レート制限超過 |
+| `500` | その他のハンドラエラー（スナップショットの読み取り失敗や整合性検査の失敗を含む） |
+| `503` | サーバーが読み込み中または読み取り専用、あるいは WAL が受け付けられなかった書き込み |
 
-### POST /event
+ハンドラのエラーはメッセージ文字列を見るのではなく型付きのエラーコードから対応付けられるため、同じ失敗はどのルートでも同じステータスになります。対応は、アイテムやファイルが見つからない条件が `404`、引数・解析・次元・`top_k`・イベントスコアのエラーが `400`、権限拒否が `403`、WAL の書き込み・ローテーション・未オープンのエラーが `503`、それ以外が `500` です。
 
-ユーザー行動（商品閲覧、購入、操作など）を追跡します。
+クライアント側の誤りのうち 2 系統は、エラーコードがこの対応表にないため `400` ではなく `500` になります。`POST /event` の `ctx` や `id` が空、あるいは空白や制御文字を含む場合は `500` で `Context cannot be empty`、`ID cannot be empty`、または `… must not contain whitespace or control characters` が返ります。存在しないファイルを指す `POST /dump/load`、`/dump/verify`、`/dump/info` も同様に `500` です。下層の失敗が not-found のコードではなくストレージの open エラーだからです。どちらもリクエスト側の不備であり、ステータスだけで分類するクライアントはこれをサーバー障害と読み違えます。
 
-**リクエスト:**
-
-`security.requirepass` が設定されている場合、このエンドポイントは認証を要求します。
-
-```http
-POST /event HTTP/1.1
-Content-Type: application/json
-
-{
-  "ctx": "user_alice",
-  "id": "product123",
-  "type": "ADD",
-  "score": 100
-}
-```
-
-**リクエストボディのパラメータ:**
-
-| フィールド | 型 | 必須 | 説明 |
-|-------|------|----------|-------------|
-| `ctx` | string | はい | コンテキスト ID（ユーザー ID、セッション ID など） |
-| `id` | string | はい | アイテム ID（商品 ID、記事 ID など） |
-| `type` | string | はい | イベント種別: `ADD`、`SET`、`DEL` |
-| `score` | integer | `ADD`/`SET` では必須 | イベントスコア（0-100、例: 100=購入、80=閲覧） |
-| `timestamp` | integer | いいえ | イベントのタイムスタンプ（epoch 秒） |
-
-**レスポンス (200 OK):**
+エラー本文はすべて 1 フィールドのオブジェクトです。
 
 ```json
-{
-  "status": "ok"
-}
+{"error":"Vector not found: zz"}
 ```
 
-**エラーレスポンス (400 Bad Request):**
+例外は `POST /dump/verify` で、検証に失敗した場合は `error` だけでなく完全な本文を返します（後述）。
+
+## 書き込みルート
+
+### `POST /event`
 
 ```json
-{
-  "error": "Missing required field: ctx"
-}
+{"ctx": "user_alice", "id": "item1", "type": "ADD", "score": 100, "timestamp": 1730000000}
 ```
 
-### POST /vecset
-
-アイテムの埋め込みベクトルを登録または更新します。
-
-`security.requirepass` が設定されている場合、このエンドポイントは認証を要求します。
-
-**リクエスト:**
-
-```http
-POST /vecset HTTP/1.1
-Content-Type: application/json
-
-{
-  "id": "product123",
-  "vector": [0.1, 0.2, 0.3, 0.4, 0.5],
-  "metadata": {
-    "category": "electronics",
-    "active": true
-  }
-}
-```
-
-**リクエストボディのパラメータ:**
-
-| フィールド | 型 | 必須 | 説明 |
-|-------|------|----------|-------------|
-| `id` | string | はい | アイテム ID |
-| `vector` | float の配列 | はい | 埋め込みベクトル（次元は既存ベクトルと一致する必要があります） |
-| `metadata` | object | いいえ | `filter=` クエリが使用するメタデータ。値は string、integer、float、bool のいずれか。 |
-
-**レスポンス (200 OK):**
+| フィールド | 型 | 必須 | 備考 |
+|---|---|---|---|
+| `ctx` | 文字列 | はい | コンテキスト ID |
+| `id` | 文字列 | はい | アイテム ID |
+| `type` | 文字列 | はい | `ADD`、`SET`、`DEL`（大文字小文字どちらでも可） |
+| `score` | 整数 | `ADD` と `SET` で必須 | 浮動小数点数ではなく整数、範囲 0〜100 |
+| `timestamp` | 符号なし整数 | いいえ | epoch 秒、省略時はサーバーの時計 |
 
 ```json
-{
-  "status": "ok"
-}
+{"status":"ok"}
 ```
 
-**エラーレスポンス (400 Bad Request):**
+浮動小数点数の `score` は切り詰められずに拒否されるため、整数という契約が TCP と一致します。
+
+### `POST /vecset`
 
 ```json
-{
-  "error": "Dimension mismatch: expected 768, got 512"
-}
+{"id": "item1", "vector": [0.1, 0.2, 0.3, 0.4], "metadata": {"category": "books", "price": 19, "active": true}}
 ```
 
-### DELETE /vecset
-
-アイテムのベクトル、そのメタデータ、キャッシュ済みの結果を削除します。
-
-`security.requirepass` が設定されている場合、このエンドポイントは認証を要求します。
-
-**リクエスト:**
-
-```http
-DELETE /vecset HTTP/1.1
-Content-Type: application/json
-
-{
-  "id": "product123"
-}
-```
-
-**リクエストボディのパラメータ:**
-
-| フィールド | 型 | 必須 | 説明 |
-|-------|------|----------|-------------|
-| `id` | string | はい | アイテム ID |
-
-**レスポンス (200 OK):**
+| フィールド | 型 | 必須 | 備考 |
+|---|---|---|---|
+| `id` | 文字列 | はい | アイテム ID |
+| `vector` | 数値の配列 | はい | 各要素は有限かつ float の範囲内 |
+| `metadata` | オブジェクト | いいえ | 値は文字列、整数、浮動小数点数、真偽値、キーは空不可 |
 
 ```json
-{
-  "status": "ok"
-}
+{"dimension":4,"status":"ok"}
 ```
 
-**エラーレスポンス (404 Not Found):**
+`dimension` は保存されたベクトルの長さをそのまま返します。TCP の `VECSET` と違い、このルートは同じリクエストでメタデータを付けられます。
+
+### `DELETE /vecset`
 
 ```json
-{
-  "error": "Vector not found: product123"
-}
+{"id": "item1"}
 ```
-
-### POST /metaset
-
-既存アイテムのメタデータを設定（置換）します。メタデータはアイテム ID をキーとし、`filter=` クエリで使用されます。対象アイテムには `/vecset` でベクトルが登録済みである必要があり、そうでない場合は `404 Not Found` を返します。
-
-`security.requirepass` が設定されている場合、このエンドポイントは認証を要求します。
-
-**リクエスト:**
-
-```http
-POST /metaset HTTP/1.1
-Content-Type: application/json
-
-{
-  "id": "product123",
-  "metadata": {
-    "category": "electronics",
-    "active": true,
-    "price": 199
-  }
-}
-```
-
-**リクエストボディのパラメータ:**
-
-| フィールド | 型 | 必須 | 説明 |
-|-------|------|----------|-------------|
-| `id` | string | はい | アイテム ID（この ID のベクトルが既に存在する必要があります） |
-| `metadata` | object | はい | メタデータのマップ。値は string、integer、float、bool のいずれか。 |
-
-**レスポンス (200 OK):**
 
 ```json
-{
-  "status": "ok"
-}
+{"status":"ok"}
 ```
 
-**エラーレスポンス (404 Not Found):**
+ID はパスやクエリ文字列ではなく JSON ボディから読むため、`DELETE` でボディを送らないクライアントライブラリは送るように設定する必要があります。`id` が空または欠落している場合は `400`、未知の ID の場合は `404` で `Vector not found: <id>` を返します。
+
+### `POST /metaset`
 
 ```json
-{
-  "error": "Vector not found for metadata: product123"
-}
+{"id": "item1", "metadata": {"category": "books", "price": 19, "active": true}}
 ```
-
-### POST /sim
-
-ID を指定して類似アイテムを検索します。
-
-**リクエスト:**
-
-```http
-POST /sim HTTP/1.1
-Content-Type: application/json
-
-{
-  "id": "product123",
-  "top_k": 10,
-  "mode": "fusion"
-}
-```
-
-**リクエストボディのパラメータ:**
-
-| フィールド | 型 | 必須 | 既定値 | 説明 |
-|-------|------|----------|---------|-------------|
-| `id` | string | はい | - | クエリ対象のアイテム ID |
-| `top_k` | integer | いいえ | 10 | 返す結果数 |
-| `mode` | string | いいえ | "fusion" | 検索モード: "vectors"、"events"、"fusion" |
-| `filter` | string | いいえ | - | メタデータフィルタ（例: "category:electronics,type:laptop"） |
-| `min_score` | float | いいえ | 0.0 | 最小スコア閾値（これを下回る結果は除外されます） |
-| `adaptive` | boolean | いいえ | false | adaptive fusion を有効化（データ密度に応じて重みを自動調整） |
-
-**検索モード:**
-
-| モード | 説明 |
-|------|-------------|
-| `vectors` | コンテンツベースの類似度（ベクトル埋め込みを使用） |
-| `events` | 行動ベースの類似度（イベントからの共起） |
-| `fusion` | ハイブリッド: ベクトルとイベントを統合 |
-
-**レスポンス (200 OK):**
 
 ```json
-{
-  "status": "ok",
-  "count": 3,
-  "mode": "fusion",
-  "results": [
-    {
-      "id": "product456",
-      "score": 0.9245
-    },
-    {
-      "id": "product789",
-      "score": 0.8932
-    },
-    {
-      "id": "product101",
-      "score": 0.8501
-    }
-  ]
-}
+{"status":"ok"}
 ```
 
-**レスポンスフィールド:**
+ここでの `metadata` は構造化された JSON オブジェクトであり、TCP の `METASET` やクライアントライブラリが取る `key:value,key:value` 文字列ではありません。対象のアイテムはすでにベクトルを持っている必要があり、そうでない場合は `404` で `Vector not found for metadata: <id>` を返します。
 
-| フィールド | 説明 |
-|-------|-------------|
-| `status` | 成功時は `"ok"` |
-| `count` | 返した結果数 |
-| `mode` | 実際に使用された検索モード |
-| `results` | 類似アイテムの配列（スコア降順） |
-| `results[].id` | アイテム ID |
-| `results[].score` | 類似度スコア（0.0-1.0、大きいほど類似） |
+## 検索ルート
 
-**エラーレスポンス (404 Not Found):**
+### `POST /sim`
 
 ```json
-{
-  "error": "Vector not found: product123"
-}
+{"id": "item1", "top_k": 3, "mode": "vectors", "filter": "category:books", "min_score": 0.1, "adaptive": true}
 ```
 
-### POST /simv
-
-ベクトルを直接指定して類似アイテムを検索します。
-
-**リクエスト:**
-
-```http
-POST /simv HTTP/1.1
-Content-Type: application/json
-
-{
-  "vector": [0.1, 0.2, 0.3, 0.4, 0.5],
-  "top_k": 10
-}
-```
-
-**リクエストボディのパラメータ:**
-
-| フィールド | 型 | 必須 | 既定値 | 説明 |
-|-------|------|----------|---------|-------------|
-| `vector` | float の配列 | はい | - | クエリベクトル |
-| `top_k` | integer | いいえ | 10 | 返す結果数 |
-| `filter` | string | いいえ | - | メタデータフィルタ（例: "type:article"） |
-| `min_score` | float | いいえ | 0.0 | 最小スコア閾値 |
-
-`/simv` は常にベクトル空間の検索を行うため、`mode` パラメータはありません。
-
-**レスポンス (200 OK):**
+| フィールド | 型 | 必須 | 既定値 |
+|---|---|---|---|
+| `id` | 文字列 | はい | — |
+| `top_k` | 整数 | いいえ | `similarity.default_top_k` |
+| `mode` | 文字列 | いいえ | `fusion`（`events`、`vectors`、`fusion` のいずれか） |
+| `filter` | 文字列 | いいえ | フィルタなし |
+| `min_score` | 有限の数値 | いいえ | `0.0` |
+| `adaptive` | 真偽値 | いいえ | サーバーの `similarity.adaptive_fusion` |
 
 ```json
-{
-  "status": "ok",
-  "count": 3,
-  "dimension": 5,
-  "results": [
-    { "id": "product456", "score": 0.9245 }
-  ]
-}
+{"count":1,"mode":"vectors","results":[{"id":"item3","score":0.9333}],"status":"ok"}
 ```
 
-**ユースケース:**
+`count` は `min_score` 適用後の `results` の要素数です。スコアは小数点以下 4 桁に丸められ、これは TCP 面が描画する精度と同じです。
 
-- ユーザークエリの埋め込みで検索する（例: 「赤いランニングシューズ」→ ベクトル）
-- 計算したベクトルに一致するアイテムを探す（例: 気に入ったアイテムの平均）
+`top_k` は正で、かつ `similarity.max_top_k` 以下でなければなりません。どちらの違反も `400` です。`filter` は TCP の `filter=` と同じ文法（`=`、`:`、`!=`、`>`、`<`、`>=`、`<=`、`in(a|b|c)`）を使い、[protocol.md](./protocol.md) に記載しています。ベクトルを持たない `id` は `404` で `Query vector not found: <id>` を返します。
 
-### GET /info
+### `POST /simv`
 
-サーバーの統計情報と監視情報（Redis スタイル）を返します。
-
-**リクエスト:**
-
-```http
-GET /info HTTP/1.1
+```json
+{"vector": [0.1, 0.2, 0.3, 0.4], "top_k": 3, "filter": "active:true", "min_score": 0.1}
 ```
 
-**レスポンス (200 OK):**
+| フィールド | 型 | 必須 | 既定値 |
+|---|---|---|---|
+| `vector` | 数値の配列 | はい | — |
+| `top_k` | 整数 | いいえ | `similarity.default_top_k` |
+| `filter` | 文字列 | いいえ | フィルタなし |
+| `min_score` | 有限の数値 | いいえ | `0.0` |
+
+```json
+{"count":2,"dimension":4,"results":[{"id":"item1","score":1.0},{"id":"item3","score":0.9333}],"status":"ok"}
+```
+
+`dimension` はクエリベクトルの長さをそのまま返します。`mode` も `adaptive` もありません。このルートは常にベクトル検索を行います。
+
+## 内省ルート
+
+### `GET /info`
 
 ```json
 {
   "server": "nvecd",
   "version": "0.1.0",
-  "uptime_seconds": 3600,
-  "total_requests": 15000,
-  "total_commands_processed": 15000,
+  "uptime_seconds": 44,
+  "total_requests": 52,
+  "total_commands_processed": 52,
   "failed_commands": 12,
   "memory": {
-    "used_memory_bytes": 949452800,
-    "used_memory_human": "905.50 MB",
-    "used_memory_events": "500.00 MB",
-    "used_memory_vectors": "293.00 MB",
-    "used_memory_co_occurrence": "100.00 MB",
-    "peak_memory_bytes": 1010000000,
-    "peak_memory_human": "963.20 MB",
-    "process_rss": 990000000,
-    "process_rss_human": "944.13 MB",
+    "used_memory_bytes": 4240,
+    "used_memory_human": "4.14KB",
+    "used_memory_events": "3.08KB",
+    "used_memory_vectors": "578B",
+    "used_memory_co_occurrence": "504B",
+    "peak_memory_bytes": 9961472,
+    "peak_memory_human": "9.50MB",
+    "process_rss": 9961472,
+    "process_rss_human": "9.50MB",
+    "process_rss_peak": 9961472,
+    "process_rss_peak_human": "9.50MB",
+    "total_system_memory": 137438953472,
+    "total_system_memory_human": "128GB",
+    "available_system_memory": 67508912128,
+    "available_system_memory_human": "62.9GB",
+    "system_memory_usage_ratio": 0.5088080167770386,
     "memory_health": "HEALTHY"
   },
   "stores": {
-    "event_store": {
-      "contexts": 50000,
-      "total_events": 1000000
-    },
-    "vector_store": {
-      "vectors": 100000,
-      "dimension": 768
-    },
-    "co_index": {
-      "tracked_ids": 250000
-    }
+    "event_store": {"contexts": 1, "total_events": 4},
+    "vector_store": {"vectors": 1, "dimension": 4},
+    "co_index": {"tracked_ids": 2}
   },
   "cache": {
     "enabled": true,
-    "total_queries": 10000,
-    "cache_hits": 8500,
-    "cache_misses": 1500,
-    "hit_rate": 0.85,
-    "current_entries": 2450,
-    "current_memory_bytes": 13107200,
-    "evictions": 320,
-    "time_saved_ms": 15420.50
+    "total_queries": 10,
+    "cache_hits": 0,
+    "cache_misses": 10,
+    "hit_rate": 0.0,
+    "current_entries": 0,
+    "current_memory_bytes": 0,
+    "evictions": 0,
+    "time_saved_ms": 0.0
   }
 }
 ```
 
-**レスポンスフィールド:**
+`total_requests` と `total_commands_processed` は同じカウンタを 2 つの名前で運んでいます。`memory.used_memory_bytes` は 3 つのストアの合計であり、ベクトル行列だけを数える TCP の `INFO` の `used_memory_bytes` とは別の数値です。`process_rss*` の一群はプロセスのメモリ情報が読める場合にだけ、`*_system_memory*` の一群はシステムのメモリ情報が読める場合にだけ現れます。`stores` の下のエントリは、そのストアが存在する場合にだけ現れます。キャッシュが接続されていない場合、`cache` は `{"enabled": false}` だけになります。
 
-| 分類 | フィールド | 説明 |
-|----------|-------|-------------|
-| **サーバー** | `server` | サーバー名（nvecd） |
-| | `version` | サーバーバージョン |
-| | `uptime_seconds` | サーバー稼働時間（秒） |
-| | `total_requests` | `total_commands_processed` の別名。両者は同じカウンタを返します |
-| | `total_commands_processed` | 処理したコマンド総数 |
-| | `failed_commands` | エラーを返したコマンド数 |
-| **メモリ** | `used_memory_bytes` | 追跡対象ストアの合計メモリ（バイト） |
-| | `used_memory_events` | イベントストアのメモリ（可読形式） |
-| | `used_memory_vectors` | ベクトルストアのメモリ（可読形式） |
-| | `used_memory_co_occurrence` | 共起インデックスのメモリ（可読形式） |
-| | `peak_memory_bytes` | プロセス RSS のピーク（バイト） |
-| | `memory_health` | メモリの健全性ステータス |
-| **ストア** | `stores.vector_store.vectors` | 格納されているベクトル数 |
-| | `stores.vector_store.dimension` | ベクトルの次元数 |
-| | `stores.event_store.contexts` | コンテキスト数（ユーザー / セッション） |
-| | `stores.event_store.total_events` | 追跡したイベント総数 |
-| | `stores.co_index.tracked_ids` | 共起インデックスが追跡している ID 数 |
-| **キャッシュ** | `cache.enabled` | クエリキャッシュが有効かどうか |
-| | `cache.hit_rate` | キャッシュヒット率（0.0-1.0） |
-| | `cache.current_memory_bytes` | 現在のキャッシュメモリ使用量（バイト） |
-| | `cache.time_saved_ms` | キャッシュによって短縮された累計時間 |
-
-このエンドポイントは監視ツールやヘルスチェックに適しています。プラットフォームが公開している場合、`memory` オブジェクトにはシステム全体のフィールド（`total_system_memory`、`available_system_memory`、`system_memory_usage_ratio`）も含まれます。
-
-### GET /health
-
-ロードバランサ向けの簡易ヘルスチェックです。
-
-**リクエスト:**
-
-```http
-GET /health HTTP/1.1
-```
-
-**レスポンス (200 OK):**
+### `GET /config`
 
 ```json
 {
-  "status": "ok"
-}
-```
-
-### GET /health/live
-
-Kubernetes の liveness プローブです（サーバーが動作していれば常に 200 を返します）。
-
-**リクエスト:**
-
-```http
-GET /health/live HTTP/1.1
-```
-
-**レスポンス (200 OK):**
-
-```json
-{
-  "status": "alive",
-  "timestamp": 1705564800
-}
-```
-
-### GET /health/ready
-
-Kubernetes の readiness プローブです（スナップショット読み込み中は 503 を返します）。
-
-**リクエスト:**
-
-```http
-GET /health/ready HTTP/1.1
-```
-
-**レスポンス (200 OK):**
-
-```json
-{
-  "status": "ready",
-  "loading": false
-}
-```
-
-**レスポンス (503 Service Unavailable):**
-
-```json
-{
-  "status": "not_ready",
-  "loading": true,
-  "reason": "Server is loading"
-}
-```
-
-### GET /health/detail
-
-メトリクスを含む詳細なヘルス情報（`/info` と同じ内容）を返します。
-
-**リクエスト:**
-
-```http
-GET /health/detail HTTP/1.1
-```
-
-**レスポンス (200 OK):**
-
-`/info` エンドポイントと同じ形式です。
-
-### GET /metrics
-
-サーバーのメトリクスを Prometheus テキスト形式（`Content-Type: text/plain; version=0.0.4`）で返します。
-
-**リクエスト:**
-
-```http
-GET /metrics HTTP/1.1
-```
-
-**レスポンス (200 OK):**
-
-```text
-# HELP nvecd_uptime_seconds Server uptime in seconds
-# TYPE nvecd_uptime_seconds counter
-nvecd_uptime_seconds 3600
-
-# HELP nvecd_commands_total Total commands processed
-# TYPE nvecd_commands_total counter
-nvecd_commands_total{command="event"} 4200
-nvecd_commands_total{command="vecset"} 1800
-nvecd_commands_total{command="sim"} 9000
-nvecd_commands_total 15000
-
-# HELP nvecd_memory_bytes Current memory usage in bytes
-# TYPE nvecd_memory_bytes gauge
-nvecd_memory_bytes 949452800
-```
-
-キャッシュ・ベクトル・イベント・コンテキストのゲージも出力されます（`nvecd_cache_hit_rate`、`nvecd_vectors_total`、`nvecd_events_total` など）。
-
-### GET /config
-
-現在のサーバー設定の要約を返します（機微な値は省略されます）。
-
-**CORS**: `api.http.enable_cors` が `true` のとき、サーバーは `Access-Control-Allow-Origin` ヘッダーを付与し、OPTIONS のプリフライトリクエストを処理します。
-
-**リクエスト:**
-
-```http
-GET /config HTTP/1.1
-```
-
-**レスポンス (200 OK):**
-
-```json
-{
-  "network": {
-    "tcp_enabled": true,
-    "http_enabled": true,
-    "allow_cidrs_configured": true
-  },
+  "network": {"tcp_enabled": true, "http_enabled": true, "allow_cidrs_configured": true},
   "events": {
-    "ctx_buffer_size": 1000,
-    "decay_interval_sec": 60
+    "ctx_buffer_size": 50,
+    "max_contexts": 0,
+    "max_neighbors_per_item": 0,
+    "min_support": 0.0,
+    "decay_interval_sec": 3600
   },
-  "vectors": {
-    "default_dimension": 768
-  },
-  "similarity": {
-    "default_top_k": 10,
-    "fusion_alpha": 0.6
-  },
+  "vectors": {"default_dimension": 4},
+  "similarity": {"default_top_k": 100, "fusion_alpha": 0.6},
   "notes": "Sensitive configuration values are redacted. Use CONFIG SHOW over TCP for full details."
 }
 ```
 
-バインドアドレスとポートはセキュリティ上の理由から `/config` では意図的に省略されています。完全な内容が必要な場合は TCP の `CONFIG SHOW` を使用してください。
+これは意図的に狭くした要約です。バインドアドレス、ポート、パスワード、CIDR リストそのものは公開されず、`allow_cidrs_configured` はリストが空でないかどうかだけを報告します。稼働中の設定の全体は TCP の `CONFIG SHOW` が表示します。
 
-### POST /dump/save
-
-サーバーのスナップショットをディスクに保存します。
-
-**リクエスト:**
-
-```http
-POST /dump/save HTTP/1.1
-Content-Type: application/json
-
-{
-  "filepath": "snapshot-20250118.dmp"
-}
-```
-
-`security.requirepass` が設定されている場合、このエンドポイントは認証を要求します。
-
-**リクエストボディのパラメータ:**
-
-| フィールド | 型 | 必須 | 説明 |
-|-------|------|----------|-------------|
-| `filepath` | string | いいえ | スナップショットのファイルパス（省略時は自動生成） |
-
-**レスポンス (200 OK):**
-
-```json
-{
-  "status": "ok",
-  "filepath": "snapshot-20250118.dmp"
-}
-```
-
-**エラーレスポンス (5xx):**
-
-保存に失敗した場合、エンドポイントは実際のエラーメッセージとともに 2xx 以外のステータス（`500` など）を返します。保存が失敗したのに `status: ok` を返すことはありません。
-
-```json
-{
-  "error": "Failed to save snapshot to snapshot-20250118.dmp: ..."
-}
-```
-
-### POST /dump/load
-
-ディスクからサーバーのスナップショットを読み込みます。
-
-**リクエスト:**
-
-```http
-POST /dump/load HTTP/1.1
-Content-Type: application/json
-
-{
-  "filepath": "snapshot-20250118.dmp"
-}
-```
-
-`security.requirepass` が設定されている場合、このエンドポイントは認証を要求します。
-
-**レスポンス (200 OK):**
-
-```json
-{
-  "status": "ok",
-  "filepath": "snapshot-20250118.dmp"
-}
-```
-
-**エラーレスポンス (404 Not Found):**
-
-スナップショットファイルが存在しない場合は `404` になります。それ以外の失敗は、内部エラーに応じて `400` または `500` になります。
-
-```json
-{
-  "error": "Failed to load snapshot from snapshot-20250118.dmp: ..."
-}
-```
-
-### POST /dump/verify
-
-スナップショットファイルの整合性を検証します。
-
-**リクエスト:**
-
-```http
-POST /dump/verify HTTP/1.1
-Content-Type: application/json
-
-{
-  "filepath": "snapshot-20250118.dmp"
-}
-```
-
-`security.requirepass` が設定されている場合、このエンドポイントは認証を要求します。
-
-**レスポンス (200 OK):**
-
-```json
-{
-  "status": "ok",
-  "filepath": "snapshot-20250118.dmp",
-  "valid": true
-}
-```
-
-**レスポンス（検証失敗時）:**
-
-整合性の検証に失敗した場合、エンドポイントは `valid: false` と実際のエラーメッセージとともに 2xx 以外のステータスを返します（`valid: true` を固定で返すことはありません）。
-
-```json
-{
-  "status": "error",
-  "filepath": "snapshot-20250118.dmp",
-  "valid": false,
-  "error": "Snapshot verification failed for ...: CRC mismatch"
-}
-```
-
-### POST /dump/info
-
-スナップショットファイルのメタデータを取得します。
-
-**リクエスト:**
-
-```http
-POST /dump/info HTTP/1.1
-Content-Type: application/json
-
-{
-  "filepath": "snapshot-20250118.dmp"
-}
-```
-
-`security.requirepass` が設定されている場合、このエンドポイントは認証を要求します。
-
-**レスポンス (200 OK):**
-
-```json
-{
-  "status": "ok",
-  "filepath": "snapshot-20250118.dmp",
-  "info": {
-    "version": "1",
-    "stores": "3",
-    "flags": "0",
-    "file_size": "314572800",
-    "timestamp": "1705564800",
-    "has_statistics": "true"
-  }
-}
-```
-
-### GET /dump/status
-
-バックグラウンドスナップショット処理の状態を取得します。
-
-`security.requirepass` が設定されている場合、このエンドポイントは認証を要求します。
-
-**リクエスト:**
-
-```http
-GET /dump/status HTTP/1.1
-```
-
-**レスポンス (200 OK):**
-
-```json
-{"status": "ok", "data": "IDLE"}
-```
-
-### GET /cache/stats
-
-キャッシュの統計情報（ヒット率、エントリ数、メモリ使用量）を取得します。
-
-**リクエスト:**
-
-```http
-GET /cache/stats HTTP/1.1
-```
-
-**レスポンス (200 OK):**
+### `GET /cache/stats`
 
 ```json
 {
   "enabled": true,
-  "total_queries": 10000,
-  "cache_hits": 8500,
-  "cache_misses": 1500,
-  "hit_rate": 0.85,
-  "current_entries": 2450,
-  "current_memory_mb": 12.45,
-  "evictions": 320
+  "total_queries": 10,
+  "cache_hits": 0,
+  "cache_misses": 10,
+  "cache_misses_invalidated": 0,
+  "cache_misses_not_found": 10,
+  "hit_rate": 0.0,
+  "current_entries": 0,
+  "current_memory_bytes": 0,
+  "current_memory_mb": 0.0,
+  "min_query_cost_ms": 10.0,
+  "ttl_seconds": 600,
+  "compression_enabled": true,
+  "eviction_batch_size": 10,
+  "evictions": 0,
+  "avg_hit_latency_ms": 0.0,
+  "avg_miss_latency_ms": 8.329999999999999e-05,
+  "time_saved_ms": 0.0
 }
 ```
 
-### POST /cache/clear
+`ttl_seconds` と `min_query_cost_ms` は現在値を反映し、実行時変数 `cache.ttl_seconds` と `cache.min_query_cost_ms` で変更できます。キャッシュコントローラが接続されていない場合、このルートは `500` を返します。
 
-類似検索キャッシュをクリアします。
+フィールドの集合は TCP の `CACHE STATS` に近いものの同一ではありません。TCP のブロックは `ttl_expirations` も報告し、2 つのフィールドの名前が異なります（ここでの `enabled` と `current_entries` が `cache_enabled` と `cache_entries` にあたります）。
 
-`security.requirepass` が設定されている場合、このエンドポイントは認証を要求します（`/cache/enable` と `/cache/disable` も同様です）。
+## キャッシュ管理
 
-**リクエスト:**
+### `POST /cache/clear`
 
-```http
-POST /cache/clear HTTP/1.1
-Content-Type: application/json
+```json
+{"scope": "all"}
+```
 
+空のボディは `{"scope": "all"}` として扱われます。
+
+```json
+{"entries_removed":0,"scope":"all","status":"ok"}
+```
+
+`entries_removed` は消去前に取得したエントリ数です。`all` 以外のスコープは `400` になります。
+
+```json
+{"error":"Invalid scope. Only 'all' is supported currently."}
+```
+
+JSON オブジェクトでないボディも `400` です。
+
+### `POST /cache/enable` と `POST /cache/disable`
+
+どちらもボディを取りません。
+
+```json
+{"message":"Cache enabled","status":"ok"}
+```
+
+```json
+{"message":"Cache disabled","status":"ok"}
+```
+
+どちらも実行時変数 `cache.enabled` を設定するため、変更は次に設定し直すか再起動するまで残ります。
+
+## スナップショット管理
+
+### `POST /dump/save`
+
+```json
+{"filepath": "nvecd.nvec"}
+```
+
+`filepath` は省略できます。ボディが空、またはフィールドがない場合は `snapshot.default_filename` を使います。パスは `snapshot.dir` の内側で解決され、そこから逃げるパスは `400` です。
+
+```json
+{"filepath":"/var/lib/nvecd/snapshots/nvecd.nvec","status":"ok"}
+```
+
+`filepath` はサーバーが使った解決済みの絶対パスです。既定の `snapshot.mode: fork` では、書き込みプロセスの子が生成された時点で応答が返り、ファイルはまだ読めません。応答のキーワードで 2 つのモードを区別する TCP の `DUMP SAVE` と違い、この本文はどちらのモードでも同一です。ファイルを読んだりコピーしたりする前に `GET /dump/status` をポーリングしてください。
+
+### `POST /dump/load`
+
+```json
+{"filepath": "nvecd.nvec"}
+```
+
+`filepath` は必須で、文字列でなければなりません。
+
+```json
+{"filepath":"/var/lib/nvecd/snapshots/nvecd.nvec","status":"ok"}
+```
+
+ファイルが存在しない場合は `500` で、メッセージに元の open 失敗が入ります。`snapshot.dir` から逃げるパスは `400` です。
+
+### `POST /dump/verify`
+
+```json
+{"filepath": "nvecd.nvec"}
+```
+
+```json
+{"filepath":"/var/lib/nvecd/snapshots/nvecd.nvec","status":"ok","valid":true}
+```
+
+検証に失敗しても `error` だけのオブジェクトには縮退せず、`valid` を false にした同じ形を返します。呼び出し側はどちらの場合も同じフィールドを読めます。
+
+```json
 {
-  "scope": "all"
+  "status": "error",
+  "filepath": "nope.nvec",
+  "valid": false,
+  "error": "Snapshot verification failed for /var/lib/nvecd/snapshots/nope.nvec: ..."
 }
 ```
 
-**レスポンス (200 OK):**
+ステータスは対応付けられたエラーステータスで、読めないファイルや壊れたファイルの場合は `500` です。
+
+### `POST /dump/info`
+
+```json
+{"filepath": "nvecd.nvec"}
+```
 
 ```json
 {
   "status": "ok",
-  "scope": "all",
-  "entries_removed": 2450
+  "filepath": "nvecd.nvec",
+  "info": {
+    "version": "1",
+    "stores": "4",
+    "flags": "16",
+    "file_size": "575",
+    "timestamp": "1788427664",
+    "has_statistics": "false"
+  }
 }
 ```
 
-### POST /cache/enable
+`info` の下の値はすべて文字列です。このブロックは共通ハンドラのテキスト出力を解析して作られるためです。ここでの `filepath` は解決済みのパスではなくリクエストの値をそのまま返します。
 
-類似検索キャッシュを有効にします。
+### `GET /dump/status`
 
-**リクエスト:** ボディは不要です。
+ボディを取りません。`data` がバックグラウンドのスナップショット書き込みプロセスの状態を運びます。
 
-**レスポンス (200 OK):**
-
-```json
-{"status": "ok", "message": "Cache enabled"}
-```
-
-### POST /cache/disable
-
-類似検索キャッシュを無効にします。
-
-**リクエスト:** ボディは不要です。
-
-**レスポンス (200 OK):**
+| `data` | 追加フィールド |
+|---|---|
+| `IDLE` | なし |
+| `IN_PROGRESS` | `filepath` |
+| `COMPLETED` | `filepath` |
+| `FAILED` | `filepath`、`error_message` |
 
 ```json
-{"status": "ok", "message": "Cache disabled"}
+{"data":"COMPLETED","filepath":"/var/lib/nvecd/snapshots/nvecd.nvec","status":"ok"}
 ```
-
-### POST /debug/on
-
-非推奨です。HTTP はステートレスであり、接続単位のデバッグモードをサポートしません。このエンドポイントは `410 Gone` を返します。持続的な TCP 接続上で `DEBUG ON` を使用してください。
-
-**リクエスト:**
-
-```http
-POST /debug/on HTTP/1.1
-```
-
-**レスポンス (410 Gone):**
 
 ```json
-{
-  "error": "HTTP debug mode is not supported; use DEBUG ON on a persistent TCP connection"
-}
+{"data":"IDLE","status":"ok"}
 ```
 
-### POST /debug/off
+`snapshot.mode: lock` で設定されたサーバーにはバックグラウンドの書き込みプロセスがないため、常に `IDLE` を返します。TCP の `DUMP STATUS` ブロックは同じ状態を小文字で報告し、このルートにはない `pid`、`start_time`、`end_time` を運びます。
 
-非推奨です。このエンドポイントは `410 Gone` を返します。同じ持続的な TCP 接続上で `DEBUG OFF` を使用してください。
+## デバッグルート
 
-**リクエスト:**
-
-```http
-POST /debug/off HTTP/1.1
-```
-
-**レスポンス (410 Gone):**
+`POST /debug/on` と `POST /debug/off` はルート一覧をコマンド集合に一致させるために登録されており、どちらも次のように拒否します。
 
 ```json
-{
-  "error": "HTTP debug mode is not supported; use DEBUG OFF on a persistent TCP connection"
-}
+{"error":"HTTP debug mode is not supported; use DEBUG ON on a persistent TCP connection"}
 ```
 
-## CORS サポート
+ステータスは `410` です。デバッグモードはひとつの接続の性質であり、リクエスト単位で完結する HTTP の呼び出しにはそれに相当するものがありません。
 
-ブラウザクライアント向けに CORS ヘッダーを有効にするには `api.http.enable_cors: true` を設定し、`api.http.cors_allow_origin` で信頼するオリジンを指定します。ブラウザから直接アクセスしない場合は CORS を無効のままにしてください。
+## ヘルスチェック
 
-**CORS ヘッダー:**
+4 つあり、いずれも認証の対象外で、コマンドとしても計上されません。
 
-```
-Access-Control-Allow-Origin: https://app.example.com
-Access-Control-Allow-Methods: GET, POST, OPTIONS
-Access-Control-Allow-Headers: Content-Type
-```
+`GET /health` — 素朴な生存確認で、常に `200` です。
 
-## 使用例
-
-### cURL
-
-**イベントの追跡:**
-
-```bash
-curl -X POST http://localhost:8080/event \
-  -H "Content-Type: application/json" \
-  -d '{
-    "ctx": "user_alice",
-    "id": "product123",
-    "type": "ADD",
-    "score": 100
-  }'
+```json
+{"status":"ok","timestamp":1788427653}
 ```
 
-**ベクトルの登録:**
+`GET /health/live` — オーケストレータ向けの liveness プローブで、プロセスが動いている間は常に `200` です。
 
-```bash
-curl -X POST http://localhost:8080/vecset \
-  -H "Content-Type: application/json" \
-  -d '{
-    "id": "product123",
-    "vector": [0.1, 0.2, 0.3, 0.4]
-  }'
+```json
+{"status":"alive","timestamp":1788427653}
 ```
 
-**類似アイテムの検索:**
+`GET /health/ready` — readiness プローブです。スナップショットを読み込んでいなければ `200` を返します。
 
-```bash
-curl -X POST http://localhost:8080/sim \
-  -H "Content-Type: application/json" \
-  -d '{
-    "id": "product123",
-    "top_k": 10,
-    "mode": "fusion"
-  }'
+```json
+{"loading":false,"status":"ready","timestamp":1788427653}
 ```
 
-**フィルタと min_score を指定した検索:**
+読み込み中は `503` です。
 
-```bash
-curl -X POST http://localhost:8080/sim \
-  -H "Content-Type: application/json" \
-  -d '{
-    "id": "product123",
-    "top_k": 10,
-    "mode": "fusion",
-    "filter": "category:electronics",
-    "min_score": 0.5
-  }'
+```json
+{"loading":true,"reason":"Server is loading","status":"not_ready","timestamp":1788427653}
 ```
 
-**ヘルスチェック:**
-
-```bash
-curl http://localhost:8080/health
-```
-
-**サーバー情報:**
-
-```bash
-curl http://localhost:8080/info | jq .
-```
-
-### JavaScript (fetch)
-
-```javascript
-// Track user purchase
-await fetch('http://localhost:8080/event', {
-  method: 'POST',
-  headers: {
-    'Content-Type': 'application/json'
-  },
-  body: JSON.stringify({
-    ctx: 'user_alice',
-    id: 'product123',
-    type: 'ADD',
-    score: 100
-  })
-});
-
-// Get recommendations
-const response = await fetch('http://localhost:8080/sim', {
-  method: 'POST',
-  headers: {
-    'Content-Type': 'application/json'
-  },
-  body: JSON.stringify({
-    id: 'product123',
-    top_k: 10,
-    mode: 'fusion'
-  })
-});
-
-const data = await response.json();
-console.log(`Found ${data.count} recommendations`);
-data.results.forEach(item => {
-  console.log(`  ${item.id}: ${item.score}`);
-});
-```
-
-### Python (requests)
-
-```python
-import requests
-
-# Track event
-requests.post('http://localhost:8080/event', json={
-    'ctx': 'user_alice',
-    'id': 'product123',
-    'type': 'ADD',
-    'score': 100
-})
-
-# Register vector
-requests.post('http://localhost:8080/vecset', json={
-    'id': 'product123',
-    'vector': [0.1, 0.2, 0.3, 0.4]
-})
-
-# Get recommendations
-response = requests.post('http://localhost:8080/sim', json={
-    'id': 'product123',
-    'top_k': 10,
-    'mode': 'fusion'
-})
-
-data = response.json()
-print(f"Found {data['count']} recommendations")
-for item in data['results']:
-    print(f"  {item['id']}: {item['score']}")
-```
-
-### 完全な例: EC サイトの推薦
-
-```python
-import requests
-
-BASE_URL = 'http://localhost:8080'
-
-# 1. Register product embeddings (from ML model)
-products = {
-    'laptop_001': [0.1, 0.2, 0.3, 0.4],
-    'laptop_002': [0.15, 0.25, 0.28, 0.38],
-    'phone_001': [0.8, 0.7, 0.6, 0.5]
-}
-
-for product_id, vector in products.items():
-    requests.post(f'{BASE_URL}/vecset', json={
-        'id': product_id,
-        'vector': vector
-    })
-
-# 2. Track user behavior
-events = [
-    ('user_alice', 'laptop_001', 100),  # Purchased
-    ('user_alice', 'laptop_002', 80),   # Viewed
-    ('user_bob', 'laptop_001', 100),    # Purchased
-    ('user_bob', 'phone_001', 90)       # Viewed
-]
-
-for ctx, product_id, score in events:
-    requests.post(f'{BASE_URL}/event', json={
-        'ctx': ctx,
-        'id': product_id,
-        'type': 'ADD',
-        'score': score
-    })
-
-# 3. Get content-based recommendations
-response = requests.post(f'{BASE_URL}/sim', json={
-    'id': 'laptop_001',
-    'top_k': 5,
-    'mode': 'vectors'
-})
-print("Content-based recommendations:", response.json()['results'])
-
-# 4. Get behavior-based recommendations
-response = requests.post(f'{BASE_URL}/sim', json={
-    'id': 'laptop_001',
-    'top_k': 5,
-    'mode': 'events'
-})
-print("Behavior-based recommendations:", response.json()['results'])
-
-# 5. Get hybrid recommendations (fusion)
-response = requests.post(f'{BASE_URL}/sim', json={
-    'id': 'laptop_001',
-    'top_k': 5,
-    'mode': 'fusion'
-})
-print("Hybrid recommendations:", response.json()['results'])
-```
-
-## パフォーマンス上の考慮点
-
-- **接続の再利用**: HTTP keep-alive を使うと性能が向上します
-- **キャッシュ**: `/info` のキャッシュメトリクスでキャッシュが効いているか確認します
-- **ネットワークセキュリティ**: `network.allow_cidrs` でアクセスを制限します
-- **リバースプロキシ**: TLS と認証のために nginx / HAProxy を nvecd の前段に置くことを検討します
-
-## エラーハンドリング
-
-すべてのエラーレスポンスは次の形式に従います。
+`GET /health/detail` — コンポーネントごとの状態で、常に `200` です。これは `/info` と同じ形ではありません。
 
 ```json
 {
-  "error": "Error message description"
+  "status": "healthy",
+  "timestamp": 1788427653,
+  "uptime_seconds": 44,
+  "components": {
+    "server": {"status": "ready", "loading": false},
+    "event_store": {"status": "ok", "contexts": 1, "total_events": 4},
+    "vector_store": {"status": "ok", "vectors": 1, "dimension": 4},
+    "co_index": {"status": "ok", "tracked_ids": 2}
+  }
 }
 ```
 
-**HTTP ステータスコード:**
+最上位の `status` はスナップショット読み込み中が `degraded`、それ以外が `healthy` です。`components.server.status` は同じ条件で `loading` または `ready` になります。ストアが接続されていないコンポーネントは `components` から省かれます。
 
-| コード | 説明 |
-|------|-------------|
-| 200 | 成功 |
-| 400 | Bad Request（入力が不正） |
-| 401 | Unauthorized（ゲート対象エンドポイントで資格情報が無いか不正） |
-| 403 | Forbidden（`network.allow_cidrs` によってブロック） |
-| 404 | Not Found（ベクトルまたはスナップショットが存在しない） |
-| 500 | Internal Server Error |
-| 503 | Service Unavailable（サーバーが読み込み中） |
+## メトリクス
 
-## 監視
+`GET /metrics` は Prometheus のテキスト表現形式を、コンテンツタイプ `text/plain; version=0.0.4; charset=utf-8` で返します。
 
-HTTP API は監視向けに複数のエンドポイントを提供します。
+```text
+# HELP nvecd_uptime_seconds Server uptime in seconds
+# TYPE nvecd_uptime_seconds counter
+nvecd_uptime_seconds 61
 
-- **ヘルスチェック**: `GET /health` - 簡易ヘルスチェック
-- **Liveness プローブ**: `GET /health/live` - Kubernetes の liveness
-- **Readiness プローブ**: `GET /health/ready` - Kubernetes の readiness
-- **詳細メトリクス**: `GET /health/detail` - 完全な統計情報
+# HELP nvecd_commands_total Total commands processed
+# TYPE nvecd_commands_total counter
+nvecd_commands_total{command="event"} 6
+nvecd_commands_total{command="vecset"} 3
+nvecd_commands_total{command="sim"} 14
+nvecd_commands_total 72
 
-### Kubernetes へのデプロイ
+# HELP nvecd_memory_bytes Current memory usage in bytes
+# TYPE nvecd_memory_bytes gauge
+nvecd_memory_bytes 7060
+
+# HELP nvecd_vectors_total Total vectors stored
+# TYPE nvecd_vectors_total gauge
+nvecd_vectors_total 1
+
+# HELP nvecd_events_total Total events stored
+# TYPE nvecd_events_total gauge
+nvecd_events_total 6
+
+# HELP nvecd_contexts_total Total contexts stored
+# TYPE nvecd_contexts_total gauge
+nvecd_contexts_total 2
+```
+
+| メトリクス | 型 | 意味 |
+|---|---|---|
+| `nvecd_uptime_seconds` | counter | 起動からの秒数 |
+| `nvecd_commands_total` | counter | 処理したコマンド数。コマンド別の系列は `command="event"`、`"vecset"`、`"sim"` のラベルを持ち、ラベルなしの系列が全コマンドの合計を運ぶ |
+| `nvecd_memory_bytes` | gauge | イベントストア、ベクトルストア、共起索引の合計 |
+| `nvecd_vectors_total` | gauge | 保持しているベクトル数 |
+| `nvecd_events_total` | gauge | 保持しているイベント数 |
+| `nvecd_contexts_total` | gauge | アクティブなコンテキスト数 |
+| `nvecd_cache_queries_total` | counter | キャッシュ参照回数 |
+| `nvecd_cache_hits_total` | counter | キャッシュヒット数 |
+| `nvecd_cache_misses_total` | counter | キャッシュミス数 |
+| `nvecd_cache_hit_rate` | gauge | ヒット率 |
+| `nvecd_cache_entries` | gauge | 現在保持しているエントリ数 |
+| `nvecd_cache_memory_bytes` | gauge | キャッシュの使用メモリ |
+
+ストア系の 3 メトリクスはそのストアが接続されている場合にだけ、キャッシュ系の 6 メトリクスはキャッシュが接続されている場合にだけ現れます。キャッシュを無効にした状態でスクレイプすると `nvecd_cache_*` の系列はひとつもないため、ダッシュボードはその状態を許容する必要があります。
+
+ラベルなしの `nvecd_commands_total` 系列はラベル付きの系列とメトリクス名を共有しています。この混在を拒否するスクレイプ設定もあるため、ラベルなしの系列を落とすリラベルルール、あるいはラベル付きを合計する記録ルールで回避します。
+
+## CORS
+
+CORS ヘッダは `api.http.enable_cors` が true のときだけ出力されます。`Access-Control-Allow-Origin` の値は `api.http.cors_allow_origin` から取り、空の場合はヘッダ自体を省きます。`null` として送らないのは、`null` がサンドボックス化された iframe や `file://` ページのオリジンを指す名前だからです。残りのヘッダは設定されるため、オリジンを注入するプロキシをサーバーの前段に置く構成も取れます。
+
+```bash
+$ curl -i -X OPTIONS http://127.0.0.1:8080/sim -H 'Origin: https://example.com'
+HTTP/1.1 204 No Content
+Access-Control-Allow-Origin: https://example.com
+Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS
+Access-Control-Allow-Headers: Content-Type, Authorization
+Content-Length: 0
+```
+
+CORS が無効の場合、`OPTIONS` は登録されず `404` を返します。
+
+## 実例
+
+メタデータ付きでアイテムを 2 つ登録し、イベントを記録してから検索します。
+
+```bash
+curl -X POST http://127.0.0.1:8080/vecset \
+  -d '{"id":"item1","vector":[0.1,0.2,0.3,0.4],"metadata":{"category":"books","price":12}}'
+# {"dimension":4,"status":"ok"}
+
+curl -X POST http://127.0.0.1:8080/vecset \
+  -d '{"id":"item2","vector":[0.1,0.2,0.3,0.5],"metadata":{"category":"books","price":30}}'
+# {"dimension":4,"status":"ok"}
+
+curl -X POST http://127.0.0.1:8080/event \
+  -d '{"ctx":"user_alice","id":"item1","type":"ADD","score":100}'
+# {"status":"ok"}
+
+curl -X POST http://127.0.0.1:8080/sim \
+  -d '{"id":"item1","top_k":5,"mode":"vectors","filter":"price>10"}'
+# {"count":1,"mode":"vectors","results":[{"id":"item2","score":0.9940}],"status":"ok"}
+```
+
+クエリベクトルで検索し、スコアの低い結果を落とします。
+
+```bash
+curl -X POST http://127.0.0.1:8080/simv \
+  -d '{"vector":[0.1,0.2,0.3,0.4],"top_k":5,"min_score":0.99}'
+# {"count":2,"dimension":4,"results":[{"id":"item1","score":1.0},{"id":"item2","score":0.994}],"status":"ok"}
+```
+
+スナップショットを取り、バックグラウンドの書き込みが終わるまで待ちます。
+
+```bash
+curl -X POST http://127.0.0.1:8080/dump/save -H 'Authorization: Bearer s3cret' -d '{}'
+# {"filepath":"/var/lib/nvecd/snapshots/nvecd.nvec","status":"ok"}
+
+until curl -s -H 'Authorization: Bearer s3cret' http://127.0.0.1:8080/dump/status \
+      | grep -q '"data":"COMPLETED"'; do sleep 1; done
+```
+
+Prometheus のスクレイプ設定は次のようになります。
 
 ```yaml
-apiVersion: v1
-kind: Pod
-metadata:
-  name: nvecd
-spec:
-  containers:
-  - name: nvecd
-    image: nvecd:latest
-    ports:
-    - containerPort: 8080
-    livenessProbe:
-      httpGet:
-        path: /health/live
-        port: 8080
-      initialDelaySeconds: 10
-      periodSeconds: 30
-    readinessProbe:
-      httpGet:
-        path: /health/ready
-        port: 8080
-      initialDelaySeconds: 5
-      periodSeconds: 10
+scrape_configs:
+  - job_name: nvecd
+    static_configs:
+      - targets: ["127.0.0.1:8080"]
 ```
-
-### Prometheus メトリクス
-
-現在 `GET /metrics` は Prometheus テキスト形式を公開します。JSON レスポンスが扱いやすい場合は `/info` または `/health/detail` を使用してください。

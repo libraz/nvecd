@@ -1,564 +1,325 @@
-# Installation Guide
+# Installation
 
-This guide provides detailed instructions for building and installing nvecd from source.
+This page covers building nvecd from source, installing it, running the server and diagnosing a build or startup that fails.
 
-## Prerequisites
+## Supported platforms
 
-### System Requirements
+nvecd builds and runs on Linux and macOS, on x86_64 and on 64-bit ARM. The build assumes a POSIX system with `epoll` or `kqueue` available to the I/O reactor; there is no Windows build.
 
-- **Operating System**: Linux (Ubuntu 20.04+, Debian 11+) or macOS (10.15+)
-- **Compiler**: C++17 compatible compiler
-  - GCC 9+ (Linux)
-  - Clang 10+ (macOS/Linux)
-- **CMake**: Version 3.15 or later
-- **Memory**: At least 1GB RAM for building, 512MB+ for running
+Continuous integration builds and tests on Ubuntu only. macOS is supported and the build carries macOS-specific configuration, but no automated job exercises it, so a macOS regression is found by whoever builds there.
 
-### Required Dependencies
+## Compiler and CMake requirements
 
-All dependencies are bundled in the `third_party/` directory and will be automatically fetched during build:
+- CMake 3.15 or later.
+- A C++17 compiler: GCC 9 or later, or Clang 10 or later. The build sets flags that only GCC and Clang accept; no other compiler is configured for.
+- zlib development headers, found with `find_package(ZLIB REQUIRED)`.
+- A pthreads implementation, found with `find_package(Threads REQUIRED)`.
+- A Python 3 interpreter, required at configure time whenever tests are built, which is the default. Configuration fails without it.
+- Optionally `readline`. When it is found, `nvecd-cli` gets tab completion and history; when it is not, the CLI builds without them.
 
-- **yaml-cpp**: YAML configuration parser (bundled)
-- **GoogleTest**: Testing framework (bundled, only for tests)
-- **spdlog**: Fast logging library (bundled)
+These versions are the compatibility floor for the whole project and are not restated on other pages.
 
-### System Dependencies
+## Bundled dependencies
 
-#### Ubuntu/Debian
+Seven dependencies are fetched by CMake's `FetchContent` at configure time and built as part of the project. Nothing needs to be installed for them, but the first configure of a clean tree needs network access.
+
+| Dependency | Used for |
+|---|---|
+| yaml-cpp | Parsing the YAML configuration file |
+| GoogleTest | The test suite; fetched only when `BUILD_TESTS` is on |
+| spdlog | Server logging |
+| lz4 | Compressing cached query results |
+| nlohmann/json | JSON request and response bodies on the HTTP API |
+| cpp-httplib | The HTTP server |
+| json-schema-validator | Validating the configuration against the embedded schema |
+
+Each is pinned to an immutable tag or commit, so a clean build resolves to the same sources every time. On macOS, Homebrew prefixes are added to `CMAKE_PREFIX_PATH` for `find_package` and `find_library` only, and deliberately not to the include path, so a Homebrew copy of one of these libraries cannot shadow the pinned one.
+
+## System packages
+
+### Debian and Ubuntu
 
 ```bash
-# Update package list
 sudo apt-get update
-
-# Install build essentials
-sudo apt-get install -y \
-  build-essential \
-  cmake \
-  git \
-  pkg-config \
-  libz-dev
+sudo apt-get install -y build-essential cmake git python3 zlib1g-dev
 ```
 
-#### macOS
+Optional, for the CLI's line editing and for the formatting and lint targets:
 
 ```bash
-# Install Homebrew (if not already installed)
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+sudo apt-get install -y libreadline-dev clang-format clang-tidy
+```
 
-# Install dependencies
+### macOS
+
+Install the Xcode command line tools, then the build tools:
+
+```bash
+xcode-select --install
 brew install cmake
 ```
 
----
-
-## Building from Source
-
-### Quick Start (Using Makefile)
-
-The easiest way to build nvecd is using the provided Makefile:
+Optional, for the same reasons as above:
 
 ```bash
-# Clone repository
+brew install readline llvm
+```
+
+`clang-format` and `clang-tidy` ship inside the `llvm` formula rather than with the command line tools, and the formula is not linked into `PATH` by default.
+
+## Building with make
+
+The `Makefile` wraps CMake. It configures into `build/`, then builds with one job per detected core.
+
+```bash
 git clone https://github.com/libraz/nvecd.git
 cd nvecd
-
-# Build (automatically configures CMake and builds in parallel)
 make
-
-# Run tests
-make test
-
-# View all available commands
-make help
 ```
 
-**Build output**: Binaries will be in `build/bin/nvecd`
-
-### Manual Build (Using CMake Directly)
-
-If you prefer to use CMake directly:
+The wrapper passes no build type, so a plain `make` produces a build with warnings enabled and no optimisation level selected. For a build to measure or deploy, pass the build type through to the configure step:
 
 ```bash
-# Configure build (Release mode)
+make CMAKE_OPTIONS="-DCMAKE_BUILD_TYPE=Release" configure
+make
+```
+
+`CMAKE_OPTIONS` is read by the `configure` target only. Once `build/` holds a CMake cache, later `make` invocations reuse it, so changing an option means re-running `configure`.
+
+## Building with CMake directly
+
+```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Release
-
-# Build with parallel jobs
-cmake --build build --parallel
-
-# Run tests
-cd build
-ctest --output-on-failure
-```
-
-**Build output**: Binaries will be in `build/bin/nvecd`
-
----
-
-## Build Options
-
-### Build Types
-
-```bash
-# Debug build (with symbols, no optimization)
-cmake -B build -DCMAKE_BUILD_TYPE=Debug
-
-# Release build (optimized, no debug symbols)
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-
-# RelWithDebInfo (optimized with debug symbols)
-cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
-```
-
-### Optional Features
-
-#### Disable Tests
-
-To skip building tests:
-
-```bash
-cmake -B build -DBUILD_TESTS=OFF
-```
-
-Or with Makefile:
-
-```bash
-make CMAKE_OPTIONS="-DBUILD_TESTS=OFF" configure
-make
-```
-
-#### Enable AddressSanitizer (Memory Error Detection)
-
-```bash
-cmake -B build -DENABLE_ASAN=ON -DCMAKE_BUILD_TYPE=Debug
 cmake --build build --parallel
 ```
 
-Or with Makefile:
+Binaries land in `build/bin/` and libraries in `build/lib/`, regardless of which of the two paths configured the tree.
+
+## Build types
+
+| Build type | Flags added |
+|---|---|
+| `Debug` | `-g -O0 -fno-omit-frame-pointer` |
+| `Release` | `-O3 -DNDEBUG` |
+| `RelWithDebInfo` | CMake's defaults for the type |
+| (unset) | Neither set; only the common warning and architecture flags apply |
+
+Every build also gets `-Wall -Wextra -Wpedantic` and an architecture flag chosen by `NVECD_PORTABLE_BUILD`, described below. nvecd's own targets additionally promote `-Wswitch` to an error, so adding an enumerator breaks the build at every switch that decides something about it.
+
+## CMake options
+
+| Option | Default | Effect |
+|---|---|---|
+| `BUILD_TESTS` | `ON` | Builds the test executables, fetches GoogleTest and requires a Python 3 interpreter |
+| `ENABLE_ASAN` | `OFF` | Adds `-fsanitize=address -fno-omit-frame-pointer` |
+| `ENABLE_TSAN` | `OFF` | Adds `-fsanitize=thread` |
+| `ENABLE_COVERAGE` | `OFF` | Adds `--coverage -O0 -g` and defines the `coverage` and `coverage-clean` targets |
+| `NVECD_PORTABLE_BUILD` | off | Selects a baseline architecture instead of tuning for the build host |
+
+`NVECD_PORTABLE_BUILD` decides the architecture flag. Left off, the build gets `-march=native`, which tunes for the machine doing the compiling and produces a binary that may fault with an illegal instruction on an older CPU. Turned on, the build gets `-march=x86-64` on x86_64 or `-march=armv8-a` on 64-bit ARM, which runs anywhere in that architecture family. Turn it on whenever the build host and the run host are not the same machine; continuous integration builds with it on.
+
+Unlike the four options above, `NVECD_PORTABLE_BUILD` is not declared with CMake's `option()` command. It has no cache entry, no help text and does not appear in `cmake -LH` output, so nothing advertises it. Set it explicitly:
 
 ```bash
-make CMAKE_OPTIONS="-DENABLE_ASAN=ON" configure
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DNVECD_PORTABLE_BUILD=ON
+```
+
+Sanitizers are mutually exclusive: a build with both `ENABLE_ASAN` and `ENABLE_TSAN` on does not link.
+
+The version compiled into the binary comes from the `NVECD_VERSION` environment variable when it is set, and from `git describe --tags --abbrev=0` otherwise.
+
+## Artifacts
+
+A completed build produces three things:
+
+- `build/bin/nvecd` — the server.
+- `build/bin/nvecd-cli` — an interactive and one-shot client for the TCP protocol.
+- `build/lib/libnvecdclient.so` on Linux, `build/lib/libnvecdclient.dylib` on macOS — the shared client library, described in [Client Library](./client-library.md).
+
+## Installing
+
+### To the default prefix
+
+```bash
 make
-```
-
-#### Enable ThreadSanitizer (Race Condition Detection)
-
-```bash
-cmake -B build -DENABLE_TSAN=ON -DCMAKE_BUILD_TYPE=Debug
-cmake --build build --parallel
-```
-
-Or with Makefile:
-
-```bash
-make CMAKE_OPTIONS="-DENABLE_TSAN=ON" configure
-make
-```
-
-**Note**: Do not enable both ASAN and TSAN simultaneously.
-
-#### Enable Code Coverage
-
-Coverage is a CMake target rather than a Makefile target, and it needs `lcov`
-and `genhtml` on the PATH. It is defined only when `ENABLE_COVERAGE=ON` was
-passed at configure time.
-
-```bash
-cmake -B build -DENABLE_COVERAGE=ON
-cmake --build build --parallel
-
-# Run the tests and render the report
-cmake --build build --target coverage
-
-# View coverage report
-open build/coverage/html/index.html
-```
-
----
-
-## Installing Binaries
-
-### System-wide Installation (Recommended)
-
-Install to `/usr/local` (default location):
-
-```bash
-# Build first
-make
-
-# Install (requires sudo)
 sudo make install
 ```
 
-This will install:
+The default prefix is `/usr/local`. Installed files:
 
-- **Server binary**: `/usr/local/bin/nvecd`
-- **CLI binary**: `/usr/local/bin/nvecd-cli`
-- **Client library**: `/usr/local/lib/libnvecdclient.dylib` on macOS, `libnvecdclient.so` on Linux
-- **Client headers**: `/usr/local/include/nvecd/` (`nvecdclient.h`, `nvecdclient_c.h`, and `utils/error.h`, `utils/expected.h`)
-- **CMake package**: `/usr/local/lib/cmake/nvecd/`, exporting the `nvecd::client` target
-- **Config sample**: `/usr/local/etc/nvecd/config.yaml`
-- **Config schema**: `/usr/local/etc/nvecd/config-schema.json`
-- **Documentation**: `/usr/local/share/doc/nvecd/`
+| Path | Contents |
+|---|---|
+| `bin/nvecd`, `bin/nvecd-cli` | The server and the CLI |
+| `lib/libnvecdclient.*` | The shared client library |
+| `include/nvecd/` | `nvecdclient.h`, `nvecdclient_c.h`, and `utils/error.h`, `utils/expected.h` |
+| `lib/cmake/nvecd/` | The CMake package, exporting the `nvecd::client` target |
+| `etc/nvecd/config.yaml` | The annotated example configuration |
+| `etc/nvecd/config-schema.json` | The schema the server validates configuration against |
+| `share/doc/nvecd/` | `README.md` and both documentation trees |
 
-A CMake project consumes the installed client with:
+A CMake project consumes the installed client library with:
 
 ```cmake
 find_package(nvecd CONFIG REQUIRED)
 target_link_libraries(my_app PRIVATE nvecd::client)
 ```
 
-### Custom Installation Location
-
-Install to a custom directory (e.g., `/opt/nvecd`):
-
-```bash
-# Configure with custom prefix
-cmake -B build -DCMAKE_INSTALL_PREFIX=/opt/nvecd
-
-# Build and install
-cmake --build build --parallel
-sudo cmake --install build
-```
-
-Or with Makefile:
+### To another prefix
 
 ```bash
 make PREFIX=/opt/nvecd install
 ```
 
-### Uninstalling
+Or, driving CMake directly:
 
-To remove installed files:
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/opt/nvecd
+cmake --build build --parallel
+sudo cmake --install build
+```
+
+The `Makefile` passes `PREFIX` to the configure step as `CMAKE_INSTALL_PREFIX`, so setting it on the `install` line reconfigures the tree.
+
+### Uninstalling
 
 ```bash
 sudo make uninstall
 ```
 
-Or with CMake:
+which drives the CMake target directly:
 
 ```bash
 sudo cmake --build build --target nvecd-uninstall
 ```
 
----
+Removal reads `install_manifest.txt` from the build directory, so it removes exactly what that build installed. A build tree that has been cleaned cannot uninstall a previous installation.
 
-## Running Tests
-
-nvecd includes more than 1,100 active CTest cases, plus opt-in performance and scale benchmarks.
-
-### Using Makefile
-
-```bash
-make test
-```
-
-### Using CTest Directly
-
-```bash
-cd build
-ctest --output-on-failure
-```
-
-### Running Specific Tests
-
-```bash
-# Run only event store tests
-cd build
-./bin/event_store_test
-
-# Run with verbose output
-./bin/event_store_test --gtest_verbose
-
-# Run specific test case
-./bin/event_store_test --gtest_filter="EventStoreTest.BasicIngest"
-```
-
-### Test Coverage
-
-- **Event Processing**: EventStore, CoOccurrenceIndex, StateCache, DedupCache (90+ tests)
-- **Vector Search**: VectorStore, HNSW, IVF, distance functions (180+ tests)
-- **Similarity Engine**: Fusion search, adaptive fusion, metadata filtering (45+ tests)
-- **Cache System**: SimilarityCache, cache policies, key generation, compression (100+ tests)
-- **Server & Protocol**: Command parser, handlers, HTTP server, networking (130+ tests)
-- **Storage**: Snapshots, WAL, format versioning (50+ tests)
-- **Configuration**: Config parser, runtime variables (45+ tests)
-- **Utilities**: Expected, string utils, MD5, path utils (100+ tests)
-- **Client Library**: C++ and C client tests (22+ tests)
-- **Integration (E2E)**: End-to-end, concurrency, adversarial, performance, TikTok scenarios (90+ tests)
-
-**Total**: More than 1,100 active CTest cases, plus opt-in performance and scale benchmarks
-
----
-
-## Verifying Installation
-
-After installation, verify the binary is accessible:
-
-```bash
-# Check server binary
-nvecd --help
-
-# Expected output:
-# Usage: nvecd [OPTIONS]
-#
-# Options:
-#   -c, --config <file>    Configuration file path
-#   -h, --help             Show this help message
-#   -v, --version          Show version information
-```
-
-Check version:
+## Verifying the installation
 
 ```bash
 nvecd --version
-
-# Expected output:
-# nvecd version 0.1.0
+nvecd --help
 ```
 
----
+The first prints the binary's version followed by a one-line description; the second prints the accepted options.
 
-## Running the Server
-
-### Basic Usage
+Validate a configuration file without starting the server:
 
 ```bash
-# Run with example configuration
-./build/bin/nvecd -c examples/config.yaml
-
-# Server will start and listen on 127.0.0.1:11017
+nvecd --config-test -c /etc/nvecd/config.yaml
 ```
 
-Expected output:
+The exit status is zero when the file parses and validates. On success it prints a summary of the event, vector, similarity, API and performance sections, which is the fastest way to confirm that an edit took effect.
 
-```
-[2025-11-18 14:30:00.123] [info] nvecd version 0.1.0 starting...
-[2025-11-18 14:30:00.125] [info] Loading configuration from examples/config.yaml
-[2025-11-18 14:30:00.127] [info] TCP server listening on 127.0.0.1:11017
-[2025-11-18 14:30:00.128] [info] nvecd ready to accept connections
-```
+## Running the server
 
-### Testing the Server
-
-Connect using `nc` (netcat):
+The server takes the configuration file as `-c`/`--config`, or as a bare positional argument:
 
 ```bash
-# Connect to server
-nc localhost 11017
-
-# Try commands
-EVENT user1 ADD item1 100
-VECSET item1 0.1 0.5 0.8
-SIM item1 10 using=fusion
-
-# Expected responses
-OK
-OK
-OK RESULTS 0
+nvecd -c /etc/nvecd/config.yaml
 ```
 
-When `requirepass` is configured, authenticate the CLI without exposing the
-password in the process argument list. The password file must be a regular,
-privately owned file with no group or other permissions.
+| Option | Meaning |
+|---|---|
+| `-c`, `--config` | Path to the configuration file |
+| `-t`, `--config-test` | Validate the file, print a summary and exit |
+| `-h`, `--help` | Print usage and exit |
+| `-v`, `--version` | Print version information and exit |
+
+Started with no configuration file, the server runs on the compiled-in defaults and restricts `network.allow_cidrs` to `127.0.0.1/32`, so a server started by accident is not reachable from the network. Every other setting keeps its default. See [Configuration](./configuration.md) for the full set.
+
+The server reads no environment variables for its own options; everything is set in the configuration file. `SIGINT` and `SIGTERM` request a graceful shutdown. There is no reload signal — a configuration change that is not one of the runtime-settable variables takes a restart.
+
+### Authenticating the CLI
+
+When `security.requirepass` is set, `nvecd-cli` needs the password, and both ways of supplying it keep it out of the process argument list, where any user on the machine could read it.
 
 ```bash
 chmod 600 /path/to/nvecd-password
 nvecd-cli --password-file /path/to/nvecd-password INFO
+```
 
-# Environment-variable lookup is also supported; the option names the variable.
+The password file must be a regular file owned by the user running the CLI, with no group or other permissions; the CLI refuses it otherwise, and refuses to follow a symlink to it.
+
+The second form is the only place nvecd looks at the environment for an option. `--password-env` names the variable to read; it does not read a fixed variable name.
+
+```bash
 export NVECD_PASSWORD='replace-me'
 nvecd-cli --password-env NVECD_PASSWORD INFO
 ```
 
-### Running as System Service (systemd)
+The two are mutually exclusive. A password containing a carriage return or newline is rejected, since neither can survive the line-oriented protocol.
 
-**Note**: systemd service configuration is planned for future releases.
+## Running under systemd
 
-For now, you can run nvecd manually or use a process manager like `supervisord`.
+The server runs in the foreground and stops on `SIGTERM`, so a plain service unit is enough.
 
----
+```text
+[Unit]
+Description=nvecd vector search engine
+After=network-online.target
+Wants=network-online.target
 
-## Configuration
+[Service]
+Type=simple
+User=nvecd
+Group=nvecd
+ExecStart=/usr/local/bin/nvecd -c /etc/nvecd/config.yaml
+Restart=on-failure
+RestartSec=5
 
-Before running nvecd in production, create a configuration file:
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/nvecd
 
-```bash
-# Copy example config
-sudo mkdir -p /etc/nvecd
-sudo cp examples/config.yaml /etc/nvecd/config.yaml
-
-# Edit configuration
-sudo nano /etc/nvecd/config.yaml
+[Install]
+WantedBy=multi-user.target
 ```
 
-See [Configuration Guide](configuration.md) for detailed configuration options.
+`ReadWritePaths` has to cover `snapshot.dir` and, when the write-ahead log is enabled, `wal.dir`. With `ProtectSystem=strict` and those paths missing, the server starts and then fails its first write.
 
----
-
-## Development Build
-
-For development work with debugging enabled:
+Set `logging.file` to an empty string to keep logs on stdout, where the journal collects them, and `logging.json` to `true` for a machine-readable format.
 
 ```bash
-# Debug build with sanitizers
-cmake -B build \
-  -DCMAKE_BUILD_TYPE=Debug \
-  -DENABLE_ASAN=ON
-
-cmake --build build --parallel
-
-# Run with debug logging
-./build/bin/nvecd -c examples/config.yaml
+sudo systemctl daemon-reload
+sudo systemctl enable --now nvecd
+journalctl -u nvecd -f
 ```
 
-### Code Formatting
+## File permissions and a dedicated user
+
+Run the server as an unprivileged account that owns only its data:
 
 ```bash
-# Format all source files
-make format
-
-# Or manually
-find src tests -name "*.cpp" -o -name "*.h" | xargs clang-format -i
+sudo useradd --system --shell /usr/sbin/nologin --home-dir /var/lib/nvecd nvecd
+sudo mkdir -p /var/lib/nvecd/snapshots /var/lib/nvecd/wal
+sudo chown -R nvecd:nvecd /var/lib/nvecd
+sudo chmod 700 /var/lib/nvecd/snapshots /var/lib/nvecd/wal
 ```
 
-### Static Analysis
+The configuration file holds `security.requirepass` in cleartext, so it should be readable by the service account and nobody else:
 
 ```bash
-# Run clang-tidy
-make lint
-
-# Or manually
-clang-tidy src/**/*.cpp -- -std=c++17
+sudo chown root:nvecd /etc/nvecd/config.yaml
+sudo chmod 640 /etc/nvecd/config.yaml
 ```
 
----
+The server writes snapshots and write-ahead log segments under its own account, and a snapshot taken in `fork` mode is written by a forked child, so both directories must stay writable for the account for the lifetime of the process, not only at startup.
 
 ## Troubleshooting
 
-### Build Failures
+**The first configure fails while fetching a dependency.** `FetchContent` clones each pinned dependency at configure time. Behind a proxy or without outbound network access the configure step fails before any compilation starts. Configure once on a machine with access, or make the Git remotes reachable.
 
-**Issue**: CMake cannot find yaml-cpp
+**Configure fails looking for a Python interpreter.** The test tree requires one, and tests are on by default. Install Python 3, or configure with `-DBUILD_TESTS=OFF` if the tests are not wanted.
 
-**Solution**: yaml-cpp is bundled. Make sure you have internet access during the first build (CMake will fetch dependencies).
+**The binary dies with an illegal instruction on another machine.** A build without `NVECD_PORTABLE_BUILD` is compiled with `-march=native` for the build host. Rebuild with `-DNVECD_PORTABLE_BUILD=ON`.
 
-```bash
-# Clean and rebuild
-make clean
-make
-```
+**`nvecd-cli` has no tab completion.** `readline` was not found when the CLI was configured. Install it and re-run the configure step; the search result is cached, so a rebuild alone does not pick it up.
 
-**Issue**: Compiler version too old
+**The server exits reporting that it cannot bind.** Another process holds the port. Check with `lsof -i :11017`, then either stop it or change `api.tcp.port`.
 
-**Solution**: Update to GCC 9+ or Clang 10+:
+**The server starts but refuses every connection.** `network.allow_cidrs` defaults to empty, which denies everything, and a server started without a configuration file allows only `127.0.0.1/32`. List the client networks explicitly.
 
-```bash
-# Ubuntu/Debian
-sudo apt-get install -y gcc-9 g++-9
-export CC=gcc-9
-export CXX=g++-9
-
-# Or use Clang
-sudo apt-get install -y clang-10
-export CC=clang-10
-export CXX=clang++-10
-```
-
-### Test Failures
-
-**Issue**: Tests fail with sanitizer errors
-
-**Solution**: This may indicate actual bugs. Run tests without sanitizers first:
-
-```bash
-# Build without sanitizers
-cmake -B build -DCMAKE_BUILD_TYPE=Debug
-cmake --build build --parallel
-cd build && ctest --output-on-failure
-```
-
-### Runtime Issues
-
-**Issue**: Server fails to bind to port
-
-**Solution**: Check if port 11017 is already in use:
-
-```bash
-# Check for process using port
-lsof -i :11017
-
-# Or use a different port in config.yaml
-api:
-  tcp:
-    port: 12017
-```
-
-**Issue**: Permission denied for snapshot directory
-
-**Solution**: Create directory with proper permissions:
-
-```bash
-sudo mkdir -p /var/lib/nvecd/snapshots
-sudo chown $(whoami) /var/lib/nvecd/snapshots
-chmod 755 /var/lib/nvecd/snapshots
-```
-
----
-
-## Security Notes
-
-### Production Deployment
-
-1. **Run as non-root user**:
-
-```bash
-# Create dedicated user
-sudo useradd -r -s /bin/false nvecd
-
-# Change ownership
-sudo chown -R nvecd:nvecd /var/lib/nvecd
-```
-
-2. **Protect configuration files**:
-
-```bash
-# Secure config file
-sudo chmod 600 /etc/nvecd/config.yaml
-sudo chown nvecd:nvecd /etc/nvecd/config.yaml
-```
-
-3. **Use CIDR filtering**:
-
-Configure `network.allow_cidrs` in config.yaml to restrict access:
-
-```yaml
-network:
-  allow_cidrs:
-    - "10.0.0.0/8"      # Private network only
-    - "172.16.0.0/12"
-```
-
-4. **Monitor logs**:
-
-```bash
-# Follow logs
-tail -f /var/log/nvecd/nvecd.log
-```
-
----
-
-## Next Steps
-
-After successful installation:
-
-1. **Configure nvecd**: See [Configuration Guide](configuration.md)
-2. **Learn the protocol**: See [Protocol Reference](protocol.md)
-3. **Use client libraries**: See [Client Library Guide](libnvecdclient.md)
-4. **Set up persistence**: See [Snapshot Management](snapshot.md)
-5. **Optimize performance**: See [Performance Guide](performance.md)
-
----
-
-## Getting Help
-
-- **Documentation**: [docs/en/](.)
-- **Issues**: GitHub Issues
-- **Examples**: [examples/](../../examples/)
+**Snapshot or write-ahead log writes fail with a permission error.** The directories named by `snapshot.dir` and `wal.dir` must exist and be writable by the account the server runs as; the server does not create parent directories it lacks permission for.

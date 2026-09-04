@@ -1,1162 +1,621 @@
-# HTTP API Guide
+# HTTP API
 
-Nvecd provides a RESTful JSON API for easy integration with web applications and HTTP clients.
+The HTTP server exposes the same operations as the [TCP protocol](./protocol.md) as JSON routes, plus health probes and a Prometheus scrape endpoint. It is disabled by default and is enabled with `api.http.enable`.
 
-## Configuration
-
-Enable the HTTP server in your `config.yaml`:
+## Enabling the server
 
 ```yaml
 api:
-  tcp:
-    bind: "127.0.0.1"
-    port: 11017
   http:
-    enable: true          # Enable HTTP server
-    bind: "127.0.0.1"     # Bind address (default: localhost only)
-    port: 8080            # HTTP port (default: 8080)
-    enable_cors: false    # Optional: enable only when exposing to browsers
-    cors_allow_origin: "" # Optional origin allowed when CORS is enabled
+    enable: true
+    bind: "127.0.0.1"
+    port: 8080
+    timeout_sec: 5
+network:
+  allow_cidrs:
+    - "127.0.0.1/32"
 ```
 
-**Security Note**: HTTP server binds to loopback by default. If you must expose it publicly, configure `network.allow_cidrs` to restrict access to trusted IP ranges, and use a reverse proxy with TLS/authentication.
+The listener applies `network.allow_cidrs` before routing, so an address outside the list is answered `403` regardless of the route. An empty list denies every address. Request bodies are capped at `performance.max_query_length`, concurrent connections at `performance.max_connections` and `performance.max_connections_per_ip`, and, when `api.rate_limiting.enable` is set, requests are token-bucketed per client address.
+
+All request bodies are JSON. The server does not require a `Content-Type` header, and every JSON response is served as `application/json` except `/metrics`.
+
+## Route table
+
+| Method | Path | TCP counterpart | Privilege |
+|---|---|---|---|
+| `POST` | `/event` | `EVENT` | write |
+| `POST` | `/vecset` | `VECSET` | write |
+| `DELETE` | `/vecset` | `VECDEL` | write |
+| `POST` | `/metaset` | `METASET` | write |
+| `POST` | `/sim` | `SIM` | read |
+| `POST` | `/simv` | `SIMV` | read |
+| `GET` | `/info` | `INFO` | read |
+| `GET` | `/config` | `CONFIG SHOW` | read |
+| `GET` | `/cache/stats` | `CACHE STATS` | read |
+| `POST` | `/cache/clear` | `CACHE CLEAR` | write |
+| `POST` | `/cache/enable` | `CACHE ENABLE` | write |
+| `POST` | `/cache/disable` | `CACHE DISABLE` | write |
+| `POST` | `/dump/save` | `DUMP SAVE` | admin |
+| `POST` | `/dump/load` | `DUMP LOAD` | admin |
+| `POST` | `/dump/verify` | `DUMP VERIFY` | admin |
+| `POST` | `/dump/info` | `DUMP INFO` | admin |
+| `GET` | `/dump/status` | `DUMP STATUS` | admin |
+| `POST` | `/debug/on` | `DEBUG ON` | read |
+| `POST` | `/debug/off` | `DEBUG OFF` | read |
+| `GET` | `/health` | — | none |
+| `GET` | `/health/live` | — | none |
+| `GET` | `/health/ready` | — | none |
+| `GET` | `/health/detail` | — | none |
+| `GET` | `/metrics` | — | none |
+
+A path that is not in this table, or a registered path reached with the wrong method, is answered `404`.
+
+Each route declares the TCP command it is the HTTP form of, and that single declaration decides both its privilege and which per-command counter the request lands in, so the two surfaces cannot drift apart on either.
 
 ## Authentication
 
-When `security.requirepass` is set, the HTTP server enforces authentication on
-all mutating and administrative endpoints, mirroring the TCP `AUTH` gate. Read-only
-endpoints (health, `/info`, `/config`, `/metrics`, `/cache/stats`, `/sim`, and `/simv`)
-remain open. `/dump/status` is an administrative endpoint and requires authentication.
+When `security.requirepass` is empty, every route is open. When it is set, the write and admin routes require credentials on each request; the read routes and the probe endpoints stay open, matching the TCP privilege split.
 
-Provide the password via the `Authorization` request header, using either scheme:
+These routes are gated: `POST /event`, `POST /vecset`, `DELETE /vecset`, `POST /metaset`, `POST /cache/clear`, `POST /cache/enable`, `POST /cache/disable`, `POST /dump/save`, `POST /dump/load`, `POST /dump/verify`, `POST /dump/info`, `GET /dump/status`.
 
-- `Authorization: Bearer <password>`
-- `Authorization: Basic base64(<user>:<password>)` — the username is ignored; only
-  the password is compared (matching TCP `AUTH`).
+Two credential forms are accepted:
 
-Gated endpoints: `POST /event`, `POST /vecset`, `DELETE /vecset`, `POST /metaset`,
-`POST /cache/clear`, `POST /cache/enable`, `POST /cache/disable`,
-`POST /dump/save`, `POST /dump/load`, `POST /dump/verify`, `POST /dump/info`, and
-`GET /dump/status`.
+```bash
+curl -X POST http://127.0.0.1:8080/vecset \
+  -H 'Authorization: Bearer s3cret' \
+  -d '{"id":"item1","vector":[0.1,0.2,0.3,0.4]}'
 
-Requests without a valid credential receive `401 Unauthorized`:
+curl -X POST http://127.0.0.1:8080/vecset \
+  -u ignored:s3cret \
+  -d '{"id":"item1","vector":[0.1,0.2,0.3,0.4]}'
+```
+
+With `Basic`, the username is ignored and only the password is compared, mirroring TCP `AUTH`, which validates the password alone. Both comparisons are constant-time. A missing or wrong credential is answered:
 
 ```json
-{
-  "error": "Authentication required"
-}
+{"error":"Authentication required"}
 ```
 
-When `security.requirepass` is empty (the default) no authentication is required.
+with status `401`. The check runs before the handler reads any state or assembles any body.
 
-## API Endpoints
+## Status codes
 
-All responses are in JSON format with `Content-Type: application/json`.
+| Status | Condition |
+|---|---|
+| `200` | success |
+| `204` | CORS preflight (`OPTIONS`) |
+| `400` | malformed JSON, missing or mistyped field, invalid `top_k`, dimension mismatch, invalid filter, invalid event score, snapshot path traversal, unsupported cache scope |
+| `401` | credentials missing or wrong on a gated route |
+| `403` | source address outside `network.allow_cidrs`, or a permission-denied error from a handler |
+| `404` | unknown route or method; unknown item ID; snapshot or configuration file not found |
+| `410` | `/debug/on` and `/debug/off` |
+| `429` | rate limit exceeded |
+| `500` | any other handler error, including snapshot read and integrity failures |
+| `503` | server is loading or read-only; a write the WAL could not accept |
 
-### POST /event
+Handler errors are mapped from the typed error code rather than sniffed from a message, so the same failure produces the same status on every route. Domain errors map as follows: item and file not-found conditions to `404`; argument, parsing, dimension, `top_k` and event-score errors to `400`; permission-denied to `403`; WAL write, rotation and not-open errors to `503`; everything else to `500`.
 
-Track user behavior (e.g., product views, purchases, interactions).
+Two families of client mistake land on `500` rather than `400` because their error code is not in that map. A `POST /event` whose `ctx` or `id` is empty, or carries whitespace or a control character, is answered `500` with `Context cannot be empty`, `ID cannot be empty`, or `… must not contain whitespace or control characters`. A `POST /dump/load`, `/dump/verify` or `/dump/info` naming a file that does not exist is likewise `500`, because the underlying failure is a storage open error rather than a not-found code. Both are request defects; a client that classifies purely on status will read them as server faults.
 
-**Request:**
-
-This endpoint requires authentication when `security.requirepass` is set.
-
-```http
-POST /event HTTP/1.1
-Content-Type: application/json
-
-{
-  "ctx": "user_alice",
-  "id": "product123",
-  "type": "ADD",
-  "score": 100
-}
-```
-
-**Request Body Parameters:**
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `ctx` | string | Yes | Context ID (e.g., user ID, session ID) |
-| `id` | string | Yes | Item ID (e.g., product ID, article ID) |
-| `type` | string | Yes | Event type: `ADD`, `SET`, or `DEL` |
-| `score` | integer | For `ADD`/`SET` | Event score (0-100, e.g., 100=purchase, 80=view) |
-| `timestamp` | integer | No | Event timestamp (epoch seconds) |
-
-**Response (200 OK):**
+Every error body is a single-field object:
 
 ```json
-{
-  "status": "ok"
-}
+{"error":"Vector not found: zz"}
 ```
 
-**Error Response (400 Bad Request):**
+`POST /dump/verify` is the exception: a failed verification returns a full body rather than only `error` (see below).
+
+## Write routes
+
+### `POST /event`
 
 ```json
-{
-  "error": "Missing required field: ctx"
-}
+{"ctx": "user_alice", "id": "item1", "type": "ADD", "score": 100, "timestamp": 1730000000}
 ```
 
-### POST /vecset
-
-Register or update a vector embedding for an item.
-
-This endpoint requires authentication when `security.requirepass` is set.
-
-**Request:**
-
-```http
-POST /vecset HTTP/1.1
-Content-Type: application/json
-
-{
-  "id": "product123",
-  "vector": [0.1, 0.2, 0.3, 0.4, 0.5],
-  "metadata": {
-    "category": "electronics",
-    "active": true
-  }
-}
-```
-
-**Request Body Parameters:**
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `id` | string | Yes | Item ID |
-| `vector` | array of floats | Yes | Embedding vector (dimension must match existing vectors) |
-| `metadata` | object | No | Metadata used by `filter=` queries. Values may be string, integer, float, or bool. |
-
-**Response (200 OK):**
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `ctx` | string | yes | context ID |
+| `id` | string | yes | item ID |
+| `type` | string | yes | `ADD`, `SET` or `DEL`, upper or lower case |
+| `score` | integer | for `ADD` and `SET` | must be an integer, not a float; range 0–100 |
+| `timestamp` | unsigned integer | no | epoch seconds; the server's clock is used when omitted |
 
 ```json
-{
-  "status": "ok"
-}
+{"status":"ok"}
 ```
 
-**Error Response (400 Bad Request):**
+A float `score` is rejected rather than truncated, so the integer contract matches TCP.
+
+### `POST /vecset`
 
 ```json
-{
-  "error": "Dimension mismatch: expected 768, got 512"
-}
+{"id": "item1", "vector": [0.1, 0.2, 0.3, 0.4], "metadata": {"category": "books", "price": 19, "active": true}}
 ```
 
-### DELETE /vecset
-
-Remove an item's vector, its metadata, and its cached results.
-
-This endpoint requires authentication when `security.requirepass` is set.
-
-**Request:**
-
-```http
-DELETE /vecset HTTP/1.1
-Content-Type: application/json
-
-{
-  "id": "product123"
-}
-```
-
-**Request Body Parameters:**
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `id` | string | Yes | Item ID |
-
-**Response (200 OK):**
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `id` | string | yes | item ID |
+| `vector` | array of numbers | yes | every element must be finite and within float range |
+| `metadata` | object | no | values may be string, integer, float or boolean; keys must not be empty |
 
 ```json
-{
-  "status": "ok"
-}
+{"dimension":4,"status":"ok"}
 ```
 
-**Error Response (404 Not Found):**
+`dimension` echoes the length of the stored vector. Unlike TCP `VECSET`, this route can attach metadata in the same request.
+
+### `DELETE /vecset`
 
 ```json
-{
-  "error": "Vector not found: product123"
-}
+{"id": "item1"}
 ```
-
-### POST /metaset
-
-Set (replace) the metadata for an existing item. Metadata is keyed by item ID and
-is used by `filter=` queries. The target item must already have a vector registered
-via `/vecset`; otherwise the request returns `404 Not Found`.
-
-This endpoint requires authentication when `security.requirepass` is set.
-
-**Request:**
-
-```http
-POST /metaset HTTP/1.1
-Content-Type: application/json
-
-{
-  "id": "product123",
-  "metadata": {
-    "category": "electronics",
-    "active": true,
-    "price": 199
-  }
-}
-```
-
-**Request Body Parameters:**
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `id` | string | Yes | Item ID (a vector with this ID must already exist) |
-| `metadata` | object | Yes | Metadata map. Values may be string, integer, float, or bool. |
-
-**Response (200 OK):**
 
 ```json
-{
-  "status": "ok"
-}
+{"status":"ok"}
 ```
 
-**Error Response (404 Not Found):**
+The ID is read from a JSON body, not from the path or query string, so a client library that drops bodies on `DELETE` has to be configured to send one. An empty or missing `id` is `400`; an unknown ID is `404` with `Vector not found: <id>`.
+
+### `POST /metaset`
 
 ```json
-{
-  "error": "Vector not found for metadata: product123"
-}
+{"id": "item1", "metadata": {"category": "books", "price": 19, "active": true}}
 ```
-
-### POST /sim
-
-Search for similar items by ID.
-
-**Request:**
-
-```http
-POST /sim HTTP/1.1
-Content-Type: application/json
-
-{
-  "id": "product123",
-  "top_k": 10,
-  "mode": "fusion"
-}
-```
-
-**Request Body Parameters:**
-
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| `id` | string | Yes | - | Query item ID |
-| `top_k` | integer | No | 10 | Number of results to return |
-| `mode` | string | No | "fusion" | Search mode: "vectors", "events", or "fusion" |
-| `filter` | string | No | - | Metadata filter (e.g., "category:electronics,type:laptop") |
-| `min_score` | float | No | 0.0 | Minimum score threshold (results below this are excluded) |
-| `adaptive` | boolean | No | false | Enable adaptive fusion (auto-adjusts weights by data density) |
-
-**Search Modes:**
-
-| Mode | Description |
-|------|-------------|
-| `vectors` | Content-based similarity (uses vector embeddings) |
-| `events` | Behavior-based similarity (co-occurrence from events) |
-| `fusion` | Hybrid: combines vectors + events |
-
-**Response (200 OK):**
 
 ```json
-{
-  "status": "ok",
-  "count": 3,
-  "mode": "fusion",
-  "results": [
-    {
-      "id": "product456",
-      "score": 0.9245
-    },
-    {
-      "id": "product789",
-      "score": 0.8932
-    },
-    {
-      "id": "product101",
-      "score": 0.8501
-    }
-  ]
-}
+{"status":"ok"}
 ```
 
-**Response Fields:**
+`metadata` is a structured JSON object here, not the `key:value,key:value` string that TCP `METASET` and the client library take. The item must already have a vector; otherwise the response is `404` with `Vector not found for metadata: <id>`.
 
-| Field | Description |
-|-------|-------------|
-| `status` | `"ok"` on success |
-| `count` | Number of results returned |
-| `mode` | The search mode that was used |
-| `results` | Array of similar items (sorted by score, descending) |
-| `results[].id` | Item ID |
-| `results[].score` | Similarity score (0.0-1.0, higher = more similar) |
+## Search routes
 
-**Error Response (404 Not Found):**
+### `POST /sim`
 
 ```json
-{
-  "error": "Vector not found: product123"
-}
+{"id": "item1", "top_k": 3, "mode": "vectors", "filter": "category:books", "min_score": 0.1, "adaptive": true}
 ```
 
-### POST /simv
-
-Search for similar items by raw vector query.
-
-**Request:**
-
-```http
-POST /simv HTTP/1.1
-Content-Type: application/json
-
-{
-  "vector": [0.1, 0.2, 0.3, 0.4, 0.5],
-  "top_k": 10
-}
-```
-
-**Request Body Parameters:**
-
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| `vector` | array of floats | Yes | - | Query vector |
-| `top_k` | integer | No | 10 | Number of results to return |
-| `filter` | string | No | - | Metadata filter (e.g., "type:article") |
-| `min_score` | float | No | 0.0 | Minimum score threshold |
-
-`/simv` always performs a vector-space search; it has no `mode` parameter.
-
-**Response (200 OK):**
+| Field | Type | Required | Default |
+|---|---|---|---|
+| `id` | string | yes | — |
+| `top_k` | integer | no | `similarity.default_top_k` |
+| `mode` | string | no | `fusion`; one of `events`, `vectors`, `fusion` |
+| `filter` | string | no | no filter |
+| `min_score` | finite number | no | `0.0` |
+| `adaptive` | boolean | no | the server's `similarity.adaptive_fusion` |
 
 ```json
-{
-  "status": "ok",
-  "count": 3,
-  "dimension": 5,
-  "results": [
-    { "id": "product456", "score": 0.9245 }
-  ]
-}
+{"count":1,"mode":"vectors","results":[{"id":"item3","score":0.9333}],"status":"ok"}
 ```
 
-**Use Case:**
+`count` is the number of entries in `results` after `min_score` has been applied. Scores are rounded to four decimal places, the same precision the TCP surface renders.
 
-- Search by user query embedding (e.g., "red running shoes" → vector)
-- Find items matching a computed vector (e.g., average of liked items)
+`top_k` must be positive and must not exceed `similarity.max_top_k`; both violations are `400`. `filter` uses the same grammar as the TCP `filter=` option — `=`, `:`, `!=`, `>`, `<`, `>=`, `<=` and `in(a|b|c)` — documented in [protocol.md](./protocol.md). An `id` with no vector is `404` with `Query vector not found: <id>`.
 
-### GET /info
+### `POST /simv`
 
-Server statistics and monitoring information (Redis-style).
-
-**Request:**
-
-```http
-GET /info HTTP/1.1
+```json
+{"vector": [0.1, 0.2, 0.3, 0.4], "top_k": 3, "filter": "active:true", "min_score": 0.1}
 ```
 
-**Response (200 OK):**
+| Field | Type | Required | Default |
+|---|---|---|---|
+| `vector` | array of numbers | yes | — |
+| `top_k` | integer | no | `similarity.default_top_k` |
+| `filter` | string | no | no filter |
+| `min_score` | finite number | no | `0.0` |
+
+```json
+{"count":2,"dimension":4,"results":[{"id":"item1","score":1.0},{"id":"item3","score":0.9333}],"status":"ok"}
+```
+
+`dimension` echoes the query vector's length. There is no `mode` and no `adaptive`: this route always searches vectors.
+
+## Introspection routes
+
+### `GET /info`
 
 ```json
 {
   "server": "nvecd",
   "version": "0.1.0",
-  "uptime_seconds": 3600,
-  "total_requests": 15000,
-  "total_commands_processed": 15000,
+  "uptime_seconds": 44,
+  "total_requests": 52,
+  "total_commands_processed": 52,
   "failed_commands": 12,
   "memory": {
-    "used_memory_bytes": 949452800,
-    "used_memory_human": "905.50 MB",
-    "used_memory_events": "500.00 MB",
-    "used_memory_vectors": "293.00 MB",
-    "used_memory_co_occurrence": "100.00 MB",
-    "peak_memory_bytes": 1010000000,
-    "peak_memory_human": "963.20 MB",
-    "process_rss": 990000000,
-    "process_rss_human": "944.13 MB",
+    "used_memory_bytes": 4240,
+    "used_memory_human": "4.14KB",
+    "used_memory_events": "3.08KB",
+    "used_memory_vectors": "578B",
+    "used_memory_co_occurrence": "504B",
+    "peak_memory_bytes": 9961472,
+    "peak_memory_human": "9.50MB",
+    "process_rss": 9961472,
+    "process_rss_human": "9.50MB",
+    "process_rss_peak": 9961472,
+    "process_rss_peak_human": "9.50MB",
+    "total_system_memory": 137438953472,
+    "total_system_memory_human": "128GB",
+    "available_system_memory": 67508912128,
+    "available_system_memory_human": "62.9GB",
+    "system_memory_usage_ratio": 0.5088080167770386,
     "memory_health": "HEALTHY"
   },
   "stores": {
-    "event_store": {
-      "contexts": 50000,
-      "total_events": 1000000
-    },
-    "vector_store": {
-      "vectors": 100000,
-      "dimension": 768
-    },
-    "co_index": {
-      "tracked_ids": 250000
-    }
+    "event_store": {"contexts": 1, "total_events": 4},
+    "vector_store": {"vectors": 1, "dimension": 4},
+    "co_index": {"tracked_ids": 2}
   },
   "cache": {
     "enabled": true,
-    "total_queries": 10000,
-    "cache_hits": 8500,
-    "cache_misses": 1500,
-    "hit_rate": 0.85,
-    "current_entries": 2450,
-    "current_memory_bytes": 13107200,
-    "evictions": 320,
-    "time_saved_ms": 15420.50
+    "total_queries": 10,
+    "cache_hits": 0,
+    "cache_misses": 10,
+    "hit_rate": 0.0,
+    "current_entries": 0,
+    "current_memory_bytes": 0,
+    "evictions": 0,
+    "time_saved_ms": 0.0
   }
 }
 ```
 
-**Response Fields:**
+`total_requests` and `total_commands_processed` carry the same counter under two names. `memory.used_memory_bytes` is the sum of the three store totals, which is a different figure from TCP `INFO`, where `used_memory_bytes` counts only the vector matrix. The `process_rss*` group appears only when process memory information is readable, and the `*_system_memory*` group only when system memory information is. A store's entry under `stores` is present only when that store exists. When no cache is attached, `cache` is `{"enabled": false}` alone.
 
-| Category | Field | Description |
-|----------|-------|-------------|
-| **Server** | `server` | Server name (nvecd) |
-| | `version` | Server version |
-| | `uptime_seconds` | Server uptime in seconds |
-| | `total_requests` | Alias of `total_commands_processed`; both report the same counter |
-| | `total_commands_processed` | Total commands processed |
-| | `failed_commands` | Number of commands that returned an error |
-| **Memory** | `used_memory_bytes` | Total tracked store memory (bytes) |
-| | `used_memory_events` | Human-readable event store memory |
-| | `used_memory_vectors` | Human-readable vector store memory |
-| | `used_memory_co_occurrence` | Human-readable co-occurrence index memory |
-| | `peak_memory_bytes` | Peak process RSS (bytes) |
-| | `memory_health` | Memory health status |
-| **Stores** | `stores.vector_store.vectors` | Number of vectors stored |
-| | `stores.vector_store.dimension` | Vector dimension |
-| | `stores.event_store.contexts` | Number of contexts (users/sessions) |
-| | `stores.event_store.total_events` | Total events tracked |
-| | `stores.co_index.tracked_ids` | Number of IDs tracked by the co-occurrence index |
-| **Cache** | `cache.enabled` | Whether the query cache is enabled |
-| | `cache.hit_rate` | Cache hit rate (0.0-1.0) |
-| | `cache.current_memory_bytes` | Current cache memory usage (bytes) |
-| | `cache.time_saved_ms` | Total latency saved by cache |
-
-This endpoint is suitable for monitoring tools and health checks. The `memory`
-object also includes system-level fields (`total_system_memory`,
-`available_system_memory`, `system_memory_usage_ratio`) when the platform
-exposes them.
-
-### GET /health
-
-Simple health check endpoint for load balancers.
-
-**Request:**
-
-```http
-GET /health HTTP/1.1
-```
-
-**Response (200 OK):**
+### `GET /config`
 
 ```json
 {
-  "status": "ok"
-}
-```
-
-### GET /health/live
-
-Kubernetes liveness probe (always returns 200 if server is running).
-
-**Request:**
-
-```http
-GET /health/live HTTP/1.1
-```
-
-**Response (200 OK):**
-
-```json
-{
-  "status": "alive",
-  "timestamp": 1705564800
-}
-```
-
-### GET /health/ready
-
-Kubernetes readiness probe (returns 503 if server is loading snapshot).
-
-**Request:**
-
-```http
-GET /health/ready HTTP/1.1
-```
-
-**Response (200 OK):**
-
-```json
-{
-  "status": "ready",
-  "loading": false
-}
-```
-
-**Response (503 Service Unavailable):**
-
-```json
-{
-  "status": "not_ready",
-  "loading": true,
-  "reason": "Server is loading"
-}
-```
-
-### GET /health/detail
-
-Detailed health information with metrics (same as `/info`).
-
-**Request:**
-
-```http
-GET /health/detail HTTP/1.1
-```
-
-**Response (200 OK):**
-
-Same format as `/info` endpoint.
-
-### GET /metrics
-
-Get server metrics in Prometheus text exposition format
-(`Content-Type: text/plain; version=0.0.4`).
-
-**Request:**
-
-```http
-GET /metrics HTTP/1.1
-```
-
-**Response (200 OK):**
-
-```text
-# HELP nvecd_uptime_seconds Server uptime in seconds
-# TYPE nvecd_uptime_seconds counter
-nvecd_uptime_seconds 3600
-
-# HELP nvecd_commands_total Total commands processed
-# TYPE nvecd_commands_total counter
-nvecd_commands_total{command="event"} 4200
-nvecd_commands_total{command="vecset"} 1800
-nvecd_commands_total{command="sim"} 9000
-nvecd_commands_total 15000
-
-# HELP nvecd_memory_bytes Current memory usage in bytes
-# TYPE nvecd_memory_bytes gauge
-nvecd_memory_bytes 949452800
-```
-
-Cache, vector, event, and context gauges are also emitted (e.g.
-`nvecd_cache_hit_rate`, `nvecd_vectors_total`, `nvecd_events_total`).
-
-### GET /config
-
-Current server configuration summary (sensitive values omitted).
-
-**CORS**: When `api.http.enable_cors` is `true`, the server adds `Access-Control-Allow-Origin` headers and handles OPTIONS preflight requests.
-
-**Request:**
-
-```http
-GET /config HTTP/1.1
-```
-
-**Response (200 OK):**
-
-```json
-{
-  "network": {
-    "tcp_enabled": true,
-    "http_enabled": true,
-    "allow_cidrs_configured": true
-  },
+  "network": {"tcp_enabled": true, "http_enabled": true, "allow_cidrs_configured": true},
   "events": {
-    "ctx_buffer_size": 1000,
-    "decay_interval_sec": 60
+    "ctx_buffer_size": 50,
+    "max_contexts": 0,
+    "max_neighbors_per_item": 0,
+    "min_support": 0.0,
+    "decay_interval_sec": 3600
   },
-  "vectors": {
-    "default_dimension": 768
-  },
-  "similarity": {
-    "default_top_k": 10,
-    "fusion_alpha": 0.6
-  },
+  "vectors": {"default_dimension": 4},
+  "similarity": {"default_top_k": 100, "fusion_alpha": 0.6},
   "notes": "Sensitive configuration values are redacted. Use CONFIG SHOW over TCP for full details."
 }
 ```
 
-Bind addresses and ports are intentionally omitted from `/config` for security;
-use `CONFIG SHOW` over TCP for full details.
+This is a deliberately narrow summary: bind addresses, ports, the password and the CIDR list itself are not exposed, and `allow_cidrs_configured` reports only whether the list is non-empty. `CONFIG SHOW` over TCP prints the full running configuration.
 
-### POST /dump/save
-
-Save server snapshot to disk.
-
-**Request:**
-
-```http
-POST /dump/save HTTP/1.1
-Content-Type: application/json
-
-{
-  "filepath": "snapshot-20250118.dmp"
-}
-```
-
-This endpoint requires authentication when `security.requirepass` is set.
-
-**Request Body Parameters:**
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `filepath` | string | No | Snapshot file path (auto-generated if omitted) |
-
-**Response (200 OK):**
-
-```json
-{
-  "status": "ok",
-  "filepath": "snapshot-20250118.dmp"
-}
-```
-
-**Error Response (5xx):**
-
-If the save fails, the endpoint returns a non-2xx status (e.g. `500`) with the
-real error message; it never reports `status: ok` for a failed save.
-
-```json
-{
-  "error": "Failed to save snapshot to snapshot-20250118.dmp: ..."
-}
-```
-
-### POST /dump/load
-
-Load server snapshot from disk.
-
-**Request:**
-
-```http
-POST /dump/load HTTP/1.1
-Content-Type: application/json
-
-{
-  "filepath": "snapshot-20250118.dmp"
-}
-```
-
-This endpoint requires authentication when `security.requirepass` is set.
-
-**Response (200 OK):**
-
-```json
-{
-  "status": "ok",
-  "filepath": "snapshot-20250118.dmp"
-}
-```
-
-**Error Response (404 Not Found):**
-
-A missing snapshot file maps to `404`; other failures map to `400`/`500` based on
-the underlying error.
-
-```json
-{
-  "error": "Failed to load snapshot from snapshot-20250118.dmp: ..."
-}
-```
-
-### POST /dump/verify
-
-Verify snapshot file integrity.
-
-**Request:**
-
-```http
-POST /dump/verify HTTP/1.1
-Content-Type: application/json
-
-{
-  "filepath": "snapshot-20250118.dmp"
-}
-```
-
-This endpoint requires authentication when `security.requirepass` is set.
-
-**Response (200 OK):**
-
-```json
-{
-  "status": "ok",
-  "filepath": "snapshot-20250118.dmp",
-  "valid": true
-}
-```
-
-**Response (verification failed):**
-
-When integrity verification fails, the endpoint returns a non-2xx status with
-`valid: false` and the real error message (never a hardcoded `valid: true`):
-
-```json
-{
-  "status": "error",
-  "filepath": "snapshot-20250118.dmp",
-  "valid": false,
-  "error": "Snapshot verification failed for ...: CRC mismatch"
-}
-```
-
-### POST /dump/info
-
-Get snapshot file metadata.
-
-**Request:**
-
-```http
-POST /dump/info HTTP/1.1
-Content-Type: application/json
-
-{
-  "filepath": "snapshot-20250118.dmp"
-}
-```
-
-This endpoint requires authentication when `security.requirepass` is set.
-
-**Response (200 OK):**
-
-```json
-{
-  "status": "ok",
-  "filepath": "snapshot-20250118.dmp",
-  "info": {
-    "version": "1",
-    "stores": "3",
-    "flags": "0",
-    "file_size": "314572800",
-    "timestamp": "1705564800",
-    "has_statistics": "true"
-  }
-}
-```
-
-### GET /dump/status
-
-Get the status of background snapshot operations.
-
-This endpoint requires authentication when `security.requirepass` is set.
-
-**Request:**
-
-```http
-GET /dump/status HTTP/1.1
-```
-
-**Response (200 OK):**
-
-```json
-{"status": "ok", "data": "IDLE"}
-```
-
-### GET /cache/stats
-
-Get cache statistics (hit rate, entries, memory usage).
-
-**Request:**
-
-```http
-GET /cache/stats HTTP/1.1
-```
-
-**Response (200 OK):**
+### `GET /cache/stats`
 
 ```json
 {
   "enabled": true,
-  "total_queries": 10000,
-  "cache_hits": 8500,
-  "cache_misses": 1500,
-  "hit_rate": 0.85,
-  "current_entries": 2450,
-  "current_memory_mb": 12.45,
-  "evictions": 320
+  "total_queries": 10,
+  "cache_hits": 0,
+  "cache_misses": 10,
+  "cache_misses_invalidated": 0,
+  "cache_misses_not_found": 10,
+  "hit_rate": 0.0,
+  "current_entries": 0,
+  "current_memory_bytes": 0,
+  "current_memory_mb": 0.0,
+  "min_query_cost_ms": 10.0,
+  "ttl_seconds": 600,
+  "compression_enabled": true,
+  "eviction_batch_size": 10,
+  "evictions": 0,
+  "avg_hit_latency_ms": 0.0,
+  "avg_miss_latency_ms": 8.329999999999999e-05,
+  "time_saved_ms": 0.0
 }
 ```
 
-### POST /cache/clear
+`ttl_seconds` and `min_query_cost_ms` reflect the live values, which the `cache.ttl_seconds` and `cache.min_query_cost_ms` runtime variables can change. When no cache controller is wired the route answers `500`.
 
-Clear the similarity cache.
+The field set is close to TCP `CACHE STATS` but not identical: the TCP block additionally reports `ttl_expirations`, and it names two fields differently (`cache_enabled` and `cache_entries` here are `enabled` and `current_entries`).
 
-This endpoint requires authentication when `security.requirepass` is set
-(as do `/cache/enable` and `/cache/disable`).
+## Cache management
 
-**Request:**
+### `POST /cache/clear`
 
-```http
-POST /cache/clear HTTP/1.1
-Content-Type: application/json
+```json
+{"scope": "all"}
+```
 
+An empty body is treated as `{"scope": "all"}`.
+
+```json
+{"entries_removed":0,"scope":"all","status":"ok"}
+```
+
+`entries_removed` is the entry count taken before the clear. Any scope other than `all` is `400`:
+
+```json
+{"error":"Invalid scope. Only 'all' is supported currently."}
+```
+
+A body that is not a JSON object is also `400`.
+
+### `POST /cache/enable` and `POST /cache/disable`
+
+Neither takes a body.
+
+```json
+{"message":"Cache enabled","status":"ok"}
+```
+
+```json
+{"message":"Cache disabled","status":"ok"}
+```
+
+Both set the `cache.enabled` runtime variable, so the change survives until it is set again or the server restarts.
+
+## Snapshot management
+
+### `POST /dump/save`
+
+```json
+{"filepath": "nvecd.nvec"}
+```
+
+`filepath` is optional; an empty body or an omitted field uses `snapshot.default_filename`. The path is resolved inside `snapshot.dir` and one that escapes it is `400`.
+
+```json
+{"filepath":"/var/lib/nvecd/snapshots/nvecd.nvec","status":"ok"}
+```
+
+`filepath` is the resolved absolute path the server used. Under the default `snapshot.mode: fork`, the response arrives as soon as the writer child exists and the file is not readable yet — unlike TCP `DUMP SAVE`, whose reply keyword distinguishes the two modes, this body is identical either way. Poll `GET /dump/status` before reading or copying the file.
+
+### `POST /dump/load`
+
+```json
+{"filepath": "nvecd.nvec"}
+```
+
+`filepath` is required and must be a string.
+
+```json
+{"filepath":"/var/lib/nvecd/snapshots/nvecd.nvec","status":"ok"}
+```
+
+A missing file is `500`, with the underlying open failure in the message. A path that escapes `snapshot.dir` is `400`.
+
+### `POST /dump/verify`
+
+```json
+{"filepath": "nvecd.nvec"}
+```
+
+```json
+{"filepath":"/var/lib/nvecd/snapshots/nvecd.nvec","status":"ok","valid":true}
+```
+
+A failed verification does not collapse to a bare `error` object; it reports the same shape with `valid` false, so a caller reads one field either way:
+
+```json
 {
-  "scope": "all"
+  "status": "error",
+  "filepath": "nope.nvec",
+  "valid": false,
+  "error": "Snapshot verification failed for /var/lib/nvecd/snapshots/nope.nvec: ..."
 }
 ```
 
-**Response (200 OK):**
+The status is the mapped error status, `500` for an unreadable or corrupt file.
+
+### `POST /dump/info`
+
+```json
+{"filepath": "nvecd.nvec"}
+```
 
 ```json
 {
   "status": "ok",
-  "scope": "all",
-  "entries_removed": 2450
+  "filepath": "nvecd.nvec",
+  "info": {
+    "version": "1",
+    "stores": "4",
+    "flags": "16",
+    "file_size": "575",
+    "timestamp": "1788427664",
+    "has_statistics": "false"
+  }
 }
 ```
 
-### POST /cache/enable
+Every value under `info` is a string, because the block is parsed out of the shared handler's text output. `filepath` here echoes the request rather than the resolved path.
 
-Enable the similarity cache.
+### `GET /dump/status`
 
-**Request:** No body required.
+Takes no body. `data` carries the state of the background snapshot writer.
 
-**Response (200 OK):**
-
-```json
-{"status": "ok", "message": "Cache enabled"}
-```
-
-### POST /cache/disable
-
-Disable the similarity cache.
-
-**Request:** No body required.
-
-**Response (200 OK):**
+| `data` | Extra fields |
+|---|---|
+| `IDLE` | none |
+| `IN_PROGRESS` | `filepath` |
+| `COMPLETED` | `filepath` |
+| `FAILED` | `filepath`, `error_message` |
 
 ```json
-{"status": "ok", "message": "Cache disabled"}
+{"data":"COMPLETED","filepath":"/var/lib/nvecd/snapshots/nvecd.nvec","status":"ok"}
 ```
-
-### POST /debug/on
-
-Deprecated. HTTP is stateless and does not support per-connection debug mode. This endpoint returns `410 Gone`; use `DEBUG ON` on a persistent TCP connection.
-
-**Request:**
-
-```http
-POST /debug/on HTTP/1.1
-```
-
-**Response (410 Gone):**
 
 ```json
-{
-  "error": "HTTP debug mode is not supported; use DEBUG ON on a persistent TCP connection"
-}
+{"data":"IDLE","status":"ok"}
 ```
 
-### POST /debug/off
+A server configured with `snapshot.mode: lock` has no background writer and always answers `IDLE`. The TCP `DUMP STATUS` block reports the same states in lower case and carries `pid`, `start_time` and `end_time`, which this route does not.
 
-Deprecated. This endpoint returns `410 Gone`; use `DEBUG OFF` on the same persistent TCP connection.
+## Debug routes
 
-**Request:**
-
-```http
-POST /debug/off HTTP/1.1
-```
-
-**Response (410 Gone):**
+`POST /debug/on` and `POST /debug/off` are registered so the route table matches the command set, and both refuse:
 
 ```json
-{
-  "error": "HTTP debug mode is not supported; use DEBUG OFF on a persistent TCP connection"
-}
+{"error":"HTTP debug mode is not supported; use DEBUG ON on a persistent TCP connection"}
 ```
 
-## CORS Support
+with status `410`. Debug mode is a property of one connection, which a request-scoped HTTP call has no equivalent of.
 
-Set `api.http.enable_cors: true` to enable CORS headers for browser clients, then specify the trusted origin via `api.http.cors_allow_origin`. Keep CORS disabled when the API is not accessed directly from browsers.
+## Health probes
 
-**CORS Headers:**
+Four probes, none gated and none counted as commands.
 
-```
-Access-Control-Allow-Origin: https://app.example.com
-Access-Control-Allow-Methods: GET, POST, OPTIONS
-Access-Control-Allow-Headers: Content-Type
-```
+`GET /health` — a plain liveness answer, always `200`:
 
-## Usage Examples
-
-### cURL
-
-**Track event:**
-
-```bash
-curl -X POST http://localhost:8080/event \
-  -H "Content-Type: application/json" \
-  -d '{
-    "ctx": "user_alice",
-    "id": "product123",
-    "type": "ADD",
-    "score": 100
-  }'
+```json
+{"status":"ok","timestamp":1788427653}
 ```
 
-**Register vector:**
+`GET /health/live` — the orchestrator liveness probe, always `200` while the process runs:
 
-```bash
-curl -X POST http://localhost:8080/vecset \
-  -H "Content-Type: application/json" \
-  -d '{
-    "id": "product123",
-    "vector": [0.1, 0.2, 0.3, 0.4]
-  }'
+```json
+{"status":"alive","timestamp":1788427653}
 ```
 
-**Search similar items:**
+`GET /health/ready` — the readiness probe. `200` when the server is not loading a snapshot:
 
-```bash
-curl -X POST http://localhost:8080/sim \
-  -H "Content-Type: application/json" \
-  -d '{
-    "id": "product123",
-    "top_k": 10,
-    "mode": "fusion"
-  }'
+```json
+{"loading":false,"status":"ready","timestamp":1788427653}
 ```
 
-**Search with filter and min_score:**
+and `503` while it is:
 
-```bash
-curl -X POST http://localhost:8080/sim \
-  -H "Content-Type: application/json" \
-  -d '{
-    "id": "product123",
-    "top_k": 10,
-    "mode": "fusion",
-    "filter": "category:electronics",
-    "min_score": 0.5
-  }'
+```json
+{"loading":true,"reason":"Server is loading","status":"not_ready","timestamp":1788427653}
 ```
 
-**Health check:**
-
-```bash
-curl http://localhost:8080/health
-```
-
-**Server info:**
-
-```bash
-curl http://localhost:8080/info | jq .
-```
-
-### JavaScript (fetch)
-
-```javascript
-// Track user purchase
-await fetch('http://localhost:8080/event', {
-  method: 'POST',
-  headers: {
-    'Content-Type': 'application/json'
-  },
-  body: JSON.stringify({
-    ctx: 'user_alice',
-    id: 'product123',
-    type: 'ADD',
-    score: 100
-  })
-});
-
-// Get recommendations
-const response = await fetch('http://localhost:8080/sim', {
-  method: 'POST',
-  headers: {
-    'Content-Type': 'application/json'
-  },
-  body: JSON.stringify({
-    id: 'product123',
-    top_k: 10,
-    mode: 'fusion'
-  })
-});
-
-const data = await response.json();
-console.log(`Found ${data.count} recommendations`);
-data.results.forEach(item => {
-  console.log(`  ${item.id}: ${item.score}`);
-});
-```
-
-### Python (requests)
-
-```python
-import requests
-
-# Track event
-requests.post('http://localhost:8080/event', json={
-    'ctx': 'user_alice',
-    'id': 'product123',
-    'type': 'ADD',
-    'score': 100
-})
-
-# Register vector
-requests.post('http://localhost:8080/vecset', json={
-    'id': 'product123',
-    'vector': [0.1, 0.2, 0.3, 0.4]
-})
-
-# Get recommendations
-response = requests.post('http://localhost:8080/sim', json={
-    'id': 'product123',
-    'top_k': 10,
-    'mode': 'fusion'
-})
-
-data = response.json()
-print(f"Found {data['count']} recommendations")
-for item in data['results']:
-    print(f"  {item['id']}: {item['score']}")
-```
-
-### Complete Example: E-commerce Recommendations
-
-```python
-import requests
-
-BASE_URL = 'http://localhost:8080'
-
-# 1. Register product embeddings (from ML model)
-products = {
-    'laptop_001': [0.1, 0.2, 0.3, 0.4],
-    'laptop_002': [0.15, 0.25, 0.28, 0.38],
-    'phone_001': [0.8, 0.7, 0.6, 0.5]
-}
-
-for product_id, vector in products.items():
-    requests.post(f'{BASE_URL}/vecset', json={
-        'id': product_id,
-        'vector': vector
-    })
-
-# 2. Track user behavior
-events = [
-    ('user_alice', 'laptop_001', 100),  # Purchased
-    ('user_alice', 'laptop_002', 80),   # Viewed
-    ('user_bob', 'laptop_001', 100),    # Purchased
-    ('user_bob', 'phone_001', 90)       # Viewed
-]
-
-for ctx, product_id, score in events:
-    requests.post(f'{BASE_URL}/event', json={
-        'ctx': ctx,
-        'id': product_id,
-        'type': 'ADD',
-        'score': score
-    })
-
-# 3. Get content-based recommendations
-response = requests.post(f'{BASE_URL}/sim', json={
-    'id': 'laptop_001',
-    'top_k': 5,
-    'mode': 'vectors'
-})
-print("Content-based recommendations:", response.json()['results'])
-
-# 4. Get behavior-based recommendations
-response = requests.post(f'{BASE_URL}/sim', json={
-    'id': 'laptop_001',
-    'top_k': 5,
-    'mode': 'events'
-})
-print("Behavior-based recommendations:", response.json()['results'])
-
-# 5. Get hybrid recommendations (fusion)
-response = requests.post(f'{BASE_URL}/sim', json={
-    'id': 'laptop_001',
-    'top_k': 5,
-    'mode': 'fusion'
-})
-print("Hybrid recommendations:", response.json()['results'])
-```
-
-## Performance Considerations
-
-- **Connection Pooling**: Use HTTP keep-alive for better performance
-- **Caching**: Check `/info` cache metrics to verify cache is working
-- **Network Security**: Use `network.allow_cidrs` to restrict access
-- **Reverse Proxy**: Consider nginx/HAProxy in front of nvecd for TLS/auth
-
-## Error Handling
-
-All error responses follow this format:
+`GET /health/detail` — per-component status, always `200`. This is not the same shape as `/info`:
 
 ```json
 {
-  "error": "Error message description"
+  "status": "healthy",
+  "timestamp": 1788427653,
+  "uptime_seconds": 44,
+  "components": {
+    "server": {"status": "ready", "loading": false},
+    "event_store": {"status": "ok", "contexts": 1, "total_events": 4},
+    "vector_store": {"status": "ok", "vectors": 1, "dimension": 4},
+    "co_index": {"status": "ok", "tracked_ids": 2}
+  }
 }
 ```
 
-**HTTP Status Codes:**
+The top-level `status` is `degraded` while a snapshot is loading and `healthy` otherwise; `components.server.status` is `loading` or `ready` for the same condition. A component whose store is not wired is omitted from `components`.
 
-| Code | Description |
-|------|-------------|
-| 200 | Success |
-| 400 | Bad Request (invalid input) |
-| 401 | Unauthorized (missing/invalid credential on a gated endpoint) |
-| 403 | Forbidden (blocked by `network.allow_cidrs`) |
-| 404 | Not Found (vector/snapshot doesn't exist) |
-| 500 | Internal Server Error |
-| 503 | Service Unavailable (server loading) |
+## Metrics
 
-## Monitoring
+`GET /metrics` serves the Prometheus text exposition format with content type `text/plain; version=0.0.4; charset=utf-8`.
 
-The HTTP API provides multiple endpoints for monitoring:
+```text
+# HELP nvecd_uptime_seconds Server uptime in seconds
+# TYPE nvecd_uptime_seconds counter
+nvecd_uptime_seconds 61
 
-- **Health Check**: `GET /health` - Simple health check
-- **Liveness Probe**: `GET /health/live` - Kubernetes liveness
-- **Readiness Probe**: `GET /health/ready` - Kubernetes readiness
-- **Detailed Metrics**: `GET /health/detail` - Full statistics
+# HELP nvecd_commands_total Total commands processed
+# TYPE nvecd_commands_total counter
+nvecd_commands_total{command="event"} 6
+nvecd_commands_total{command="vecset"} 3
+nvecd_commands_total{command="sim"} 14
+nvecd_commands_total 72
 
-### Kubernetes Deployment
+# HELP nvecd_memory_bytes Current memory usage in bytes
+# TYPE nvecd_memory_bytes gauge
+nvecd_memory_bytes 7060
+
+# HELP nvecd_vectors_total Total vectors stored
+# TYPE nvecd_vectors_total gauge
+nvecd_vectors_total 1
+
+# HELP nvecd_events_total Total events stored
+# TYPE nvecd_events_total gauge
+nvecd_events_total 6
+
+# HELP nvecd_contexts_total Total contexts stored
+# TYPE nvecd_contexts_total gauge
+nvecd_contexts_total 2
+```
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `nvecd_uptime_seconds` | counter | seconds since start |
+| `nvecd_commands_total` | counter | commands processed; per-command series carry `command="event"`, `"vecset"` and `"sim"`, and an unlabelled series carries the total across all commands |
+| `nvecd_memory_bytes` | gauge | event store, vector store and co-occurrence index combined |
+| `nvecd_vectors_total` | gauge | vectors stored |
+| `nvecd_events_total` | gauge | events stored |
+| `nvecd_contexts_total` | gauge | active contexts |
+| `nvecd_cache_queries_total` | counter | cache lookups |
+| `nvecd_cache_hits_total` | counter | cache hits |
+| `nvecd_cache_misses_total` | counter | cache misses |
+| `nvecd_cache_hit_rate` | gauge | hit ratio |
+| `nvecd_cache_entries` | gauge | entries currently held |
+| `nvecd_cache_memory_bytes` | gauge | cache memory in use |
+
+The three store metrics appear only when their store is wired, and the six cache metrics only when a cache is attached — a scrape taken with the cache disabled has no `nvecd_cache_*` series at all, which a dashboard has to tolerate.
+
+The unlabelled `nvecd_commands_total` series shares a metric name with the labelled ones. Some scrape configurations reject that mixture; a relabelling rule that drops the unlabelled series, or a recording rule that sums the labelled ones, avoids it.
+
+## CORS
+
+CORS headers are emitted only when `api.http.enable_cors` is true. `api.http.cors_allow_origin` supplies the value of `Access-Control-Allow-Origin`; when it is empty the header is omitted entirely rather than sent as `null`, because `null` names the origin used by sandboxed iframes and `file://` pages. The remaining headers are still set, so a deployment can front the server with a proxy that injects the origin.
+
+```bash
+$ curl -i -X OPTIONS http://127.0.0.1:8080/sim -H 'Origin: https://example.com'
+HTTP/1.1 204 No Content
+Access-Control-Allow-Origin: https://example.com
+Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS
+Access-Control-Allow-Headers: Content-Type, Authorization
+Content-Length: 0
+```
+
+With CORS disabled, `OPTIONS` is not registered and returns `404`.
+
+## Worked examples
+
+Register two items with metadata, record an event, then search:
+
+```bash
+curl -X POST http://127.0.0.1:8080/vecset \
+  -d '{"id":"item1","vector":[0.1,0.2,0.3,0.4],"metadata":{"category":"books","price":12}}'
+# {"dimension":4,"status":"ok"}
+
+curl -X POST http://127.0.0.1:8080/vecset \
+  -d '{"id":"item2","vector":[0.1,0.2,0.3,0.5],"metadata":{"category":"books","price":30}}'
+# {"dimension":4,"status":"ok"}
+
+curl -X POST http://127.0.0.1:8080/event \
+  -d '{"ctx":"user_alice","id":"item1","type":"ADD","score":100}'
+# {"status":"ok"}
+
+curl -X POST http://127.0.0.1:8080/sim \
+  -d '{"id":"item1","top_k":5,"mode":"vectors","filter":"price>10"}'
+# {"count":1,"mode":"vectors","results":[{"id":"item2","score":0.9940}],"status":"ok"}
+```
+
+Search by a query vector and drop weak matches:
+
+```bash
+curl -X POST http://127.0.0.1:8080/simv \
+  -d '{"vector":[0.1,0.2,0.3,0.4],"top_k":5,"min_score":0.99}'
+# {"count":2,"dimension":4,"results":[{"id":"item1","score":1.0},{"id":"item2","score":0.994}],"status":"ok"}
+```
+
+Take a snapshot and wait for the background writer to finish:
+
+```bash
+curl -X POST http://127.0.0.1:8080/dump/save -H 'Authorization: Bearer s3cret' -d '{}'
+# {"filepath":"/var/lib/nvecd/snapshots/nvecd.nvec","status":"ok"}
+
+until curl -s -H 'Authorization: Bearer s3cret' http://127.0.0.1:8080/dump/status \
+      | grep -q '"data":"COMPLETED"'; do sleep 1; done
+```
+
+Scrape configuration for Prometheus:
 
 ```yaml
-apiVersion: v1
-kind: Pod
-metadata:
-  name: nvecd
-spec:
-  containers:
-  - name: nvecd
-    image: nvecd:latest
-    ports:
-    - containerPort: 8080
-    livenessProbe:
-      httpGet:
-        path: /health/live
-        port: 8080
-      initialDelaySeconds: 10
-      periodSeconds: 30
-    readinessProbe:
-      httpGet:
-        path: /health/ready
-        port: 8080
-      initialDelaySeconds: 5
-      periodSeconds: 10
+scrape_configs:
+  - job_name: nvecd
+    static_configs:
+      - targets: ["127.0.0.1:8080"]
 ```
-
-### Prometheus Metrics
-
-`GET /metrics` exposes Prometheus text format today. Use `/info` or
-`/health/detail` when a JSON response is more convenient.

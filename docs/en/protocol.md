@@ -1,931 +1,687 @@
-# Protocol Reference
+# TCP protocol
 
-Nvecd uses a simple text-based protocol over TCP (similar to Redis/Memcached), with MygramDB-compatible admin commands.
+nvecd serves a line-delimited text protocol on its TCP port and, when configured, on a Unix domain socket. This page is the reference for every command: its arity, its option tokens, the exact bytes the server sends back, and the privilege it requires.
 
-**Protocol Format**: Text-based, line-delimited, UTF-8 encoded
+## Connecting
 
-## Connection
+The TCP listener binds `api.tcp.bind` (default `127.0.0.1`) on `api.tcp.port` (default `11017`). A peer whose address does not match `network.allow_cidrs` is disconnected without a response, and an empty `network.allow_cidrs` denies every address, so a reachable deployment lists at least one CIDR. See [configuration.md](./configuration.md).
 
-Connect to nvecd via TCP:
-
-```bash
-# Using netcat
-nc localhost 11017
-
-# Using telnet
-telnet localhost 11017
-
-# Using Unix domain socket (if configured)
-nc -U /var/run/nvecd.sock
-```
-
----
-
-## Protocol Format
-
-- **Transport**: Text-based line protocol (UTF-8)
-- **Request**: `COMMAND args...\r\n` (accepts both `\r\n` and `\n`)
-- **Response**: `OK data...\r\n` or `ERROR message\r\n`
-- **Max request size**: `performance.max_query_length` bytes (default 1 MiB, up to 16 MiB)
-
-### Response Format
-
-**Success**:
-```
-OK [data]\r\n
-```
-
-A command that returns nothing but an acknowledgement echoes its own name, for
-example `OK VECSET`. `AUTH` is the single exception and answers `+OK\r\n`.
-
-**Error**:
-```
-ERROR <message>\r\n
-```
-
-This is the only error shape on the wire; no Redis-style variant is emitted.
-
----
-
-## Command Categories
-
-- **Core Commands**: EVENT, VECSET, SIM, SIMV (nvecd-specific)
-- **Admin Commands**: AUTH, INFO, CONFIG, DUMP, DEBUG (MygramDB-compatible)
-- **Cache Commands**: CACHE (query result cache management)
-- **Runtime Variables**: SET, GET, SHOW VARIABLES
-
----
-
-## Core Commands
-
-### EVENT — Ingest co-occurrence event
-
-Record an event associating a context with an ID. Supports three event types:
-- **ADD**: Stream events (clicks, views) with time-window deduplication
-- **SET**: State events (likes, bookmarks, ratings) with idempotent updates
-- **DEL**: Deletion events (unlike, unbookmark) with idempotent removal
-
-**Syntax**:
-```
-EVENT <ctx> ADD <id> <score>
-EVENT <ctx> SET <id> <score>
-EVENT <ctx> DEL <id>
-```
-
-**Parameters**:
-- `<ctx>`: Context identifier (string, e.g., user ID, session ID)
-- `<type>`: Event type: `ADD`, `SET`, or `DEL`
-- `<id>`: Item identifier (string, e.g., item ID, action ID)
-- `<score>`: Event score (integer, 0-100) — required for ADD/SET, ignored for DEL
-
-**Examples**:
+Any line-oriented client works. With `nc`:
 
 ```bash
-# Stream event (click tracking)
-EVENT user123 ADD view:item456 95
-→ OK EVENT
-
-# State event (like ON)
-EVENT user123 SET like:item456 100
-→ OK EVENT
-
-# State event (like OFF)
-EVENT user123 SET like:item456 0
-→ OK EVENT
-
-# Weighted bookmark (high priority)
-EVENT user123 SET bookmark:item789 100
-→ OK EVENT
-
-# Change bookmark priority (medium)
-EVENT user123 SET bookmark:item789 50
-→ OK EVENT
-
-# Delete bookmark
-EVENT user123 DEL bookmark:item789
-→ OK EVENT
+$ printf 'VECSET item1 0.1 0.2 0.3 0.4\nSIM item1 5 using=vectors\n' | nc 127.0.0.1 11017
+OK VECSET
+OK RESULTS 1
+item2 0.9940
 ```
 
-**Event Type Behavior**:
-
-| Type | Use Case | Deduplication | Example |
-|------|----------|---------------|---------|
-| **ADD** | Stream events (clicks, views, plays) | Time-window based (default: 60 sec) | `EVENT user1 ADD view:item1 100` |
-| **SET** | State events (likes, bookmarks, ratings) | Same value = duplicate (idempotent) | `EVENT user1 SET like:item1 100` |
-| **DEL** | Deletion events | Already deleted = duplicate (idempotent) | `EVENT user1 DEL like:item1` |
-
-**Idempotency Guarantees**:
+With `telnet`, for an interactive session:
 
 ```bash
-# SET is idempotent for same value
-EVENT user1 SET like:item1 100
-EVENT user1 SET like:item1 100  # Duplicate, ignored
-→ OK EVENT (both succeed, second is deduped)
-
-# SET allows state transitions
-EVENT user1 SET bookmark:item1 100  # High priority
-EVENT user1 SET bookmark:item1 50   # Medium priority (stored)
-EVENT user1 SET bookmark:item1 50   # Duplicate (ignored)
-→ OK EVENT
-
-# DEL is idempotent
-EVENT user1 DEL like:item1
-EVENT user1 DEL like:item1  # Already deleted, ignored
-→ OK EVENT
-```
-
-**Error Responses**:
-- `ERROR Invalid EVENT type: <type> (must be ADD, SET, or DEL)`
-- `ERROR EVENT ADD requires 4 arguments: <ctx> ADD <id> <score>`
-- `ERROR EVENT SET requires 4 arguments: <ctx> SET <id> <score>`
-- `ERROR EVENT DEL requires 3 arguments: <ctx> DEL <id>`
-- `ERROR Invalid score: must be integer`
-- `ERROR Context cannot be empty`
-- `ERROR ID cannot be empty`
-
-**Notes**:
-- Events are stored in a ring buffer per context (size: `events.ctx_buffer_size`)
-- Deduplication cache size: `events.dedup_cache_size` (default: 10,000 entries)
-- Time window for ADD type: `events.dedup_window_sec` (default: 60 seconds)
-- SET/DEL use last-value tracking for idempotency (no time window)
-- Co-occurrence scores are automatically tracked between IDs in the same context
-- Scores decay over time based on `events.decay_interval_sec` and `events.decay_alpha`
-
----
-
-### VECSET — Register vector
-
-Register or update a vector for an item.
-
-**Syntax**:
-```
-VECSET <id> <f1> <f2> ... <fN>
-```
-
-**Parameters**:
-- `<id>`: Item identifier (string)
-- `<f1> <f2> ... <fN>`: Vector components (floats)
-
-**Example**:
-```
-VECSET item456 0.1 0.5 0.8
-→ OK VECSET
-```
-
-**Example with 768-dimensional vector**:
-```
-VECSET item789 0.11 0.98 -0.22 0.44 ... (768 values)
-→ OK VECSET
-```
-
-**Error Responses**:
-- `ERROR Dimension mismatch: expected 768, got 512`
-- `ERROR Invalid vector format`
-- `ERROR Invalid argument count`
-
-**Notes**:
-- Dimension is auto-detected from the number of values
-- All vectors must have the same dimension (default: 768, configurable via `vectors.default_dimension`)
-- Vectors are automatically normalized based on `vectors.distance_metric` setting
-
----
-
-### VECDEL — Delete vector
-
-Remove an item's vector, its metadata, and its cached results.
-
-**Syntax**:
-```
-VECDEL <id>
-```
-
-**Parameters**:
-- `<id>`: Item identifier (string)
-
-**Example**:
-```
-VECDEL item456
-→ OK VECDEL
-```
-
-**Error Responses**:
-- `ERROR VECDEL requires 1 argument: <id>`
-- `ERROR Vector not found: item456`
-
-**Notes**:
-- Requires authentication when `security.requirepass` is set
-- Metadata registered with `METASET` is removed together with the vector
-- The active ANN index is rebuilt, so a delete is more expensive than a write
-- Co-occurrence edges recorded by `EVENT` are not affected
-
-### METASET — Register item metadata
-
-Attach metadata to an existing vector item for `filter=` queries.
-
-**Syntax**:
-```
-METASET <id> <key:value[,key:value...]>
-```
-
-**Example**:
-```
-METASET product456 category:electronics,active:true,rank:10
-SIM product123 10 using=vectors filter=category:electronics
-```
-
-Values are auto-typed the same way as `filter=` values: string, integer, float, or bool. The item must already exist in `VectorStore` via `VECSET`.
-
----
-
-### SIM — Similarity search by ID
-
-Find similar items based on an existing item's vector and co-occurrence data.
-
-**Syntax**:
-```
-SIM <id> <top_k> [using=events|vectors|fusion] [filter=<expr>] [min_score=<float>] [adaptive=on|off]
-```
-
-**Parameters**:
-- `<id>`: Item identifier (string)
-- `<top_k>`: Number of results to return (integer, max: `similarity.max_top_k`)
-- `using=` (optional): Search mode
-  - `events`: Co-occurrence-based (event data only)
-  - `vectors`: Vector distance-based (vector data only)
-  - `fusion` (default): Hybrid co-occurrence × vector
-- `filter=` (optional): Metadata filter expression. Use `key:value` (or `key=value`) for equality; `!=`, `>`, `>=`, `<`, `<=` for comparisons; and `key=in(value1|value2)` for membership. Comma-separated conditions are ANDed. Values are auto-typed (string, int, float, bool).
-- `min_score=` (optional, default: 0.0): Minimum score threshold. Results with score < min_score are excluded from the response.
-- `adaptive=` (optional): Adaptive fusion mode. When `on`, automatically adjusts the vector/co-occurrence weight balance based on item data density. Only applicable in fusion mode. Configurable via `similarity.adaptive_*` settings.
-
-**Response Format**:
-```
-OK RESULTS <count>
-<id1> <score1>
-<id2> <score2>
+$ telnet 127.0.0.1 11017
+Trying 127.0.0.1...
+Connected to localhost.
+Escape character is '^]'.
+INFO
+OK INFO
 ...
+END
 ```
 
-**Example (fusion mode)**:
-```
-SIM item456 10 using=fusion
-→ OK RESULTS 3
-item789 0.9245
-item101 0.8932
-item202 0.8567
-```
+The server sends no banner on connect; the first bytes a client receives are the response to its first command.
 
-**Example (events only)**:
-```
-SIM item456 10 using=events
-→ OK RESULTS 2
-item101 0.9500
-item789 0.8700
+When `api.unix_socket.path` is set, the same protocol is served on that socket. The socket skips the CIDR check entirely — filesystem permissions on the socket file are the access control — and per-IP connection limits and rate limiting do not apply to it:
+
+```bash
+$ printf 'INFO\n' | nc -U /var/run/nvecd.sock
 ```
 
-**Example (vectors only)**:
-```
-SIM item456 10 using=vectors
-→ OK RESULTS 3
-item789 0.9245
-item202 0.8932
-item555 0.8567
-```
+The shipped [client library](./client-library.md) and `nvecd-cli` speak this protocol; both are described below.
 
-**Example (with filter)**:
-```
-SIM item456 10 filter=category:electronics
-→ OK RESULTS 2
-item789 0.9245
-item101 0.8932
-```
+## Framing
 
-**Example (with min_score)**:
-```
-SIM item456 10 min_score=0.85
-→ OK RESULTS 2
-item789 0.9245
-item101 0.8932
-```
+A request is one line terminated by `\n` or `\r\n`. A command cannot span lines: an embedded newline or an embedded NUL byte is rejected rather than silently truncated. Several commands may be pipelined into one write; the server answers them in order.
 
-**Example (adaptive fusion)**:
-```
-SIM new_item 10 using=fusion adaptive=on
-→ OK RESULTS 3
-item789 0.9245
-item101 0.8932
-item202 0.8567
-```
+A response is a sequence of CRLF-terminated lines with exactly one trailing CRLF. Handler bodies that build their text with bare `\n` are normalised before the bytes leave the socket, so a client may split on `\r\n` unconditionally.
 
-**Error Responses**:
-- `ERROR Item not found: item456`
-- `ERROR Invalid mode: must be events, vectors, or fusion`
-- `ERROR Invalid top_k: must be > 0 and <= 1000`
+A request longer than `performance.max_query_length` (default 1 MiB) is answered with `ERROR Request too large` and, when no newline has arrived within the limit, `ERROR Request too large (no newline detected)`. The same `ERROR Request too large` also covers a connection that exhausts the reactor's process-wide buffer budget, `performance.reactor_max_total_buffered_bytes`. When the worker pool cannot accept a request for processing, the reply is `ERROR Server busy`. Both conditions close the connection once the reply has been flushed.
 
-**Notes**:
-- Fusion mode combines vector similarity (weight: `similarity.fusion_alpha`) with co-occurrence scores (weight: `similarity.fusion_beta`)
-- Results are cached if query cost exceeds `cache.min_query_cost_ms` (when cache is enabled)
-- Cache is invalidated on VECSET (for vectors mode) or EVENT (for fusion mode)
+Responses take five shapes:
 
----
+| Shape | Example | Used by |
+|---|---|---|
+| Status line | `OK VECSET` | writes, `CACHE`, `DEBUG` |
+| Result set | `OK RESULTS <n>` followed by `<id> <score>` lines | `SIM`, `SIMV` |
+| Block | `+OK` or `OK <VERB>`, body lines, then `END` | `INFO`, `CONFIG`, `DUMP INFO`, `DUMP STATUS`, `CACHE STATS` |
+| RESP bulk or array | `$<len>` then the value; `*<n>` then `$<len>`/value pairs | `GET`, `SHOW VARIABLES` |
+| Error | `ERROR <message>` | any failure |
 
-### SIMV — Similarity search by vector
+Scores are rendered with exactly four decimal places (`0.9940`). The HTTP surface rounds to the same precision, so the two surfaces report the same number for the same query.
 
-Find similar items based on a query vector.
+## Authentication and privileges
 
-**Syntax**:
-```
-SIMV <top_k> [filter=<expr>] [min_score=<float>] <f1> <f2> ... <fN>
-```
+Every command carries one of three privilege levels. When `security.requirepass` is empty, all three are open. When it is set, only read commands are served on an unauthenticated connection; write and admin commands are refused with `ERROR NOAUTH Authentication required` until `AUTH` succeeds on that connection.
 
-**Parameters**:
-- `<top_k>`: Number of results to return (integer)
-- `filter=` (optional): Same as SIM filter. Metadata filter expression.
-- `min_score=` (optional, default: 0.0): Minimum score threshold.
-- `<f1> <f2> ... <fN>`: Query vector components (floats)
+| Privilege | Commands |
+|---|---|
+| Read | `SIM`, `SIMV`, `INFO`, `CONFIG HELP`, `CONFIG SHOW`, `CACHE STATS`, `DEBUG ON`, `DEBUG OFF`, `GET`, `SHOW VARIABLES` |
+| Write | `EVENT`, `VECSET`, `VECDEL`, `METASET`, `SET`, `CACHE CLEAR`, `CACHE ENABLE`, `CACHE DISABLE` |
+| Admin | `DUMP SAVE`, `DUMP LOAD`, `DUMP VERIFY`, `DUMP INFO`, `DUMP STATUS`, `CONFIG VERIFY` |
 
-**Response Format**:
-```
-OK RESULTS <count>
-<id1> <score1>
-<id2> <score2>
-...
-```
+Authentication is per connection and is not carried across reconnects.
 
-**Example**:
-```
-SIMV 5 0.1 0.9 -0.2 0.5
-→ OK RESULTS 2
-item789 0.9800
-item101 0.8200
-```
+### `AUTH <password>`
 
-**Example (with filter and min_score)**:
-```
-SIMV 5 filter=type:article min_score=0.7 0.1 0.9 -0.2 0.5
-→ OK RESULTS 1
-item789 0.9800
-```
-
-**Error Responses**:
-- `ERROR Dimension mismatch: expected 768, got 512`
-- `ERROR Invalid vector format`
-- `ERROR Invalid top_k`
-
-**Notes**:
-- Dimension is auto-detected from the number of values
-- Only vector similarity is used (fusion mode not supported for query vectors)
-- Results are cached if query cost exceeds `cache.min_query_cost_ms`
-
----
-
-## Admin Commands (MygramDB-compatible)
-
-### AUTH — Authenticate connection
-
-Authenticate the current connection with a password. Required when `security.requirepass` is configured.
-
-**Syntax**:
-```
+```text
 AUTH <password>
 ```
 
-**Parameters**:
-- `<password>`: Server password (must match `security.requirepass` in config)
+The password is everything after the first space or tab, taken as opaque bytes: it is not trimmed, split or upper-cased, so a password containing spaces authenticates as configured. Comparison is constant-time.
 
-**Example**:
-```bash
-AUTH mysecretpassword
-→ +OK
+```text
+> AUTH s3cret
++OK
 
-# Without auth, write commands are rejected:
-VECSET item1 0.1 0.2 0.3
-→ ERROR NOAUTH Authentication required
+> AUTH wrong
+ERROR ERR invalid password
 ```
 
-**Notes**:
-- Authentication is per-connection (resets on disconnect)
-- Read commands (SIM, SIMV, INFO, CONFIG SHOW) work without auth
-- Write/admin commands (VECSET, DUMP SAVE/LOAD, SET) require auth when `requirepass` is set
-- If `requirepass` is empty (default), AUTH is not needed
+On a server with no password configured, `AUTH` succeeds and says so:
 
----
-
-### INFO — Server statistics
-
-Get comprehensive server information and statistics (Redis-style format).
-
-**Syntax**:
+```text
+> AUTH anything
++OK (no password required)
 ```
+
+## Write commands
+
+### `EVENT`
+
+```text
+EVENT <ctx> ADD <id> <score> [timestamp=<epoch_sec>]
+EVENT <ctx> SET <id> <score> [timestamp=<epoch_sec>]
+EVENT <ctx> DEL <id> [timestamp=<epoch_sec>]
+```
+
+Records that item `<id>` occurred in context `<ctx>`. `ADD` and `SET` take a score; `DEL` does not. The score is an integer in the inclusive range 0–100, and the subcommand keyword is case-insensitive. `timestamp=` takes unsigned epoch seconds and, when omitted, the server stamps the event with its own clock. All three forms answer `OK EVENT`, including a deduplicated repeat that changes nothing.
+
+```text
+> EVENT user_alice ADD item1 100
+OK EVENT
+
+> EVENT user_alice SET item2 90 timestamp=1730000000
+OK EVENT
+
+> EVENT user_alice DEL item2
+OK EVENT
+```
+
+`ADD` accumulates, `SET` replaces the stored score for that item in that context, and `DEL` removes it. What each does to the co-occurrence graph is described in [events-and-co-occurrence.md](./events-and-co-occurrence.md).
+
+Both identifiers are validated: neither may be empty, and neither may carry a byte at or below `0x20` or the `0x7F` delete byte, because such a byte in an ID lets one ingestion surface corrupt another's framing. Bytes at or above `0x80` are left alone, so multi-byte UTF-8 identifiers work. A space-delimited command cannot carry either violation, so these rejections are reached through the JSON surface rather than from here.
+
+### `VECSET`
+
+```text
+VECSET <id> <f1> <f2> ... <fN>
+```
+
+Registers or replaces the vector for `<id>`. The dimension is taken from the number of float tokens and must match the dimension the store is already using, which is `vectors.default_dimension` until the first vector fixes it.
+
+```text
+> VECSET item1 0.1 0.2 0.3 0.4
+OK VECSET
+
+> VECSET item1 0.1 0.2 0.3
+ERROR Vector dimension mismatch: expected 4, got 3
+```
+
+The TCP form carries no metadata; use `METASET` for that.
+
+### `VECDEL`
+
+```text
+VECDEL <id>
+```
+
+Removes the vector and its metadata. An unknown ID is an error, not a silent success.
+
+```text
+> VECDEL item2
+OK VECDEL
+
+> VECDEL nope
+ERROR Vector not found: nope
+```
+
+### `METASET`
+
+```text
+METASET <id> <key:value[,key:value...]>
+```
+
+Attaches metadata to an item that already has a vector. The pairs are one whitespace-free token; the same expression grammar `filter=` uses is accepted here, and each condition's field and value become one metadata entry. Values are typed by their spelling: `true`/`false` become booleans, a bare integer becomes an integer, a bare decimal becomes a double, anything else stays a string.
+
+```text
+> METASET item1 category:books,price:12,active:true
+OK METASET
+
+> METASET nope category:books
+ERROR Vector not found for metadata: nope
+```
+
+Because metadata affects filtered results broadly, a successful `METASET` clears the whole query cache.
+
+## Search commands
+
+### `SIM`
+
+```text
+SIM <id> <top_k> [using=events|vectors|fusion] [adaptive=on|off] [filter=<expr>] [min_score=<float>]
+```
+
+Searches for items similar to `<id>`. `top_k` is a positive integer and must not exceed `similarity.max_top_k`. Options may appear in any order after `top_k`; an unrecognised token is rejected rather than ignored.
+
+| Option | Values | Default |
+|---|---|---|
+| `using=` | `events`, `vectors`, `fusion` | `fusion` |
+| `adaptive=` | `on`, `off` | server's `similarity.adaptive_fusion` |
+| `filter=` | a filter expression (see below) | no filter |
+| `min_score=` | any finite float | `0.0` |
+
+`adaptive=` applies to fusion mode only. `min_score=` is applied after the search, so it trims the result set rather than widening it.
+
+```text
+> SIM item1 5 using=vectors
+OK RESULTS 1
+item2 0.9940
+
+> SIM item1 5 using=fusion adaptive=on min_score=0.5
+OK RESULTS 1
+item2 0.9947
+```
+
+Two option tokens are recognised and explicitly refused, so a client using them fails loudly instead of getting an unfiltered answer:
+
+```text
+> SIM item1 5 candidate_limit=100
+ERROR candidate_limit option is not supported
+
+> SIM item1 5 explain=1
+ERROR explain option is not supported
+```
+
+Any other unknown token is a syntax error:
+
+```text
+> SIM item1 5 bogus=1
+ERROR Invalid SIM option: bogus=1
+```
+
+An ID with no vector cannot seed a vector or fusion search:
+
+```text
+> SIM nosuch 5
+ERROR Query vector not found: nosuch
+```
+
+The three modes are described in [vector-search.md](./vector-search.md) and [fusion.md](./fusion.md).
+
+### `SIMV`
+
+```text
+SIMV <top_k> [filter=<expr>] [min_score=<float>] <f1> <f2> ... <fN>
+```
+
+Searches by a query vector rather than by an existing ID. Every option token must precede the vector: the parser stops treating tokens as options at the first token containing no `=`, and reads the rest as floats. `SIMV` accepts no `using=` and no `adaptive=`; it always searches vectors.
+
+```text
+> SIMV 3 0.1 0.2 0.3 0.4
+OK RESULTS 2
+item1 1.0000
+item2 0.9940
+
+> SIMV 3 filter=active:true 0.1 0.2 0.3 0.4
+OK RESULTS 1
+item1 1.0000
+```
+
+The query vector's dimension must match the store's:
+
+```text
+> SIMV 3 1 2 3
+ERROR Query vector dimension mismatch: expected 4, got 3
+```
+
+### The `filter=` grammar
+
+A filter expression is a comma-separated list of conditions, all of which must match. Each condition is `<field><operator><value>`, with no whitespace anywhere in the token. The field must not be empty and the value must not be empty. Values are typed the same way `METASET` types them.
+
+| Operator | Meaning | Example |
+|---|---|---|
+| `=` | equal | `filter=category=books` |
+| `:` | equal, alias for `=` | `filter=category:books` |
+| `!=` | not equal | `filter=category!=books` |
+| `>` | greater than | `filter=price>10` |
+| `<` | less than | `filter=price<10` |
+| `>=` | greater than or equal | `filter=price>=20` |
+| `<=` | less than or equal | `filter=price<=5` |
+| `in(a\|b\|c)` | member of the list | `filter=category=in(books\|music)` |
+
+`in(...)` is written as a value after `=` or `:`, with `|` separating members; an empty member makes the whole expression invalid. Conditions combine with `,` as a conjunction, and there is no disjunction between conditions and no grouping — `in(...)` is the way to express a set.
+
+```text
+> SIM item1 5 using=vectors filter=active:true,price>10
+OK RESULTS 1
+item2 0.9940
+
+> SIM item1 5 using=vectors filter=bogus
+ERROR Invalid filter condition: 'bogus'
+```
+
+An item with no metadata matches no condition, so a filter narrows results to items that have been through `METASET` or the HTTP `/metaset` and `/vecset` routes.
+
+## Administrative commands
+
+### `INFO`
+
+```text
 INFO
 ```
 
-**Response**:
-```
+Reports server, traffic, memory, cache and data counters as an `END`-terminated block.
+
+```text
+> INFO
 OK INFO
 
 # Server
 version: 0.1.0
-uptime_seconds: 3600
+uptime_seconds: 29
 
 # Stats
-total_commands_processed: 100000
-total_connections_received: 150
+total_commands_processed: 29
+failed_commands: 8
+total_connections_received: 3
+active_connections: 1
+event_commands: 4
+sim_commands: 10
+vecset_commands: 2
+wal_replay_records_skipped: 0
 
 # Memory
-used_memory_bytes: 536870912
-used_memory_human: 512.00 MB
+used_memory_bytes: 16
+used_memory_human: 0.00 MB
 memory_health: HEALTHY
 
+# Cache
+cache_entries: 0
+cache_hits: 0
+cache_misses: 9
+cache_hit_rate: 0.0000
+
 # Data
-id_count: 12345
-ctx_count: 6789
-vector_count: 12000
-event_count: 987654
-
-# Commandstats
-cmd_event: 50000
-cmd_vecset: 20000
-cmd_sim: 25000
-cmd_simv: 5000
+id_count: 2
+ctx_count: 1
+vector_count: 1
+event_count: 4
+END
 ```
 
-**Memory Health**:
-- `HEALTHY`: >20% system memory available
-- `WARNING`: 10-20% available
-- `CRITICAL`: <10% available
+`used_memory_bytes` counts only the vector matrix (`vector_count × dimension × 4`); the HTTP `/info` route reports per-store totals and process RSS as well. `wal_replay_records_skipped` is the running count of WAL records that recovery could not restore, described in [persistence.md](./persistence.md).
 
----
+### `CONFIG`
 
-### CONFIG — Configuration management
-
-**Commands**:
-```
+```text
 CONFIG HELP [path]
 CONFIG SHOW [path]
-CONFIG VERIFY
+CONFIG VERIFY <filepath>
 ```
 
-#### CONFIG HELP
+`CONFIG HELP` with no path lists the configuration sections; with a path it prints the type, default, allowed values and description of that key.
 
-Show configuration documentation.
+```text
+> CONFIG HELP similarity.index_type
++OK
+similarity.index_type
 
-**Example**:
-```
-CONFIG HELP events
-→ +OK
-Available paths under 'events':
-  ctx_buffer_size  - Number of events to track per context (ring buffer size)
-  decay_alpha      - Decay factor
-  ...
+Type: string (enum)
+Default: "flat"
+Allowed values:
+  - "hnsw"
+  - "ivf"
+  - "flat"
+Description: ANN index type: hnsw, ivf, or flat (brute-force)
 END
 ```
 
-`CONFIG HELP`, `CONFIG SHOW` and `CONFIG VERIFY` answer `+OK` followed by a
-multi-line body and the terminator `END`. Read until `END` rather than until the
-first blank line.
+`CONFIG SHOW` prints the running configuration as YAML, optionally narrowed to one section. `security.requirepass` is redacted to `***`, and a derived `security.auth_enabled` flag is shown alongside it.
 
-#### CONFIG SHOW
-
-Display current configuration (passwords masked).
-
-**Example**:
-```
-CONFIG SHOW events.ctx_buffer_size
-→ +OK
-50
+```text
+> CONFIG SHOW cache
++OK
+compression_enabled: true
+enabled: true
+eviction_batch_size: 10
+max_memory_mb: 32
+min_query_cost_ms: 10.0
+ttl_seconds: 3600
 END
 ```
 
-#### CONFIG VERIFY
+`CONFIG VERIFY` loads and validates a configuration file without applying it. The path is resolved inside the directory the running configuration file came from — or, for a server started without one, inside the snapshot directory. Every path that resolves outside that root, does not exist, or cannot be opened is refused with one message, so the command answers no questions about the surrounding filesystem.
 
-Validate configuration file (usable before server start).
-
-`CONFIG VERIFY` requires a filepath and reports a summary of the parsed file:
-
-**Response**:
-```
-CONFIG VERIFY /etc/nvecd/config.yaml
-→ +OK
-Configuration is valid
-  Vectors:
-    dimension: 768
-    distance_metric: cosine
-  Events:
-    ctx_buffer_size: 50
-    decay_interval_sec: 3600
-  API:
-    tcp: 127.0.0.1:11017
-END
+```text
+> CONFIG VERIFY /etc/passwd
+ERROR Configuration file is not accessible
 ```
 
-**Error Responses**:
-- `ERROR CONFIG VERIFY requires a filepath`
-- `ERROR Configuration validation failed: <reason>`
+### `DUMP`
 
----
-
-### DUMP — Snapshot management
-
-**Commands**:
-```
-DUMP SAVE [<filepath>]
-DUMP LOAD [<filepath>]
-DUMP VERIFY [<filepath>]
-DUMP INFO [<filepath>]
-```
-
-Single binary `.dmp` format, MygramDB-compatible.
-
-#### DUMP SAVE
-
-Save a complete snapshot to disk. The response depends on `snapshot.mode`.
-
-**Example (`snapshot.mode: lock`)**:
-```
-DUMP SAVE /data/nvecd.nvec
-→ OK DUMP_SAVED /data/nvecd.nvec
-```
-
-`OK DUMP_SAVED` means the whole durability handshake completed: the snapshot was
-written, its sidecar was made durable, and the WAL was checkpointed and
-truncated. A failure at any of those steps is reported as an error rather than
-logged under an OK response, so the acknowledgement never outruns the data.
-
-**Example (`snapshot.mode: fork`)**:
-```
-DUMP SAVE /data/nvecd.nvec
-→ OK DUMP_SAVE_STARTED /data/nvecd.nvec
-```
-
-Fork mode acknowledges that the background child started, not that it finished.
-Poll `DUMP STATUS` for the outcome.
-
-**Without filepath**:
-```
-DUMP SAVE
-→ OK DUMP_SAVED /var/lib/nvecd/snapshots/nvecd.snapshot
-```
-
-An argument-less save writes to `snapshot.default_filename`, resolved inside the
-snapshot directory under the same path validation as a client-supplied name. If
-that setting is empty, the name falls back to `snapshot_YYYYMMDD_HHMMSS.dmp`.
-
-**Error Responses**:
-- `ERROR Another snapshot save is already in progress`
-- `ERROR Cannot save snapshot while a snapshot load is in progress`
-- `ERROR Failed to save snapshot to /data/nvecd.nvec: <reason>`
-
-#### DUMP LOAD
-
-Load a snapshot from disk (the server becomes read-only during the load).
-
-**Example**:
-```
-DUMP LOAD /data/nvecd.nvec
-→ OK DUMP_LOADED /data/nvecd.nvec
-```
-
-A load makes the loaded snapshot the durable recovery base and discards the
-pre-load WAL tail, so a later restart does not replay the mutations the operator
-rolled back.
-
-**Error Responses**:
-- `ERROR File not found: /data/nvecd.nvec`
-- `ERROR CRC mismatch: file may be corrupted`
-- `ERROR Unsupported snapshot version`
-
-#### DUMP VERIFY
-
-Verify snapshot integrity without loading.
-
-**Example**:
-```
-DUMP VERIFY /data/nvecd.nvec
-→ OK DUMP_VERIFIED /data/nvecd.nvec
-```
-
-**Error Responses**:
-- `ERROR Snapshot verification failed for /data/nvecd.nvec: <reason>`
-
-#### DUMP INFO
-
-Show snapshot metadata.
-
-**Example**:
-```
-DUMP INFO /data/nvecd.nvec
-→ OK DUMP_INFO /data/nvecd.nvec
-version: 1
-stores: 3
-flags: 0
-file_size: 536870912
-timestamp: 1705564800
-has_statistics: true
-END
-```
-
-#### DUMP STATUS
-
-Check the status of a background snapshot operation (fork-based).
-
-**Syntax**:
-```
+```text
+DUMP SAVE [filename]
+DUMP LOAD <filename>
+DUMP VERIFY <filename>
+DUMP INFO <filename>
 DUMP STATUS
 ```
 
-**Response**:
+Every filename is resolved inside `snapshot.dir`; a path that escapes it is refused with `ERROR Invalid filepath: path traversal detected`. Only `DUMP SAVE` may omit its filename — it then writes `snapshot.default_filename`, which goes through the same validation. `LOAD`, `VERIFY` and `INFO` each reject an empty filepath with their own message.
+
+`DUMP LOAD`, `DUMP VERIFY` and `DUMP INFO` wrap whatever went wrong underneath into one message naming the resolved path, so a missing file and a corrupt file are told apart by the reason rather than by the message shape.
+
+The reply to `DUMP SAVE` differs by `snapshot.mode` and the difference is a durability guarantee, not wording. In `fork` mode the file is not readable yet:
+
+```text
+> DUMP SAVE
+OK DUMP_SAVE_STARTED /var/lib/nvecd/snapshots/nvecd.nvec
 ```
+
+In `lock` mode the file is complete when the reply arrives:
+
+```text
+> DUMP SAVE
+OK DUMP_SAVED /var/lib/nvecd/snapshots/nvecd.nvec
+```
+
+`DUMP STATUS` reports the background writer. `status: idle` is the only field when nothing has run; the other three states carry the path and timings, and a failure carries its message.
+
+```text
+> DUMP STATUS
 OK DUMP_STATUS
-status: idle|in_progress|completed|failed
-filepath: <path>
-pid: <pid>
-start_time: <timestamp>
-end_time: <timestamp>
-error: <message>
-END
-```
-
-Which fields follow `status:` depends on the status itself: `idle` carries none,
-`in_progress` adds `filepath`, `pid` and `start_time`, `completed` adds
-`end_time` instead of `pid`, and `failed` adds `error` as well. Read until `END`.
-
-**Example**:
-```bash
-DUMP STATUS
-→ OK DUMP_STATUS
 status: completed
-filepath: /var/lib/nvecd/snapshots/dump_20250325_120000.nvec
-start_time: 1711360800
-end_time: 1711360802
+filepath: /var/lib/nvecd/snapshots/nvecd.nvec
+start_time: 1788427643
+end_time: 1788427643
 END
 ```
 
-**Notes**:
-- Shows the state of the most recent background snapshot
-- `in_progress`: Fork child is writing the snapshot
-- `completed`: Last snapshot saved successfully
-- `failed`: Last snapshot encountered an error
-- `idle`: No snapshot has been started
+The `in_progress` state adds `pid`, and the `failed` state adds `error`.
 
----
+`DUMP LOAD` replaces the live stores with the snapshot's contents, rebuilds the ANN index, clears the cache and makes that snapshot the recovery base. `DUMP VERIFY` checks integrity without loading. `DUMP INFO` reads the header:
 
-### DEBUG — Debug mode
-
-Per-connection debug mode. Shows detailed execution info for SIM commands.
-
-**Commands**:
-```
-DEBUG ON
-DEBUG OFF
+```text
+> DUMP INFO nvecd.nvec
+OK DUMP_INFO /var/lib/nvecd/snapshots/nvecd.nvec
+version: 1
+stores: 4
+flags: 16
+file_size: 476
+timestamp: 1788427643
+has_statistics: false
+END
 ```
 
-#### DEBUG ON
+While a save or load is running, commands that touch the stores are refused with `ERROR READONLY Snapshot in progress` or `ERROR LOADING Snapshot load in progress`. [persistence.md](./persistence.md) covers the mechanics.
 
-Enable debug logging for this connection.
+### `CACHE`
 
-**Example**:
-```
-DEBUG ON
-→ OK DEBUG_ON
-```
-
-#### DEBUG OFF
-
-Disable debug logging for this connection.
-
-**Example**:
-```
-DEBUG OFF
-→ OK DEBUG_OFF
-```
-
-**Debug output example** (when DEBUG ON):
-```
-SIM item456 10 using=fusion
-→ OK RESULTS 3
-item789 0.9245
-item101 0.8932
-item202 0.8567
-# DEBUG 4
-mode: fusion
-query_time_us: 850
-candidates: 15
-results: 3
-```
-
-The debug block is appended after the normal SIM/SIMV results for connections with
-DEBUG mode enabled. The `# DEBUG` header carries the number of fields that
-follow, so a stateful client can frame the block without parsing it. Fields:
-- `mode`: search mode (`events`, `vectors`, `fusion`, or `vector` for SIMV)
-- `query_time_us`: total query execution time in microseconds
-- `candidates`: number of candidates produced before `min_score` filtering
-- `results`: number of results returned to the client
-
----
-
-## Cache Commands
-
-### CACHE — Cache management
-
-Query result cache management commands.
-
-**Commands**:
-```
+```text
 CACHE STATS
 CACHE CLEAR
 CACHE ENABLE
 CACHE DISABLE
 ```
 
-#### CACHE STATS
+`CACHE ENABLE` and `CACHE DISABLE` are shorthands for setting the `cache.enabled` runtime variable; both are write-privileged, as is `CACHE CLEAR`.
 
-Returns detailed cache statistics.
+None of the four degrades quietly when its dependency is missing. `CACHE STATS` and `CACHE CLEAR` reach the cache controller and fail with `Cache controller is not initialized` when there is none; `CACHE ENABLE` and `CACHE DISABLE` never consult the controller at all — they go through the runtime variable manager and fail with `Runtime variable manager is not initialized` when that is absent.
 
-**Response**:
-```
-OK CACHE_STATS
-cache_enabled: true
-cache_entries: 342
-cache_memory_bytes: 12845632
-current_memory_mb: 12.25
-total_queries: 1250
-cache_hits: 985
-cache_misses: 265
-cache_misses_invalidated: 45
-cache_misses_not_found: 220
-cache_hit_rate: 0.7880
-evictions: 15
-ttl_expirations: 8
-avg_hit_latency_ms: 0.125
-avg_miss_latency_ms: 2.450
-total_time_saved_ms: 2418.75
-END
-```
-
-When no cache instance is configured, only the enabled flag and entry count are returned:
-```
-OK CACHE_STATS
-cache_enabled: false
-cache_entries: 0
-END
-```
-
-**Statistics fields**:
-- `cache_enabled`: Whether the cache is currently enabled (`true`/`false`)
-- `cache_entries`: Number of cached entries
-- `cache_memory_bytes`: Current cache memory usage in bytes
-- `current_memory_mb`: Current cache memory usage in mebibytes
-- `total_queries`: Total number of cache lookups
-- `cache_hits`: Number of cache hits
-- `cache_misses`: Total misses (invalidated + not found)
-- `cache_misses_invalidated`: Misses due to invalidation (VECSET/EVENT)
-- `cache_misses_not_found`: Misses due to key not in cache, TTL expiration, or decompression failure
-- `cache_hit_rate`: Cache hit rate (0.0 to 1.0)
-- `evictions`: Number of LRU evictions
-- `ttl_expirations`: Number of entries removed due to TTL expiration
-- `avg_hit_latency_ms`: Average cache lookup latency on hit
-- `avg_miss_latency_ms`: Average cache lookup latency on miss
-- `total_time_saved_ms`: Total query time saved by cache hits
-
-#### CACHE CLEAR
-
-Clear all cache entries.
-
-**Response**:
-```
+```text
+> CACHE CLEAR
 OK CACHE_CLEARED
-```
 
-When no cache instance is configured, the response notes that there was nothing to clear:
-```
-OK CACHE_CLEARED (no cache)
-```
+> CACHE DISABLE
+OK CACHE_DISABLED
 
-#### CACHE ENABLE
-
-Enable the cache at runtime.
-
-**Response**:
-```
+> CACHE ENABLE
 OK CACHE_ENABLED
 ```
 
-When no cache instance was configured at startup, the command is acknowledged but has no effect:
-```
-OK CACHE_ENABLED (no cache instance)
-```
+`CACHE STATS` is an `END`-terminated block:
 
-**Note**: A cache instance must be configured in `config.yaml` at startup. When no instance exists, runtime enabling has no effect.
-
-#### CACHE DISABLE
-
-Disable the cache at runtime. Existing entries are retained but no new lookups or insertions are served until the cache is re-enabled with `CACHE ENABLE`.
-
-**Response**:
-```
-OK CACHE_DISABLED
-```
-
-When no cache instance was configured at startup, the command is acknowledged but has no effect:
-```
-OK CACHE_DISABLED (no cache instance)
-```
-
-**Cache Behavior**:
-- SIM/SIMV query results are cached if `query_cost_ms >= min_query_cost_ms`
-- Cache entries are invalidated on VECSET (for SIM queries) and EVENT (for fusion queries)
-- LRU eviction occurs when `current_memory_bytes >= max_memory_bytes`
-- Results are compressed with LZ4 to reduce memory usage
-
-**Configuration** (`config.yaml`):
-```yaml
-cache:
-  enabled: true               # Enable/disable cache
-  max_memory_mb: 32           # Maximum cache memory
-  min_query_cost_ms: 10.0     # Minimum query cost to cache
-  ttl_seconds: 3600           # Cache entry TTL (0 = no TTL)
-  compression_enabled: true   # Enable LZ4 compression
+```text
+> CACHE STATS
+OK CACHE_STATS
+cache_enabled: true
+cache_entries: 0
+cache_memory_bytes: 0
+current_memory_mb: 0.00
+min_query_cost_ms: 10.00
+ttl_seconds: 3600
+compression_enabled: true
+eviction_batch_size: 10
+total_queries: 9
+cache_hits: 0
+cache_misses: 9
+cache_misses_invalidated: 0
+cache_misses_not_found: 9
+cache_hit_rate: 0.0000
+evictions: 0
+ttl_expirations: 0
+avg_hit_latency_ms: 0.000
+avg_miss_latency_ms: 0.000
+total_time_saved_ms: 0.00
+END
 ```
 
----
+[caching.md](./caching.md) explains what the counters mean.
 
-## Error Responses
+### `DEBUG`
 
-All errors follow a consistent format:
-
-```
-ERROR <error_message>
-```
-
-**Common error examples**:
-- `ERROR Unknown command: FOO`
-- `ERROR Invalid argument count`
-- `ERROR Item not found: item123`
-- `ERROR Dimension mismatch: expected 768, got 512`
-- `ERROR Invalid score: must be 0-100`
-- `ERROR File not found: /data/dump.dmp`
-- `ERROR CRC mismatch: file may be corrupted`
-
----
-
-## Similarity Modes
-
-### `events` - Event-based (Co-occurrence)
-
-Uses only co-occurrence scores from event data. Best for collaborative filtering without content features.
-
-**Use case**: "Users who interacted with this also interacted with..."
-
-### `vectors` - Vector-based
-
-Uses only vector similarity (dot product or cosine). Best for content-based recommendations.
-
-**Use case**: "Items with similar content/features..."
-
-### `fusion` - Fusion Search (SIM only)
-
-Combines vector similarity (weight: `similarity.fusion_alpha`) with co-occurrence scores (weight: `similarity.fusion_beta`).
-
-**Use case**: Hybrid recommendations combining content similarity + user behavior.
-
-**Formula**:
-```
-fusion_score = (alpha × vector_similarity) + (beta × co_occurrence_score)
-where alpha + beta = 1.0
+```text
+DEBUG ON
+DEBUG OFF
 ```
 
-**Note**: `fusion` mode is only available for `SIM` command (not `SIMV`).
+Debug mode is a property of the connection that issued it, not of the server, and it is dropped when the connection closes.
 
----
+```text
+> DEBUG ON
+OK DEBUG_ON
+```
 
-## Best Practices
+While it is on, every `SIM` and `SIMV` response carries an extra block after the results:
 
-### Performance Tips
+```text
+> SIM item1 3 using=vectors
+OK RESULTS 0
+# DEBUG 4
+mode: vectors
+query_time_us: 2
+candidates: 0
+results: 0
+```
 
-1. **Use appropriate top_k**: Lower values are faster
-2. **Enable caching**: Set `cache.enabled=true` for repeated queries
-3. **Tune fusion weights**: Adjust `fusion_alpha` and `fusion_beta` based on your use case
-4. **Use events mode for cold items**: Items without vectors can still be recommended via events
-5. **Monitor cache hit rate**: Use `CACHE STATS` to check performance
+`# DEBUG 4` names the number of fields that follow, which lets a stateful client frame the block. `mode` is the search mode (`vector` for `SIMV`), `candidates` is the result count before `min_score=` was applied, and `results` is the count after. On a cache hit `query_time_us` is `0`, because the timing covers the search the lookup replaced.
 
-### Data Management
+### Runtime variables
 
-1. **Regular snapshots**: Use `DUMP SAVE` for backups
-2. **Verify snapshots**: Use `DUMP VERIFY` before loading
-3. **Monitor memory**: Use `INFO` to track memory usage
-4. **Decay configuration**: Adjust `decay_interval_sec` based on your data freshness needs
+```text
+SET <variable> <value>
+GET <variable>
+SHOW VARIABLES [LIKE <pattern>]
+```
 
-### Debugging
+`SET` returns `+OK`; `GET` returns a RESP bulk string. Only five variables are mutable — `logging.level`, `logging.json`, `cache.enabled`, `cache.min_query_cost_ms` and `cache.ttl_seconds` — and every other known variable is readable but rejects a write.
 
-1. **Enable DEBUG mode**: Use `DEBUG ON` to see query execution details
-2. **Check INFO stats**: Monitor command counts and performance
-3. **Test with small datasets**: Verify behavior before scaling
+```text
+> SET cache.ttl_seconds 600
++OK
 
----
+> GET cache.enabled
+$4
+true
 
-## Next Steps
+> SET vectors.default_dimension 8
+ERROR Variable 'vectors.default_dimension' is immutable (requires restart)
 
-- See [Configuration Guide](configuration.md) for tuning options
-- See [Snapshot Management](snapshot.md) for persistence details
-- See [Client Library Guide](libnvecdclient.md) for programmatic access
-- See [Performance Guide](performance.md) for optimization tips
+> GET nosuch
+ERROR Unknown variable: nosuch
+```
+
+Boolean values accept `true`/`false`, `on`/`off`, `1`/`0` and `yes`/`no`, and are stored canonically as `true` or `false`.
+
+`SHOW VARIABLES` returns a RESP array of `<name>=<value> (mutable|immutable)` lines. `LIKE` takes a prefix; a trailing `%` is stripped and the rest is used as the prefix.
+
+```text
+> SHOW VARIABLES LIKE cache.%
+*6
+$42
+cache.compression_enabled=true (immutable)
+$28
+cache.enabled=true (mutable)
+$40
+cache.eviction_batch_size=10 (immutable)
+$34
+cache.max_memory_mb=32 (immutable)
+$43
+cache.min_query_cost_ms=10.000000 (mutable)
+$31
+cache.ttl_seconds=600 (mutable)
+```
+
+The `performance.` prefix is also accepted as `perf.` on input, but introspection always reports the `performance.` spelling. The full variable list and its mutability is in [configuration.md](./configuration.md).
+
+## Error responses
+
+Every failure is a single `ERROR <message>` line. A rejected command still counts towards the `total_commands_processed` and `failed_commands` counters, so the failure ratio an operator alerts on cannot exceed one.
+
+| Message | Cause |
+|---|---|
+| `Empty command` | blank line |
+| `Command must be a single line` | embedded CR or LF |
+| `Command must not contain embedded NUL bytes` | NUL byte in the request |
+| `Unknown command: <NAME>` | unrecognised first token |
+| `Request too large` | request exceeds `performance.max_query_length`, or the reactor's shared buffer budget is exhausted |
+| `Request too large (no newline detected)` | limit reached before any newline arrived |
+| `Server busy` | the worker pool could not accept the request |
+| `NOAUTH Authentication required` | write or admin command on an unauthenticated connection |
+| `ERR invalid password` | `AUTH` with the wrong password |
+| `LOADING Snapshot load in progress` | `DUMP LOAD` is publishing |
+| `READONLY Snapshot in progress` | lock-mode `DUMP SAVE` is running |
+| `EVENT requires at least 3 arguments: <ctx> <type> <id> [<score>]` | `EVENT` arity |
+| `EVENT ADD requires 4-5 arguments: <ctx> ADD <id> <score> [timestamp=<value>]` | `EVENT ADD` arity |
+| `Invalid EVENT type: <T> (must be ADD, SET, or DEL)` | unknown `EVENT` subcommand |
+| `Score must be in range [0, 100], got <n>` | event score out of range |
+| `Invalid integer: <t>` | integer token with trailing characters, such as a decimal score or `top_k` |
+| `Failed to parse integer: <t>` | integer token that is not a number at all |
+| `Failed to parse timestamp: <v>` | non-numeric `timestamp=` |
+| `Context cannot be empty` / `ID cannot be empty` | empty `EVENT` context or item ID |
+| `Context must not contain whitespace or control characters` | `EVENT` context carrying a byte at or below `0x20`, or `0x7F` |
+| `ID must not contain whitespace or control characters` | the same rule for an `EVENT` item ID |
+| `VECSET requires at least 2 arguments: <id> <floats>` | `VECSET` arity |
+| `Invalid float: <t>` | float token with trailing characters, or a non-finite spelling such as `nan` or `inf` |
+| `Failed to parse float: <t>` | float token that is not a number at all |
+| `ID cannot be empty` | `VECSET` with an empty item ID |
+| `Vector cannot be empty` | `VECSET` with no components |
+| `Vector dimension exceeds maximum of <n>` | `VECSET` above the store's hard ceiling |
+| `Vector dimension mismatch: expected <n>, got <m>` | `VECSET` dimension |
+| `Query vector cannot be empty` | `SIMV` with no components |
+| `Query vector components must be finite` | non-finite component in a `SIMV` query vector |
+| `Query vector norm must be finite and non-zero` | `SIMV` query vector whose norm cannot be used |
+| `Query vector dimension mismatch: expected <n>, got <m>` | `SIMV` dimension |
+| `VECDEL requires 1 argument: <id>` | `VECDEL` arity |
+| `Vector not found: <id>` | `VECDEL` on an unknown ID |
+| `Vector not found for metadata: <id>` | `METASET` on an item with no vector |
+| `METASET requires 2 arguments: <id> <key:value[,key:value...]>` | `METASET` arity |
+| `SIM requires at least 2 arguments: <id> <top_k>` | `SIM` arity |
+| `SIMV requires at least 2 arguments: <top_k> <floats>` | `SIMV` arity |
+| `SIMV requires at least one vector float` | `SIMV` whose tokens were all options |
+| `top_k must be positive, got <n>` | non-positive `top_k` |
+| `top_k <n> exceeds maximum allowed: <m>` | `top_k` above `similarity.max_top_k` |
+| `Invalid using value: <v> (must be events, vectors, or fusion)` | unknown mode |
+| `Invalid adaptive value: <v> (must be on or off)` | unknown `adaptive=` value |
+| `Invalid SIM option: <t>` / `Invalid SIMV option: <t>` | unknown option token |
+| `candidate_limit option is not supported` | `candidate_limit=` |
+| `explain option is not supported` | `explain=` |
+| `Invalid filter condition: '<pair>'` | malformed `filter=` condition |
+| `Query vector not found: <id>` | `SIM` on an ID with no vector |
+| `CONFIG requires subcommand: HELP\|SHOW\|VERIFY` | `CONFIG` arity |
+| `Unknown CONFIG subcommand: <S>` | unknown `CONFIG` subcommand |
+| `Configuration file is not accessible` | `CONFIG VERIFY` path outside the allowed root |
+| `DUMP requires subcommand: SAVE\|LOAD\|VERIFY\|INFO\|STATUS` | `DUMP` arity |
+| `DUMP LOAD requires a filepath` | `DUMP LOAD` with no argument |
+| `DUMP VERIFY requires a filepath` | `DUMP VERIFY` with no argument |
+| `DUMP INFO requires a filepath` | `DUMP INFO` with no argument |
+| `Invalid filepath: path traversal detected` | snapshot path escapes `snapshot.dir` |
+| `Failed to load snapshot from <path>: <reason>` | every `DUMP LOAD` failure, with an integrity detail appended in parentheses when there is one |
+| `Snapshot verification failed for <path>: <reason>` | every `DUMP VERIFY` failure, with the same optional detail |
+| `Failed to read snapshot info from <path>: <reason>` | `DUMP INFO` could not read the header |
+| `Another snapshot load is already in progress` | a second concurrent `DUMP LOAD` |
+| `Another snapshot save is already in progress` | a second concurrent lock-mode `DUMP SAVE` |
+| `A snapshot save is already in progress` | `DUMP LOAD` while a save holds the store |
+| `Cannot save snapshot while a snapshot load is in progress` | `DUMP SAVE` during a load |
+| `CACHE requires subcommand: STATS\|CLEAR\|ENABLE\|DISABLE` | `CACHE` arity |
+| `Cache controller is not initialized` | `CACHE STATS` or `CACHE CLEAR` on a server with no cache controller |
+| `Runtime variable manager is not initialized` | `CACHE ENABLE` or `CACHE DISABLE` with no variable manager |
+| `DEBUG requires exactly one argument: ON\|OFF` | `DEBUG` arity |
+| `SET requires 2 arguments: <variable_name> <value>` | `SET` arity |
+| `Unknown variable: <name>` | unknown runtime variable |
+| `Variable '<name>' is immutable (requires restart)` | write to an immutable variable |
+
+Error codes are partitioned by module: 1000–1999 configuration, 2000–2999 event processing, 3000–3999 command parsing, 4000–4999 vector and similarity, 5000–5999 storage and snapshot, 6000–6999 network and server, 7000–7999 client, 8000–8999 cache. The TCP surface reports the message only; the [HTTP surface](./http-api.md) maps the code to a status.
+
+## nvecd-cli
+
+`nvecd-cli` is a REPL and a one-shot command runner over the same protocol. It connects over TCP only; it has no Unix-socket option.
+
+```text
+Usage: nvecd-cli [OPTIONS] [COMMAND]
+```
+
+| Flag | Meaning |
+|---|---|
+| `-h HOST` | server hostname or IPv4 address (default `127.0.0.1`) |
+| `-p PORT` | server port (default `11017`) |
+| `--retry N` | retry the connection N times when it is refused (default `0`) |
+| `--wait-ready` | keep retrying until the server accepts, up to 100 attempts |
+| `--password-file FILE` | read the `AUTH` password from a private file |
+| `--password-env NAME` | read the `AUTH` password from an environment variable |
+| `--help` | print usage and exit |
+
+The first argument that is not a recognised flag starts the command; everything from there on is joined with single spaces and sent as one command, and the process exits. With no command, the CLI enters interactive mode, where `help` prints the command summary and `quit` or `exit` leaves.
+
+```bash
+$ nvecd-cli -p 11017 INFO
+INFO
+
+# Server
+version: 0.1.0
+...
+
+$ nvecd-cli -p 11017 BOGUS; echo "exit=$?"
+(error) Unknown command: BOGUS
+exit=1
+```
+
+An error response exits non-zero, which makes the one-shot form usable in scripts. Retries apply only to a refused connection: a name that does not resolve, or any other connection error, fails immediately.
+
+`--password-file` and `--password-env` are mutually exclusive, and only one may be given. The password file must be a regular file owned by the current user with mode `0600` or stricter, must not exceed 4096 bytes, and must contain no CR, LF or NUL; one trailing newline is stripped. The password is sent with `AUTH` immediately after connecting, and a rejected password aborts before any command runs.
+
+```bash
+$ NVECD_PASSWORD=s3cret nvecd-cli --password-env NVECD_PASSWORD VECSET item1 0.1 0.2 0.3 0.4
+VECSET
+```
+
+When built with readline available, interactive mode has history and context-aware tab completion for command names, subcommands and `using=` values.
