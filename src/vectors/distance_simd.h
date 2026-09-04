@@ -12,17 +12,12 @@
 
 #include <cstddef>
 
-#include "vectors/cpu_features.h"
-#include "vectors/distance_scalar.h"
-
-// Include platform-specific SIMD implementations
-#ifdef __AVX2__
-#include "vectors/distance_avx2.h"
-#endif
-
-#ifdef __ARM_NEON
-#include "vectors/distance_neon.h"
-#endif
+// The ISA-specific kernels are deliberately NOT included here. Selecting one is
+// a compile-time decision that depends on -mavx2, which CMake applies only to
+// the nvecd_vectors target; a header that branched on __AVX2__ would compile a
+// different body in every other target. The selection therefore lives in
+// distance_simd.cpp, which is part of that target, and this header only
+// declares the result.
 
 namespace nvecd::vectors::simd {
 
@@ -61,31 +56,7 @@ struct DistanceFunctions {
  *
  * @return Reference to optimal function dispatch table
  */
-inline const DistanceFunctions& GetOptimalImpl() {
-  // Static initialization is thread-safe in C++11+
-  static const DistanceFunctions impl = []() {
-    [[maybe_unused]] CpuInfo cpu = DetectCpuFeatures();
-
-#ifdef __AVX2__
-    // AVX2 available at compile-time, check runtime support
-    if (cpu.has_avx2) {
-      return DistanceFunctions{DotProductAVX2, L2NormAVX2, L2DistanceAVX2, "AVX2"};
-    }
-#endif
-
-#ifdef __ARM_NEON
-    // NEON available at compile-time, check runtime support
-    if (cpu.has_neon) {
-      return DistanceFunctions{DotProductNEON, L2NormNEON, L2DistanceNEON, "NEON"};
-    }
-#endif
-
-    // Fallback to scalar implementation
-    return DistanceFunctions{DotProductScalar, L2NormScalar, L2DistanceScalar, "Scalar"};
-  }();
-
-  return impl;
-}
+const DistanceFunctions& GetOptimalImpl();
 
 /**
  * @brief Get implementation name for logging
@@ -95,8 +66,6 @@ inline const DistanceFunctions& GetOptimalImpl() {
  *
  * @return Implementation name ("AVX2", "NEON", or "Scalar")
  */
-inline const char* GetImplementationName() {
-  return GetOptimalImpl().implementation_name;
-}
+const char* GetImplementationName();
 
 }  // namespace nvecd::vectors::simd

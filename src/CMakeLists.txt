@@ -78,6 +78,9 @@ add_library(nvecd_vectors STATIC
   vectors/merge_scheduler.cpp
   vectors/quantizer.cpp
   vectors/cpu_features.cpp
+  # Must stay in this target: it is where the ISA flags below apply, and it
+  # holds the single definition of the kernel selection.
+  vectors/distance_simd.cpp
 )
 target_link_libraries(nvecd_vectors PUBLIC
   nvecd_utils
