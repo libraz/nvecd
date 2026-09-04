@@ -1,0 +1,189 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 740" width="960" height="740" role="img" aria-labelledby="ttl dsc">
+  <title id="ttl">The layers of an nvecd process</title>
+  <desc id="dsc">Five stacked bands, top to bottom: clients, transport, dispatch, engine and stores, and persistence. A request enters at the top over TCP, a Unix socket or HTTP, is turned into a command and routed to a handler, and reaches the stores through the similarity engine. The engine owns the ANN index and reads the vector and event stores; the co-occurrence index and event store are the event side, the vector and metadata stores the vector side. A column on the right holds the pieces that cut across every layer: configuration, runtime variables, the two background schedulers, the error type, and the non-owning handler context.</desc>
+
+  <style>
+    .bg    { fill:#f7f5f1 }
+    .grp   { fill:#edeae4 }
+    .chip  { fill:#ffffff; stroke:#d7d4cd }
+    .card  { fill:#ffffff; stroke:#3f6b8a }
+    .alt   { fill:#ffffff; stroke:#8a6a1f }
+    .rule  { fill:none; stroke:#b8b4ac; stroke-width:1 }
+    .lnn   { fill:none; stroke:#b8b4ac; stroke-width:1.4 }
+    .ahn   { fill:#b8b4ac }
+    text   { font-family:Inter,"Helvetica Neue","Hiragino Sans","Noto Sans JP",Arial,sans-serif; fill:#1f2328 }
+    .h     { font-size:12.5px }
+    .lbl   { font-size:11px; fill:#6e7781; letter-spacing:.06em }
+    .s     { font-size:10.5px; fill:#6e7781 }
+    .mono  { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:10.5px; fill:#3f6b8a }
+    @media (prefers-color-scheme: dark) {
+      .bg{fill:#0d1117} .grp{fill:#12171d}
+      .chip{fill:#161b22;stroke:#30363d} .card{fill:#161b22;stroke:#7fb3d5} .alt{fill:#161b22;stroke:#d9b45c}
+      .rule{stroke:#484f58} .lnn{stroke:#484f58} .ahn{fill:#484f58}
+      .mono{fill:#7fb3d5}
+      text{fill:#e6edf3} .lbl{fill:#8b949e} .s{fill:#8b949e}
+    }
+  </style>
+
+  <defs>
+    <marker id="c" markerUnits="userSpaceOnUse" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto">
+      <path class="ahn" d="M0,0 L9,4.5 L0,9 z"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="960" height="740" rx="12"/>
+
+  <path class="lnn" d="M 36 44 V 688" marker-end="url(#c)"/>
+  <text class="lbl" x="22" y="366" text-anchor="middle" transform="rotate(-90 22 366)">a request enters at the top and works down</text>
+
+  <rect class="grp" x="52" y="32" width="672" height="86" rx="8"/>
+  <text class="lbl" x="68" y="54">CLIENTS</text>
+  <rect class="chip" x="68" y="64" width="148" height="40" rx="5"/>
+  <text class="h" x="142" y="82" text-anchor="middle">TCP client</text>
+  <text class="s" x="142" y="98" text-anchor="middle">default port 11017</text>
+  <rect class="chip" x="232" y="64" width="148" height="40" rx="5"/>
+  <text class="h" x="306" y="82" text-anchor="middle">HTTP client</text>
+  <text class="s" x="306" y="98" text-anchor="middle">JSON over HTTP</text>
+  <rect class="chip" x="396" y="64" width="148" height="40" rx="5"/>
+  <text class="mono" x="470" y="82" text-anchor="middle">nvecd-cli</text>
+  <text class="s" x="470" y="98" text-anchor="middle">interactive shell</text>
+  <rect class="chip" x="560" y="64" width="148" height="40" rx="5"/>
+  <text class="mono" x="634" y="82" text-anchor="middle">libnvecdclient</text>
+  <text class="s" x="634" y="98" text-anchor="middle">C and C++ library</text>
+
+  <rect class="grp" x="52" y="136" width="672" height="86" rx="8"/>
+  <text class="lbl" x="68" y="158">TRANSPORT</text>
+  <rect class="chip" x="68" y="168" width="148" height="40" rx="5"/>
+  <text class="h" x="142" y="186" text-anchor="middle">ConnectionAcceptor</text>
+  <text class="s" x="142" y="202" text-anchor="middle">TCP and Unix socket</text>
+  <rect class="chip" x="232" y="168" width="148" height="40" rx="5"/>
+  <text class="h" x="306" y="186" text-anchor="middle">IoReactor</text>
+  <text class="s" x="306" y="202" text-anchor="middle">epoll or kqueue</text>
+  <rect class="chip" x="396" y="168" width="148" height="40" rx="5"/>
+  <text class="h" x="470" y="186" text-anchor="middle">HttpServer</text>
+  <text class="s" x="470" y="202" text-anchor="middle">JSON routes and CORS</text>
+  <rect class="chip" x="560" y="168" width="148" height="40" rx="5"/>
+  <text class="h" x="634" y="186" text-anchor="middle">RateLimiter</text>
+  <text class="s" x="634" y="202" text-anchor="middle">token bucket per IP</text>
+
+  <rect class="grp" x="52" y="240" width="672" height="144" rx="8"/>
+  <text class="lbl" x="68" y="262">DISPATCH</text>
+  <rect class="chip" x="68" y="272" width="148" height="40" rx="5"/>
+  <text class="h" x="142" y="290" text-anchor="middle">ThreadPool</text>
+  <text class="s" x="142" y="306" text-anchor="middle">runs the callbacks</text>
+  <rect class="chip" x="232" y="272" width="148" height="40" rx="5"/>
+  <text class="h" x="306" y="290" text-anchor="middle">CommandParser</text>
+  <text class="s" x="306" y="306" text-anchor="middle">one line to a Command</text>
+  <rect class="chip" x="396" y="272" width="148" height="40" rx="5"/>
+  <text class="h" x="470" y="290" text-anchor="middle">FilterParser</text>
+  <text class="s" x="470" y="306" text-anchor="middle">metadata filter text</text>
+  <rect class="chip" x="560" y="272" width="148" height="40" rx="5"/>
+  <text class="h" x="634" y="290" text-anchor="middle">RequestDispatcher</text>
+  <text class="s" x="634" y="306" text-anchor="middle">routes a TCP command</text>
+
+  <text class="lbl" x="68" y="344">HANDLERS</text>
+  <rect class="chip" x="132" y="326" width="86" height="26" rx="5"/>
+  <text class="mono" x="175" y="343" text-anchor="middle">admin</text>
+  <rect class="chip" x="230" y="326" width="86" height="26" rx="5"/>
+  <text class="mono" x="273" y="343" text-anchor="middle">cache</text>
+  <rect class="chip" x="328" y="326" width="86" height="26" rx="5"/>
+  <text class="mono" x="371" y="343" text-anchor="middle">debug</text>
+  <rect class="chip" x="426" y="326" width="86" height="26" rx="5"/>
+  <text class="mono" x="469" y="343" text-anchor="middle">dump</text>
+  <rect class="chip" x="524" y="326" width="86" height="26" rx="5"/>
+  <text class="mono" x="567" y="343" text-anchor="middle">info</text>
+  <rect class="chip" x="622" y="326" width="86" height="26" rx="5"/>
+  <text class="mono" x="665" y="343" text-anchor="middle">variable</text>
+
+  <text class="s" x="68" y="372">HttpServer reaches the same handlers through HandlerContext, without going through RequestDispatcher.</text>
+
+  <rect class="grp" x="52" y="402" width="672" height="190" rx="8"/>
+  <text class="lbl" x="68" y="424">ENGINE AND STORES</text>
+
+  <rect class="card" x="68" y="434" width="380" height="54" rx="6"/>
+  <text class="h" x="84" y="456">SimilarityEngine</text>
+  <text class="s" x="84" y="474">events · vectors · fusion</text>
+  <rect class="card" x="256" y="442" width="176" height="38" rx="5"/>
+  <text class="h" x="272" y="458">AnnIndex</text>
+  <text class="mono" x="272" y="474">flat / hnsw / ivf</text>
+
+  <rect class="chip" x="464" y="434" width="244" height="54" rx="6"/>
+  <text class="h" x="480" y="456">SimilarityCacheController</text>
+  <text class="s" x="480" y="474">owns and publishes the cache</text>
+
+  <rect class="alt" x="68" y="502" width="148" height="76" rx="5"/>
+  <text class="h" x="142" y="522" text-anchor="middle">EventStore</text>
+  <text class="s" x="142" y="540" text-anchor="middle">a ring buffer per</text>
+  <text class="s" x="142" y="556" text-anchor="middle">context, plus dedup</text>
+  <text class="s" x="142" y="572" text-anchor="middle">and state caches</text>
+  <rect class="alt" x="232" y="502" width="148" height="76" rx="5"/>
+  <text class="h" x="306" y="522" text-anchor="middle">CoOccurrenceIndex</text>
+  <text class="s" x="306" y="540" text-anchor="middle">how often two items</text>
+  <text class="s" x="306" y="556" text-anchor="middle">appear in the same</text>
+  <text class="s" x="306" y="572" text-anchor="middle">context, with decay</text>
+  <rect class="card" x="396" y="502" width="148" height="76" rx="5"/>
+  <text class="h" x="470" y="522" text-anchor="middle">VectorStore</text>
+  <text class="s" x="470" y="540" text-anchor="middle">one compact block of</text>
+  <text class="s" x="470" y="556" text-anchor="middle">vectors, searched</text>
+  <text class="s" x="470" y="572" text-anchor="middle">with SIMD kernels</text>
+  <rect class="card" x="560" y="502" width="148" height="76" rx="5"/>
+  <text class="h" x="634" y="522" text-anchor="middle">MetadataStore</text>
+  <text class="s" x="634" y="540" text-anchor="middle">per-item metadata</text>
+  <text class="s" x="634" y="556" text-anchor="middle">that backs filtered</text>
+  <text class="s" x="634" y="572" text-anchor="middle">SIM and SIMV</text>
+
+  <rect class="grp" x="52" y="610" width="672" height="86" rx="8"/>
+  <text class="lbl" x="68" y="632">PERSISTENCE</text>
+  <rect class="chip" x="68" y="642" width="148" height="40" rx="5"/>
+  <text class="h" x="142" y="660" text-anchor="middle">ForkSnapshotWriter</text>
+  <text class="s" x="142" y="676" text-anchor="middle">fork, copy-on-write</text>
+  <rect class="chip" x="232" y="642" width="148" height="40" rx="5"/>
+  <text class="h" x="306" y="660" text-anchor="middle">SnapshotSession</text>
+  <text class="s" x="306" y="676" text-anchor="middle">finishes one save</text>
+  <rect class="chip" x="396" y="642" width="148" height="40" rx="5"/>
+  <text class="h" x="470" y="660" text-anchor="middle">WriteAheadLog</text>
+  <text class="s" x="470" y="676" text-anchor="middle">writes since the save</text>
+  <rect class="chip" x="560" y="642" width="148" height="40" rx="5"/>
+  <text class="h" x="634" y="660" text-anchor="middle">Startup recovery</text>
+  <text class="s" x="634" y="676" text-anchor="middle">snapshot, then WAL</text>
+
+  <rect class="grp" x="740" y="32" width="196" height="664" rx="8"/>
+  <text class="lbl" x="756" y="54">ACROSS THE LAYERS</text>
+
+  <text class="h" x="756" y="88">Config</text>
+  <text class="s" x="756" y="106">parsed once at startup;</text>
+  <text class="s" x="756" y="122">every layer reads the</text>
+  <text class="s" x="756" y="138">same object</text>
+  <path class="rule" d="M 756 158 H 920"/>
+
+  <text class="h" x="756" y="186">RuntimeVariableManager</text>
+  <text class="s" x="756" y="204">SET and SHOW VARIABLES</text>
+  <text class="s" x="756" y="220">change a subset of the</text>
+  <text class="s" x="756" y="236">settings without a restart</text>
+  <path class="rule" d="M 756 256 H 920"/>
+
+  <text class="h" x="756" y="284">SnapshotScheduler</text>
+  <text class="s" x="756" y="302">writes a snapshot on an</text>
+  <text class="s" x="756" y="318">interval, through the fork</text>
+  <text class="s" x="756" y="334">writer below</text>
+  <path class="rule" d="M 756 354 H 920"/>
+
+  <text class="h" x="756" y="382">DecayScheduler</text>
+  <text class="s" x="756" y="400">ages co-occurrence scores</text>
+  <text class="s" x="756" y="416">and prunes the ones that</text>
+  <text class="s" x="756" y="432">have become negligible</text>
+  <path class="rule" d="M 756 452 H 920"/>
+
+  <text class="h" x="756" y="480">Expected and Error</text>
+  <text class="s" x="756" y="498">every fallible call returns</text>
+  <text class="s" x="756" y="514">a value or an error code;</text>
+  <text class="s" x="756" y="530">no exception crosses a layer</text>
+  <path class="rule" d="M 756 550 H 920"/>
+
+  <text class="h" x="756" y="578">HandlerContext</text>
+  <text class="s" x="756" y="596">the non-owning view of the</text>
+  <text class="s" x="756" y="612">stores that every handler</text>
+  <text class="s" x="756" y="628">is handed</text>
+
+  <text class="s" x="480" y="720" text-anchor="middle">All of this is one process; the only exception is the child that ForkSnapshotWriter forks to write a snapshot.</text>
+</svg>

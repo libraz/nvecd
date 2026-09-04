@@ -1,0 +1,127 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 750" width="960" height="750" role="img" aria-labelledby="ttl dsc">
+  <title id="ttl">What nvecd does at startup to get its memory back</title>
+  <desc id="dsc">Six stages running downward: select the newest snapshot that has a valid checkpoint sidecar, load it into the stores, open the write-ahead log and recover its sequence, replay only the records after the checkpoint, publish the log for live writes, then rebuild the ANN index and start serving. Two files on the right feed the flow: the snapshot directory and the WAL directory. A marked note beside the replay stage records the one gap in this path: with vector payloads excluded from the log, vectors written during that time cannot be replayed.</desc>
+
+  <style>
+    .bg    { fill:#f7f5f1 }
+    .chip  { fill:#ffffff; stroke:#d7d4cd }
+    .card  { fill:#ffffff; stroke:#3f6b8a }
+    .alt   { fill:#ffffff; stroke:#8a6a1f }
+    .ln    { fill:none; stroke:#3f6b8a; stroke-width:1.4 }
+    .ah    { fill:#3f6b8a }
+    .warn  { fill:none; stroke:#a3401f; stroke-width:1.6 }
+    .warnt { fill:#a3401f; font-size:10.5px }
+    text   { font-family:Inter,"Helvetica Neue","Hiragino Sans","Noto Sans JP",Arial,sans-serif; fill:#1f2328 }
+    .h     { font-size:12.5px }
+    .lbl   { font-size:11px; fill:#6e7781; letter-spacing:.06em }
+    .s     { font-size:10.5px; fill:#6e7781 }
+    .mono  { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:10.5px; fill:#3f6b8a }
+    .mono2 { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:10.5px; fill:#8a6a1f }
+    .monw  { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:10.5px; fill:#a3401f }
+    @media (prefers-color-scheme: dark) {
+      .bg{fill:#0d1117}
+      .chip{fill:#161b22;stroke:#30363d} .card{fill:#161b22;stroke:#7fb3d5} .alt{fill:#161b22;stroke:#d9b45c}
+      .ln{stroke:#7fb3d5} .ah{fill:#7fb3d5}
+      .warn{stroke:#e08a68} .warnt{fill:#e08a68} .monw{fill:#e08a68}
+      .mono{fill:#7fb3d5} .mono2{fill:#d9b45c}
+      text{fill:#e6edf3} .lbl{fill:#8b949e} .s{fill:#8b949e}
+    }
+  </style>
+
+  <defs>
+    <marker id="a" markerUnits="userSpaceOnUse" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto">
+      <path class="ah" d="M0,0 L9,4.5 L0,9 z"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="960" height="750" rx="12"/>
+
+  <text class="lbl" x="142" y="78" text-anchor="end">SELECT</text>
+  <rect class="chip" x="158" y="56" width="440" height="88" rx="6"/>
+  <text class="h" x="170" y="78">Pick the newest snapshot with a valid checkpoint</text>
+  <text class="s" x="170" y="100">candidates: *.nvec and *.dmp in the snapshot directory, newest first</text>
+  <text class="s" x="170" y="116">the .walseq sidecar must match the snapshot's size and CRC32</text>
+  <text class="s" x="170" y="132">a candidate that fails either check is skipped and the next tried</text>
+
+  <path class="ln" d="M 378 144 V 164" marker-end="url(#a)"/>
+
+  <text class="lbl" x="142" y="186" text-anchor="end">LOAD</text>
+  <rect class="chip" x="158" y="164" width="440" height="72" rx="6"/>
+  <text class="h" x="170" y="186">Load it into the stores</text>
+  <text class="s" x="170" y="208">read into staging stores, then swapped in as a unit; caches cleared</text>
+  <text class="s" x="170" y="224">the stores now hold exactly what the checkpoint sequence covers</text>
+
+  <path class="ln" d="M 378 236 V 256" marker-end="url(#a)"/>
+
+  <text class="lbl" x="142" y="278" text-anchor="end">OPEN</text>
+  <rect class="chip" x="158" y="256" width="440" height="72" rx="6"/>
+  <text class="h" x="170" y="278">Open the WAL and recover its sequence</text>
+  <text class="s" x="170" y="300">the wal-NNNNNN.log segments are scanned for the highest sequence</text>
+  <text class="s" x="170" y="316">startup fails outright if the WAL cannot be opened</text>
+
+  <path class="ln" d="M 378 328 V 348" marker-end="url(#a)"/>
+
+  <text class="lbl" x="142" y="370" text-anchor="end">REPLAY</text>
+  <rect class="chip" x="158" y="348" width="440" height="170" rx="6"/>
+  <text class="h" x="170" y="370">Replay only the records after the checkpoint</text>
+  <text class="s" x="170" y="392">replay starts at checkpoint + 1, or at 0 when no snapshot was loaded</text>
+  <text class="s" x="170" y="408">the WAL is still unpublished, so replayed records are not re-appended</text>
+  <text class="lbl" x="170" y="432">RECORD TYPES REPLAYED</text>
+
+  <rect class="card" x="170" y="442" width="64" height="24" rx="5"/>
+  <text class="mono" x="202" y="458" text-anchor="middle">kVecSet</text>
+  <rect class="card" x="242" y="442" width="64" height="24" rx="5"/>
+  <text class="mono" x="274" y="458" text-anchor="middle">kVecDel</text>
+  <rect class="alt" x="314" y="442" width="77" height="24" rx="5"/>
+  <text class="mono2" x="352" y="458" text-anchor="middle">kEventAdd</text>
+  <rect class="alt" x="399" y="442" width="77" height="24" rx="5"/>
+  <text class="mono2" x="437" y="458" text-anchor="middle">kEventDel</text>
+  <rect class="card" x="170" y="474" width="70" height="24" rx="5"/>
+  <text class="mono" x="205" y="490" text-anchor="middle">kMetaSet</text>
+  <rect class="card" x="248" y="474" width="70" height="24" rx="5"/>
+  <text class="mono" x="283" y="490" text-anchor="middle">kMetaDel</text>
+  <rect class="alt" x="326" y="474" width="171" height="24" rx="5"/>
+  <text class="mono2" x="411" y="490" text-anchor="middle">kCoOccurrenceMaintenance</text>
+
+  <path class="ln" d="M 378 518 V 538" marker-end="url(#a)"/>
+
+  <text class="lbl" x="142" y="560" text-anchor="end">PUBLISH</text>
+  <rect class="chip" x="158" y="538" width="440" height="72" rx="6"/>
+  <text class="h" x="170" y="560">Publish the WAL for live writes</text>
+  <text class="s" x="170" y="582">from here on, appends take sequences above the recovered maximum</text>
+  <text class="s" x="170" y="598">the fork writer is wired to it for checkpoint and truncate</text>
+
+  <path class="ln" d="M 378 610 V 630" marker-end="url(#a)"/>
+
+  <text class="lbl" x="142" y="652" text-anchor="end">SERVE</text>
+  <rect class="chip" x="158" y="630" width="440" height="72" rx="6"/>
+  <text class="h" x="170" y="652">Rebuild the ANN index, then start serving</text>
+  <text class="s" x="170" y="674">snapshot load and replay bypass the incremental index path,</text>
+  <text class="s" x="170" y="690">so the index is rebuilt from the restored store</text>
+
+  <path class="ln" d="M 622 100 H 598" marker-end="url(#a)"/>
+  <rect class="chip" x="622" y="56" width="250" height="88" rx="6"/>
+  <text class="h" x="634" y="78">snapshot directory</text>
+  <text class="mono" x="634" y="96">auto_&lt;timestamp&gt;.nvec</text>
+  <text class="mono" x="634" y="112">auto_&lt;timestamp&gt;.nvec.walseq</text>
+  <text class="s" x="634" y="130">one sidecar per snapshot</text>
+
+  <path class="ln" d="M 622 292 H 598" marker-end="url(#a)"/>
+  <rect class="chip" x="622" y="256" width="250" height="72" rx="6"/>
+  <text class="h" x="634" y="278">WAL directory</text>
+  <text class="mono" x="634" y="298">wal-NNNNNN.log</text>
+  <text class="s" x="634" y="316">records the snapshot does not cover</text>
+
+  <path class="warn" d="M 598 406 H 622"/>
+  <rect class="warn" x="622" y="348" width="306" height="124" rx="6"/>
+  <text class="monw" x="634" y="372">wal.include_vectors: false</text>
+  <text class="warnt" x="634" y="392">keeps vector payloads out of the log.</text>
+  <text class="warnt" x="634" y="410">Vectors written while it was off live</text>
+  <text class="warnt" x="634" y="426">only in a snapshot; replay cannot</text>
+  <text class="warnt" x="634" y="442">restore them, and a later delete or</text>
+  <text class="warnt" x="634" y="458">metadata record naming one is skipped.</text>
+
+  <text class="s" x="160" y="730">With</text>
+  <text class="mono" x="189" y="730">wal.enabled: false</text>
+  <text class="s" x="306" y="730">there is no sidecar and no replay: the newest loadable snapshot is the whole recovery.</text>
+</svg>

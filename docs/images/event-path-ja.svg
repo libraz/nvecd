@@ -1,0 +1,119 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 724" width="900" height="724" role="img" aria-labelledby="ttl dsc">
+  <title id="ttl">EVENT コマンド 1 件の書き込み経路と順序</title>
+  <desc id="dsc">EVENT コマンド 1 件が、受信から応答までにたどる経路を 5 つの帯で示しています。コマンドは解析され、認証とスナップショットのゲートを通過したうえで排他の書き込みゲートを取得します。イベントストアはタイムスタンプを解決し、DEL のスコアを 0 に固定して検証したのち、動詞に応じた重複キャッシュを照会します。ADD は時間窓、SET は最終値、DEL は削除フラグです。重複ならここで終了します。そうでなければ、どのストアに触れるよりも先に WAL レコードを追記し、そのあとでコンテキスト別リングバッファと共起インデックスに反映します。最後の帯で該当項目の類似度キャッシュを無効化し、応答を返します。</desc>
+
+  <style>
+    .bg    { fill:#f7f5f1 }
+    .grp   { fill:#edeae4 }
+    .chip  { fill:#ffffff; stroke:#d7d4cd }
+    .alt   { fill:#ffffff; stroke:#8a6a1f }
+    .ln2   { fill:none; stroke:#8a6a1f; stroke-width:1.4 }
+    .ah2   { fill:#8a6a1f }
+    text   { font-family:Inter,"Helvetica Neue","Hiragino Sans","Noto Sans JP",Arial,sans-serif; fill:#1f2328 }
+    .lbl   { font-size:11px; fill:#6e7781; letter-spacing:.06em }
+    .s     { font-size:10.5px; fill:#6e7781 }
+    .warnt { fill:#a3401f }
+    .mono  { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:10.5px; fill:#8a6a1f }
+    @media (prefers-color-scheme: dark) {
+      .bg{fill:#0d1117} .grp{fill:#12171d}
+      .chip{fill:#161b22;stroke:#30363d} .alt{fill:#161b22;stroke:#d9b45c}
+      .ln2{stroke:#d9b45c} .ah2{fill:#d9b45c} .mono{fill:#d9b45c}
+      text{fill:#e6edf3} .lbl{fill:#8b949e} .s{fill:#8b949e} .warnt{fill:#e08a68}
+    }
+  </style>
+
+  <defs>
+    <marker id="b" markerUnits="userSpaceOnUse" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto">
+      <path class="ah2" d="M0,0 L9,4.5 L0,9 z"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="900" height="724" rx="12"/>
+
+  <rect class="grp" x="24" y="48" width="852" height="76" rx="8"/>
+  <text class="lbl" x="38" y="68">解析とゲート</text>
+  <text class="s" x="150" y="68">HTTP ハンドラも同じ Command を組み立てて ApplyWrite を直接呼ぶ</text>
+  <rect class="alt" x="38" y="78" width="264" height="32" rx="5"/>
+  <text class="mono" x="170" y="98" text-anchor="middle">EVENT &lt;ctx&gt; ADD|SET|DEL &lt;id&gt;</text>
+  <path class="ln2" d="M 302 94 H 320" marker-end="url(#b)"/>
+  <rect class="chip" x="320" y="78" width="150" height="32" rx="5"/>
+  <text class="s" x="395" y="98" text-anchor="middle">CommandParser</text>
+  <path class="ln2" d="M 470 94 H 488" marker-end="url(#b)"/>
+  <rect class="chip" x="488" y="78" width="182" height="32" rx="5"/>
+  <text class="s" x="579" y="98" text-anchor="middle">AUTH とスナップショット判定</text>
+  <path class="ln2" d="M 670 94 H 688" marker-end="url(#b)"/>
+  <rect class="chip" x="688" y="78" width="154" height="32" rx="5"/>
+  <text class="s" x="765" y="98" text-anchor="middle">書き込みゲート（排他）</text>
+
+  <path class="ln2" d="M 170 124 V 148" marker-end="url(#b)"/>
+
+  <rect class="grp" x="24" y="148" width="852" height="152" rx="8"/>
+  <text class="lbl" x="38" y="168">前処理</text>
+  <text class="s" x="150" y="168">EventStore::PrepareEvent — 検証したうえで、重複キャッシュを更新せずに照会する</text>
+  <rect class="alt" x="38" y="178" width="130" height="32" rx="5"/>
+  <text class="s" x="103" y="198" text-anchor="middle">タイムスタンプ解決</text>
+  <path class="ln2" d="M 168 194 H 186" marker-end="url(#b)"/>
+  <rect class="alt" x="186" y="178" width="168" height="32" rx="5"/>
+  <text class="s" x="270" y="198" text-anchor="middle">DEL は score を 0 に固定</text>
+  <path class="ln2" d="M 354 194 H 372" marker-end="url(#b)"/>
+  <rect class="alt" x="372" y="178" width="190" height="32" rx="5"/>
+  <text class="s" x="467" y="198" text-anchor="middle">EventValidator::Validate</text>
+  <rect class="alt" x="38" y="224" width="252" height="46" rx="5"/>
+  <text class="s" x="164" y="243" text-anchor="middle">ADD — DedupCache</text>
+  <text class="s" x="164" y="258" text-anchor="middle">時間窓内の同一キー</text>
+  <rect class="alt" x="302" y="224" width="252" height="46" rx="5"/>
+  <text class="s" x="428" y="243" text-anchor="middle">SET — StateCache</text>
+  <text class="s" x="428" y="258" text-anchor="middle">同じ id への同じ最終値</text>
+  <rect class="alt" x="566" y="224" width="252" height="46" rx="5"/>
+  <text class="s" x="692" y="243" text-anchor="middle">DEL — StateCache</text>
+  <text class="s" x="692" y="258" text-anchor="middle">すでに削除済み</text>
+  <text class="s" x="38" y="288">重複ならここで終了。WAL 記録もリングバッファ追加も共起更新も行わないが、応答は OK</text>
+
+  <path class="ln2" d="M 170 300 V 324" marker-end="url(#b)"/>
+
+  <rect class="grp" x="24" y="324" width="852" height="82" rx="8"/>
+  <text class="lbl" x="38" y="344">永続化</text>
+  <text class="s warnt" x="150" y="344">WAL が先 — ストアに触れる前にレコードが受理される</text>
+  <rect class="chip" x="38" y="354" width="200" height="32" rx="5"/>
+  <text class="s" x="138" y="374" text-anchor="middle">EncodeCommand でペイロード化</text>
+  <path class="ln2" d="M 238 370 H 256" marker-end="url(#b)"/>
+  <rect class="chip" x="256" y="354" width="132" height="32" rx="5"/>
+  <text class="s" x="322" y="374" text-anchor="middle">Wal::Append</text>
+  <path class="ln2" d="M 388 370 H 406" marker-end="url(#b)"/>
+  <rect class="chip" x="406" y="354" width="210" height="32" rx="5"/>
+  <text class="s" x="511" y="374" text-anchor="middle">kEventAdd、DEL なら kEventDel</text>
+
+  <path class="ln2" d="M 170 406 V 430" marker-end="url(#b)"/>
+
+  <rect class="grp" x="24" y="430" width="852" height="134" rx="8"/>
+  <text class="lbl" x="38" y="450">メモリへの反映</text>
+  <text class="s" x="150" y="450">EventStore::AddEventAndGetPrior のあと CoOccurrenceIndex::ApplyIngestedEvent</text>
+  <rect class="alt" x="38" y="460" width="130" height="32" rx="5"/>
+  <text class="s" x="103" y="480" text-anchor="middle">重複エントリを確定</text>
+  <path class="ln2" d="M 168 476 H 186" marker-end="url(#b)"/>
+  <rect class="alt" x="186" y="460" width="232" height="32" rx="5"/>
+  <text class="s" x="302" y="480" text-anchor="middle">コンテキスト別リングバッファへ Push</text>
+  <path class="ln2" d="M 418 476 H 436" marker-end="url(#b)"/>
+  <rect class="alt" x="436" y="460" width="150" height="32" rx="5"/>
+  <text class="s" x="511" y="480" text-anchor="middle">直前イベント列を控える</text>
+  <path class="ln2" d="M 586 476 H 604" marker-end="url(#b)"/>
+  <rect class="alt" x="604" y="460" width="110" height="32" rx="5"/>
+  <text class="s" x="659" y="480" text-anchor="middle">共起スコア更新</text>
+  <text class="s" x="38" y="512">(新規, 直前) の各ペアを new × prior で加点し、必要なら半減期で時間減衰させる</text>
+  <text class="s" x="38" y="530">そのうえで <tspan class="mono">max_neighbors_per_item</tspan> と <tspan class="mono">min_support</tspan> で刈り込み、インデックス世代を進める</text>
+  <text class="s" x="38" y="548"><tspan class="mono">max_contexts</tspan> を超えたコンテキストは LRU で追い出し、<tspan class="mono">negative_signals</tspan> 有効時の DEL は削除項目の辺も減衰させる</text>
+
+  <path class="ln2" d="M 170 564 V 588" marker-end="url(#b)"/>
+
+  <rect class="grp" x="24" y="588" width="852" height="94" rx="8"/>
+  <text class="lbl" x="38" y="608">無効化と応答</text>
+  <text class="s" x="150" y="608">キャッシュはイベントが指した項目単位で選択的に無効化される</text>
+  <rect class="chip" x="38" y="618" width="240" height="32" rx="5"/>
+  <text class="s" x="158" y="638" text-anchor="middle">SimilarityCache::InvalidateByItemId</text>
+  <path class="ln2" d="M 278 634 H 296" marker-end="url(#b)"/>
+  <rect class="chip" x="296" y="618" width="106" height="32" rx="5"/>
+  <text class="mono" x="349" y="638" text-anchor="middle">OK EVENT</text>
+  <text class="s" x="38" y="672">SIM のキャッシュキーは共起世代も含むため、この更新で該当エントリが無効になる</text>
+
+  <text class="s" x="450" y="706" text-anchor="middle">WAL リプレイでは追記が省かれるため、再適用された EVENT はメモリにだけ反映される。</text>
+</svg>

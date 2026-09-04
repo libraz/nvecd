@@ -1,0 +1,147 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 550" width="960" height="550" role="img" aria-labelledby="ttl dsc">
+  <title id="ttl">唯一のルートオーナーと、非所有のビュー</title>
+  <desc id="dsc">NvecdServer が唯一のルートオーナーです。そこから実線が下へ伸び、ストア、エンジンとキャッシュ、通信とディスパッチ、永続化、設定とスケジューラという 5 つのまとまりに届きます。これらはすべてサーバとともに破棄されます。下端の HandlerContext は同じクラスのメンバー変数で、上のまとまりへの生ポインタだけを持ちます。破線は所有せずに参照することを表します。トランスポートへの破線がないのは、ハンドラがソケットに触れないためです。</desc>
+
+  <style>
+    .bg    { fill:#f7f5f1 }
+    .grp   { fill:#edeae4 }
+    .chip  { fill:#ffffff; stroke:#d7d4cd }
+    .card  { fill:#ffffff; stroke:#3f6b8a }
+    .alt   { fill:#ffffff; stroke:#8a6a1f }
+    .lnn   { fill:none; stroke:#b8b4ac; stroke-width:1.4 }
+    .lnq   { fill:none; stroke:#b8b4ac; stroke-width:1.4; stroke-dasharray:5 4 }
+    .ahn   { fill:#b8b4ac }
+    text   { font-family:Inter,"Helvetica Neue","Hiragino Sans","Noto Sans JP",Arial,sans-serif; fill:#1f2328 }
+    .h     { font-size:12.5px }
+    .lbl   { font-size:11px; fill:#6e7781; letter-spacing:.06em }
+    .s     { font-size:10.5px; fill:#6e7781 }
+    .mono  { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:10.5px; fill:#3f6b8a }
+    @media (prefers-color-scheme: dark) {
+      .bg{fill:#0d1117} .grp{fill:#12171d}
+      .chip{fill:#161b22;stroke:#30363d} .card{fill:#161b22;stroke:#7fb3d5} .alt{fill:#161b22;stroke:#d9b45c}
+      .lnn{stroke:#484f58} .lnq{stroke:#484f58} .ahn{fill:#484f58}
+      .mono{fill:#7fb3d5}
+      text{fill:#e6edf3} .lbl{fill:#8b949e} .s{fill:#8b949e}
+    }
+  </style>
+
+  <defs>
+    <marker id="c" markerUnits="userSpaceOnUse" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto">
+      <path class="ahn" d="M0,0 L9,4.5 L0,9 z"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="960" height="550" rx="12"/>
+
+  <rect class="chip" x="16" y="28" width="928" height="72" rx="8"/>
+  <text class="lbl" x="36" y="52">ルートオーナー</text>
+  <text class="h" x="36" y="76">NvecdServer</text>
+  <text class="s" x="232" y="52">以下のサブシステムはすべて、この 1 つのクラスのメンバーです。Start() で構築され、宣言と逆の順で破棄されます。</text>
+  <text class="s" x="232" y="70">多くは std::unique_ptr で保持しますが、config_、stats_、handler_ctx_、wal_ の 4 つは値メンバーです。</text>
+  <text class="s" x="232" y="88">ポインタではありませんが、所有していることに変わりはありません。</text>
+
+  <path class="lnn" d="M 498 100 V 148" marker-end="url(#c)"/>
+  <path class="lnn" d="M 104 124 H 854"/>
+  <path class="lnn" d="M 104 124 V 148" marker-end="url(#c)"/>
+  <path class="lnn" d="M 302 124 V 148" marker-end="url(#c)"/>
+  <path class="lnn" d="M 674 124 V 148" marker-end="url(#c)"/>
+  <path class="lnn" d="M 854 124 V 148" marker-end="url(#c)"/>
+  <text class="s" x="510" y="119">所有し、破棄する</text>
+
+  <rect class="grp" x="16" y="148" width="176" height="264" rx="8"/>
+  <text class="lbl" x="28" y="170">ストア</text>
+  <rect class="alt" x="28" y="182" width="152" height="26" rx="5"/>
+  <text class="s" x="104" y="199" text-anchor="middle">EventStore</text>
+  <rect class="alt" x="28" y="216" width="152" height="26" rx="5"/>
+  <text class="s" x="104" y="233" text-anchor="middle">CoOccurrenceIndex</text>
+  <rect class="card" x="28" y="250" width="152" height="26" rx="5"/>
+  <text class="s" x="104" y="267" text-anchor="middle">VectorStore</text>
+  <rect class="card" x="28" y="284" width="152" height="26" rx="5"/>
+  <text class="s" x="104" y="301" text-anchor="middle">MetadataStore</text>
+  <text class="s" x="28" y="342">4 つのストアは互いに</text>
+  <text class="s" x="28" y="358">独立している。イベント</text>
+  <text class="s" x="28" y="374">だけ、ベクトルだけ、</text>
+  <text class="s" x="28" y="390">その両方でもよい。</text>
+
+  <rect class="grp" x="204" y="148" width="196" height="264" rx="8"/>
+  <text class="lbl" x="216" y="170">エンジンとキャッシュ</text>
+  <rect class="card" x="216" y="182" width="172" height="26" rx="5"/>
+  <text class="s" x="302" y="199" text-anchor="middle">SimilarityEngine</text>
+  <path class="lnn" d="M 224 208 V 234 H 232" marker-end="url(#c)"/>
+  <rect class="card" x="232" y="216" width="156" height="38" rx="5"/>
+  <text class="s" x="310" y="233" text-anchor="middle">AnnIndex</text>
+  <text class="s" x="310" y="247" text-anchor="middle">flat · HNSW · IVF</text>
+  <rect class="chip" x="216" y="262" width="172" height="26" rx="5"/>
+  <text class="s" x="302" y="279" text-anchor="middle">SimilarityCacheController</text>
+  <path class="lnn" d="M 224 288 V 309 H 232" marker-end="url(#c)"/>
+  <rect class="chip" x="232" y="296" width="156" height="26" rx="5"/>
+  <text class="s" x="310" y="313" text-anchor="middle">SimilarityCache</text>
+  <text class="s" x="216" y="346">インデックス種別は</text>
+  <text class="mono" x="216" y="362">similarity.index_type</text>
+  <text class="s" x="216" y="378">で決まり、キャッシュを</text>
+  <text class="s" x="216" y="394">公開するのはコントローラだけ。</text>
+
+  <rect class="grp" x="412" y="148" width="172" height="264" rx="8"/>
+  <text class="lbl" x="424" y="170">通信とディスパッチ</text>
+  <rect class="chip" x="424" y="182" width="148" height="38" rx="5"/>
+  <text class="s" x="498" y="199" text-anchor="middle">ConnectionAcceptor</text>
+  <text class="s" x="498" y="214" text-anchor="middle">TCP と Unix の 2 つ</text>
+  <rect class="chip" x="424" y="228" width="148" height="26" rx="5"/>
+  <text class="s" x="498" y="245" text-anchor="middle">IoReactor</text>
+  <rect class="chip" x="424" y="262" width="148" height="26" rx="5"/>
+  <text class="s" x="498" y="279" text-anchor="middle">ThreadPool</text>
+  <rect class="chip" x="424" y="296" width="148" height="26" rx="5"/>
+  <text class="s" x="498" y="313" text-anchor="middle">RequestDispatcher</text>
+  <rect class="chip" x="424" y="330" width="148" height="26" rx="5"/>
+  <text class="s" x="498" y="347" text-anchor="middle">HttpServer</text>
+  <rect class="chip" x="424" y="364" width="148" height="26" rx="5"/>
+  <text class="s" x="498" y="381" text-anchor="middle">RateLimiter</text>
+
+  <rect class="grp" x="596" y="148" width="156" height="264" rx="8"/>
+  <text class="lbl" x="608" y="170">永続化</text>
+  <rect class="chip" x="608" y="182" width="132" height="26" rx="5"/>
+  <text class="s" x="674" y="199" text-anchor="middle">ForkSnapshotWriter</text>
+  <rect class="chip" x="608" y="216" width="132" height="26" rx="5"/>
+  <text class="s" x="674" y="233" text-anchor="middle">WriteAheadLog</text>
+  <text class="s" x="608" y="258">wal_ は値メンバーで、</text>
+  <text class="s" x="608" y="274">ポインタではない。</text>
+  <text class="s" x="608" y="290">ストアを満たした後に</text>
+  <text class="s" x="608" y="306">開かれる。</text>
+  <text class="s" x="608" y="330">SnapshotSession は</text>
+  <text class="s" x="608" y="346">メンバーではない。</text>
+  <text class="s" x="608" y="362">ライタが保存ごとに</text>
+  <text class="s" x="608" y="378">1 つ作り、子プロセス</text>
+  <text class="s" x="608" y="394">の終了で捨てる。</text>
+
+  <rect class="grp" x="764" y="148" width="180" height="264" rx="8"/>
+  <text class="lbl" x="776" y="170">設定とスケジューラ</text>
+  <rect class="chip" x="776" y="182" width="156" height="26" rx="5"/>
+  <text class="s" x="854" y="199" text-anchor="middle">Config</text>
+  <rect class="chip" x="776" y="216" width="156" height="26" rx="5"/>
+  <text class="s" x="854" y="233" text-anchor="middle">RuntimeVariableManager</text>
+  <rect class="chip" x="776" y="250" width="156" height="26" rx="5"/>
+  <text class="s" x="854" y="267" text-anchor="middle">SnapshotScheduler</text>
+  <rect class="chip" x="776" y="284" width="156" height="26" rx="5"/>
+  <text class="s" x="854" y="301" text-anchor="middle">DecayScheduler</text>
+  <text class="s" x="776" y="326">Config は値メンバー。</text>
+  <text class="s" x="776" y="342">各スケジューラは背景</text>
+  <text class="s" x="776" y="358">スレッドを 1 本持ち、</text>
+  <text class="s" x="776" y="374">Stop() でストアより先に</text>
+  <text class="s" x="776" y="390">join される。</text>
+
+  <path class="lnq" d="M 104 452 V 412" marker-end="url(#c)"/>
+  <path class="lnq" d="M 302 452 V 412" marker-end="url(#c)"/>
+  <path class="lnq" d="M 674 452 V 412" marker-end="url(#c)"/>
+  <path class="lnq" d="M 854 452 V 412" marker-end="url(#c)"/>
+  <text class="s" x="116" y="437">参照するだけ、所有しない</text>
+  <text class="s" x="498" y="437" text-anchor="middle">トランスポートへの参照はない</text>
+
+  <rect class="chip" x="16" y="452" width="928" height="64" rx="8"/>
+  <text class="lbl" x="36" y="476">非所有ビュー</text>
+  <text class="h" x="36" y="500">HandlerContext</text>
+  <text class="s" x="232" y="474">NvecdServer のメンバー変数であって、NvecdServer へのポインタではありません。ハンドラがストアを所有せず</text>
+  <text class="s" x="232" y="492">に参照できるよう、生ポインタを持ちます。共有カウンタ、世代番号、書き込みゲートも同じ場所にあります。</text>
+  <text class="s" x="232" y="510">サーバがハンドラより長く生きるので、ここにあるポインタはどのハンドラよりも長く有効です。</text>
+
+  <text class="s" x="480" y="534" text-anchor="middle">実線はサーバがそのオブジェクトを保持し破棄することを、破線はポインタを渡すだけであることを表します。</text>
+</svg>

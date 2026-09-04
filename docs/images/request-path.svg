@@ -1,0 +1,116 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 544" width="960" height="544" role="img" aria-labelledby="ttl dsc">
+  <title id="ttl">What a request crosses, and which thread runs each stage</title>
+  <desc id="dsc">Three stacked bands trace a TCP connection across three kinds of thread. An accept thread — one per listener, TCP and Unix socket alike — checks the network ACL and the connection limits, then registers the socket with a single reactor thread. The reactor watches every registered socket, hands a readable connection to the worker pool, and later writes the queued response back. A worker runs rate limiting, dispatch and the command handler. A separate band on the right shows the HTTP server, which has its own listener and thread pool and never enters the reactor. Both entry paths end at the same shared state.</desc>
+
+  <style>
+    .bg    { fill:#f7f5f1 }
+    .grp   { fill:#edeae4 }
+    .chip  { fill:#ffffff; stroke:#d7d4cd }
+    .card  { fill:#ffffff; stroke:#3f6b8a }
+    .alt   { fill:#ffffff; stroke:#8a6a1f }
+    .ln    { fill:none; stroke:#3f6b8a; stroke-width:1.4 }
+    .ah    { fill:#3f6b8a }
+    text   { font-family:Inter,"Helvetica Neue","Hiragino Sans","Noto Sans JP",Arial,sans-serif; fill:#1f2328 }
+    .lbl   { font-size:11px; fill:#6e7781; letter-spacing:.06em }
+    .s     { font-size:10.5px; fill:#6e7781 }
+    .mono  { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:10.5px; fill:#3f6b8a }
+    @media (prefers-color-scheme: dark) {
+      .bg{fill:#0d1117} .grp{fill:#12171d}
+      .chip{fill:#161b22;stroke:#30363d} .card{fill:#161b22;stroke:#7fb3d5} .alt{fill:#161b22;stroke:#d9b45c}
+      .ln{stroke:#7fb3d5} .ah{fill:#7fb3d5} .mono{fill:#7fb3d5}
+      text{fill:#e6edf3} .lbl{fill:#8b949e} .s{fill:#8b949e}
+    }
+  </style>
+
+  <defs>
+    <marker id="a" markerUnits="userSpaceOnUse" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto">
+      <path class="ah" d="M0,0 L9,4.5 L0,9 z"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="960" height="544" rx="12"/>
+
+  <rect class="grp" x="24" y="56" width="676" height="92" rx="8"/>
+  <text class="lbl" x="38" y="76">ACCEPT THREADS</text>
+  <text class="s" x="224" y="76">one per listener, blocking in accept()</text>
+  <rect class="chip" x="38" y="86" width="176" height="30" rx="5"/>
+  <text class="s" x="126" y="105" text-anchor="middle">ConnectionAcceptor (TCP)</text>
+  <rect class="chip" x="226" y="86" width="214" height="30" rx="5"/>
+  <text class="s" x="333" y="105" text-anchor="middle">ConnectionAcceptor (Unix socket)</text>
+  <text class="s" x="38" y="134">an accepted fd passes <tspan class="mono">allow_cidrs</tspan>, <tspan class="mono">max_connections</tspan> and the per-IP cap; a Unix-socket peer skips the ACL</text>
+
+  <path class="ln" d="M 126 148 V 172" marker-end="url(#a)"/>
+  <path class="ln" d="M 333 148 V 172" marker-end="url(#a)"/>
+
+  <rect class="grp" x="24" y="172" width="676" height="92" rx="8"/>
+  <text class="lbl" x="38" y="192">REACTOR THREAD</text>
+  <text class="s" x="224" y="192">single event loop; owns every registered socket</text>
+  <rect class="chip" x="38" y="202" width="160" height="30" rx="5"/>
+  <text class="s" x="118" y="221" text-anchor="middle">IoReactor event loop</text>
+  <rect class="chip" x="210" y="202" width="222" height="30" rx="5"/>
+  <text class="s" x="321" y="221" text-anchor="middle">EventMultiplexer · epoll / kqueue</text>
+  <rect class="chip" x="444" y="202" width="118" height="30" rx="5"/>
+  <text class="s" x="503" y="221" text-anchor="middle">CRLF framing</text>
+  <text class="s" x="38" y="250">dispatches a readable connection to the pool, and writes the queued response back</text>
+
+  <path class="ln" d="M 126 264 V 288" marker-end="url(#a)"/>
+  <path class="ln" d="M 600 288 V 264" marker-end="url(#a)"/>
+  <text class="s" x="610" y="280">response</text>
+
+  <rect class="grp" x="24" y="288" width="676" height="102" rx="8"/>
+  <text class="lbl" x="38" y="308">WORKER POOL</text>
+  <text class="s" x="224" y="308"><tspan class="mono">perf.thread_pool_size</tspan> workers; each runs one framed request end to end</text>
+  <rect class="chip" x="38" y="318" width="136" height="32" rx="5"/>
+  <text class="s" x="106" y="338" text-anchor="middle">DrainRequests</text>
+  <path class="ln" d="M 174 334 H 192" marker-end="url(#a)"/>
+  <rect class="chip" x="192" y="318" width="112" height="32" rx="5"/>
+  <text class="s" x="248" y="338" text-anchor="middle">RateLimiter</text>
+  <path class="ln" d="M 304 334 H 322" marker-end="url(#a)"/>
+  <rect class="chip" x="322" y="318" width="150" height="32" rx="5"/>
+  <text class="s" x="397" y="338" text-anchor="middle">RequestDispatcher</text>
+  <path class="ln" d="M 472 334 H 490" marker-end="url(#a)"/>
+  <rect class="chip" x="490" y="318" width="156" height="32" rx="5"/>
+  <text class="s" x="568" y="338" text-anchor="middle">command handler</text>
+  <text class="s" x="38" y="372">Dispatch parses with CommandParser, checks AUTH and the snapshot gates, then routes</text>
+
+  <rect class="grp" x="724" y="56" width="212" height="334" rx="8"/>
+  <text class="lbl" x="738" y="76">HTTP SERVER</text>
+  <text class="s" x="738" y="96">own listener and thread pool;</text>
+  <text class="s" x="738" y="111">it never enters the reactor</text>
+  <rect class="chip" x="738" y="126" width="184" height="30" rx="5"/>
+  <text class="s" x="830" y="145" text-anchor="middle">httplib listener</text>
+  <path class="ln" d="M 830 156 V 174" marker-end="url(#a)"/>
+  <rect class="chip" x="738" y="174" width="184" height="46" rx="5"/>
+  <text class="s" x="830" y="193" text-anchor="middle">pre-routing handler</text>
+  <text class="s" x="830" y="208" text-anchor="middle">allow_cidrs + RateLimiter</text>
+  <path class="ln" d="M 830 220 V 238" marker-end="url(#a)"/>
+  <rect class="chip" x="738" y="238" width="184" height="46" rx="5"/>
+  <text class="s" x="830" y="257" text-anchor="middle">JSON route handler</text>
+  <text class="s" x="830" y="272" text-anchor="middle">builds a Command</text>
+  <path class="ln" d="M 830 284 V 302" marker-end="url(#a)"/>
+  <rect class="chip" x="738" y="302" width="184" height="46" rx="5"/>
+  <text class="s" x="830" y="321" text-anchor="middle">ApplyWrite or</text>
+  <text class="s" x="830" y="336" text-anchor="middle">SimilarityEngine</text>
+  <text class="s" x="738" y="372">no CommandParser here</text>
+
+  <path class="ln" d="M 126 390 V 418" marker-end="url(#a)"/>
+  <path class="ln" d="M 830 390 V 418" marker-end="url(#a)"/>
+
+  <rect class="grp" x="24" y="418" width="912" height="84" rx="8"/>
+  <text class="lbl" x="38" y="438">SHARED STATE</text>
+  <text class="s" x="224" y="438">one HandlerContext; writes serialize on a single gate</text>
+  <rect class="alt" x="38" y="448" width="96" height="32" rx="5"/>
+  <text class="s" x="86" y="468" text-anchor="middle">EventStore</text>
+  <rect class="alt" x="146" y="448" width="136" height="32" rx="5"/>
+  <text class="s" x="214" y="468" text-anchor="middle">CoOccurrenceIndex</text>
+  <rect class="card" x="294" y="448" width="112" height="32" rx="5"/>
+  <text class="s" x="350" y="468" text-anchor="middle">VectorStore</text>
+  <rect class="card" x="418" y="448" width="172" height="32" rx="5"/>
+  <text class="s" x="504" y="468" text-anchor="middle">SimilarityEngine + ANN</text>
+  <rect class="chip" x="602" y="448" width="140" height="32" rx="5"/>
+  <text class="s" x="672" y="468" text-anchor="middle">SimilarityCache</text>
+  <rect class="chip" x="754" y="448" width="76" height="32" rx="5"/>
+  <text class="s" x="792" y="468" text-anchor="middle">WAL</text>
+
+  <text class="s" x="480" y="524" text-anchor="middle">Idle sockets stay with the reactor; a worker is occupied only while a request is being answered.</text>
+</svg>

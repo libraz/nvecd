@@ -1,0 +1,133 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 846" width="900" height="846" role="img" aria-labelledby="ttl dsc">
+  <title id="ttl">VECSET コマンド 1 件の書き込み経路と順序</title>
+  <desc id="dsc">VECSET コマンド 1 件が、受信から応答までにたどる経路を 6 つの帯で示しています。ベクトルストアは何かを書き込む前に、ID・各成分・次元を検証します。続いて、メモリ上のあらゆる変更よりも先に WAL レコードを追記します。そのあとでベクトルがコンパクト行列に入り、既存行の上書き、墓石スロットの再利用、新しい行の追加のいずれかとして格納され、L2 ノルムの事前計算と ID から行への対応表の更新が行われます。ANN インデックスの更新はそのあとで、所有者は SimilarityEngine です。何が起きるかはインデックス種別で変わります。最後の帯でベクトル世代を進め、該当項目のキャッシュを無効化して応答を返します。</desc>
+
+  <style>
+    .bg    { fill:#f7f5f1 }
+    .grp   { fill:#edeae4 }
+    .chip  { fill:#ffffff; stroke:#d7d4cd }
+    .card  { fill:#ffffff; stroke:#3f6b8a }
+    .ln    { fill:none; stroke:#3f6b8a; stroke-width:1.4 }
+    .ah    { fill:#3f6b8a }
+    text   { font-family:Inter,"Helvetica Neue","Hiragino Sans","Noto Sans JP",Arial,sans-serif; fill:#1f2328 }
+    .lbl   { font-size:11px; fill:#6e7781; letter-spacing:.06em }
+    .s     { font-size:10.5px; fill:#6e7781 }
+    .warnt { fill:#a3401f }
+    .mono  { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:10.5px; fill:#3f6b8a }
+    @media (prefers-color-scheme: dark) {
+      .bg{fill:#0d1117} .grp{fill:#12171d}
+      .chip{fill:#161b22;stroke:#30363d} .card{fill:#161b22;stroke:#7fb3d5}
+      .ln{stroke:#7fb3d5} .ah{fill:#7fb3d5} .mono{fill:#7fb3d5}
+      text{fill:#e6edf3} .lbl{fill:#8b949e} .s{fill:#8b949e} .warnt{fill:#e08a68}
+    }
+  </style>
+
+  <defs>
+    <marker id="a" markerUnits="userSpaceOnUse" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto">
+      <path class="ah" d="M0,0 L9,4.5 L0,9 z"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="900" height="846" rx="12"/>
+
+  <rect class="grp" x="24" y="48" width="852" height="76" rx="8"/>
+  <text class="lbl" x="38" y="68">解析とゲート</text>
+  <text class="s" x="150" y="68">HTTP ハンドラも同じ Command を組み立てて ApplyWrite を直接呼ぶ</text>
+  <rect class="card" x="38" y="78" width="196" height="32" rx="5"/>
+  <text class="mono" x="136" y="98" text-anchor="middle">VECSET &lt;id&gt; &lt;f1&gt; ... &lt;fN&gt;</text>
+  <path class="ln" d="M 234 94 H 252" marker-end="url(#a)"/>
+  <rect class="chip" x="252" y="78" width="150" height="32" rx="5"/>
+  <text class="s" x="327" y="98" text-anchor="middle">CommandParser</text>
+  <path class="ln" d="M 402 94 H 420" marker-end="url(#a)"/>
+  <rect class="chip" x="420" y="78" width="182" height="32" rx="5"/>
+  <text class="s" x="511" y="98" text-anchor="middle">AUTH とスナップショット判定</text>
+  <path class="ln" d="M 602 94 H 620" marker-end="url(#a)"/>
+  <rect class="chip" x="620" y="78" width="154" height="32" rx="5"/>
+  <text class="s" x="697" y="98" text-anchor="middle">書き込みゲート（排他）</text>
+
+  <path class="ln" d="M 136 124 V 148" marker-end="url(#a)"/>
+
+  <rect class="grp" x="24" y="148" width="852" height="88" rx="8"/>
+  <text class="lbl" x="38" y="168">検証</text>
+  <text class="s" x="150" y="168">VectorStore::ValidateVector — すべての検査を通るまで何も書き込まない</text>
+  <rect class="card" x="38" y="178" width="140" height="32" rx="5"/>
+  <text class="s" x="108" y="198" text-anchor="middle">id とベクトルが非空</text>
+  <path class="ln" d="M 178 194 H 196" marker-end="url(#a)"/>
+  <rect class="card" x="196" y="178" width="96" height="32" rx="5"/>
+  <text class="s" x="244" y="198" text-anchor="middle">全成分が有限</text>
+  <path class="ln" d="M 292 194 H 310" marker-end="url(#a)"/>
+  <rect class="card" x="310" y="178" width="114" height="32" rx="5"/>
+  <text class="s" x="367" y="198" text-anchor="middle">L2 ノルムが有限</text>
+  <path class="ln" d="M 424 194 H 442" marker-end="url(#a)"/>
+  <rect class="card" x="442" y="178" width="128" height="32" rx="5"/>
+  <text class="s" x="506" y="198" text-anchor="middle">次元がストアと一致</text>
+  <text class="s" x="38" y="226">最初のベクトルがストアの次元を確定し、以後の書き込みに適用される</text>
+
+  <path class="ln" d="M 136 236 V 254" marker-end="url(#a)"/>
+
+  <rect class="grp" x="24" y="254" width="852" height="100" rx="8"/>
+  <text class="lbl" x="38" y="274">永続化</text>
+  <text class="s warnt" x="150" y="274">WAL が先 — 行列・ANN インデックス・キャッシュのいずれよりも前にレコードが受理される</text>
+  <rect class="chip" x="38" y="284" width="200" height="32" rx="5"/>
+  <text class="s" x="138" y="304" text-anchor="middle">EncodeCommand でペイロード化</text>
+  <path class="ln" d="M 238 300 H 256" marker-end="url(#a)"/>
+  <rect class="chip" x="256" y="284" width="132" height="32" rx="5"/>
+  <text class="s" x="322" y="304" text-anchor="middle">Wal::Append</text>
+  <path class="ln" d="M 388 300 H 406" marker-end="url(#a)"/>
+  <rect class="chip" x="406" y="284" width="100" height="32" rx="5"/>
+  <text class="mono" x="456" y="304" text-anchor="middle">kVecSet</text>
+  <text class="s" x="38" y="338"><tspan class="mono">wal.include_vectors</tspan> が無効なら省略され、スナップショットがベクトルの耐久境界になる</text>
+
+  <path class="ln" d="M 136 354 V 378" marker-end="url(#a)"/>
+
+  <rect class="grp" x="24" y="378" width="852" height="132" rx="8"/>
+  <text class="lbl" x="38" y="398">コンパクトストア</text>
+  <text class="s" x="150" y="398">VectorStore::SetVector — 連続した float 行列に、生存ベクトル 1 件が 1 行として並ぶ</text>
+  <rect class="card" x="38" y="408" width="108" height="32" rx="5"/>
+  <text class="s" x="92" y="428" text-anchor="middle">既存行を上書き</text>
+  <rect class="card" x="160" y="408" width="160" height="32" rx="5"/>
+  <text class="s" x="240" y="428" text-anchor="middle">空き墓石スロットを再利用</text>
+  <rect class="card" x="334" y="408" width="108" height="32" rx="5"/>
+  <text class="s" x="388" y="428" text-anchor="middle">新しい行を追加</text>
+  <path class="ln" d="M 442 424 H 460" marker-end="url(#a)"/>
+  <rect class="card" x="460" y="408" width="136" height="32" rx="5"/>
+  <text class="s" x="528" y="428" text-anchor="middle">L2 ノルムを事前計算</text>
+  <text class="s" x="38" y="458">id に既存行があるか、空き墓石スロットがあるかで分岐が決まる</text>
+  <text class="s" x="38" y="476"><tspan class="mono">id_to_idx</tspan> と逆引きマップを更新し、ストア世代を進める</text>
+  <text class="s warnt" x="38" y="494">書き込み経路は正規化なしで SetVector を呼ぶため、ベクトルは送られたまま格納される</text>
+
+  <path class="ln" d="M 136 510 V 534" marker-end="url(#a)"/>
+
+  <rect class="grp" x="24" y="534" width="852" height="152" rx="8"/>
+  <text class="lbl" x="38" y="554">ANN インデックス</text>
+  <text class="s" x="150" y="554">所有者は SimilarityEngine で VectorStore ではない。ストア更新のあと、専用の公開ロック下で更新される</text>
+  <rect class="card" x="38" y="564" width="276" height="46" rx="5"/>
+  <text class="mono" x="176" y="583" text-anchor="middle">flat</text>
+  <text class="s" x="176" y="598" text-anchor="middle">挿入なし。検索は行列を走査</text>
+  <rect class="card" x="328" y="564" width="252" height="46" rx="5"/>
+  <text class="mono" x="454" y="583" text-anchor="middle">hnsw</text>
+  <text class="s" x="454" y="598" text-anchor="middle">Add(row, vector) で逐次挿入</text>
+  <rect class="card" x="594" y="564" width="252" height="46" rx="5"/>
+  <text class="mono" x="720" y="583" text-anchor="middle">ivf</text>
+  <text class="s" x="720" y="598" text-anchor="middle">AppendToBuffer、あとで封緘</text>
+  <text class="s" x="38" y="630">IVF の書き込みバッファは保守スレッドが封緘し、初回に必要となった時点で学習も行う</text>
+  <text class="s" x="38" y="648">ストア世代が 2 以上進んでいた場合は、コンパクト行列からインデックス全体を作り直す</text>
+  <text class="s" x="38" y="666">VECDEL は行を削除済みにするか、ストアが詰め直された場合は作り直しを強制する</text>
+
+  <path class="ln" d="M 136 686 V 710" marker-end="url(#a)"/>
+
+  <rect class="grp" x="24" y="710" width="852" height="94" rx="8"/>
+  <text class="lbl" x="38" y="730">無効化と応答</text>
+  <text class="s" x="150" y="730">ベクトル世代は SIM と SIMV のキャッシュキー双方に含まれる</text>
+  <rect class="chip" x="38" y="740" width="138" height="32" rx="5"/>
+  <text class="s" x="107" y="760" text-anchor="middle">ベクトル世代を進める</text>
+  <path class="ln" d="M 176 756 H 194" marker-end="url(#a)"/>
+  <rect class="chip" x="194" y="740" width="240" height="32" rx="5"/>
+  <text class="s" x="314" y="760" text-anchor="middle">SimilarityCache::InvalidateByItemId</text>
+  <path class="ln" d="M 434 756 H 452" marker-end="url(#a)"/>
+  <rect class="chip" x="452" y="740" width="106" height="32" rx="5"/>
+  <text class="mono" x="505" y="760" text-anchor="middle">OK VECSET</text>
+  <text class="s" x="38" y="790">ベクトルと同時にメタデータを送った場合は、絞り込み結果へ広く影響するためキャッシュ全体を破棄する</text>
+
+  <text class="s" x="450" y="828" text-anchor="middle">ANN インデックスは SimilarityEngine のもので、VectorStore が持つのは行列・ノルム・ID から行への対応表だけ。</text>
+</svg>

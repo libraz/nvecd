@@ -1,0 +1,137 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 900" width="960" height="900" role="img" aria-labelledby="ttl dsc">
+  <title id="ttl">How a fusion SIM query is answered</title>
+  <desc id="dsc">A top-to-bottom read path for a SIM query in fusion mode. The request is turned into a cache key that carries the query parameters and four generation counters; a lookup either hits, decompressing the stored top-k result, or misses. On a miss two retrieval arms run: a co-occurrence lookup and a vector search, each oversampled to three times top_k. Each source is min-max normalized to zero-to-one, the two are combined by a weighted sum, the metadata filter is re-applied and the list is cut to top_k. The result is written back to the cache only when the query cost exceeded a threshold, and the min_score cutoff is applied last, on both the hit and miss paths.</desc>
+
+  <style>
+    .bg    { fill:#f7f5f1 }
+    .grp   { fill:#edeae4 }
+    .chip  { fill:#ffffff; stroke:#d7d4cd }
+    .card  { fill:#ffffff; stroke:#3f6b8a }
+    .alt   { fill:#ffffff; stroke:#8a6a1f }
+    .ln    { fill:none; stroke:#3f6b8a; stroke-width:1.4 }
+    .ln2   { fill:none; stroke:#8a6a1f; stroke-width:1.4 }
+    .lnn   { fill:none; stroke:#b8b4ac; stroke-width:1.4 }
+    .lnq   { fill:none; stroke:#b8b4ac; stroke-width:1.4; stroke-dasharray:5 4 }
+    .ah    { fill:#3f6b8a }
+    .ah2   { fill:#8a6a1f }
+    .ahn   { fill:#b8b4ac }
+    text   { font-family:Inter,"Helvetica Neue","Hiragino Sans","Noto Sans JP",Arial,sans-serif; fill:#1f2328 }
+    .h     { font-size:12.5px }
+    .lbl   { font-size:11px; fill:#6e7781; letter-spacing:.06em }
+    .s     { font-size:10.5px; fill:#6e7781 }
+    .mono  { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:10.5px; fill:#3f6b8a }
+    @media (prefers-color-scheme: dark) {
+      .bg{fill:#0d1117} .grp{fill:#12171d}
+      .chip{fill:#161b22;stroke:#30363d} .card{fill:#161b22;stroke:#7fb3d5} .alt{fill:#161b22;stroke:#d9b45c}
+      .ln{stroke:#7fb3d5} .ln2{stroke:#d9b45c} .lnn{stroke:#484f58} .lnq{stroke:#484f58}
+      .ah{fill:#7fb3d5} .ah2{fill:#d9b45c} .ahn{fill:#484f58}
+      .mono{fill:#7fb3d5}
+      text{fill:#e6edf3} .lbl{fill:#8b949e} .s{fill:#8b949e}
+    }
+  </style>
+
+  <defs>
+    <marker id="a" markerUnits="userSpaceOnUse" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto">
+      <path class="ah" d="M0,0 L9,4.5 L0,9 z"/>
+    </marker>
+    <marker id="b" markerUnits="userSpaceOnUse" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto">
+      <path class="ah2" d="M0,0 L9,4.5 L0,9 z"/>
+    </marker>
+    <marker id="c" markerUnits="userSpaceOnUse" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto">
+      <path class="ahn" d="M0,0 L9,4.5 L0,9 z"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="960" height="900" rx="12"/>
+
+  <rect class="chip" x="260" y="44" width="440" height="56" rx="6"/>
+  <text class="mono" x="276" y="68">SIM item42 10 using=fusion filter=genre:jazz min_score=0.2</text>
+  <text class="s" x="276" y="86">top_k = 10 · the filter expression is parsed into a MetadataFilter</text>
+
+  <path class="lnn" d="M 480 100 V 118" marker-end="url(#c)"/>
+
+  <rect class="chip" x="260" y="118" width="440" height="72" rx="6"/>
+  <text class="lbl" x="276" y="140">CACHE KEY</text>
+  <text class="s" x="276" y="159">id · top_k · mode · adaptive · filter expression</text>
+  <text class="s" x="276" y="176">co-occurrence · vector · metadata · dataset generations</text>
+
+  <path class="lnn" d="M 480 190 V 212" marker-end="url(#c)"/>
+
+  <rect class="chip" x="280" y="212" width="400" height="50" rx="6"/>
+  <text class="h" x="480" y="234" text-anchor="middle">Cache lookup</text>
+  <text class="s" x="480" y="250" text-anchor="middle">keyed per search type: item · vector · filtered</text>
+
+  <path class="lnn" d="M 680 237 H 804 V 288" marker-end="url(#c)"/>
+  <text class="s" x="692" y="230">hit</text>
+
+  <path class="lnn" d="M 480 262 V 300" marker-end="url(#c)"/>
+  <text class="s" x="490" y="284">miss</text>
+
+  <rect class="chip" x="708" y="288" width="192" height="72" rx="6"/>
+  <text class="lbl" x="724" y="310">CACHE HIT</text>
+  <text class="s" x="724" y="329">decompress the stored</text>
+  <text class="s" x="724" y="345">top-k result (LZ4)</text>
+
+  <path class="lnn" d="M 804 360 V 754 H 700" marker-end="url(#c)"/>
+
+  <rect class="grp" x="260" y="300" width="440" height="186" rx="8"/>
+  <text class="lbl" x="276" y="321">RETRIEVAL</text>
+  <text class="mono" x="352" y="321">fetch_k = min(top_k × 3, similarity.max_top_k)</text>
+
+  <rect class="alt" x="276" y="332" width="196" height="84" rx="6"/>
+  <text class="lbl" x="290" y="353">CO-OCCURRENCE</text>
+  <text class="mono" x="290" y="372">GetSimilar(id, fetch_k)</text>
+  <text class="s" x="290" y="390">neighbours of the query</text>
+  <text class="s" x="290" y="405">item, metadata-filtered</text>
+
+  <rect class="card" x="488" y="332" width="196" height="84" rx="6"/>
+  <text class="lbl" x="502" y="353">VECTOR SEARCH</text>
+  <text class="mono" x="502" y="372">AnnIndex::Search</text>
+  <text class="s" x="502" y="390">HNSW or IVF; a full scan</text>
+  <text class="s" x="502" y="405">when the index is flat</text>
+
+  <path class="ln2" d="M 374 416 V 436" marker-end="url(#b)"/>
+  <path class="ln" d="M 586 416 V 436" marker-end="url(#a)"/>
+
+  <rect class="chip" x="276" y="436" width="408" height="34" rx="5"/>
+  <text class="s" x="480" y="457" text-anchor="middle">each source min–max normalized to [0, 1]</text>
+
+  <path class="lnn" d="M 480 486 V 506" marker-end="url(#c)"/>
+
+  <rect class="chip" x="260" y="506" width="440" height="92" rx="6"/>
+  <text class="lbl" x="276" y="528">WEIGHTED MERGE</text>
+  <text class="mono" x="276" y="548">score = α × vector + β × co-occurrence</text>
+  <text class="mono" x="276" y="565">similarity.fusion_alpha / similarity.fusion_beta</text>
+  <text class="s" x="276" y="583">or adaptive weights from the item's neighbour count</text>
+
+  <path class="lnn" d="M 480 598 V 618" marker-end="url(#c)"/>
+
+  <rect class="chip" x="260" y="618" width="440" height="72" rx="6"/>
+  <text class="lbl" x="276" y="640">FILTER AND TOP-K</text>
+  <text class="s" x="276" y="659">metadata filter re-applied over the merged candidates,</text>
+  <text class="s" x="276" y="675">then partial-sort and cut to top_k</text>
+
+  <rect class="chip" x="56" y="618" width="184" height="92" rx="6"/>
+  <text class="lbl" x="72" y="640">CACHE INSERT</text>
+  <text class="s" x="72" y="659">stored only when the</text>
+  <text class="s" x="72" y="675">query cost exceeds</text>
+  <text class="mono" x="72" y="694">cache.min_query_cost_ms</text>
+
+  <path class="lnq" d="M 260 654 H 240" marker-end="url(#c)"/>
+
+  <path class="lnn" d="M 480 690 V 718" marker-end="url(#c)"/>
+
+  <rect class="chip" x="260" y="718" width="440" height="72" rx="6"/>
+  <text class="lbl" x="276" y="740">SCORE CUTOFF</text>
+  <text class="mono" x="372" y="740">min_score</text>
+  <text class="s" x="276" y="759">applied after top-k selection and after the cache write,</text>
+  <text class="s" x="276" y="775">so it is not part of the cache key</text>
+
+  <path class="lnn" d="M 480 790 V 814" marker-end="url(#c)"/>
+
+  <rect class="chip" x="260" y="814" width="440" height="42" rx="6"/>
+  <text class="lbl" x="276" y="840">RESPONSE</text>
+  <text class="s" x="350" y="840">ranked (item_id, score) pairs</text>
+
+  <text class="s" x="480" y="882" text-anchor="middle">The key carries the co-occurrence, vector, metadata and dataset generations, so a write invalidates every affected entry without a scan.</text>
+</svg>

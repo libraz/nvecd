@@ -1,0 +1,151 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 816" width="900" height="816" role="img" aria-labelledby="ttl dsc">
+  <title id="ttl">How two score lists become one ranking</title>
+  <desc id="dsc">A worked example of fusion scoring for a single query item. The co-occurrence side and the vector side each return their own short candidate list, and each list is min-max normalized to the zero-to-one range independently, so the best candidate in a list becomes one and the worst becomes zero. The two normalized lists are then unioned and blended by a weighted sum, with the vector weight alpha and the co-occurrence weight beta taken from configuration. A final panel shows the adaptive variant, where alpha slides from its maximum down to its minimum as the query item accumulates co-occurrence neighbours.</desc>
+
+  <style>
+    .bg    { fill:#f7f5f1 }
+    .chip  { fill:#ffffff; stroke:#d7d4cd }
+    .card  { fill:#ffffff; stroke:#3f6b8a }
+    .alt   { fill:#ffffff; stroke:#8a6a1f }
+    .rule  { fill:none; stroke:#b8b4ac; stroke-width:1 }
+    .ln    { fill:none; stroke:#3f6b8a; stroke-width:1.4 }
+    .ln2   { fill:none; stroke:#8a6a1f; stroke-width:1.4 }
+    .lnn   { fill:none; stroke:#b8b4ac; stroke-width:1.4 }
+    .ah    { fill:#3f6b8a }
+    .ah2   { fill:#8a6a1f }
+    .ahn   { fill:#b8b4ac }
+    text   { font-family:Inter,"Helvetica Neue","Hiragino Sans","Noto Sans JP",Arial,sans-serif; fill:#1f2328 }
+    .lbl   { font-size:11px; fill:#6e7781; letter-spacing:.06em }
+    .s     { font-size:10.5px; fill:#6e7781 }
+    .mono  { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:10.5px; fill:#3f6b8a }
+    @media (prefers-color-scheme: dark) {
+      .bg{fill:#0d1117}
+      .chip{fill:#161b22;stroke:#30363d} .card{fill:#161b22;stroke:#7fb3d5} .alt{fill:#161b22;stroke:#d9b45c}
+      .rule{stroke:#484f58}
+      .ln{stroke:#7fb3d5} .ln2{stroke:#d9b45c} .lnn{stroke:#484f58}
+      .ah{fill:#7fb3d5} .ah2{fill:#d9b45c} .ahn{fill:#484f58}
+      .mono{fill:#7fb3d5}
+      text{fill:#e6edf3} .lbl{fill:#8b949e} .s{fill:#8b949e}
+    }
+  </style>
+
+  <defs>
+    <marker id="a" markerUnits="userSpaceOnUse" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto">
+      <path class="ah" d="M0,0 L9,4.5 L0,9 z"/>
+    </marker>
+    <marker id="b" markerUnits="userSpaceOnUse" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto">
+      <path class="ah2" d="M0,0 L9,4.5 L0,9 z"/>
+    </marker>
+    <marker id="c" markerUnits="userSpaceOnUse" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto">
+      <path class="ahn" d="M0,0 L9,4.5 L0,9 z"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="900" height="816" rx="12"/>
+
+  <rect class="chip" x="300" y="24" width="300" height="32" rx="6"/>
+  <text class="mono" x="450" y="44" text-anchor="middle">SIM item42 3 using=fusion</text>
+
+  <path class="lnn" d="M 450 56 V 68"/>
+  <path class="rule" d="M 243 68 H 657"/>
+  <path class="ln2" d="M 243 68 V 88" marker-end="url(#b)"/>
+  <path class="ln" d="M 657 68 V 88" marker-end="url(#a)"/>
+
+  <rect class="alt" x="48" y="88" width="390" height="152" rx="8"/>
+  <text class="lbl" x="64" y="110">CO-OCCURRENCE</text>
+  <text class="s" x="64" y="132">item</text>
+  <text class="s" x="250" y="132" text-anchor="end">raw</text>
+  <text class="s" x="418" y="132" text-anchor="end">normalized to [0, 1]</text>
+  <path class="rule" d="M 64 140 H 422"/>
+  <text class="mono" x="64" y="159">itemB</text>
+  <text class="mono" x="250" y="159" text-anchor="end">180</text>
+  <text class="mono" x="418" y="159" text-anchor="end">1.00</text>
+  <text class="mono" x="64" y="179">itemD</text>
+  <text class="mono" x="250" y="179" text-anchor="end">120</text>
+  <text class="mono" x="418" y="179" text-anchor="end">0.50</text>
+  <text class="mono" x="64" y="199">itemE</text>
+  <text class="mono" x="250" y="199" text-anchor="end">60</text>
+  <text class="mono" x="418" y="199" text-anchor="end">0.00</text>
+  <text class="s" x="64" y="225">min–max: (raw − 60) / 120</text>
+
+  <rect class="card" x="462" y="88" width="390" height="152" rx="8"/>
+  <text class="lbl" x="478" y="110">VECTOR SIMILARITY</text>
+  <text class="s" x="478" y="132">item</text>
+  <text class="s" x="664" y="132" text-anchor="end">cosine</text>
+  <text class="s" x="832" y="132" text-anchor="end">normalized to [0, 1]</text>
+  <path class="rule" d="M 478 140 H 836"/>
+  <text class="mono" x="478" y="159">itemC</text>
+  <text class="mono" x="664" y="159" text-anchor="end">0.94</text>
+  <text class="mono" x="832" y="159" text-anchor="end">1.00</text>
+  <text class="mono" x="478" y="179">itemB</text>
+  <text class="mono" x="664" y="179" text-anchor="end">0.86</text>
+  <text class="mono" x="832" y="179" text-anchor="end">0.60</text>
+  <text class="mono" x="478" y="199">itemD</text>
+  <text class="mono" x="664" y="199" text-anchor="end">0.74</text>
+  <text class="mono" x="832" y="199" text-anchor="end">0.00</text>
+  <text class="s" x="478" y="225">min–max: (cos − 0.74) / 0.20</text>
+
+  <path class="ln2" d="M 243 240 V 272" marker-end="url(#b)"/>
+  <path class="ln" d="M 657 240 V 272" marker-end="url(#a)"/>
+
+  <rect class="chip" x="48" y="272" width="804" height="84" rx="8"/>
+  <text class="lbl" x="64" y="294">BLEND</text>
+  <text class="mono" x="124" y="294">score = α × vector + β × co-occurrence</text>
+  <text class="mono" x="64" y="318">α = similarity.fusion_alpha = 0.6</text>
+  <text class="mono" x="440" y="318">β = similarity.fusion_beta = 0.4</text>
+  <text class="s" x="64" y="338">one empty source list: its weight is dropped and the other takes 1; otherwise α and β are scaled to sum to 1</text>
+
+  <path class="lnn" d="M 450 356 V 388" marker-end="url(#c)"/>
+
+  <rect class="chip" x="48" y="388" width="804" height="174" rx="8"/>
+  <text class="lbl" x="64" y="410">FUSED RANKING</text>
+  <text class="s" x="64" y="432">item</text>
+  <text class="s" x="260" y="432" text-anchor="end">co-occ</text>
+  <text class="s" x="400" y="432" text-anchor="end">vector</text>
+  <text class="s" x="440" y="432">0.6 × vector + 0.4 × co-occ</text>
+  <text class="s" x="836" y="432" text-anchor="end">fused</text>
+  <path class="rule" d="M 64 440 H 836"/>
+  <text class="mono" x="64" y="459">itemB</text>
+  <text class="mono" x="260" y="459" text-anchor="end">1.00</text>
+  <text class="mono" x="400" y="459" text-anchor="end">0.60</text>
+  <text class="mono" x="440" y="459">0.6 × 0.60 + 0.4 × 1.00</text>
+  <text class="mono" x="836" y="459" text-anchor="end">0.76</text>
+  <text class="mono" x="64" y="479">itemC</text>
+  <text class="mono" x="260" y="479" text-anchor="end">—</text>
+  <text class="mono" x="400" y="479" text-anchor="end">1.00</text>
+  <text class="mono" x="440" y="479">0.6 × 1.00 + 0.4 × 0</text>
+  <text class="mono" x="836" y="479" text-anchor="end">0.60</text>
+  <text class="mono" x="64" y="499">itemD</text>
+  <text class="mono" x="260" y="499" text-anchor="end">0.50</text>
+  <text class="mono" x="400" y="499" text-anchor="end">0.00</text>
+  <text class="mono" x="440" y="499">0.6 × 0.00 + 0.4 × 0.50</text>
+  <text class="mono" x="836" y="499" text-anchor="end">0.20</text>
+  <text class="mono" x="64" y="519">itemE</text>
+  <text class="mono" x="260" y="519" text-anchor="end">0.00</text>
+  <text class="mono" x="400" y="519" text-anchor="end">—</text>
+  <text class="mono" x="440" y="519">0.6 × 0 + 0.4 × 0.00</text>
+  <text class="mono" x="836" y="519" text-anchor="end">0.00</text>
+  <text class="s" x="64" y="545">— is an item absent from that list, contributing 0; itemB ranks first by appearing in both, itemC rides on the vector side alone</text>
+
+  <rect class="chip" x="48" y="594" width="804" height="176" rx="8"/>
+  <text class="lbl" x="64" y="616">ADAPTIVE WEIGHTS</text>
+  <text class="mono" x="196" y="616">similarity.adaptive_fusion</text>
+  <text class="mono" x="64" y="640">α = adaptive_max_alpha − min(1, n / adaptive_maturity_threshold) × (adaptive_max_alpha − adaptive_min_alpha)</text>
+  <text class="mono" x="64" y="658">β = 1 − α</text>
+  <text class="s" x="152" y="658">n = the query item's co-occurrence neighbour count</text>
+  <text class="mono" x="64" y="678">adaptive_max_alpha = 0.9 · adaptive_min_alpha = 0.2 · adaptive_maturity_threshold = 50</text>
+
+  <rect class="chip" x="64" y="696" width="248" height="54" rx="5"/>
+  <text class="mono" x="80" y="716">n = 5   →  α 0.83, β 0.17</text>
+  <text class="s" x="80" y="734">new item: the vector score leads</text>
+
+  <rect class="chip" x="328" y="696" width="248" height="54" rx="5"/>
+  <text class="mono" x="344" y="716">n = 25  →  α 0.55, β 0.45</text>
+  <text class="s" x="344" y="734">half-mature: the two balance</text>
+
+  <rect class="chip" x="592" y="696" width="244" height="54" rx="5"/>
+  <text class="mono" x="608" y="716">n ≥ 50  →  α 0.20, β 0.80</text>
+  <text class="s" x="608" y="734">mature: co-occurrence leads</text>
+
+  <text class="s" x="450" y="794" text-anchor="middle">The two lists are unioned, not intersected: a candidate in only one list still ranks, with the absent side contributing zero.</text>
+</svg>

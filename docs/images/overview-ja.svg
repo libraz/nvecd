@@ -1,0 +1,115 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 404" width="960" height="404" role="img" aria-labelledby="ttl dsc">
+  <title id="ttl">2 つの信号と、1 本の順位</title>
+  <desc id="dsc">アプリケーションは、独立した 2 つの信号を 1 つの nvecd プロセスに書き込みます。EVENT は「何が起きたか」を記録してイベントストアと共起インデックスを育て、VECSET は「その項目がどんなものか」を記録してベクトルストアと ANN インデックスを育てます。SIM や SIMV による問い合わせは、同じ問いが繰り返されたときはキャッシュから、そうでなければ類似度エンジンから返ります。エンジンはイベントだけ、ベクトルだけ、その重み付き融合のいずれかで並べ替えます。答えは item と score の順位付きリストとしてアプリケーションへ戻ります。</desc>
+
+  <style>
+    .bg    { fill:#f7f5f1 }
+    .grp   { fill:#edeae4 }
+    .chip  { fill:#ffffff; stroke:#d7d4cd }
+    .card  { fill:#ffffff; stroke:#3f6b8a }
+    .alt   { fill:#ffffff; stroke:#8a6a1f }
+    .ln    { fill:none; stroke:#3f6b8a; stroke-width:1.4 }
+    .ln2   { fill:none; stroke:#8a6a1f; stroke-width:1.4 }
+    .lnn   { fill:none; stroke:#b8b4ac; stroke-width:1.4 }
+    .lnq   { fill:none; stroke:#b8b4ac; stroke-width:1.4; stroke-dasharray:5 4 }
+    .ah    { fill:#3f6b8a }
+    .ah2   { fill:#8a6a1f }
+    .ahn   { fill:#b8b4ac }
+    text   { font-family:Inter,"Helvetica Neue","Hiragino Sans","Noto Sans JP",Arial,sans-serif; fill:#1f2328 }
+    .h     { font-size:12.5px }
+    .lbl   { font-size:11px; fill:#6e7781; letter-spacing:.06em }
+    .s     { font-size:10.5px; fill:#6e7781 }
+    .mono  { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:10.5px; fill:#3f6b8a }
+    @media (prefers-color-scheme: dark) {
+      .bg{fill:#0d1117} .grp{fill:#12171d}
+      .chip{fill:#161b22;stroke:#30363d} .card{fill:#161b22;stroke:#7fb3d5} .alt{fill:#161b22;stroke:#d9b45c}
+      .ln{stroke:#7fb3d5} .ln2{stroke:#d9b45c} .lnn{stroke:#484f58} .lnq{stroke:#484f58}
+      .ah{fill:#7fb3d5} .ah2{fill:#d9b45c} .ahn{fill:#484f58}
+      .mono{fill:#7fb3d5}
+      text{fill:#e6edf3} .lbl{fill:#8b949e} .s{fill:#8b949e}
+    }
+  </style>
+
+  <defs>
+    <marker id="a" markerUnits="userSpaceOnUse" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto">
+      <path class="ah" d="M0,0 L9,4.5 L0,9 z"/>
+    </marker>
+    <marker id="b" markerUnits="userSpaceOnUse" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto">
+      <path class="ah2" d="M0,0 L9,4.5 L0,9 z"/>
+    </marker>
+    <marker id="c" markerUnits="userSpaceOnUse" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto">
+      <path class="ahn" d="M0,0 L9,4.5 L0,9 z"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="960" height="404" rx="12"/>
+
+  <rect class="chip" x="396" y="14" width="192" height="52" rx="6"/>
+  <text class="h" x="492" y="36" text-anchor="middle">SimilarityCache</text>
+  <text class="s" x="492" y="54" text-anchor="middle">同じ問い合わせは再計算しない</text>
+
+  <path class="lnn" d="M 100 92 V 30 H 396" marker-end="url(#c)"/>
+  <text class="mono" x="216" y="24">SIM / SIMV</text>
+
+  <path class="lnq" d="M 396 54 H 132 V 92" marker-end="url(#c)"/>
+  <text class="s" x="216" y="70">キャッシュヒット</text>
+
+  <path class="lnn" d="M 588 30 H 752 V 92" marker-end="url(#c)"/>
+  <text class="s" x="616" y="24">未ヒット</text>
+
+  <rect class="chip" x="24" y="92" width="160" height="224" rx="8"/>
+  <text class="lbl" x="38" y="118">アプリケーション</text>
+  <text class="s" x="38" y="148">起きたことと、</text>
+  <text class="s" x="38" y="164">項目の見た目を</text>
+  <text class="s" x="38" y="180">両方書き込む</text>
+  <text class="s" x="38" y="236">そのうえで、</text>
+  <text class="s" x="38" y="252">ある項目に近い</text>
+  <text class="s" x="38" y="268">ものを尋ねる</text>
+
+  <rect class="grp" x="248" y="92" width="372" height="104" rx="8"/>
+  <text class="lbl" x="264" y="114">イベント信号</text>
+  <rect class="alt" x="264" y="126" width="152" height="56" rx="6"/>
+  <text class="h" x="340" y="150" text-anchor="middle">EventStore</text>
+  <text class="s" x="340" y="168" text-anchor="middle">コンテキスト別の履歴</text>
+  <rect class="alt" x="452" y="126" width="152" height="56" rx="6"/>
+  <text class="h" x="528" y="150" text-anchor="middle">CoOccurrenceIndex</text>
+  <text class="s" x="528" y="168" text-anchor="middle">同時に現れた回数</text>
+
+  <rect class="grp" x="248" y="212" width="372" height="104" rx="8"/>
+  <text class="lbl" x="264" y="234">ベクトル信号</text>
+  <rect class="card" x="264" y="246" width="152" height="56" rx="6"/>
+  <text class="h" x="340" y="270" text-anchor="middle">VectorStore</text>
+  <text class="s" x="340" y="288" text-anchor="middle">項目ごとに 1 本</text>
+  <rect class="card" x="452" y="246" width="152" height="56" rx="6"/>
+  <text class="h" x="528" y="270" text-anchor="middle">AnnIndex</text>
+  <text class="s" x="528" y="288" text-anchor="middle">flat / HNSW / IVF</text>
+
+  <path class="ln2" d="M 184 154 H 264" marker-end="url(#b)"/>
+  <text class="mono" x="196" y="148">EVENT</text>
+  <path class="ln" d="M 184 274 H 264" marker-end="url(#a)"/>
+  <text class="mono" x="196" y="268">VECSET</text>
+
+  <path class="ln2" d="M 416 154 H 452" marker-end="url(#b)"/>
+  <path class="ln" d="M 416 274 H 452" marker-end="url(#a)"/>
+
+  <path class="ln2" d="M 604 154 H 664" marker-end="url(#b)"/>
+  <path class="ln" d="M 604 274 H 664" marker-end="url(#a)"/>
+
+  <rect class="card" x="664" y="92" width="176" height="224" rx="8"/>
+  <text class="lbl" x="680" y="118">検索</text>
+  <text class="h" x="680" y="142">SimilarityEngine</text>
+  <text class="s" x="680" y="164">2 つの信号を</text>
+  <text class="s" x="680" y="180">1 本の順位に統合</text>
+  <text class="lbl" x="680" y="210">SIM のモード</text>
+  <rect class="chip" x="680" y="220" width="144" height="24" rx="5"/>
+  <text class="mono" x="752" y="236" text-anchor="middle">events</text>
+  <rect class="chip" x="680" y="250" width="144" height="24" rx="5"/>
+  <text class="mono" x="752" y="266" text-anchor="middle">vectors</text>
+  <rect class="chip" x="680" y="280" width="144" height="24" rx="5"/>
+  <text class="mono" x="752" y="296" text-anchor="middle">fusion</text>
+
+  <path class="lnn" d="M 840 204 H 890 V 348 H 140 V 316" marker-end="url(#c)"/>
+  <text class="s" x="515" y="340" text-anchor="middle">item と score の順位付きリスト</text>
+
+  <text class="s" x="480" y="384" text-anchor="middle">2 つの信号は独立しています。イベントだけ、ベクトルだけ、その両方、どれでも項目は見つかります。</text>
+</svg>

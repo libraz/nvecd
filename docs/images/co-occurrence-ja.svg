@@ -1,0 +1,142 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 640" width="900" height="640" role="img" aria-labelledby="ttl dsc">
+  <title id="ttl">コンテキストごとのイベント列から項目間スコアへ</title>
+  <desc id="dsc">ユーザーやセッションといったコンテキスト ID ごとに、直近のイベントを保持するリングバッファが 3 つ並んでいます。1 つのコンテキスト内の項目ペアは、2 つのイベント重みの積を対称な項目間スコアへ両方向に書き込むため、多くのコンテキストで見られたペアほど高いスコアになります。時間減衰を有効にすると、各寄与にはペアの 2 件のイベント間隔を半減期で割った値の 2 のべき乗が掛かるため、1 日離れたペアの寄与は半分になります。項目ごとの近傍数の上限と最小支持度の下限という 2 つの設定値が、後段の別処理ではなく更新と同じ書き込みロック内で行列そのものを制約します。</desc>
+
+  <style>
+    .bg    { fill:#f7f5f1 }
+    .grp   { fill:#edeae4 }
+    .chip  { fill:#ffffff; stroke:#d7d4cd }
+    .alt   { fill:#ffffff; stroke:#8a6a1f }
+    .rule  { fill:none; stroke:#b8b4ac; stroke-width:1 }
+    .ln2   { fill:none; stroke:#8a6a1f; stroke-width:1.4 }
+    .lnq   { fill:none; stroke:#b8b4ac; stroke-width:1.4; stroke-dasharray:5 4 }
+    .ah2   { fill:#8a6a1f }
+    .ahn   { fill:#b8b4ac }
+    .warn  { fill:none; stroke:#a3401f; stroke-width:1.6 }
+    text   { font-family:Inter,"Helvetica Neue","Hiragino Sans","Noto Sans JP",Arial,sans-serif; fill:#1f2328 }
+    .lbl   { font-size:11px; fill:#6e7781; letter-spacing:.06em }
+    .s     { font-size:10.5px; fill:#6e7781 }
+    .mono  { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:10.5px; fill:#3f6b8a }
+    @media (prefers-color-scheme: dark) {
+      .bg{fill:#0d1117} .grp{fill:#12171d}
+      .chip{fill:#161b22;stroke:#30363d} .alt{fill:#161b22;stroke:#d9b45c}
+      .rule{stroke:#484f58}
+      .ln2{stroke:#d9b45c} .lnq{stroke:#484f58}
+      .ah2{fill:#d9b45c} .ahn{fill:#484f58}
+      .warn{stroke:#e08a68}
+      .mono{fill:#7fb3d5}
+      text{fill:#e6edf3} .lbl{fill:#8b949e} .s{fill:#8b949e}
+    }
+  </style>
+
+  <defs>
+    <marker id="b" markerUnits="userSpaceOnUse" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto">
+      <path class="ah2" d="M0,0 L9,4.5 L0,9 z"/>
+    </marker>
+    <marker id="c" markerUnits="userSpaceOnUse" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto">
+      <path class="ahn" d="M0,0 L9,4.5 L0,9 z"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="900" height="640" rx="12"/>
+
+  <rect class="grp" x="48" y="64" width="804" height="172" rx="8"/>
+  <text class="lbl" x="64" y="86">コンテキスト</text>
+  <text class="s" x="160" y="86">コンテキスト ID ごとに直近イベントを保持するリングバッファ（ユーザー、セッションなど）</text>
+  <text class="mono" x="648" y="86">events.ctx_buffer_size</text>
+
+  <rect class="alt" x="64" y="100" width="248" height="120" rx="6"/>
+  <text class="mono" x="80" y="121">ctx user:1</text>
+  <text class="s" x="80" y="140">item</text>
+  <text class="s" x="204" y="140" text-anchor="end">スコア</text>
+  <text class="s" x="296" y="140" text-anchor="end">時刻</text>
+  <path class="rule" d="M 80 147 H 296"/>
+  <text class="mono" x="80" y="166">itemA</text>
+  <text class="mono" x="204" y="166" text-anchor="end">2</text>
+  <text class="mono" x="296" y="166" text-anchor="end">0s</text>
+  <text class="mono" x="80" y="184">itemB</text>
+  <text class="mono" x="204" y="184" text-anchor="end">3</text>
+  <text class="mono" x="296" y="184" text-anchor="end">0s</text>
+  <text class="mono" x="80" y="202">itemC</text>
+  <text class="mono" x="204" y="202" text-anchor="end">1</text>
+  <text class="mono" x="296" y="202" text-anchor="end">0s</text>
+
+  <rect class="alt" x="328" y="100" width="248" height="120" rx="6"/>
+  <text class="mono" x="344" y="121">ctx user:2</text>
+  <text class="s" x="344" y="140">item</text>
+  <text class="s" x="468" y="140" text-anchor="end">スコア</text>
+  <text class="s" x="560" y="140" text-anchor="end">時刻</text>
+  <path class="rule" d="M 344 147 H 560"/>
+  <text class="mono" x="344" y="166">itemA</text>
+  <text class="mono" x="468" y="166" text-anchor="end">2</text>
+  <text class="mono" x="560" y="166" text-anchor="end">0s</text>
+  <text class="mono" x="344" y="184">itemB</text>
+  <text class="mono" x="468" y="184" text-anchor="end">2</text>
+  <text class="mono" x="560" y="184" text-anchor="end">1d</text>
+  <text class="s" x="344" y="204">1 日差 → 減衰あり</text>
+
+  <rect class="alt" x="592" y="100" width="244" height="120" rx="6"/>
+  <text class="mono" x="608" y="121">ctx user:3</text>
+  <text class="s" x="608" y="140">item</text>
+  <text class="s" x="728" y="140" text-anchor="end">スコア</text>
+  <text class="s" x="820" y="140" text-anchor="end">時刻</text>
+  <path class="rule" d="M 608 147 H 820"/>
+  <text class="mono" x="608" y="166">itemB</text>
+  <text class="mono" x="728" y="166" text-anchor="end">1</text>
+  <text class="mono" x="820" y="166" text-anchor="end">0s</text>
+  <text class="mono" x="608" y="184">itemC</text>
+  <text class="mono" x="728" y="184" text-anchor="end">2</text>
+  <text class="mono" x="820" y="184" text-anchor="end">0s</text>
+
+  <path class="ln2" d="M 188 220 V 244"/>
+  <path class="ln2" d="M 452 220 V 244"/>
+  <path class="ln2" d="M 714 220 V 244"/>
+  <path class="rule" d="M 188 244 H 714"/>
+  <path class="ln2" d="M 302 244 V 268" marker-end="url(#b)"/>
+
+  <rect class="chip" x="48" y="268" width="508" height="210" rx="8"/>
+  <text class="lbl" x="64" y="290">項目間スコア</text>
+  <text class="mono" x="64" y="312">score(i, j) += w(i) × w(j)</text>
+  <text class="s" x="64" y="331">コンテキスト内の全ペアを合算し、両方向に書き込む</text>
+  <text class="s" x="64" y="357">ペア</text>
+  <text class="s" x="190" y="357">コンテキスト</text>
+  <text class="s" x="300" y="357">寄与</text>
+  <text class="s" x="540" y="357" text-anchor="end">スコア</text>
+  <path class="rule" d="M 64 365 H 540"/>
+  <text class="mono" x="64" y="389">itemA – itemB</text>
+  <text class="mono" x="190" y="389">user:1, 2</text>
+  <text class="mono" x="300" y="389">2×3 = 6, 2×2 = 4</text>
+  <text class="mono" x="540" y="389" text-anchor="end">10</text>
+  <text class="mono" x="64" y="411">itemB – itemC</text>
+  <text class="mono" x="190" y="411">user:1, 3</text>
+  <text class="mono" x="300" y="411">3×1 = 3, 1×2 = 2</text>
+  <text class="mono" x="540" y="411" text-anchor="end">5</text>
+  <text class="mono" x="64" y="433">itemA – itemC</text>
+  <text class="mono" x="190" y="433">user:1</text>
+  <text class="mono" x="300" y="433">2×1 = 2</text>
+  <text class="mono" x="540" y="433" text-anchor="end">2</text>
+  <text class="s" x="64" y="459">多くのコンテキストで見られたペアほど高いスコアになる</text>
+
+  <rect class="chip" x="580" y="268" width="272" height="188" rx="8"/>
+  <text class="lbl" x="596" y="290">時間減衰</text>
+  <text class="mono" x="596" y="311">events.temporal_cooccurrence</text>
+  <text class="mono" x="596" y="328">events.temporal_half_life_sec</text>
+  <text class="mono" x="596" y="352">contribution × 2^(−Δt / H)</text>
+  <text class="s" x="596" y="371">Δt = ペアの 2 件の</text>
+  <text class="s" x="596" y="386">イベント間隔、H = 半減期</text>
+  <text class="s" x="596" y="406">user:2 では 1 日差のため</text>
+  <text class="s" x="596" y="421">4 → 2 となり、itemA–itemB</text>
+  <text class="s" x="596" y="436">の合計は 10 ではなく 8</text>
+
+  <path class="lnq" d="M 580 300 H 556" marker-end="url(#c)"/>
+
+  <rect class="warn" x="48" y="502" width="804" height="88" rx="8"/>
+  <text class="lbl" x="64" y="524">行列に対する上限</text>
+  <text class="s" x="228" y="524">更新と同じ書き込みロック内で、触れた項目ごとに適用される（後段の別処理ではない）</text>
+  <text class="mono" x="64" y="550">events.max_neighbors_per_item</text>
+  <text class="s" x="272" y="550">項目ごとに絶対値の大きい近傍だけを残す</text>
+  <text class="mono" x="64" y="572">events.min_support</text>
+  <text class="s" x="272" y="572">大きさが下限を割ったエッジを両方向から削除する</text>
+
+  <text class="s" x="450" y="616" text-anchor="middle">クエリに返されるのは正のスコアだけですが、行列は負のシグナルの値も保持するため、スナップショットの往復でも失われません。</text>
+</svg>

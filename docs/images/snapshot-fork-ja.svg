@@ -1,0 +1,138 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 990" width="960" height="990" role="img" aria-labelledby="ttl dsc">
+  <title id="ttl">fork によるスナップショットの書き出しと永続化</title>
+  <desc id="dsc">2 本のプロセスレーンを上から下へ時間順に並べた図です。親プロセス側は、契機、WAL シーケンスを取得するストアのロックバリア、fork、4 つのロックの即時解放、そして子の終了後に走る永続化ハンドシェイクを示します。フォーク子プロセス側は、引き継いだロックの初期化、記述子の close、シグナルハンドラの初期化、全ストアの直列化、終了までを示します。左側の括弧は、親がロックを保持するのはバリアから fork までだけであることを表し、下段の帯はディスク上の 3 つのファイル、スナップショット、チェックポイントサイドカー、ライトアヘッドログを表します。</desc>
+
+  <style>
+    .bg    { fill:#f7f5f1 }
+    .grp   { fill:#edeae4 }
+    .chip  { fill:#ffffff; stroke:#d7d4cd }
+    .seam  { fill:none; stroke:#b8b4ac; stroke-dasharray:6 5 }
+    .rule  { fill:none; stroke:#b8b4ac; stroke-width:1 }
+    .ln    { fill:none; stroke:#3f6b8a; stroke-width:1.4 }
+    .ah    { fill:#3f6b8a }
+    text   { font-family:Inter,"Helvetica Neue","Hiragino Sans","Noto Sans JP",Arial,sans-serif; fill:#1f2328 }
+    .h     { font-size:12.5px }
+    .lbl   { font-size:11px; fill:#6e7781; letter-spacing:.06em }
+    .s     { font-size:10.5px; fill:#6e7781 }
+    .mono  { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:10.5px; fill:#3f6b8a }
+    @media (prefers-color-scheme: dark) {
+      .bg{fill:#0d1117} .grp{fill:#12171d}
+      .chip{fill:#161b22;stroke:#30363d}
+      .seam{stroke:#484f58} .rule{stroke:#484f58}
+      .ln{stroke:#7fb3d5} .ah{fill:#7fb3d5} .mono{fill:#7fb3d5}
+      text{fill:#e6edf3} .lbl{fill:#8b949e} .s{fill:#8b949e}
+    }
+  </style>
+
+  <defs>
+    <marker id="a" markerUnits="userSpaceOnUse" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto">
+      <path class="ah" d="M0,0 L9,4.5 L0,9 z"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="960" height="990" rx="12"/>
+
+  <rect class="grp" x="36" y="32" width="436" height="778" rx="8"/>
+  <rect class="grp" x="496" y="32" width="432" height="656" rx="8"/>
+  <text class="lbl" x="52" y="52">親プロセス</text>
+  <text class="lbl" x="512" y="52">フォーク子プロセス</text>
+
+  <path class="rule" d="M 28 134 H 18 V 374 H 28"/>
+  <text class="lbl" x="13" y="254" text-anchor="middle" transform="rotate(-90 13 254)">ロック保持はバリアから fork() まで</text>
+
+  <rect class="chip" x="52" y="66" width="404" height="52" rx="6"/>
+  <text class="h" x="64" y="88">スナップショット要求</text>
+  <text class="mono" x="64" y="106">DUMP SAVE</text>
+  <text class="s" x="129" y="106">または自動スナップショットの周期</text>
+
+  <rect class="chip" x="52" y="134" width="404" height="76" rx="6"/>
+  <text class="h" x="64" y="156">ストアのロックバリア</text>
+  <text class="s" x="64" y="178">EventStore、CoOccurrenceIndex、VectorStore、</text>
+  <text class="s" x="64" y="194">MetadataStore の 4 つを同時に共有ロック</text>
+
+  <rect class="chip" x="52" y="226" width="404" height="58" rx="6"/>
+  <text class="h" x="64" y="248">WAL シーケンスを記録</text>
+  <text class="s" x="64" y="270">バリア下で取得するため、凍結される像に含まれる最大の操作と一致</text>
+
+  <rect class="chip" x="52" y="300" width="404" height="58" rx="6"/>
+  <text class="h" x="64" y="322">ログをフラッシュしてから</text>
+  <text class="mono" x="220" y="322">fork()</text>
+  <text class="s" x="64" y="344">子は全ストアのコピーオンライト像を引き継ぐ</text>
+
+  <path class="ln" d="M 456 334 H 512" marker-end="url(#a)"/>
+
+  <rect class="chip" x="52" y="374" width="404" height="58" rx="6"/>
+  <text class="h" x="64" y="396">4 つのロックを解放し、応答を再開</text>
+  <text class="s" x="64" y="418">保持はここで終わり、書き出しは子が行う</text>
+
+  <rect class="chip" x="52" y="448" width="404" height="76" rx="6"/>
+  <text class="h" x="64" y="470">SnapshotSession が子を引き取る</text>
+  <text class="s" x="64" y="492">専用の完了スレッドがその pid に対する唯一の</text>
+  <text class="s" x="64" y="508">waitpid() を実行し、要求がなくても後処理は完了する</text>
+
+  <path class="seam" d="M 120 536 V 690"/>
+  <text class="s" x="140" y="600">親は子が書き出す間も</text>
+  <text class="s" x="140" y="616">要求を処理し続ける</text>
+
+  <rect class="chip" x="52" y="700" width="404" height="96" rx="6"/>
+  <text class="h" x="64" y="722">子の終了後に永続化ハンドシェイク</text>
+  <text class="s" x="64" y="744">チェックポイントサイドカーを書いて fsync し、</text>
+  <text class="s" x="64" y="760">そのシーケンスまで WAL を切り詰める</text>
+  <text class="s" x="64" y="776">子が失敗した場合は一時ファイルを回収し、WAL は触らない</text>
+
+  <text class="s" x="712" y="170" text-anchor="middle">上の fork までは子は存在しない</text>
+
+  <rect class="chip" x="512" y="306" width="400" height="58" rx="6"/>
+  <text class="h" x="524" y="328">引き継いだストアロックをすべて初期化</text>
+  <text class="s" x="524" y="350">親の待機中ライタ状態のままではデッドロックする</text>
+
+  <rect class="chip" x="512" y="380" width="400" height="58" rx="6"/>
+  <text class="h" x="524" y="402">引き継いだ記述子 (fd 3 以降) を閉じる</text>
+  <text class="s" x="524" y="424">サーバソケットと親のログシンク</text>
+
+  <rect class="chip" x="512" y="454" width="400" height="58" rx="6"/>
+  <text class="h" x="524" y="476">シグナルハンドラを戻す</text>
+  <text class="mono" x="524" y="498">SIGCHLD, SIGPIPE, SIGTERM</text>
+  <text class="s" x="690" y="498">を既定に</text>
+
+  <rect class="chip" x="512" y="528" width="400" height="76" rx="6"/>
+  <text class="h" x="524" y="550">全ストアを一時ファイルへ直列化</text>
+  <text class="s" x="524" y="572">ログは抑止され、子は spdlog に再入しない</text>
+  <text class="s" x="524" y="588">像は凍結済みで、以降の親の書き込みは含まれない</text>
+
+  <rect class="chip" x="512" y="620" width="300" height="58" rx="6"/>
+  <text class="h" x="524" y="642">即座に終了</text>
+  <text class="s" x="524" y="664">成功は 0、失敗は 1</text>
+
+  <path class="ln" d="M 512 649 H 300 V 700" marker-end="url(#a)"/>
+  <text class="s" x="340" y="641">終了ステータス</text>
+
+  <path class="ln" d="M 860 604 V 862" marker-end="url(#a)"/>
+  <path class="ln" d="M 150 796 V 862" marker-end="url(#a)"/>
+  <path class="ln" d="M 400 796 V 862" marker-end="url(#a)"/>
+
+  <rect class="grp" x="36" y="830" width="892" height="128" rx="8"/>
+  <text class="lbl" x="52" y="850">ディスク上</text>
+
+  <rect class="chip" x="52" y="862" width="230" height="82" rx="6"/>
+  <text class="h" x="64" y="884">チェックポイントサイドカー</text>
+  <text class="mono" x="64" y="902">&lt;snapshot&gt;.walseq</text>
+  <text class="s" x="64" y="920">WAL シーケンスと</text>
+  <text class="s" x="64" y="936">スナップショットのサイズと CRC32</text>
+
+  <rect class="chip" x="298" y="862" width="250" height="82" rx="6"/>
+  <text class="h" x="310" y="884">ライトアヘッドログ</text>
+  <text class="mono" x="310" y="902">wal-NNNNNN.log</text>
+  <text class="s" x="310" y="920">サイドカーが永続化された後に</text>
+  <text class="s" x="310" y="936">のみ切り詰める</text>
+
+  <rect class="chip" x="564" y="862" width="348" height="82" rx="6"/>
+  <text class="h" x="576" y="884">スナップショットファイル</text>
+  <text class="mono" x="576" y="902">auto_&lt;timestamp&gt;.nvec</text>
+  <text class="s" x="576" y="920">一時ファイルに書いて rename で公開</text>
+  <text class="s" x="576" y="936">または</text>
+  <text class="mono" x="614" y="936">DUMP SAVE</text>
+  <text class="s" x="677" y="936">が指定した経路</text>
+
+  <text class="s" x="480" y="978" text-anchor="middle">コピーオンライトのため、子の像は親が書き込んだぶんだけ分岐する。ほぼ待機中のサーバならコストはごくわずか</text>
+</svg>

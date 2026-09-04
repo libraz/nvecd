@@ -1,0 +1,127 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 750" width="960" height="750" role="img" aria-labelledby="ttl dsc">
+  <title id="ttl">起動時にメモリ上の状態を復旧する手順</title>
+  <desc id="dsc">上から下へ 6 段階を並べた図です。有効なチェックポイントサイドカーを持つ最新のスナップショットを選び、ストアへ読み込み、ライトアヘッドログを開いてシーケンスを復元し、チェックポイントより後のレコードだけをリプレイし、ログを公開してから ANN インデックスを再構築して応答を開始します。右側の 2 つのファイル、スナップショットディレクトリと WAL ディレクトリが流れに入力を与えます。リプレイ段の横にある注記は、この経路に唯一残る欠落を示します。ベクトル本体をログに含めない設定の間に書かれたベクトルは、リプレイでは復元できません。</desc>
+
+  <style>
+    .bg    { fill:#f7f5f1 }
+    .chip  { fill:#ffffff; stroke:#d7d4cd }
+    .card  { fill:#ffffff; stroke:#3f6b8a }
+    .alt   { fill:#ffffff; stroke:#8a6a1f }
+    .ln    { fill:none; stroke:#3f6b8a; stroke-width:1.4 }
+    .ah    { fill:#3f6b8a }
+    .warn  { fill:none; stroke:#a3401f; stroke-width:1.6 }
+    .warnt { fill:#a3401f; font-size:10.5px }
+    text   { font-family:Inter,"Helvetica Neue","Hiragino Sans","Noto Sans JP",Arial,sans-serif; fill:#1f2328 }
+    .h     { font-size:12.5px }
+    .lbl   { font-size:11px; fill:#6e7781; letter-spacing:.06em }
+    .s     { font-size:10.5px; fill:#6e7781 }
+    .mono  { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:10.5px; fill:#3f6b8a }
+    .mono2 { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:10.5px; fill:#8a6a1f }
+    .monw  { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:10.5px; fill:#a3401f }
+    @media (prefers-color-scheme: dark) {
+      .bg{fill:#0d1117}
+      .chip{fill:#161b22;stroke:#30363d} .card{fill:#161b22;stroke:#7fb3d5} .alt{fill:#161b22;stroke:#d9b45c}
+      .ln{stroke:#7fb3d5} .ah{fill:#7fb3d5}
+      .warn{stroke:#e08a68} .warnt{fill:#e08a68} .monw{fill:#e08a68}
+      .mono{fill:#7fb3d5} .mono2{fill:#d9b45c}
+      text{fill:#e6edf3} .lbl{fill:#8b949e} .s{fill:#8b949e}
+    }
+  </style>
+
+  <defs>
+    <marker id="a" markerUnits="userSpaceOnUse" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto">
+      <path class="ah" d="M0,0 L9,4.5 L0,9 z"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="960" height="750" rx="12"/>
+
+  <text class="lbl" x="142" y="78" text-anchor="end">選択</text>
+  <rect class="chip" x="158" y="56" width="440" height="88" rx="6"/>
+  <text class="h" x="170" y="78">チェックポイントが有効な最新スナップショットを選ぶ</text>
+  <text class="s" x="170" y="100">候補はスナップショットディレクトリの *.nvec と *.dmp、更新時刻の新しい順</text>
+  <text class="s" x="170" y="116">.walseq サイドカーのサイズと CRC32 が本体と一致すること</text>
+  <text class="s" x="170" y="132">どちらかに失敗した候補は飛ばして次を試す</text>
+
+  <path class="ln" d="M 378 144 V 164" marker-end="url(#a)"/>
+
+  <text class="lbl" x="142" y="186" text-anchor="end">読み込み</text>
+  <rect class="chip" x="158" y="164" width="440" height="72" rx="6"/>
+  <text class="h" x="170" y="186">ストアへ読み込む</text>
+  <text class="s" x="170" y="208">いったん一時ストアへ読み、まとめて差し替える。キャッシュは破棄</text>
+  <text class="s" x="170" y="224">この時点の状態はチェックポイントのシーケンスまで</text>
+
+  <path class="ln" d="M 378 236 V 256" marker-end="url(#a)"/>
+
+  <text class="lbl" x="142" y="278" text-anchor="end">オープン</text>
+  <rect class="chip" x="158" y="256" width="440" height="72" rx="6"/>
+  <text class="h" x="170" y="278">WAL を開いてシーケンスを復元</text>
+  <text class="s" x="170" y="300">wal-NNNNNN.log の各セグメントから最大シーケンスを求める</text>
+  <text class="s" x="170" y="316">WAL を開けなければ起動そのものを失敗させる</text>
+
+  <path class="ln" d="M 378 328 V 348" marker-end="url(#a)"/>
+
+  <text class="lbl" x="142" y="370" text-anchor="end">リプレイ</text>
+  <rect class="chip" x="158" y="348" width="440" height="170" rx="6"/>
+  <text class="h" x="170" y="370">チェックポイントより後のレコードだけをリプレイ</text>
+  <text class="s" x="170" y="392">開始位置はチェックポイント + 1、スナップショットがなければ 0</text>
+  <text class="s" x="170" y="408">WAL はまだ公開していないため、リプレイしたレコードは再追記されない</text>
+  <text class="lbl" x="170" y="432">リプレイするレコード種別</text>
+
+  <rect class="card" x="170" y="442" width="64" height="24" rx="5"/>
+  <text class="mono" x="202" y="458" text-anchor="middle">kVecSet</text>
+  <rect class="card" x="242" y="442" width="64" height="24" rx="5"/>
+  <text class="mono" x="274" y="458" text-anchor="middle">kVecDel</text>
+  <rect class="alt" x="314" y="442" width="77" height="24" rx="5"/>
+  <text class="mono2" x="352" y="458" text-anchor="middle">kEventAdd</text>
+  <rect class="alt" x="399" y="442" width="77" height="24" rx="5"/>
+  <text class="mono2" x="437" y="458" text-anchor="middle">kEventDel</text>
+  <rect class="card" x="170" y="474" width="70" height="24" rx="5"/>
+  <text class="mono" x="205" y="490" text-anchor="middle">kMetaSet</text>
+  <rect class="card" x="248" y="474" width="70" height="24" rx="5"/>
+  <text class="mono" x="283" y="490" text-anchor="middle">kMetaDel</text>
+  <rect class="alt" x="326" y="474" width="171" height="24" rx="5"/>
+  <text class="mono2" x="411" y="490" text-anchor="middle">kCoOccurrenceMaintenance</text>
+
+  <path class="ln" d="M 378 518 V 538" marker-end="url(#a)"/>
+
+  <text class="lbl" x="142" y="560" text-anchor="end">公開</text>
+  <rect class="chip" x="158" y="538" width="440" height="72" rx="6"/>
+  <text class="h" x="170" y="560">WAL を公開して通常の書き込みを受ける</text>
+  <text class="s" x="170" y="582">以降の追記は復元した最大シーケンスより後の番号を取る</text>
+  <text class="s" x="170" y="598">fork スナップショットのチェックポイントと切り詰めにも接続される</text>
+
+  <path class="ln" d="M 378 610 V 630" marker-end="url(#a)"/>
+
+  <text class="lbl" x="142" y="652" text-anchor="end">サービス開始</text>
+  <rect class="chip" x="158" y="630" width="440" height="72" rx="6"/>
+  <text class="h" x="170" y="652">ANN インデックスを再構築して応答を開始</text>
+  <text class="s" x="170" y="674">スナップショットの読み込みとリプレイは差分更新経路を通らないため、</text>
+  <text class="s" x="170" y="690">復元後のストアからインデックスを作り直す</text>
+
+  <path class="ln" d="M 622 100 H 598" marker-end="url(#a)"/>
+  <rect class="chip" x="622" y="56" width="250" height="88" rx="6"/>
+  <text class="h" x="634" y="78">スナップショットディレクトリ</text>
+  <text class="mono" x="634" y="96">auto_&lt;timestamp&gt;.nvec</text>
+  <text class="mono" x="634" y="112">auto_&lt;timestamp&gt;.nvec.walseq</text>
+  <text class="s" x="634" y="130">スナップショット 1 つにサイドカー 1 つ</text>
+
+  <path class="ln" d="M 622 292 H 598" marker-end="url(#a)"/>
+  <rect class="chip" x="622" y="256" width="250" height="72" rx="6"/>
+  <text class="h" x="634" y="278">WAL ディレクトリ</text>
+  <text class="mono" x="634" y="298">wal-NNNNNN.log</text>
+  <text class="s" x="634" y="316">スナップショットが含まない分の記録</text>
+
+  <path class="warn" d="M 598 406 H 622"/>
+  <rect class="warn" x="622" y="348" width="306" height="140" rx="6"/>
+  <text class="monw" x="634" y="372">wal.include_vectors: false</text>
+  <text class="warnt" x="634" y="392">はベクトル本体をログに残さない。</text>
+  <text class="warnt" x="634" y="410">その間に書いたベクトルは</text>
+  <text class="warnt" x="634" y="426">スナップショットにしか残らず、</text>
+  <text class="warnt" x="634" y="442">リプレイでは復元できない。</text>
+  <text class="warnt" x="634" y="458">後続の削除やメタ設定がそれを指す</text>
+  <text class="warnt" x="634" y="474">場合は読み飛ばされる。</text>
+
+  <text class="mono" x="229" y="730">wal.enabled: false</text>
+  <text class="s" x="346" y="730">ならサイドカーもリプレイもなく、読み込める最新スナップショットが復旧のすべて</text>
+</svg>

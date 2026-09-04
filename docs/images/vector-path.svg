@@ -1,0 +1,133 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 846" width="900" height="846" role="img" aria-labelledby="ttl dsc">
+  <title id="ttl">The ordered write path of a single VECSET command</title>
+  <desc id="dsc">Six stacked bands follow one VECSET command from the wire to the reply. The vector store validates the id, the components and the dimension before anything is written. The WAL record is appended next, ahead of every in-memory change. Only then does the vector reach the compact matrix — overwriting an existing row, reusing a tombstone slot or appending a new one — with its L2 norm precomputed and the id-to-row map updated. The ANN index is updated afterwards and belongs to the SimilarityEngine, and what happens there depends on the index type. The last band bumps the vector generation, invalidates the cache for the item and replies.</desc>
+
+  <style>
+    .bg    { fill:#f7f5f1 }
+    .grp   { fill:#edeae4 }
+    .chip  { fill:#ffffff; stroke:#d7d4cd }
+    .card  { fill:#ffffff; stroke:#3f6b8a }
+    .ln    { fill:none; stroke:#3f6b8a; stroke-width:1.4 }
+    .ah    { fill:#3f6b8a }
+    text   { font-family:Inter,"Helvetica Neue","Hiragino Sans","Noto Sans JP",Arial,sans-serif; fill:#1f2328 }
+    .lbl   { font-size:11px; fill:#6e7781; letter-spacing:.06em }
+    .s     { font-size:10.5px; fill:#6e7781 }
+    .warnt { fill:#a3401f }
+    .mono  { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:10.5px; fill:#3f6b8a }
+    @media (prefers-color-scheme: dark) {
+      .bg{fill:#0d1117} .grp{fill:#12171d}
+      .chip{fill:#161b22;stroke:#30363d} .card{fill:#161b22;stroke:#7fb3d5}
+      .ln{stroke:#7fb3d5} .ah{fill:#7fb3d5} .mono{fill:#7fb3d5}
+      text{fill:#e6edf3} .lbl{fill:#8b949e} .s{fill:#8b949e} .warnt{fill:#e08a68}
+    }
+  </style>
+
+  <defs>
+    <marker id="a" markerUnits="userSpaceOnUse" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto">
+      <path class="ah" d="M0,0 L9,4.5 L0,9 z"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="900" height="846" rx="12"/>
+
+  <rect class="grp" x="24" y="48" width="852" height="76" rx="8"/>
+  <text class="lbl" x="38" y="68">PARSE AND GATE</text>
+  <text class="s" x="150" y="68">the HTTP handler builds the same Command and calls ApplyWrite directly</text>
+  <rect class="card" x="38" y="78" width="196" height="32" rx="5"/>
+  <text class="mono" x="136" y="98" text-anchor="middle">VECSET &lt;id&gt; &lt;f1&gt; ... &lt;fN&gt;</text>
+  <path class="ln" d="M 234 94 H 252" marker-end="url(#a)"/>
+  <rect class="chip" x="252" y="78" width="150" height="32" rx="5"/>
+  <text class="s" x="327" y="98" text-anchor="middle">CommandParser</text>
+  <path class="ln" d="M 402 94 H 420" marker-end="url(#a)"/>
+  <rect class="chip" x="420" y="78" width="196" height="32" rx="5"/>
+  <text class="s" x="518" y="98" text-anchor="middle">AUTH + snapshot gates</text>
+  <path class="ln" d="M 616 94 H 634" marker-end="url(#a)"/>
+  <rect class="chip" x="634" y="78" width="152" height="32" rx="5"/>
+  <text class="s" x="710" y="98" text-anchor="middle">write gate (exclusive)</text>
+
+  <path class="ln" d="M 136 124 V 148" marker-end="url(#a)"/>
+
+  <rect class="grp" x="24" y="148" width="852" height="88" rx="8"/>
+  <text class="lbl" x="38" y="168">VALIDATE</text>
+  <text class="s" x="150" y="168">VectorStore::ValidateVector — nothing is stored until every check passes</text>
+  <rect class="card" x="38" y="178" width="158" height="32" rx="5"/>
+  <text class="s" x="117" y="198" text-anchor="middle">id and vector non-empty</text>
+  <path class="ln" d="M 196 194 H 214" marker-end="url(#a)"/>
+  <rect class="card" x="214" y="178" width="158" height="32" rx="5"/>
+  <text class="s" x="293" y="198" text-anchor="middle">every component finite</text>
+  <path class="ln" d="M 372 194 H 390" marker-end="url(#a)"/>
+  <rect class="card" x="390" y="178" width="112" height="32" rx="5"/>
+  <text class="s" x="446" y="198" text-anchor="middle">L2 norm finite</text>
+  <path class="ln" d="M 502 194 H 520" marker-end="url(#a)"/>
+  <rect class="card" x="520" y="178" width="186" height="32" rx="5"/>
+  <text class="s" x="613" y="198" text-anchor="middle">dimension matches the store</text>
+  <text class="s" x="38" y="226">the first vector fixes the store dimension for every later write</text>
+
+  <path class="ln" d="M 136 236 V 254" marker-end="url(#a)"/>
+
+  <rect class="grp" x="24" y="254" width="852" height="100" rx="8"/>
+  <text class="lbl" x="38" y="274">DURABILITY</text>
+  <text class="s warnt" x="150" y="274">WAL first — the record is accepted before the matrix, the ANN index or the cache changes</text>
+  <rect class="chip" x="38" y="284" width="190" height="32" rx="5"/>
+  <text class="s" x="133" y="304" text-anchor="middle">EncodeCommand payload</text>
+  <path class="ln" d="M 228 300 H 246" marker-end="url(#a)"/>
+  <rect class="chip" x="246" y="284" width="132" height="32" rx="5"/>
+  <text class="s" x="312" y="304" text-anchor="middle">Wal::Append</text>
+  <path class="ln" d="M 378 300 H 396" marker-end="url(#a)"/>
+  <rect class="chip" x="396" y="284" width="100" height="32" rx="5"/>
+  <text class="mono" x="446" y="304" text-anchor="middle">kVecSet</text>
+  <text class="s" x="38" y="338">skipped when <tspan class="mono">wal.include_vectors</tspan> is off, so snapshots become the vector durability boundary</text>
+
+  <path class="ln" d="M 136 354 V 378" marker-end="url(#a)"/>
+
+  <rect class="grp" x="24" y="378" width="852" height="132" rx="8"/>
+  <text class="lbl" x="38" y="398">COMPACT STORE</text>
+  <text class="s" x="150" y="398">VectorStore::SetVector — one contiguous float matrix, one row per live vector</text>
+  <rect class="card" x="38" y="408" width="180" height="32" rx="5"/>
+  <text class="s" x="128" y="428" text-anchor="middle">overwrite the existing row</text>
+  <rect class="card" x="232" y="408" width="176" height="32" rx="5"/>
+  <text class="s" x="320" y="428" text-anchor="middle">or reuse a tombstone slot</text>
+  <rect class="card" x="422" y="408" width="140" height="32" rx="5"/>
+  <text class="s" x="492" y="428" text-anchor="middle">or append a new row</text>
+  <path class="ln" d="M 562 424 H 580" marker-end="url(#a)"/>
+  <rect class="card" x="580" y="408" width="158" height="32" rx="5"/>
+  <text class="s" x="659" y="428" text-anchor="middle">precompute the L2 norm</text>
+  <text class="s" x="38" y="458">the row branch is chosen by whether the id already has a row and whether a tombstone slot is free</text>
+  <text class="s" x="38" y="476"><tspan class="mono">id_to_idx</tspan> and the reverse map are updated, and the store generation is bumped</text>
+  <text class="s warnt" x="38" y="494">the write path calls SetVector without normalization — the vector is stored exactly as sent</text>
+
+  <path class="ln" d="M 136 510 V 534" marker-end="url(#a)"/>
+
+  <rect class="grp" x="24" y="534" width="852" height="152" rx="8"/>
+  <text class="lbl" x="38" y="554">ANN INDEX</text>
+  <text class="s" x="150" y="554">owned by SimilarityEngine, not by VectorStore; updated after the store, under its own publication lock</text>
+  <rect class="card" x="38" y="564" width="276" height="46" rx="5"/>
+  <text class="mono" x="176" y="583" text-anchor="middle">flat</text>
+  <text class="s" x="176" y="598" text-anchor="middle">nothing to insert; search scans the matrix</text>
+  <rect class="card" x="328" y="564" width="252" height="46" rx="5"/>
+  <text class="mono" x="454" y="583" text-anchor="middle">hnsw</text>
+  <text class="s" x="454" y="598" text-anchor="middle">incremental Add(row, vector)</text>
+  <rect class="card" x="594" y="564" width="252" height="46" rx="5"/>
+  <text class="mono" x="720" y="583" text-anchor="middle">ivf</text>
+  <text class="s" x="720" y="598" text-anchor="middle">AppendToBuffer, sealed later</text>
+  <text class="s" x="38" y="630">a maintenance thread seals the IVF write buffer, and trains the index the first time it is needed</text>
+  <text class="s" x="38" y="648">if the store generation moved by more than one, the whole index is rebuilt from the compact matrix instead</text>
+  <text class="s" x="38" y="666">VECDEL marks the row deleted, or forces a rebuild when the store compacted</text>
+
+  <path class="ln" d="M 136 686 V 710" marker-end="url(#a)"/>
+
+  <rect class="grp" x="24" y="710" width="852" height="94" rx="8"/>
+  <text class="lbl" x="38" y="730">INVALIDATE AND REPLY</text>
+  <text class="s" x="236" y="730">the vector generation participates in every SIM and SIMV cache key</text>
+  <rect class="chip" x="38" y="740" width="140" height="32" rx="5"/>
+  <text class="s" x="108" y="760" text-anchor="middle">vector generation++</text>
+  <path class="ln" d="M 178 756 H 196" marker-end="url(#a)"/>
+  <rect class="chip" x="196" y="740" width="240" height="32" rx="5"/>
+  <text class="s" x="316" y="760" text-anchor="middle">SimilarityCache::InvalidateByItemId</text>
+  <path class="ln" d="M 436 756 H 454" marker-end="url(#a)"/>
+  <rect class="chip" x="454" y="740" width="106" height="32" rx="5"/>
+  <text class="mono" x="507" y="760" text-anchor="middle">OK VECSET</text>
+  <text class="s" x="38" y="790">metadata sent alongside the vector clears the whole cache instead, since it changes filtered results broadly</text>
+
+  <text class="s" x="450" y="828" text-anchor="middle">The ANN index is the SimilarityEngine's; VectorStore only owns the matrix, the norms and the id-to-row map.</text>
+</svg>
