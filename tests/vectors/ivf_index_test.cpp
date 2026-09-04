@@ -8,7 +8,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
-#include <chrono>
+#include <atomic>
 #include <cmath>
 #include <map>
 #include <numeric>
@@ -470,31 +470,60 @@ TEST_F(IvfIndexTest, SealingTierRemainsSearchableUntilCommit) {
   config.nlist = 64;
   config.nprobe = 64;
   config.seal_threshold = 1;
-  IvfIndex index(kDim, config);
-  index.Train(matrix.data(), training_indices.data(), training_indices.size(), kDim);
-  for (size_t vector_index = kTrainCount; vector_index < kTotal; ++vector_index) {
-    index.AppendToBuffer(vector_index, all_vectors[vector_index].data());
-  }
-
-  std::thread sealer([&index]() { index.SealBuffer(); });
-  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-  while (index.GetSealingSize() == 0 && std::chrono::steady_clock::now() < deadline) {
-    std::this_thread::yield();
-  }
-  const bool observed_sealing = index.GetSealingSize() > 0;
 
   constexpr size_t kTarget = 1000;
-  std::vector<std::pair<float, size_t>> during;
-  if (observed_sealing) {
-    during = index.Search(all_vectors[kTarget].data(), norms[kTarget], matrix.data(), norms.data(), kTotal, kDim, 1);
-  }
-  sealer.join();
+  constexpr int kAttempts = 5;
 
-  ASSERT_TRUE(observed_sealing);
+  // The sealing tier exists only between the moment SealBuffer swaps the write
+  // buffer out and the moment it commits the assignments, and nothing here can
+  // hold that window open. A scheduler that runs the seal to completion before
+  // this thread first looks has missed the window, not broken the property, so
+  // an attempt that misses it starts over on a fresh index rather than failing.
+  // Re-filling the same index is not an option: AppendToBuffer only deduplicates
+  // against the write buffer, so a second seal of the same indices would append
+  // them to the inverted lists twice.
+  bool observed_sealing = false;
+  std::vector<std::pair<float, size_t>> during;
+  std::vector<std::pair<float, size_t>> after;
+
+  for (int attempt = 0; attempt < kAttempts && !observed_sealing; ++attempt) {
+    IvfIndex index(kDim, config);
+    index.Train(matrix.data(), training_indices.data(), training_indices.size(), kDim);
+    for (size_t vector_index = kTrainCount; vector_index < kTotal; ++vector_index) {
+      index.AppendToBuffer(vector_index, all_vectors[vector_index].data());
+    }
+
+    std::atomic<bool> seal_done{false};
+    std::thread sealer([&index, &seal_done]() {
+      index.SealBuffer();
+      seal_done.store(true, std::memory_order_release);
+    });
+
+    // Bounded by the seal itself rather than by a wall clock: the loop ends
+    // when the tier is seen or when the thread that would have published it has
+    // returned, so a slow machine waits longer instead of reporting a failure.
+    while (!seal_done.load(std::memory_order_acquire)) {
+      if (index.GetSealingSize() > 0) {
+        observed_sealing = true;
+        break;
+      }
+      std::this_thread::yield();
+    }
+
+    if (observed_sealing) {
+      during = index.Search(all_vectors[kTarget].data(), norms[kTarget], matrix.data(), norms.data(), kTotal, kDim, 1);
+    }
+    sealer.join();
+
+    if (observed_sealing) {
+      after = index.Search(all_vectors[kTarget].data(), norms[kTarget], matrix.data(), norms.data(), kTotal, kDim, 1);
+    }
+  }
+
+  ASSERT_TRUE(observed_sealing) << "the sealing tier was never observed across " << kAttempts << " seals";
   ASSERT_EQ(during.size(), 1U);
   EXPECT_EQ(during.front().second, kTarget);
 
-  auto after = index.Search(all_vectors[kTarget].data(), norms[kTarget], matrix.data(), norms.data(), kTotal, kDim, 1);
   ASSERT_EQ(after.size(), 1U);
   EXPECT_EQ(after.front().second, kTarget);
 }
