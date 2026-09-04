@@ -16,9 +16,9 @@ class Version {
  public:
   /**
    * @brief Get version string
-   * @return Version string (e.g., "0.1.0")
+   * @return Version string (e.g., "0.2.0")
    */
-  static std::string String() { return "0.1.0"; }
+  static std::string String() { return "0.2.0"; }
 
   /**
    * @brief Get major version
@@ -28,7 +28,7 @@ class Version {
   /**
    * @brief Get minor version
    */
-  static int Minor() { return 1; }
+  static int Minor() { return 2; }
 
   /**
    * @brief Get patch version

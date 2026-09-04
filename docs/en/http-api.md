@@ -221,7 +221,7 @@ The ID is read from a JSON body, not from the path or query string, so a client 
 ```json
 {
   "server": "nvecd",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "uptime_seconds": 44,
   "total_requests": 52,
   "total_commands_processed": 52,

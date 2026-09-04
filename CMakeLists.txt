@@ -25,7 +25,7 @@ else()
     string(REGEX REPLACE "^v" "" PROJECT_VERSION_FROM_GIT "${GIT_TAG}")
     message(STATUS "Version from git tag: ${PROJECT_VERSION_FROM_GIT}")
   else()
-    set(PROJECT_VERSION_FROM_GIT "0.1.0")
+    set(PROJECT_VERSION_FROM_GIT "0.2.0")
     message(STATUS "No git tag found, using default version: ${PROJECT_VERSION_FROM_GIT}")
   endif()
 

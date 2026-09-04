@@ -221,7 +221,7 @@ ID はパスやクエリ文字列ではなく JSON ボディから読むため�
 ```json
 {
   "server": "nvecd",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "uptime_seconds": 44,
   "total_requests": 52,
   "total_commands_processed": 52,
