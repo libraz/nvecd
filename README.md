@@ -1,270 +1,94 @@
-# Nvecd
+# nvecd
 
-[![CI](https://github.com/libraz/nvecd/actions/workflows/ci.yml/badge.svg)](https://github.com/libraz/nvecd/actions/workflows/ci.yml)
+An in-memory search engine that keeps two signals about the same items: the vectors you assign to them, and the record of which items were acted on together. A query can be answered from either signal, or from both blended into one ranking.
+
+[![CI](https://img.shields.io/github/actions/workflow/status/libraz/nvecd/ci.yml?branch=main&label=CI)](https://github.com/libraz/nvecd/actions)
+[![Version](https://img.shields.io/github/v/tag/libraz/nvecd?label=version)](https://github.com/libraz/nvecd/tags)
 [![codecov](https://codecov.io/gh/libraz/nvecd/branch/main/graph/badge.svg)](https://codecov.io/gh/libraz/nvecd)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![License](https://img.shields.io/badge/license-MIT-blue)](https://github.com/libraz/nvecd/blob/main/LICENSE)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-blue?logo=c%2B%2B)](https://en.cppreference.com/w/cpp/17)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-lightgrey)](https://github.com/libraz/nvecd)
 
-**In-memory vector search engine with event-based co-occurrence tracking and fusion search.**
+![Events and vectors are maintained separately and fused at query time](docs/images/overview.svg)
 
-## Why Nvecd?
+"Customers who bought this also bought" and "items whose embeddings are close" are two different questions, and answering both usually means running two systems and reconciling their answers in the application. nvecd holds both indexes in one process and merges them behind a single query.
 
-Recommendation engines are complex — they require ML pipelines, model training, and infrastructure. Most teams just need "users who did X also did Y."
-
-**Nvecd** solves this with an in-memory engine that combines user behavior tracking with vector similarity, delivering instant recommendations with zero ML setup.
-
-## Quick Start
-
-### Build & Run
+## What it does
 
 ```bash
-# Build
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --parallel
-
-# Run server
-./build/bin/nvecd -c examples/config.yaml
-# → Listening on 127.0.0.1:11017
+./build/bin/nvecd -c examples/config.yaml   # listening on 127.0.0.1:11017
 ```
 
-### Basic Usage
-
 ```bash
-# Track user purchases
-nvecd-cli -p 11017 EVENT user_alice ADD product123 100
-nvecd-cli -p 11017 EVENT user_alice ADD product456 80
-nvecd-cli -p 11017 EVENT user_bob ADD product123 100
-nvecd-cli -p 11017 EVENT user_bob ADD product789 95
+# What was acted on together. No vectors involved.
+nvecd-cli -p 11017 EVENT alice ADD widget 100
+nvecd-cli -p 11017 EVENT alice ADD gasket 80
+nvecd-cli -p 11017 EVENT bob   ADD widget 100
+nvecd-cli -p 11017 EVENT bob   ADD flange 95
 
-# Get recommendations: "People who bought product123 also bought..."
-nvecd-cli -p 11017 SIM product123 10 using=events
+nvecd-cli -p 11017 SIM widget 10 using=events
 # (2 results, showing 2)
-# 1) product789 (score: 0.92)
-# 2) product456 (score: 0.75)
+# 1) flange (score: 9500)
+# 2) gasket (score: 8000)
 
-# Register item vectors (optional, for content-based similarity)
-nvecd-cli -p 11017 VECSET product123 0.1 0.2 0.3 0.4
-nvecd-cli -p 11017 VECSET product456 0.15 0.18 0.32 0.41
+# Give the same items vectors, and content similarity becomes available too.
+nvecd-cli -p 11017 VECSET widget 0.10 0.20 0.30 0.40
+nvecd-cli -p 11017 VECSET gasket 0.15 0.18 0.32 0.41
 
-# Hybrid search: behavior + content similarity
-nvecd-cli -p 11017 SIM product123 10 using=fusion
+nvecd-cli -p 11017 SIM widget 10 using=fusion
+# (2 results, showing 2)
+# 1) gasket (score: 0.5972)
+# 2) flange (score: 0.4)
 
-# Search by query vector
-nvecd-cli -p 11017 SIMV 10 0.5 0.3 0.2 0.1
-
-# Filter by metadata
-nvecd-cli -p 11017 METASET product456 category:electronics
-nvecd-cli -p 11017 SIM product123 10 filter=category:electronics
-
-# Set minimum score threshold
-nvecd-cli -p 11017 SIM product123 10 min_score=0.5
+nvecd-cli -p 11017 SIMV 10 0.5 0.3 0.2 0.1          # nearest to a query vector
+# (2 results, showing 2)
+# 1) gasket (score: 0.6569)
+# 2) widget (score: 0.6139)
 ```
 
-### Interactive Mode
+A co-occurrence score is the accumulated product of the paired event weights — `flange` scores 9500 because one context held it alongside `widget` at 95 and 100. It is a raw sum, not a similarity in `[0, 1]`. Fusion normalizes each side before blending, which is why the third query reorders the first one's answer: `gasket` gains a vector and overtakes the vectorless `flange`.
 
-```bash
-nvecd-cli -p 11017
-# nvecd> EVENT user1 ADD item1 100
-# OK
-# nvecd> SIM item1 10 using=fusion
-# (3 results, showing 3)
-# 1) item3 (score: 0.85)
-# 2) item2 (score: 0.72)
-# 3) item4 (score: 0.61)
-# nvecd> help
-```
+Co-occurrence works from the first event, with no embedding model and no training step. Vectors are optional and can be added later. When both are present, `using=fusion` blends them, and the blend can follow each item's data density instead of a fixed weight, so a new item is ranked mostly by its vector and a well-observed one mostly by its behaviour.
 
-### Monitor Cache Performance
+Events carry a timestamp and decay, so associations age out on their own. Results can be narrowed by item metadata and cut off below a score.
 
-```bash
-nvecd-cli -p 11017 CACHE STATS
-# hit_rate: 0.8500
-# current_memory_mb: 12.45
-# time_saved_ms: 15420.50
-```
+## Use cases
 
-### Test
+| Use case | What it does | Guide |
+|---|---|---|
+| A recommender with no vectors | Co-occurrence alone, from a stream of interactions. | [Recommendations](docs/en/use-cases/recommendations.md) |
+| A product recommender | Engagement weighting, then content and behaviour fused per query. | [E-commerce](docs/en/use-cases/e-commerce.md) |
+| A personalized feed | Continuous engagement events with a short half-life. | [Real-time feed](docs/en/use-cases/real-time-feed.md) |
+| Semantic retrieval | Query-vector search over a document corpus. | [Semantic search](docs/en/use-cases/semantic-search.md) |
 
-```bash
+## Install
+
+A C++17 compiler (GCC 9+ or Clang 10+) and CMake 3.15+. Dependencies are fetched during configuration; nothing needs to be installed system-wide.
+
+```sh
+git clone https://github.com/libraz/nvecd.git
+cd nvecd
+make          # configure, build, and produce bin/nvecd, bin/nvecd-cli, libnvecdclient
 make test
 ```
 
-## Performance
-
-Measured on Apple M5 Max (NEON), dim=128, cosine, top_k=10:
-
-| Vectors | SIM Latency | SIMV Latency |
-|---|---|---|
-| 1K | 0.010ms | 0.010ms |
-| 10K | 0.092ms | 0.092ms |
-| 100K | **0.90ms** | **0.91ms** |
-
-Cache hit: **0.21us** (4.8M ops/sec). See [Benchmarks](docs/en/benchmarks.md) for methodology and detailed breakdown.
-
-## Features
-
-- **Behavior-Based Recommendations** - Track user actions, get instant recommendations
-- **Vector Similarity Search** - Find similar items using embeddings (cosine, dot, L2)
-- **Hybrid Fusion Search** - Combine user behavior + content similarity with configurable weights
-- **Real-time Updates** - Recommendations adapt as users interact
-- **Smart Caching** - LRU cache with LZ4 compression and selective invalidation
-- **SIMD Optimization** - AVX2/NEON acceleration for vector operations
-- **Fork-Based Snapshots** - Copy-on-write persistence with near-zero downtime
-- **Dual Protocol** - TCP (Redis-style) and HTTP/REST JSON API
-- **Unix Domain Sockets** - Low-latency local connections
-- **Rate Limiting** - Per-client token bucket rate limiting
-- **Authentication** - Optional password-based AUTH for write commands
-- **CLI Tool** - `nvecd-cli` with tab completion and interactive mode
-- **Client Library** - C++ and C client libraries for language bindings
-- **Metadata Filtering** - Attribute-based post-filtering for SIM/SIMV queries (`filter=key:value`)
-- **Score Thresholding** - Minimum score cutoff (`min_score=0.5`) to filter low-confidence results
-- **Write-Ahead Log** - Optional CRC32-verified operation log (`wal.enabled`); on restart, writes since the last snapshot are recovered by replaying the WAL. Vector payloads are replayed only while `wal.include_vectors` stays enabled
-- **ANN Indexing** - Select HNSW or IVF through `similarity.index_type`
-- **Co-occurrence Pruning** - Configurable max neighbors and minimum support thresholds
-
-## What Makes Nvecd Different
-
-Most vector search engines treat behavioral signals and vector similarity as separate concerns, leaving the integration to the application layer. Nvecd uniquely combines them at the engine level:
-
-### Adaptive Fusion — Automatic Cold-Start Handling
-
-Static weight blending breaks down when item maturity varies. Nvecd automatically adjusts the balance between vector similarity and behavioral co-occurrence based on each item's data density:
-
-```bash
-# New item (few events) → vector similarity weighted more heavily
-nvecd-cli -p 11017 SIM new_product 10 using=fusion adaptive=on
-
-# Mature item (many events) → co-occurrence weighted more heavily
-nvecd-cli -p 11017 SIM popular_product 10 using=fusion adaptive=on
-```
-
-No hand-tuning required. Configurable via `similarity.adaptive_min_alpha`, `adaptive_max_alpha`, and `adaptive_maturity_threshold`.
-
-### Temporal Co-occurrence — Trend-Aware Scoring
-
-Standard co-occurrence counts treat all events equally regardless of recency. Nvecd applies time-decay so recent interactions naturally outweigh older ones:
-
-```yaml
-# config.yaml
-events:
-  temporal_cooccurrence: true
-  temporal_half_life_sec: 86400  # 1 day — score halves per day of age
-```
-
-Trending items rise automatically; stale associations fade without manual intervention.
-
-### Negative Signals — Preference-Aware Filtering
-
-Co-occurrence alone cannot distinguish "viewed together and chose both" from "viewed together but rejected one." Nvecd's negative signal support suppresses items that users explicitly dismissed:
-
-```bash
-# User viewed item_a and item_b, then removed item_a
-nvecd-cli -p 11017 EVENT user1 DEL item_a
-# Future SIM queries for item_b will down-rank item_a
-```
-
-Configurable via `events.negative_signals` and `events.negative_weight`.
-
-### Feature Matrix — How Nvecd Differs
-
-| | Nvecd | General-purpose vector database | Embedded ANN library |
-|--|--|--|--|
-| Vector search | Yes | Yes | Yes |
-| Behavioral co-occurrence | Engine-level | App-level | No |
-| Adaptive fusion | Built-in | No | No |
-| Temporal co-occurrence | Built-in | No | No |
-| Negative signal suppression | Built-in | No | No |
-| Cold-start handling | Automatic | Manual | N/A |
-| Distributed search | No | Typically yes | No |
-| Managed cloud service | No | Commonly offered | No |
-| ANN indexing (HNSW, IVF) | HNSW + IVF ([recall curve](docs/en/configuration.md#what-the-tuning-knobs-buy)) | Yes | Yes |
-| Metadata filtering | Yes (post-filter) | Yes | No |
-
-## Architecture
-
-```mermaid
-graph LR
-    App[Application] -->|Track Events| Nvecd[Nvecd]
-    App -->|Register Vectors| Nvecd
-    Nvecd -->|Recommendations| App
-
-    subgraph Nvecd Engine
-        Events[Event Store] --> CoOcc[Co-occurrence Index]
-        Vectors[Vector Store] --> ANN[HNSW / IVF Index]
-        ANN --> Sim[Similarity Engine]
-        CoOcc --> Sim
-        Sim --> Cache[Query Cache]
-        WAL[Write-Ahead Log] -.->|Recovery| Events
-        WAL -.->|Recovery| Vectors
-    end
-```
-
-Nvecd combines user behavior tracking (events) with vector similarity search. The similarity engine fuses both signals to produce hybrid recommendations.
-
-## When to Use Nvecd
-
-**Good fit:**
-- Recommendation systems ("customers who bought X also bought Y")
-- Content-based similarity search with embeddings
-- Hybrid recommendations combining behavior + content
-- Real-time personalization without ML pipeline
-- Simple deployment requirements
-
-**Not recommended:**
-- Dataset doesn't fit in RAM
-- Need distributed search across nodes
-- Complex ML model serving
+[Installation](docs/en/installation.md) covers system packages, build options, installing the binaries and running as a service.
 
 ## Documentation
 
-- [**Architecture**](docs/en/architecture.md) - System design and component overview
-- [**Protocol Reference**](docs/en/protocol.md) - All available commands
-- [**HTTP API Reference**](docs/en/http-api.md) - REST API documentation
-- [**Configuration Guide**](docs/en/configuration.md) - Configuration options
-- [**Use Cases**](docs/en/use-cases.md) - Real-world examples
-- [**Snapshot Management**](docs/en/snapshot.md) - Persistence and backups
-- [**Benchmarks**](docs/en/benchmarks.md) - Measured performance data and optimization results
-- [**Performance Tuning**](docs/en/performance.md) - Cache tuning and SIMD optimization
-- [**Installation Guide**](docs/en/installation.md) - Build and install instructions
-- [**Development Guide**](docs/en/development.md) - Getting started guide
-- [**Client Library**](docs/en/libnvecdclient.md) - C/C++ client library
+Start at [Introduction](docs/en/introduction.md) for the model the engine is built on, then [Getting started](docs/en/getting-started.md) for a first session end to end.
 
-### Japanese Documentation
+The concept pages explain what the engine is doing: [events and co-occurrence](docs/en/events-and-co-occurrence.md), [vector search](docs/en/vector-search.md), [fusion](docs/en/fusion.md), [caching](docs/en/caching.md) and [persistence](docs/en/persistence.md). The reference pages are the [TCP protocol](docs/en/protocol.md), the [HTTP API](docs/en/http-api.md), the [client library](docs/en/client-library.md) and the [configuration](docs/en/configuration.md) keys. [Architecture](docs/en/architecture.md) describes the internals, and [benchmarks](docs/en/benchmarks.md) records what has been measured.
 
-- [README (日本語)](README_ja.md)
-- [ドキュメント一覧](docs/ja/)
+## What it doesn't do
 
-## Requirements
+- **No embeddings.** nvecd stores and searches vectors; it does not produce them. Encode items with whatever model you already use and send the result with `VECSET`.
+- **Single node.** The dataset lives in the memory of one process. There is no sharding, no replication and no cross-node query.
+- **Memory-resident.** Snapshots and a write-ahead log make a restart recoverable, but nothing is served from disk. A dataset larger than RAM is out of scope.
+- **No model serving.** Ranking is a weighted merge of two score lists, not an inference step.
 
-- C++17 or later (GCC 9+, Clang 10+)
-- CMake 3.15+
-- yaml-cpp (bundled in third_party/)
-
-## Building from Source
-
-```bash
-# Using Makefile (recommended)
-make
-
-# Or using CMake directly
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --parallel
-
-# Run tests
-make test
-```
+The project is pre-1.0: the wire protocol and the configuration keys can still change between versions. Security issues are best reported through a private GitHub advisory rather than a public issue.
 
 ## License
 
-[MIT License](LICENSE)
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit issues or pull requests.
-
-## Links
-
-- **Documentation**: [docs/en/](docs/en/)
-- **Examples**: [examples/](examples/)
-- **Tests**: [tests/](tests/)
+[MIT](LICENSE).
