@@ -85,8 +85,8 @@ similarity:
 snapshot:
   # Snapshot directory path
   dir: "/var/lib/nvecd/snapshots"
-  # Filename an argument-less DUMP SAVE writes inside the snapshot directory; validated like a client-supplied path, so an absolute or escaping name is refused (empty = fall back to a timestamped name)
-  default_filename: "nvecd.snapshot"
+  # Filename an argument-less DUMP SAVE writes inside the snapshot directory; validated like a client-supplied path, so an absolute or escaping name is refused (empty = fall back to a timestamped name). Must end in .nvec or .dmp, or startup will not treat the file as a recovery candidate
+  default_filename: "nvecd.nvec"
   # Snapshot interval in seconds (0 = disabled) [0-86400]
   interval_sec: 0
   # Number of automatic snapshots to retain; manual snapshots are never removed (0 = keep every file) [0-100]

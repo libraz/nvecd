@@ -186,7 +186,7 @@
         "ivf_nlist": {
           "type": "integer",
           "description": "Number of Voronoi cells/clusters for IVF index (0 = auto sqrt(n))",
-          "description_ja": "IVF インデックスのボロノイセル（クラスタ）数（0 = 自動で sqrt(n)）",
+          "description_ja": "IVF 索引のボロノイセル（クラスタ）数（0 = 自動で sqrt(n)）",
           "default": 256,
           "minimum": 0,
           "maximum": 65536
@@ -202,7 +202,7 @@
         "ivf_train_threshold": {
           "type": "integer",
           "description": "Minimum number of vectors before auto-training IVF index; the maximum is the range of the type it is read into, not a tuning limit",
-          "description_ja": "IVF インデックスを自動学習するまでに必要な最小ベクトル数。上限は読み込み先の型の範囲であり、チューニング上の制限ではない",
+          "description_ja": "IVF 索引を自動学習するまでに必要な最小ベクトル数。上限は読み込み先の型の範囲であり、チューニング上の制限ではない",
           "default": 10000,
           "minimum": 1,
           "maximum": 4294967295
@@ -248,7 +248,7 @@
         "index_type": {
           "type": "string",
           "description": "ANN index type: hnsw, ivf, or flat (brute-force)",
-          "description_ja": "ANN インデックスの種類: hnsw、ivf、flat（全探索）",
+          "description_ja": "ANN 索引の種類: hnsw、ivf、flat（全探索）",
           "default": "flat",
           "enum": [
             "hnsw",
@@ -283,7 +283,7 @@
         "hnsw_max_elements": {
           "type": "integer",
           "description": "HNSW pre-allocated capacity (0 = dynamic growth); the value is reserved at startup and the maximum is the largest index the snapshot loader accepts, so reserving beyond it produces an index that cannot be reloaded",
-          "description_ja": "HNSW の事前確保容量（0 = 動的に拡張）。値は起動時に確保され、上限はスナップショット読み込みが受け付けるインデックスの最大サイズ。これを超えて確保すると再読み込みできないインデックスになる",
+          "description_ja": "HNSW の事前確保容量（0 = 動的に拡張）。値は起動時に確保され、上限はスナップショット読み込みが受け付ける索引の最大サイズ。これを超えて確保すると再読み込みできない索引になる",
           "default": 0,
           "minimum": 0,
           "maximum": 10000000
@@ -304,9 +304,9 @@
         },
         "default_filename": {
           "type": "string",
-          "description": "Filename an argument-less DUMP SAVE writes inside the snapshot directory; validated like a client-supplied path, so an absolute or escaping name is refused (empty = fall back to a timestamped name)",
-          "description_ja": "引数なしの DUMP SAVE がスナップショットディレクトリ内に書き込むファイル名。クライアント指定のパスと同様に検証されるため、絶対パスやディレクトリを抜け出す名前は拒否される（空 = タイムスタンプ付きの名前にフォールバック）",
-          "default": "nvecd.snapshot"
+          "description": "Filename an argument-less DUMP SAVE writes inside the snapshot directory; validated like a client-supplied path, so an absolute or escaping name is refused (empty = fall back to a timestamped name). Must end in .nvec or .dmp, or startup will not treat the file as a recovery candidate",
+          "description_ja": "引数なしの DUMP SAVE がスナップショットディレクトリ内に書き込むファイル名。クライアント指定のパスと同様に検証されるため、絶対パスやディレクトリを抜け出す名前は拒否される（空 = タイムスタンプ付きの名前にフォールバック）。.nvec か .dmp で終わる必要があり、そうでないと起動時に復旧候補として扱われない",
+          "default": "nvecd.nvec"
         },
         "interval_sec": {
           "type": "integer",
@@ -409,7 +409,7 @@
         "reactor_max_total_buffered_bytes": {
           "type": "integer",
           "description": "Process-wide cap for bytes buffered by the TCP reactor",
-          "description_ja": "TCP リアクターがバッファするバイト数のプロセス全体での上限",
+          "description_ja": "TCP リアクタがバッファするバイト数のプロセス全体での上限",
           "default": 268435456,
           "minimum": 1048576,
           "maximum": 1073741824
@@ -473,13 +473,13 @@
             "enable_cors": {
               "type": "boolean",
               "description": "Enable CORS headers",
-              "description_ja": "CORS ヘッダーを有効にする",
+              "description_ja": "CORS ヘッダを有効にする",
               "default": false
             },
             "cors_allow_origin": {
               "type": "string",
               "description": "Value for Access-Control-Allow-Origin header when CORS is enabled",
-              "description_ja": "CORS 有効時の Access-Control-Allow-Origin ヘッダーの値",
+              "description_ja": "CORS 有効時の Access-Control-Allow-Origin ヘッダの値",
               "default": ""
             },
             "timeout_sec": {

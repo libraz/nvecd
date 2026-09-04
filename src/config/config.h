@@ -40,7 +40,9 @@ constexpr uint32_t kSampleSize = 10000;  ///< Default sample size for approximat
 
 // Snapshot defaults
 constexpr int kSnapshotIntervalSec = 0;  // 0 = disabled
-constexpr const char* kSnapshotDefaultFilename = "nvecd.snapshot";
+// Must carry a storage::snapshot_format::kRecoverableExtensions suffix, or an
+// argument-less DUMP SAVE would write a file that startup never picks up.
+constexpr const char* kSnapshotDefaultFilename = "nvecd.nvec";
 
 // API defaults
 constexpr int kTcpPort = 11017;

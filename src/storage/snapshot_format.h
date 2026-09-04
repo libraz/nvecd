@@ -20,9 +20,11 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <string>
+#include <string_view>
 
 namespace nvecd::storage {
 
@@ -50,6 +52,22 @@ constexpr uint32_t kMinSupportedVersion = 1;
 // Fixed file header size (magic + version)
 // This header is present in all snapshot versions
 constexpr size_t kFixedHeaderSize = 8;
+
+// Extensions that mark a file as a published snapshot, and therefore as a
+// candidate for recovery at startup. A snapshot written under any other
+// extension is readable by DUMP LOAD but is never picked up automatically, so
+// every path that names a snapshot must produce one of these: the scheduler's
+// auto_<timestamp>.nvec, DUMP SAVE's timestamped fallback, and the configured
+// snapshot.default_filename alike.
+constexpr std::array<std::string_view, 2> kRecoverableExtensions = {".nvec", ".dmp"};
+
+/**
+ * @brief Whether a path's extension marks it as a recovery candidate
+ */
+inline bool IsRecoverableExtension(std::string_view extension) {
+  return std::any_of(kRecoverableExtensions.begin(), kRecoverableExtensions.end(),
+                     [extension](std::string_view candidate) { return extension == candidate; });
+}
 
 /**
  * @brief Format version enum for type safety

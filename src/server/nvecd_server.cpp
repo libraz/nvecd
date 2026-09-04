@@ -27,6 +27,7 @@
 #include "server/http_server.h"
 #include "server/reactor_connection.h"
 #include "server/request_dispatcher.h"
+#include "storage/snapshot_format.h"
 #include "storage/snapshot_format_v1.h"
 #include "storage/wal_checkpoint.h"
 #include "utils/error.h"
@@ -77,8 +78,7 @@ std::vector<std::string> FindSnapshotCandidates(const std::string& dir, bool req
     // Only a final snapshot suffix denotes a published recovery candidate.
     // Writer temporary files contain an additional ".tmp.<random>" suffix;
     // checkpoint sidecars and unrelated files are therefore excluded too.
-    const auto extension = entry.path().extension();
-    if (extension != ".nvec" && extension != ".dmp") {
+    if (!storage::snapshot_format::IsRecoverableExtension(entry.path().extension().string())) {
       continue;
     }
     // With WAL enabled, only snapshots with a checkpoint sidecar are valid
