@@ -34,7 +34,8 @@
  * │   - Snapshot Statistics                                     │
  * ├─────────────────────────────────────────────────────────────┤
  * │ Store Data Section                                          │
- * │   - Store Count (4 bytes): 3 (events, co_occurrence, vectors)│
+ * │   - Store Count (4 bytes): 4, or 3 without a metadata store │
+ * │     (events, co_occurrence, vectors, metadata)              │
  * │   ┌───────────────────────────────────────────────────────┐│
  * │   │ For each store:                                       ││
  * │   │   - Store Name (length-prefixed string)               ││

@@ -144,12 +144,13 @@ void SnapshotScheduler::SchedulerLoop() {
   auto next_save_time = std::chrono::steady_clock::now() + std::chrono::seconds(interval_sec);
 
   while (running_) {
-    // Reap any finished fork child every tick. This is the only place the
-    // auto-snapshot path drives ForkSnapshotWriter::CheckChild(), which reaps
-    // the child (preventing zombies), flips status out of kInProgress (so the
-    // next snapshot can start), and — critically — writes the WAL checkpoint
-    // sidecar and truncates the WAL. Without it a single fork would stay
-    // kInProgress forever: only one snapshot per process, WAL growing unbounded.
+    // Publish the outcome of a finished session every tick. This is the only
+    // place the auto-snapshot path drives ForkSnapshotWriter::CheckChild().
+    // Reaping the child, writing the WAL checkpoint sidecar and truncating the
+    // WAL all happen on the session's own completion thread and do not depend
+    // on this call; CheckChild() only picks up the finished outcome and clears
+    // the session. Without it the writer stays kInProgress forever, so a single
+    // fork would be the only snapshot the process ever takes.
     if (fork_writer_ != nullptr) {
       const bool was_in_progress = fork_writer_->IsInProgress();
       fork_writer_->CheckChild();

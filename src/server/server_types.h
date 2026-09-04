@@ -293,10 +293,11 @@ struct HandlerContext {
 
   /// Write-Ahead Log for durability (non-owning, owned by NvecdServer).
   ///
-  /// When non-null, write handlers append a record to the WAL after the
-  /// in-memory mutation succeeds and before returning OK to the client. The
-  /// pointer stays null during startup WAL replay so re-applied records are not
-  /// logged a second time; the server only publishes it once replay completes.
+  /// When non-null, write handlers append a record to the WAL before applying
+  /// the in-memory mutation, so a record can never be missing for a change that
+  /// is already visible. The pointer stays null during startup WAL replay so
+  /// re-applied records are not logged a second time; the server only publishes
+  /// it once replay completes.
   storage::WriteAheadLog* wal = nullptr;
 
   /// Vector-store generation counter.
