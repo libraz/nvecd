@@ -85,6 +85,9 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
 endif()
 
+list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
+include(NvecdSimd)
+
 # Export compile commands for clang-tidy
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 

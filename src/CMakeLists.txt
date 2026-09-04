@@ -87,29 +87,9 @@ target_link_libraries(nvecd_vectors PUBLIC
   Threads::Threads
 )
 
-# Platform-specific SIMD optimizations
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86)|(X86)|(amd64)|(AMD64)")
-  # x86_64: Enable AVX2 if supported
-  include(CheckCXXCompilerFlag)
-  check_cxx_compiler_flag("-mavx2" COMPILER_SUPPORTS_AVX2)
-
-  if(COMPILER_SUPPORTS_AVX2)
-    target_compile_options(nvecd_vectors PRIVATE -mavx2)
-    message(STATUS "AVX2 SIMD enabled for vectors")
-  else()
-    message(WARNING "AVX2 not supported by compiler")
-  endif()
-
-elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "arm|aarch64|ARM|ARM64")
-  # ARM: NEON is baseline for AArch64, explicit flag for ARMv7
-  if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm64")
-    message(STATUS "NEON SIMD enabled (AArch64 baseline)")
-  else()
-    # ARMv7: Explicitly enable NEON
-    target_compile_options(nvecd_vectors PRIVATE -mfpu=neon)
-    message(STATUS "NEON SIMD enabled (ARMv7)")
-  endif()
-endif()
+# Platform-specific SIMD optimizations. Shared with the kernel test target, so
+# both compile the same set of kernels; see cmake/NvecdSimd.cmake.
+nvecd_target_simd_flags(nvecd_vectors)
 
 # Similarity library
 add_library(nvecd_similarity STATIC

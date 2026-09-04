@@ -6,9 +6,13 @@
  * numerically equivalent to the scalar reference implementation.
  */
 
+#include "vectors/distance_simd.h"
+
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <random>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -219,6 +223,29 @@ TEST_F(DistanceSIMDTest, NonMultipleOfVectorSize) {
     EXPECT_NEAR(scalar, neon, tolerance) << "Dimension: " << dim;
 #endif
   }
+}
+
+// ============================================================================
+// Coverage of the kernel the library actually runs
+// ============================================================================
+
+TEST_F(DistanceSIMDTest, ActiveImplementationIsAsserted) {
+  // Everything above is behind #ifdef, so this file asserts only the kernels it
+  // was compiled for, while the library selects from the flags its own target
+  // was built with. When the two disagree the assertions do not fail, they
+  // disappear, and the kernel that ships is the one nothing here ever calls.
+  // Naming the mismatch is the only way it becomes visible.
+  std::vector<std::string> asserted = {"Scalar"};
+#ifdef __AVX2__
+  asserted.emplace_back("AVX2");
+#endif
+#ifdef __ARM_NEON
+  asserted.emplace_back("NEON");
+#endif
+
+  const std::string active = GetImplementationName();
+  EXPECT_NE(std::find(asserted.begin(), asserted.end(), active), asserted.end())
+      << "the library dispatches to " << active << ", which this test is not compiled to exercise";
 }
 
 // ============================================================================
