@@ -74,7 +74,7 @@ ERROR_CODES_WITHOUT_CONSTRUCTOR = (
 )
 
 # Documentation pages whose vocabulary the server must produce verbatim.
-WIRE_DOCS = ("protocol.md", "http-api.md", "snapshot.md")
+WIRE_DOCS = ("protocol.md", "http-api.md", "persistence.md")
 
 # A token that names something the reader can type or receive: an identifier,
 # a dotted path, an endpoint, an HTTP verb plus path, or a status code. Prose
@@ -350,7 +350,7 @@ def check_client_api_signatures(source_root: Path) -> None:
 
     for language in ("en", "ja"):
         guide = (
-            source_root / "docs" / language / "libnvecdclient.md"
+            source_root / "docs" / language / "client-library.md"
         ).read_text(encoding="utf-8")
         tokens = re.findall(r"`([^`\n]{1,90})`", guide)
 
@@ -489,8 +489,8 @@ def check_stale_text(all_docs: str) -> None:
         "VECSET item1 3 0.1 0.5 0.8",
         "--target uninstall",
         # The dispatcher formats every failure as "ERROR <message>"; the
-        # Redis-style spellings were never on the wire.
-        "(error) ",
+        # Redis-style spelling was never on the wire. "(error) " is checked
+        # separately, because nvecd-cli really does render a failure that way.
         "-ERR ",
         # The client headers state that a handle is shareable across threads
         # and serializes commands internally. Telling readers otherwise pushes
@@ -518,11 +518,36 @@ def check_stale_text(all_docs: str) -> None:
             fail(description)
 
 
+def check_error_spelling(source_root: Path, docs: list[Path]) -> None:
+    """"(error) " belongs to nvecd-cli output, never to a wire transcript.
+
+    The CLI prints a failed command as "(error) <message>" (src/cli), so a
+    transcript of it legitimately carries that spelling. The server itself only
+    ever writes "ERROR <message>", so the same text under a raw socket or an
+    HTTP example is a promise it cannot keep. A doc alternates command blocks
+    and output blocks, so the transport is whatever the nearest preceding
+    command block used.
+    """
+    for path in docs:
+        transport_is_cli = False
+        for _language, block in FENCED_BLOCK.findall(path.read_text(encoding="utf-8")):
+            if "nvecd-cli" in block or "nvecd>" in block:
+                transport_is_cli = True
+            elif re.search(r"\b(?:nc|telnet|curl|socat)\b", block):
+                transport_is_cli = False
+            if "(error) " in block and not transport_is_cli:
+                fail(
+                    f"{path.relative_to(source_root)} spells a failure "
+                    '"(error) " outside nvecd-cli output; the wire sends '
+                    '"ERROR <message>"'
+                )
+
+
 def check_required_text(source_root: Path) -> None:
     """Interfaces each guide must document because operators depend on them."""
     for language in ("en", "ja"):
         client_doc = (
-            source_root / "docs" / language / "libnvecdclient.md"
+            source_root / "docs" / language / "client-library.md"
         ).read_text(encoding="utf-8")
         for required in (
             "nvecd::client",
@@ -530,7 +555,10 @@ def check_required_text(source_root: Path) -> None:
             "total_commands_processed",
             "ctypes.c_uint16",
             "ctypes.c_size_t",
-            "result->results[i].id",
+            # Indexing into the C response array and reading an item, whatever
+            # the example names the handle. The contract is the access pattern,
+            # not the local variable.
+            "results[i].id",
         ):
             if required not in client_doc:
                 fail(f"{language} client guide is missing: {required}")
@@ -574,6 +602,7 @@ def main() -> int:
     all_docs = "\n".join(path.read_text(encoding="utf-8") for path in docs)
 
     check_stale_text(all_docs)
+    check_error_spelling(source_root, docs)
     check_required_text(source_root)
     check_generated_docs(source_root)
     check_schema_wiring(source_root)
