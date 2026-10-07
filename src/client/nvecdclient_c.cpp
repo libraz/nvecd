@@ -17,6 +17,7 @@
 
 #include <atomic>
 #include <cstring>
+#include <initializer_list>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -63,6 +64,24 @@ struct NvecdClient_C {
 static void set_last_error(NvecdClient_C* client, std::string message) {
   const std::lock_guard<std::mutex> lock(client->error_mutex);
   client->last_error = std::move(message);
+}
+
+// Validate the handle and every required pointer argument. A rejected call
+// leaves its reason in the handle's error slot, so get_last_error never reports
+// a message left over from an earlier call; a NULL handle has no slot and gets
+// the fallback string from get_last_error instead.
+static bool args_usable(NvecdClient_C* client, std::initializer_list<const void*> required) {
+  if (client == nullptr) {
+    return false;
+  }
+  bool usable = client->client != nullptr;
+  for (const void* argument : required) {
+    usable = usable && argument != nullptr;
+  }
+  if (!usable) {
+    set_last_error(client, "Invalid argument");
+  }
+  return usable;
 }
 
 // Helper: Allocate C string copy
@@ -211,9 +230,10 @@ NvecdClient_C* nvecdclient_create(const NvecdClientConfig_C* config) {
 
   ClientConfig cpp_config;
   cpp_config.host = (config->host != nullptr) ? config->host : "127.0.0.1";
-  cpp_config.port = config->port != 0 ? config->port : 11017;                                      // NOLINT
-  cpp_config.timeout_ms = config->timeout_ms != 0 ? config->timeout_ms : 5000;                     // NOLINT
-  cpp_config.recv_buffer_size = config->recv_buffer_size != 0 ? config->recv_buffer_size : 65536;  // NOLINT
+  cpp_config.port = config->port != 0 ? config->port : 11017;  // NOLINT
+  // Zero timeout_ms / recv_buffer_size are resolved to defaults by the C++ client.
+  cpp_config.timeout_ms = config->timeout_ms;
+  cpp_config.recv_buffer_size = config->recv_buffer_size;
 
   client_c->client = std::make_unique<NvecdClient>(cpp_config);
 
@@ -225,7 +245,7 @@ void nvecdclient_destroy(NvecdClient_C* client) {
 }
 
 int nvecdclient_connect(NvecdClient_C* client) {
-  if (client == nullptr || client->client == nullptr) {
+  if (!args_usable(client, {})) {
     return -1;
   }
 
@@ -257,7 +277,7 @@ int nvecdclient_is_connected(const NvecdClient_C* client) {
 //
 
 int nvecdclient_event(NvecdClient_C* client, const char* ctx, const char* type, const char* id, int score) {
-  if (client == nullptr || client->client == nullptr || ctx == nullptr || type == nullptr || id == nullptr) {
+  if (!args_usable(client, {ctx, type, id})) {
     return -1;
   }
 
@@ -271,7 +291,7 @@ int nvecdclient_event(NvecdClient_C* client, const char* ctx, const char* type, 
 }
 
 int nvecdclient_vecset(NvecdClient_C* client, const char* id, const float* vector, size_t dimension) {
-  if (client == nullptr || client->client == nullptr || id == nullptr || vector == nullptr || dimension == 0) {
+  if (!args_usable(client, {id, vector})) {
     return -1;
   }
 
@@ -286,7 +306,7 @@ int nvecdclient_vecset(NvecdClient_C* client, const char* id, const float* vecto
 }
 
 int nvecdclient_vecdel(NvecdClient_C* client, const char* id) {
-  if (client == nullptr || client->client == nullptr || id == nullptr) {
+  if (!args_usable(client, {id})) {
     return -1;
   }
 
@@ -299,7 +319,7 @@ int nvecdclient_vecdel(NvecdClient_C* client, const char* id) {
 }
 
 int nvecdclient_metaset(NvecdClient_C* client, const char* id, const char* metadata) {
-  if (client == nullptr || client->client == nullptr || id == nullptr || metadata == nullptr) {
+  if (!args_usable(client, {id, metadata})) {
     return -1;
   }
 
@@ -319,7 +339,7 @@ int nvecdclient_sim(NvecdClient_C* client, const char* id, uint32_t top_k, const
 
 int nvecdclient_sim_ex(NvecdClient_C* client, const char* id, uint32_t top_k, const char* mode,
                        const NvecdSearchOptions_C* options, NvecdSimResponse_C** result) {
-  if (client == nullptr || client->client == nullptr || id == nullptr || result == nullptr) {
+  if (!args_usable(client, {id, result})) {
     return -1;
   }
 
@@ -340,7 +360,7 @@ int nvecdclient_simv(NvecdClient_C* client, const float* vector, size_t dimensio
 
 int nvecdclient_simv_ex(NvecdClient_C* client, const float* vector, size_t dimension, uint32_t top_k, const char* mode,
                         const NvecdSearchOptions_C* options, NvecdSimResponse_C** result) {
-  if (client == nullptr || client->client == nullptr || vector == nullptr || dimension == 0 || result == nullptr) {
+  if (!args_usable(client, {vector, result})) {
     return -1;
   }
 
@@ -360,7 +380,7 @@ int nvecdclient_simv_ex(NvecdClient_C* client, const float* vector, size_t dimen
 //
 
 int nvecdclient_auth(NvecdClient_C* client, const char* password) {
-  if (client == nullptr || client->client == nullptr || password == nullptr) {
+  if (!args_usable(client, {password})) {
     return -1;
   }
 
@@ -374,7 +394,7 @@ int nvecdclient_auth(NvecdClient_C* client, const char* password) {
 }
 
 int nvecdclient_info(NvecdClient_C* client, NvecdServerInfo_C** info) {
-  if (client == nullptr || client->client == nullptr || info == nullptr) {
+  if (!args_usable(client, {info})) {
     return -1;
   }
 
@@ -412,7 +432,7 @@ int nvecdclient_info(NvecdClient_C* client, NvecdServerInfo_C** info) {
 }
 
 int nvecdclient_get_config(NvecdClient_C* client, char** config_str) {
-  if (client == nullptr || client->client == nullptr || config_str == nullptr) {
+  if (!args_usable(client, {config_str})) {
     return -1;
   }
 
@@ -426,7 +446,7 @@ int nvecdclient_get_config(NvecdClient_C* client, char** config_str) {
 }
 
 int nvecdclient_save(NvecdClient_C* client, const char* filepath, char** saved_path) {
-  if (client == nullptr || client->client == nullptr || saved_path == nullptr) {
+  if (!args_usable(client, {saved_path})) {
     return -1;
   }
 
@@ -448,7 +468,7 @@ int nvecdclient_save(NvecdClient_C* client, const char* filepath, char** saved_p
 }
 
 int nvecdclient_load(NvecdClient_C* client, const char* filepath, char** loaded_path) {
-  if (client == nullptr || client->client == nullptr || filepath == nullptr || loaded_path == nullptr) {
+  if (!args_usable(client, {filepath, loaded_path})) {
     return -1;
   }
 
@@ -462,7 +482,7 @@ int nvecdclient_load(NvecdClient_C* client, const char* filepath, char** loaded_
 }
 
 int nvecdclient_verify(NvecdClient_C* client, const char* filepath, char** result_str) {
-  if (client == nullptr || client->client == nullptr || filepath == nullptr || result_str == nullptr) {
+  if (!args_usable(client, {filepath, result_str})) {
     return -1;
   }
 
@@ -476,7 +496,7 @@ int nvecdclient_verify(NvecdClient_C* client, const char* filepath, char** resul
 }
 
 int nvecdclient_dump_info(NvecdClient_C* client, const char* filepath, char** info_str) {
-  if (client == nullptr || client->client == nullptr || filepath == nullptr || info_str == nullptr) {
+  if (!args_usable(client, {filepath, info_str})) {
     return -1;
   }
 
@@ -490,7 +510,7 @@ int nvecdclient_dump_info(NvecdClient_C* client, const char* filepath, char** in
 }
 
 int nvecdclient_dump_status(NvecdClient_C* client, char** status_str) {
-  if (client == nullptr || client->client == nullptr || status_str == nullptr) {
+  if (!args_usable(client, {status_str})) {
     return -1;
   }
 
@@ -504,7 +524,7 @@ int nvecdclient_dump_status(NvecdClient_C* client, char** status_str) {
 }
 
 int nvecdclient_cache_stats(NvecdClient_C* client, char** stats_str) {
-  if (client == nullptr || client->client == nullptr || stats_str == nullptr) {
+  if (!args_usable(client, {stats_str})) {
     return -1;
   }
 
@@ -518,7 +538,7 @@ int nvecdclient_cache_stats(NvecdClient_C* client, char** stats_str) {
 }
 
 int nvecdclient_cache_clear(NvecdClient_C* client) {
-  if (client == nullptr || client->client == nullptr) {
+  if (!args_usable(client, {})) {
     return -1;
   }
 
@@ -532,7 +552,7 @@ int nvecdclient_cache_clear(NvecdClient_C* client) {
 }
 
 int nvecdclient_cache_enable(NvecdClient_C* client) {
-  if (client == nullptr || client->client == nullptr) {
+  if (!args_usable(client, {})) {
     return -1;
   }
 
@@ -546,7 +566,7 @@ int nvecdclient_cache_enable(NvecdClient_C* client) {
 }
 
 int nvecdclient_cache_disable(NvecdClient_C* client) {
-  if (client == nullptr || client->client == nullptr) {
+  if (!args_usable(client, {})) {
     return -1;
   }
 
@@ -560,7 +580,7 @@ int nvecdclient_cache_disable(NvecdClient_C* client) {
 }
 
 int nvecdclient_debug_on(NvecdClient_C* client) {
-  if (client == nullptr || client->client == nullptr) {
+  if (!args_usable(client, {})) {
     return -1;
   }
 
@@ -574,7 +594,7 @@ int nvecdclient_debug_on(NvecdClient_C* client) {
 }
 
 int nvecdclient_debug_off(NvecdClient_C* client) {
-  if (client == nullptr || client->client == nullptr) {
+  if (!args_usable(client, {})) {
     return -1;
   }
 

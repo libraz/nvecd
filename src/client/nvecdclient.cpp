@@ -27,6 +27,7 @@
 #include <utility>
 
 #include "client/protocol_transport.h"
+#include "events/id_validation.h"
 #include "utils/error.h"
 #include "utils/expected.h"
 #include "utils/fd_guard.h"
@@ -105,32 +106,6 @@ void AppendSearchOptions(std::ostringstream& cmd, const SearchOptions& options) 
 }
 
 /**
- * @brief Reject bytes the line protocol cannot carry.
- *
- * The wire protocol is the authority on what a command may contain: the server
- * refuses an embedded NUL and an embedded CR/LF and accepts every other byte
- * (see ParseCommand in src/server/command_parser.cpp). Rejecting more than
- * that here - a blanket std::iscntrl test also excludes TAB - makes the shipped
- * client refuse input the server, the CLI and a hand-written socket client all
- * accept, which is a difference callers cannot see or work around.
- *
- * These three bytes are exactly the ones that would break framing: NUL
- * terminates the command for the parser, CR/LF splits one command into two.
- */
-std::optional<std::string> ValidateNoFramingBytes(const std::string& value, const char* field_name) {
-  for (unsigned char character : value) {
-    if (character == '\0' || character == '\r' || character == '\n') {
-      std::ostringstream oss;
-      oss << "Input for " << field_name << " contains byte 0x" << std::uppercase << std::hex << std::setw(2)
-          << std::setfill('0') << static_cast<int>(character) << ", which the line protocol cannot carry";
-      return oss.str();
-    }
-  }
-
-  return std::nullopt;
-}
-
-/**
  * @brief Validate a whitespace-delimited protocol token.
  *
  * nvecd does not implement shell-style quoting. Reject whitespace rather than
@@ -138,7 +113,7 @@ std::optional<std::string> ValidateNoFramingBytes(const std::string& value, cons
  * deliberately excluded because its password is an opaque suffix.
  */
 std::optional<std::string> ValidateProtocolToken(const std::string& value, const char* field_name) {
-  if (auto error = ValidateNoFramingBytes(value, field_name)) {
+  if (auto error = transport::ValidateNoFramingBytes(value, field_name)) {
     return error;
   }
   for (unsigned char character : value) {
@@ -149,13 +124,41 @@ std::optional<std::string> ValidateProtocolToken(const std::string& value, const
   return std::nullopt;
 }
 
+/**
+ * @brief Validate a context, item or vector identifier.
+ *
+ * Identifiers follow the server's own rule (non-empty, no whitespace or control
+ * characters), so a value the server would refuse never reaches the wire and an
+ * empty one cannot vanish from the whitespace-delimited command and shift the
+ * arguments that follow it.
+ */
+std::optional<std::string> ValidateIdToken(const std::string& value, const char* field_name) {
+  if (auto valid = events::ValidateIdentifier(field_name, value); !valid) {
+    return valid.error().message();
+  }
+  return std::nullopt;
+}
+
+/**
+ * @brief Replace zero-valued tuning fields with their defaults.
+ *
+ * A zero timeout would mean "block forever" and a zero buffer would make
+ * recv() return 0 as if the peer had closed, so zero is read as "unset" on
+ * every surface that builds a client, the C wrapper included.
+ */
+ClientConfig WithDefaults(ClientConfig config) {
+  const ClientConfig defaults;
+  config.timeout_ms = config.timeout_ms != 0 ? config.timeout_ms : defaults.timeout_ms;
+  config.recv_buffer_size = config.recv_buffer_size != 0 ? config.recv_buffer_size : defaults.recv_buffer_size;
+  return config;
+}
+
 }  // namespace
 
 namespace detail {
 
 std::optional<size_t> CompleteResponseLength(const std::string& buffer, bool requires_end_terminator) {
-  transport::ResponseFrame frame;
-  frame.end_terminated = requires_end_terminator;
+  const transport::ResponseFrame frame{requires_end_terminator};
   return transport::CompleteResponseLength(buffer, frame);
 }
 
@@ -170,7 +173,7 @@ bool IsResponseComplete(const std::string& buffer) {
  */
 class NvecdClient::Impl {
  public:
-  explicit Impl(ClientConfig config) : config_(std::move(config)) {}
+  explicit Impl(ClientConfig config) : config_(WithDefaults(std::move(config))) {}
 
   ~Impl() { Disconnect(); }
 
@@ -276,6 +279,12 @@ class NvecdClient::Impl {
   }
 
   Expected<std::string, Error> SendCommand(const std::string& command) const {
+    // One call is exactly one command line: an embedded CR/LF would put a second
+    // command on the wire and desynchronize every reply after it.
+    if (auto err = transport::ValidateNoFramingBytes(command, "command")) {
+      return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, *err));
+    }
+
     std::lock_guard lock(round_trip_mutex_);
     if (sock_ < 0) {
       return MakeUnexpected(MakeError(ErrorCode::kClientNotConnected, "Not connected"));
@@ -351,13 +360,13 @@ class NvecdClient::Impl {
   //
 
   Expected<void, Error> Event(const std::string& ctx, const std::string& type, const std::string& id, int score) const {
-    if (auto err = ValidateProtocolToken(ctx, "context ID")) {
+    if (auto err = ValidateIdToken(ctx, "context ID")) {
       return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, *err));
     }
-    if (auto err = ValidateNoFramingBytes(type, "event type")) {
+    if (auto err = transport::ValidateNoFramingBytes(type, "event type")) {
       return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, *err));
     }
-    if (auto err = ValidateProtocolToken(id, "document ID")) {
+    if (auto err = ValidateIdToken(id, "document ID")) {
       return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, *err));
     }
 
@@ -394,7 +403,7 @@ class NvecdClient::Impl {
   }
 
   Expected<void, Error> Vecset(const std::string& id, const std::vector<float>& vector) const {
-    if (auto err = ValidateProtocolToken(id, "vector ID")) {
+    if (auto err = ValidateIdToken(id, "vector ID")) {
       return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, *err));
     }
     if (vector.empty()) {
@@ -424,11 +433,8 @@ class NvecdClient::Impl {
   }
 
   Expected<void, Error> Vecdel(const std::string& id) const {
-    if (auto err = ValidateProtocolToken(id, "vector ID")) {
+    if (auto err = ValidateIdToken(id, "vector ID")) {
       return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, *err));
-    }
-    if (id.empty()) {
-      return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, "Vector ID cannot be empty"));
     }
 
     auto result = SendCommand("VECDEL " + id);
@@ -445,7 +451,7 @@ class NvecdClient::Impl {
   }
 
   Expected<void, Error> Metaset(const std::string& id, const std::string& metadata) const {
-    if (auto err = ValidateProtocolToken(id, "item ID")) {
+    if (auto err = ValidateIdToken(id, "item ID")) {
       return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, *err));
     }
     if (auto err = ValidateProtocolToken(metadata, "metadata")) {
@@ -476,7 +482,7 @@ class NvecdClient::Impl {
 
   Expected<SimResponse, Error> Sim(const std::string& id, uint32_t top_k, const std::string& mode,
                                    const SearchOptions& options) const {
-    if (auto err = ValidateProtocolToken(id, "document ID")) {
+    if (auto err = ValidateIdToken(id, "document ID")) {
       return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, *err));
     }
     if (auto err = ValidateProtocolToken(mode, "search mode")) {
@@ -807,7 +813,10 @@ class NvecdClient::Impl {
   }
 
   Expected<void, Error> Auth(const std::string& password) const {
-    if (auto err = ValidateNoFramingBytes(password, "password")) {
+    if (password.empty()) {
+      return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, "Password cannot be empty"));
+    }
+    if (auto err = transport::ValidateNoFramingBytes(password, "password")) {
       return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, *err));
     }
 

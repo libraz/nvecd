@@ -600,3 +600,81 @@ TEST(NvecdClientCSaveTest, StartedSaveGetsItsOwnReturnCode) {
   nvecdclient_disconnect(client);
   nvecdclient_destroy(client);
 }
+
+TEST(NvecdClientCFailureTest, EveryRejectedCallDescribesItselfInsteadOfLeavingAStaleMessage) {
+  NvecdClientConfig_C config = {};
+  config.host = "127.0.0.1";
+  config.port = 1;  // Never connected
+  NvecdClient_C* client = nvecdclient_create(&config);
+  ASSERT_NE(client, nullptr);
+
+  const float vec[3] = {1.0F, 0.0F, 0.0F};
+
+  // A refused empty identifier is reported as such, not as the connection
+  // failure that preceded it.
+  EXPECT_EQ(nvecdclient_connect(client), -1);
+  const std::string connect_error = nvecdclient_get_last_error(client);
+  EXPECT_EQ(nvecdclient_vecset(client, "", vec, 3), -1);
+  const std::string empty_id_error = nvecdclient_get_last_error(client);
+  EXPECT_NE(empty_id_error, connect_error);
+  EXPECT_NE(empty_id_error.find("cannot be empty"), std::string::npos) << empty_id_error;
+
+  // Null arguments leave a current message as well.
+  EXPECT_EQ(nvecdclient_vecset(client, "item", nullptr, 3), -1);
+  const std::string null_arg_error = nvecdclient_get_last_error(client);
+  EXPECT_NE(null_arg_error, empty_id_error);
+  EXPECT_FALSE(null_arg_error.empty());
+
+  EXPECT_EQ(nvecdclient_connect(client), -1);
+  EXPECT_EQ(nvecdclient_vecdel(client, nullptr), -1);
+  EXPECT_EQ(std::string(nvecdclient_get_last_error(client)), null_arg_error);
+
+  // Out-parameters are NULL after a rejection, never left as the caller had them.
+  auto* sim_sentinel = reinterpret_cast<NvecdSimResponse_C*>(std::uintptr_t{1});
+  EXPECT_EQ(nvecdclient_sim(client, "", 1, "vectors", &sim_sentinel), -1);
+  EXPECT_EQ(sim_sentinel, nullptr);
+  auto* string_sentinel = reinterpret_cast<char*>(std::uintptr_t{1});
+  EXPECT_EQ(nvecdclient_dump_info(client, nullptr, &string_sentinel), -1);
+  EXPECT_EQ(string_sentinel, nullptr);
+
+  nvecdclient_destroy(client);
+}
+
+TEST(NvecdClientCConfigTest, ZeroTimeoutAndBufferSizeUseTheSameDefaultsAsTheCppClient) {
+  nvecd::testing::CannedResponseServer server({"OK\r\n"});
+  ASSERT_GT(server.Port(), 0);
+
+  NvecdClientConfig_C config = {};
+  config.host = "127.0.0.1";
+  config.port = server.Port();
+  NvecdClient_C* client = nvecdclient_create(&config);
+  ASSERT_NE(client, nullptr);
+  ASSERT_EQ(nvecdclient_connect(client), 0) << nvecdclient_get_last_error(client);
+  EXPECT_EQ(nvecdclient_cache_clear(client), 0) << nvecdclient_get_last_error(client);
+  nvecdclient_disconnect(client);
+  nvecdclient_destroy(client);
+}
+
+TEST(NvecdClientCFramingTest, DumpInfoReturnsTheWholeBlockAndKeepsTheStreamAligned) {
+  nvecd::testing::CannedResponseServer server(
+      {"OK DUMP_INFO /tmp/snap.dmp\r\nversion: 1\r\nstores: 3\r\nEND\r\n", "OK\r\n"});
+  ASSERT_GT(server.Port(), 0);
+
+  NvecdClientConfig_C config = {};
+  config.host = "127.0.0.1";
+  config.port = server.Port();
+  config.timeout_ms = 2000;
+  NvecdClient_C* client = nvecdclient_create(&config);
+  ASSERT_NE(client, nullptr);
+  ASSERT_EQ(nvecdclient_connect(client), 0) << nvecdclient_get_last_error(client);
+
+  char* info = nullptr;
+  ASSERT_EQ(nvecdclient_dump_info(client, "/tmp/snap.dmp", &info), 0) << nvecdclient_get_last_error(client);
+  ASSERT_NE(info, nullptr);
+  EXPECT_NE(std::string(info).find("stores: 3"), std::string::npos) << info;
+  nvecdclient_free_string(info);
+
+  EXPECT_EQ(nvecdclient_vecdel(client, "item"), 0) << nvecdclient_get_last_error(client);
+  nvecdclient_disconnect(client);
+  nvecdclient_destroy(client);
+}

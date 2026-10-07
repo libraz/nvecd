@@ -65,6 +65,8 @@ config.recv_buffer_size = 65536;
 | `recv_buffer_size` | `uint32_t` | `65536` | receive buffer size |
 | `unix_socket_path` | `std::string` | `""` | Unix domain socket path |
 
+A zero `timeout_ms` or `recv_buffer_size` means "unset" and is replaced by the default, in the C++ client and the C API alike.
+
 Setting `unix_socket_path` switches the transport: the client connects to that socket and ignores `host` and `port`.
 
 ```cpp
@@ -110,7 +112,7 @@ client.Metaset("item1", "category:books,active:true");
 
 This is the shape TCP `METASET` accepts, and it is not the shape the HTTP `/metaset` route accepts — that route takes a JSON object under a `metadata` key. Code ported from the HTTP surface has to convert its map into `key:value,key:value` before calling this method. The expression must contain no whitespace, and an empty expression is rejected locally.
 
-Every string argument is checked for bytes the line protocol cannot carry — NUL, CR and LF — plus whitespace where the command is whitespace-delimited. Nothing else is filtered, so the client accepts exactly the bytes the server does.
+Every string argument is checked for bytes the line protocol cannot carry — NUL, CR and LF — plus whitespace where the command is whitespace-delimited. Context, item and vector IDs follow the server's identifier rule: they must be non-empty and free of whitespace and control characters, so an empty ID is rejected locally instead of silently shifting the arguments after it. Nothing else is filtered, so the client accepts exactly the bytes the server does.
 
 ### Search
 
@@ -186,7 +188,7 @@ struct SaveResult {
 
 Under the default `snapshot.mode: fork`, `completed` is false and `filepath` is not readable yet — it may be missing or still hold the previous snapshot. Poll `DumpStatus()` until the writer finishes before copying or loading it. Under `snapshot.mode: lock`, `completed` is true and the file is ready when `Save` returns.
 
-`SendCommand` is the escape hatch for commands the class does not wrap, such as `SET`, `GET` and `SHOW VARIABLES`. It returns the response with the trailing CRLF stripped and does not classify it, so a caller checks for an `ERROR` prefix itself.
+`SendCommand` is the escape hatch for commands the class does not wrap, such as `SET`, `GET` and `SHOW VARIABLES`. It returns the response with the trailing CRLF stripped and does not classify it, so a caller checks for an `ERROR` prefix itself. A command containing NUL, CR or LF is rejected locally with `kClientInvalidArgument` before any byte is sent, so one call always puts exactly one command line on the wire.
 
 `EnableDebug` and `DisableDebug` toggle the connection's debug mode, which appends a `# DEBUG` block to every subsequent `SIM` and `SIMV` response. The parsers in `Sim` and `Simv` read the leading result set and stop, so the block is discarded rather than mis-parsed.
 
@@ -344,7 +346,7 @@ int nvecdclient_simv_ex(NvecdClient_C* client, const float* vector, size_t dimen
 
 A `NULL` `mode` means `"fusion"` for the two `sim` functions and `"vectors"` for the two `simv` functions. The `_ex` variants add filtering; `options` may be `NULL`, and `min_score` and `adaptive` are read only when their `has_` companion is non-zero. `adaptive` reaches the wire only from `sim_ex`, because `SIMV` has no adaptive option.
 
-On success `*result` receives a heap-allocated response the caller owns. Free it with `nvecdclient_free_sim_response`, which frees each `id`, the `results` array, `mode` and the response itself in one call; freeing any member individually is a double free. On failure `*result` is untouched.
+On success `*result` receives a heap-allocated response the caller owns. Free it with `nvecdclient_free_sim_response`, which frees each `id`, the `results` array, `mode` and the response itself in one call; freeing any member individually is a double free. On failure `*result` is set to `NULL`.
 
 ### Administration
 
@@ -376,6 +378,8 @@ int nvecdclient_debug_off(NvecdClient_C* client);
 `*saved_path` is written for both success codes. A `1` means the caller polls `nvecdclient_dump_status` before touching the file. Treating `!= 0` as failure loses a successful fork-mode save; treating `>= 0` as "file ready" hands a backup script a path that does not exist yet.
 
 `filepath` may be `NULL` for `nvecdclient_save`, which uses the server's configured default name. It is required for `load`, `verify` and `dump_info`.
+
+Every `-1` return from a call with a non-`NULL` handle leaves a message describing that call in `nvecdclient_get_last_error`, argument-validation failures included. Out-parameters (`*result`, `*info`, `*saved_path` and the other string outputs) are set to `NULL` on every failure.
 
 ### Ownership
 

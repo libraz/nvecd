@@ -13,8 +13,10 @@
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
+#include <iomanip>
 #include <limits>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <string_view>
 
@@ -23,6 +25,7 @@ namespace nvecd::client::transport {
 struct ResponseFrame {
   bool end_terminated = false;
   bool debug_similarity = false;
+  bool long_running = false;  ///< Snapshot save/load/verify: the server may take far longer than a query to reply
 };
 
 // Upper bound on the bytes a client buffers for one response. A peer that never
@@ -45,11 +48,6 @@ inline std::string UpperCommand(std::string_view command) {
   return upper;
 }
 
-inline bool StartsWithCommand(const std::string& command, std::string_view prefix) {
-  return command == prefix || (command.size() > prefix.size() && command.compare(0, prefix.size(), prefix) == 0 &&
-                               std::isspace(static_cast<unsigned char>(command[prefix.size()])) != 0);
-}
-
 /**
  * @brief Whether a response line is an error reply.
  *
@@ -64,13 +62,67 @@ inline bool IsErrorResponse(std::string_view response) {
   return response.rfind("ERROR", 0) == 0 || response.rfind("-ERR", 0) == 0 || response.rfind("(error)", 0) == 0;
 }
 
+/**
+ * @brief Reject bytes the line protocol cannot carry.
+ *
+ * The wire protocol is the authority on what a command may contain: the server
+ * refuses an embedded NUL and an embedded CR/LF and accepts every other byte
+ * (see ParseCommand in src/server/command_parser.cpp). Rejecting more than
+ * that - a blanket std::iscntrl test also excludes TAB - makes the shipped
+ * clients refuse input the server and a hand-written socket client accept.
+ *
+ * These three bytes are exactly the ones that would break framing: NUL
+ * terminates the command for the parser, CR/LF splits one command into two.
+ * Every client surface checks the finished command line with this one
+ * function before any byte is sent.
+ *
+ * @param value Text to check.
+ * @param field_name Human-readable name used in the message.
+ * @return std::nullopt when the text is carriable, otherwise the reason.
+ */
+inline std::optional<std::string> ValidateNoFramingBytes(std::string_view value, const char* field_name) {
+  for (unsigned char character : value) {
+    if (character == '\0' || character == '\r' || character == '\n') {
+      std::ostringstream oss;
+      oss << "Input for " << field_name << " contains byte 0x" << std::uppercase << std::hex << std::setw(2)
+          << std::setfill('0') << static_cast<int>(character) << ", which the line protocol cannot carry";
+      return oss.str();
+    }
+  }
+  return std::nullopt;
+}
+
+/**
+ * @brief Classify a command's reply framing.
+ *
+ * This is the one table of multi-line replies: the verb tokens decide, so
+ * "DUMP INFO <file>" frames like "DUMP INFO" and extra whitespace between
+ * tokens does not change the answer.
+ */
 inline ResponseFrame FrameForCommand(std::string_view command, bool debug_mode) {
   const std::string upper = UpperCommand(command);
-  const bool similarity = StartsWithCommand(upper, "SIM") || StartsWithCommand(upper, "SIMV");
+  std::string_view rest = upper;
+  const auto next_token = [&rest]() {
+    while (!rest.empty() && std::isspace(static_cast<unsigned char>(rest.front())) != 0) {
+      rest.remove_prefix(1);
+    }
+    size_t length = 0;
+    while (length < rest.size() && std::isspace(static_cast<unsigned char>(rest[length])) == 0) {
+      ++length;
+    }
+    const std::string_view token = rest.substr(0, length);
+    rest.remove_prefix(length);
+    return token;
+  };
+  const std::string_view verb = next_token();
+  const std::string_view subcommand = next_token();
+
   ResponseFrame frame;
-  frame.end_terminated = upper == "INFO" || StartsWithCommand(upper, "CONFIG") || upper == "CACHE STATS" ||
-                         upper == "DUMP INFO" || upper == "DUMP STATUS";
-  frame.debug_similarity = debug_mode && similarity;
+  frame.end_terminated = (verb == "INFO" && subcommand.empty()) || verb == "CONFIG" ||
+                         (verb == "CACHE" && subcommand == "STATS") ||
+                         (verb == "DUMP" && (subcommand == "INFO" || subcommand == "STATUS"));
+  frame.debug_similarity = debug_mode && (verb == "SIM" || verb == "SIMV");
+  frame.long_running = verb == "DUMP" && (subcommand == "SAVE" || subcommand == "LOAD" || subcommand == "VERIFY");
   return frame;
 }
 

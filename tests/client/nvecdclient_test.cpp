@@ -174,6 +174,107 @@ TEST(NvecdClientFramingTest, DebugSimilarityWaitsForExplicitDebugBlockShape) {
   EXPECT_EQ(*transport::CompleteResponseLength(response, frame), response.size());
 }
 
+TEST(NvecdClientFramingTest, EveryMultiLineCommandIsClassifiedByItsVerbTokens) {
+  using transport::FrameForCommand;
+  EXPECT_TRUE(FrameForCommand("DUMP INFO /tmp/snap.dmp", false).end_terminated);
+  EXPECT_TRUE(FrameForCommand("dump   info /tmp/snap.dmp", false).end_terminated);
+  EXPECT_TRUE(FrameForCommand("DUMP STATUS", false).end_terminated);
+  EXPECT_TRUE(FrameForCommand("CACHE STATS", false).end_terminated);
+  EXPECT_TRUE(FrameForCommand("INFO", false).end_terminated);
+  EXPECT_TRUE(FrameForCommand("CONFIG SHOW", false).end_terminated);
+  EXPECT_FALSE(FrameForCommand("DUMP SAVE /tmp/snap.dmp", false).end_terminated);
+  EXPECT_FALSE(FrameForCommand("DUMP VERIFY /tmp/snap.dmp", false).end_terminated);
+  EXPECT_FALSE(FrameForCommand("CACHE CLEAR", false).end_terminated);
+
+  EXPECT_TRUE(FrameForCommand("DUMP SAVE", false).long_running);
+  EXPECT_TRUE(FrameForCommand("DUMP LOAD /tmp/snap.dmp", false).long_running);
+  EXPECT_TRUE(FrameForCommand("DUMP VERIFY /tmp/snap.dmp", false).long_running);
+  EXPECT_FALSE(FrameForCommand("DUMP INFO /tmp/snap.dmp", false).long_running);
+  EXPECT_FALSE(FrameForCommand("SIM item 1", false).long_running);
+}
+
+TEST(NvecdClientFramingTest, DumpInfoBlockIsCompleteOnlyAtEndUnderSplitDelivery) {
+  const std::string reply = "OK DUMP_INFO /tmp/snap.dmp\r\nversion: 1\r\nstores: 3\r\nEND\r\n";
+  const std::string next = "OK\r\n";
+  const auto frame = transport::FrameForCommand("DUMP INFO /tmp/snap.dmp", false);
+
+  for (size_t split = 1; split < reply.size(); ++split) {
+    EXPECT_FALSE(transport::CompleteResponseLength(reply.substr(0, split), frame).has_value())
+        << "block reported complete after " << split << " bytes";
+  }
+  EXPECT_EQ(transport::CompleteResponseLength(reply, frame), reply.size());
+  EXPECT_EQ(transport::CompleteResponseLength(reply + next, frame), reply.size());
+}
+
+TEST(NvecdClientFramingTest, DumpInfoLeavesTheStreamAlignedForTheNextCommand) {
+  nvecd::testing::CannedResponseServer server(
+      {"OK DUMP_INFO /tmp/snap.dmp\r\nversion: 1\r\nstores: 3\r\nEND\r\n", "OK\r\n"});
+  ASSERT_GT(server.Port(), 0);
+
+  ClientConfig config;
+  config.host = "127.0.0.1";
+  config.port = server.Port();
+  config.timeout_ms = 2000;
+  NvecdClient client(config);
+  ASSERT_TRUE(client.Connect());
+
+  auto info = client.DumpInfo("/tmp/snap.dmp");
+  ASSERT_TRUE(info) << info.error().message();
+  EXPECT_NE(info->find("version: 1"), std::string::npos) << *info;
+  EXPECT_NE(info->find("stores: 3"), std::string::npos) << *info;
+  EXPECT_EQ(info->substr(info->size() - 3), "END");
+
+  EXPECT_TRUE(client.Vecdel("item")) << "reply of the next command was misaligned";
+  client.Disconnect();
+}
+
+TEST(NvecdClientValidationTest, SendCommandPutsExactlyOneLineOnTheWire) {
+  nvecd::testing::CannedResponseServer server({"OK first\r\n", "OK second\r\n"});
+  ASSERT_GT(server.Port(), 0);
+
+  ClientConfig config;
+  config.host = "127.0.0.1";
+  config.port = server.Port();
+  config.timeout_ms = 2000;
+  NvecdClient client(config);
+  ASSERT_TRUE(client.Connect());
+
+  for (const char* command : {"INFO\r\nVECDEL victim", "INFO\nVECDEL victim", "INFO\rVECDEL victim"}) {
+    auto rejected = client.SendCommand(command);
+    ASSERT_FALSE(rejected) << command;
+    EXPECT_EQ(rejected.error().code(), ErrorCode::kClientInvalidArgument);
+  }
+  auto nul = client.SendCommand(std::string("INFO\0VECDEL victim", 18));
+  ASSERT_FALSE(nul);
+  EXPECT_EQ(nul.error().code(), ErrorCode::kClientInvalidArgument);
+
+  // None of the refused calls reached the peer, so the first scripted reply is
+  // still waiting for this command.
+  auto accepted = client.SendCommand("PING");
+  ASSERT_TRUE(accepted) << accepted.error().message();
+  EXPECT_EQ(*accepted, "OK first");
+  client.Disconnect();
+}
+
+TEST(NvecdClientConfigTest, ZeroTimeoutAndBufferSizeFallBackToDefaults) {
+  nvecd::testing::CannedResponseServer server({"OK pong\r\n"});
+  ASSERT_GT(server.Port(), 0);
+
+  ClientConfig config;
+  config.host = "127.0.0.1";
+  config.port = server.Port();
+  config.timeout_ms = 0;
+  config.recv_buffer_size = 0;
+  NvecdClient client(config);
+  ASSERT_TRUE(client.Connect());
+
+  // A zero-length receive buffer would make recv() report a closed peer.
+  auto reply = client.SendCommand("PING");
+  ASSERT_TRUE(reply) << reply.error().message();
+  EXPECT_EQ(*reply, "OK pong");
+  client.Disconnect();
+}
+
 TEST(NvecdClientTransportTest, SendAllHandlesPartialWritesAndSuppressesSigpipe) {
   int sockets[2] = {-1, -1};
   ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets), 0);
@@ -441,6 +542,23 @@ TEST(NvecdClientValidationTest, AcceptsEveryIdentifierTheEventLayerAccepts) {
     EXPECT_FALSE(ClientRejectsArgument(client.Vecset(id, {1.0F, 0.0F, 0.0F})))
         << "client refused an identifier the server accepts: " << id;
   }
+}
+
+TEST(NvecdClientValidationTest, EmptyIdentifiersAreRejectedBeforeAnythingIsSent) {
+  // An unconnected client reports kClientNotConnected for anything it would
+  // have sent, so kClientInvalidArgument proves the argument itself was refused.
+  NvecdClient client(ClientConfig{});
+  EXPECT_TRUE(ClientRejectsArgument(client.Event("", "ADD", "item", 1)));
+  EXPECT_TRUE(ClientRejectsArgument(client.Event("ctx", "ADD", "", 1)));
+  EXPECT_TRUE(ClientRejectsArgument(client.Vecset("", {1.0F, 0.0F, 0.0F})));
+  EXPECT_TRUE(ClientRejectsArgument(client.Vecdel("")));
+  EXPECT_TRUE(ClientRejectsArgument(client.Metaset("", "category:books")));
+  EXPECT_TRUE(ClientRejectsArgument(client.Event("ctx", "ADD", "bell\x01id", 1)));
+
+  const auto sim = client.Sim("", 5, "vectors");
+  ASSERT_FALSE(sim);
+  EXPECT_EQ(sim.error().code(), ErrorCode::kClientInvalidArgument);
+  EXPECT_TRUE(ClientRejectsArgument(client.Auth("")));
 }
 
 TEST(NvecdClientMovedFromTest, MovedFromClientIsSafeAndReportsNotConnected) {

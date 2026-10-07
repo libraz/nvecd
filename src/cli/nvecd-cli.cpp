@@ -45,6 +45,8 @@ constexpr size_t kOkPrefixLength = 3;         // "OK " length
 constexpr size_t kErrorPrefixLength = 6;      // "ERROR " length
 constexpr int kMaxWaitReadyRetries = 100;     // Maximum retries for --wait-ready (~5 minutes)
 constexpr size_t kMaxPasswordBytes = 4096;
+constexpr int kCliTimeoutSeconds = 5;       // Interactive send/receive deadline
+constexpr int kAdminTimeoutSeconds = 3600;  // Receive deadline for snapshot save/load/verify
 
 bool ValidatePassword(std::string* password, std::string* error) {
   if (password->empty()) {
@@ -60,6 +62,12 @@ bool ValidatePassword(std::string* password, std::string* error) {
     return false;
   }
   return true;
+}
+
+void SetReceiveTimeout(int socket_fd, int seconds) {
+  struct timeval timeout_value = {};
+  timeout_value.tv_sec = seconds;
+  (void)setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout_value, sizeof(timeout_value));
 }
 
 std::optional<std::string> ReadPasswordFile(const std::string& path, std::string* error) {
@@ -402,10 +410,9 @@ class NvecdClient {
         }
         (void)nvecd::client::transport::ConfigureNoSigpipe(sock_.Get());
 
-        constexpr int kCliTimeoutSeconds = 5;
+        SetReceiveTimeout(sock_.Get(), kCliTimeoutSeconds);
         struct timeval timeout_value = {};
         timeout_value.tv_sec = kCliTimeoutSeconds;
-        (void)setsockopt(sock_.Get(), SOL_SOCKET, SO_RCVTIMEO, &timeout_value, sizeof(timeout_value));
         (void)setsockopt(sock_.Get(), SOL_SOCKET, SO_SNDTIMEO, &timeout_value, sizeof(timeout_value));
 
         if (connect(sock_.Get(), candidate->ai_addr, candidate->ai_addrlen) == 0) {
@@ -469,6 +476,11 @@ class NvecdClient {
   [[nodiscard]] bool IsConnected() const { return sock_.Get() >= 0; }
 
   [[nodiscard]] std::string SendCommand(const std::string& command) const {
+    // One call is exactly one command line: an embedded CR/LF would put a second
+    // command on the wire and desynchronize every reply after it.
+    if (auto invalid = nvecd::client::transport::ValidateNoFramingBytes(command, "command")) {
+      return "(error) " + *invalid;
+    }
     if (!IsConnected()) {
       return "(error) Not connected";
     }
@@ -493,6 +505,15 @@ class NvecdClient {
     char buffer[kReceiveBufferSize];
 
     const auto frame = nvecd::client::transport::FrameForCommand(command, debug_mode_);
+    // Snapshot save/load/verify can legitimately outlast the interactive deadline.
+    if (frame.long_running) {
+      SetReceiveTimeout(sock_.Get(), kAdminTimeoutSeconds);
+    }
+    const nvecd::utils::ScopeGuard restore_timeout([this, &frame]() {
+      if (frame.long_running && IsConnected()) {
+        SetReceiveTimeout(sock_.Get(), kCliTimeoutSeconds);
+      }
+    });
     while (true) {
       if (const auto response_length = nvecd::client::transport::CompleteResponseLength(response_buffer_, frame)) {
         response.assign(response_buffer_.data(), *response_length);
@@ -713,19 +734,26 @@ class NvecdClient {
   static void PrintResponse(const std::string& response) {
     // Parse response type
     if (response.find("OK RESULTS") == 0) {
-      // SIM/SIMV response: OK RESULTS <count> <id1> <score1> <id2> <score2> ...
+      // SIM/SIMV response: OK RESULTS <count>, then <count> "<id> <score>" lines.
+      // Whatever follows them (the DEBUG block) is echoed verbatim.
       std::istringstream iss(response);
+      std::string header;
+      std::getline(iss, header);
+      std::istringstream header_stream(header);
       std::string status;
       std::string results_str;
       size_t count = 0;
-      iss >> status >> results_str >> count;
+      header_stream >> status >> results_str >> count;
 
       std::vector<std::pair<std::string, float>> items;
-      std::string id;
-      float score = 0.0f;
-
-      while (iss >> id >> score) {
-        items.emplace_back(id, score);
+      std::string line;
+      while (items.size() < count && std::getline(iss, line)) {
+        std::istringstream item_stream(line);
+        std::string id;
+        float score = 0.0f;
+        if (item_stream >> id >> score) {
+          items.emplace_back(id, score);
+        }
       }
 
       std::cout << "(" << count << " results";
@@ -738,6 +766,9 @@ class NvecdClient {
 
       for (size_t i = 0; i < items.size(); ++i) {
         std::cout << (i + 1) << ") " << items[i].first << " (score: " << items[i].second << ")\n";
+      }
+      while (std::getline(iss, line)) {
+        std::cout << line << '\n';
       }
     } else if (response.find("OK DEBUG_ON") == 0) {
       std::cout << "Debug mode enabled" << '\n';
@@ -887,6 +918,15 @@ int main(int argc, char* argv[]) {
       }
       config.interactive = false;
       break;
+    }
+  }
+
+  // An empty argument would vanish from the joined command line and shift the
+  // arguments after it onto the wrong fields.
+  for (const std::string& arg : command_args) {
+    if (arg.empty()) {
+      std::cerr << "Error: empty command argument" << '\n';
+      return 1;
     }
   }
 

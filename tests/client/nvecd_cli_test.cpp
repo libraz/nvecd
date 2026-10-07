@@ -157,6 +157,48 @@ TEST(NvecdCliTest, ARefusedDebugCommandDoesNotLatchDebugFraming) {
   EXPECT_NE(run.output.find("item (score: 0.9)"), std::string::npos) << run.output;
 }
 
+TEST(NvecdCliTest, DebugBlockAfterSearchResultsIsPrintedVerbatim) {
+  nvecd::testing::CannedResponseServer server(
+      {"OK DEBUG_ON\r\n", "OK RESULTS 1\r\nitem 0.9000\r\n# DEBUG 2\r\nvector_score: 0.5\r\nevent_score: 0.25\r\n"});
+  ASSERT_GT(server.Port(), 0);
+
+  const CliRun run =
+      RunCliArgs({"-h", "127.0.0.1", "-p", std::to_string(server.Port())}, "DEBUG ON\nSIM item 1 using=vectors\n");
+
+  EXPECT_NE(run.output.find("item (score: 0.9)"), std::string::npos) << run.output;
+  EXPECT_NE(run.output.find("# DEBUG 2"), std::string::npos) << run.output;
+  EXPECT_NE(run.output.find("vector_score: 0.5"), std::string::npos) << run.output;
+  EXPECT_NE(run.output.find("event_score: 0.25"), std::string::npos) << run.output;
+}
+
+TEST(NvecdCliTest, DumpInfoPrintsTheWholeBlockAndTheNextReplyStaysAligned) {
+  nvecd::testing::CannedResponseServer server(
+      {"OK DUMP_INFO /tmp/snap.dmp\r\nversion: 1\r\nstores: 3\r\nEND\r\n", "OK RESULTS 1\r\nitem 0.9000\r\n"});
+  ASSERT_GT(server.Port(), 0);
+
+  const CliRun run = RunCliArgs({"-h", "127.0.0.1", "-p", std::to_string(server.Port())},
+                                "DUMP INFO /tmp/snap.dmp\nSIM item 1 using=vectors\n");
+
+  EXPECT_NE(run.output.find("stores: 3"), std::string::npos) << run.output;
+  EXPECT_NE(run.output.find("item (score: 0.9)"), std::string::npos) << run.output;
+}
+
+TEST(NvecdCliTest, OneShotRefusesEmptyArgumentsAndEmbeddedLineBreaks) {
+  nvecd::testing::CannedResponseServer server({"OK first\r\n"});
+  ASSERT_GT(server.Port(), 0);
+  const std::string port = std::to_string(server.Port());
+
+  // The empty argument would otherwise vanish from the joined line and shift
+  // the vector components onto the id.
+  const CliRun empty = RunCliArgs({"-h", "127.0.0.1", "-p", port, "VECSET", "", "1", "0", "0"});
+  EXPECT_EQ(empty.exit_code, 1) << empty.output;
+  EXPECT_NE(empty.output.find("empty command argument"), std::string::npos) << empty.output;
+
+  const CliRun injected = RunCliArgs({"-h", "127.0.0.1", "-p", port, "INFO\nVECDEL victim"});
+  EXPECT_EQ(injected.exit_code, 1) << injected.output;
+  EXPECT_NE(injected.output.find("cannot carry"), std::string::npos) << injected.output;
+}
+
 TEST(NvecdCliTest, ASilentServerIsReportedAsATimeoutNotAsAGenericReceiveFailure) {
   // The CLI has to call the same condition a timeout that the client library
   // reports as a timeout error code. A receive deadline expires as EAGAIN on

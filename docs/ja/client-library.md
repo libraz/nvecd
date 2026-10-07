@@ -65,6 +65,8 @@ config.recv_buffer_size = 65536;
 | `recv_buffer_size` | `uint32_t` | `65536` | 受信バッファのサイズ |
 | `unix_socket_path` | `std::string` | `""` | Unix ドメインソケットのパス |
 
+`timeout_ms` と `recv_buffer_size` が 0 の場合は「未設定」として扱われ、C++ クライアントでも C API でも既定値に置き換えられます。
+
 `unix_socket_path` を設定すると転送方式が切り替わり、クライアントはそのソケットに接続して `host` と `port` を無視します。
 
 ```cpp
@@ -110,7 +112,7 @@ client.Metaset("item1", "category:books,active:true");
 
 これは TCP の `METASET` が受け付ける形であり、HTTP の `/metaset` ルートが受け付ける形ではありません。あちらは `metadata` キーの下に JSON オブジェクトを取ります。HTTP 面から移植したコードは、マップを `key:value,key:value` に変換してからこのメソッドを呼ぶ必要があります。式に空白を含めることはできず、空の式はクライアント側で拒否されます。
 
-すべての文字列引数は、行プロトコルが運べないバイト（NUL、CR、LF）と、コマンドが空白で区切られる位置の空白について検査されます。それ以外は何も濾さないため、クライアントはサーバーが受け付けるのとまったく同じバイト列を受け付けます。
+すべての文字列引数は、行プロトコルが運べないバイト（NUL、CR、LF）と、コマンドが空白で区切られる位置の空白について検査されます。コンテキスト ID、アイテム ID、ベクトル ID はサーバーの識別子規則に従い、空でなく、空白や制御文字を含まないことが必要です。空の ID は後続の引数をずらしてしまう代わりに、クライアント側で拒否されます。それ以外は何も濾さないため、クライアントはサーバーが受け付けるのとまったく同じバイト列を受け付けます。
 
 ### 検索
 
@@ -186,7 +188,7 @@ struct SaveResult {
 
 既定の `snapshot.mode: fork` では `completed` は false で、`filepath` はまだ読めません。存在しないか、以前のスナップショットのままである可能性があります。コピーや読み込みの前に `DumpStatus()` をポーリングして、書き込みの完了を待ちます。`snapshot.mode: lock` では `completed` は true で、`Save` が返った時点でファイルは使えます。
 
-`SendCommand` はクラスがラップしていないコマンド（`SET`、`GET`、`SHOW VARIABLES` など）のための逃げ道です。末尾の CRLF を取り除いた応答を返し、内容の分類はしないため、`ERROR` で始まるかどうかは呼び出し側が判定します。
+`SendCommand` はクラスがラップしていないコマンド（`SET`、`GET`、`SHOW VARIABLES` など）のための逃げ道です。末尾の CRLF を取り除いた応答を返し、内容の分類はしないため、`ERROR` で始まるかどうかは呼び出し側が判定します。NUL、CR、LF を含むコマンドは、1 バイトも送信されないうちに `kClientInvalidArgument` でクライアント側で拒否されるため、1 回の呼び出しは常にちょうど 1 行のコマンドをワイヤに載せます。
 
 `EnableDebug` と `DisableDebug` は接続のデバッグモードを切り替え、以降のすべての `SIM` と `SIMV` の応答に `# DEBUG` ブロックが追加されます。`Sim` と `Simv` のパーサーは先頭の結果セットを読んで止まるため、このブロックは誤って解析されるのではなく捨てられます。
 
@@ -344,7 +346,7 @@ int nvecdclient_simv_ex(NvecdClient_C* client, const float* vector, size_t dimen
 
 `mode` が `NULL` の場合、`sim` 系の 2 関数では `"fusion"`、`simv` 系の 2 関数では `"vectors"` になります。`_ex` 系は絞り込みを加えます。`options` は `NULL` でもよく、`min_score` と `adaptive` はそれぞれの `has_` が非ゼロのときにだけ読まれます。`adaptive` がワイヤに届くのは `sim_ex` からだけです。`SIMV` には adaptive オプションがないためです。
 
-成功時、`*result` にはヒープ上に確保された応答が入り、その所有権は呼び出し側にあります。解放には `nvecdclient_free_sim_response` を使います。この 1 回の呼び出しで各 `id`、`results` 配列、`mode`、そして応答自身が解放されるため、メンバを個別に解放すると二重解放になります。失敗時、`*result` は書き換えられません。
+成功時、`*result` にはヒープ上に確保された応答が入り、その所有権は呼び出し側にあります。解放には `nvecdclient_free_sim_response` を使います。この 1 回の呼び出しで各 `id`、`results` 配列、`mode`、そして応答自身が解放されるため、メンバを個別に解放すると二重解放になります。失敗時、`*result` は `NULL` になります。
 
 ### 管理
 
@@ -376,6 +378,8 @@ int nvecdclient_debug_off(NvecdClient_C* client);
 `*saved_path` は成功の 2 コードのどちらでも書き込まれます。`1` は、ファイルに触れる前に `nvecdclient_dump_status` をポーリングすることを意味します。`!= 0` を失敗として扱うと fork モードでの成功した保存を取りこぼし、`>= 0` を「ファイルが使える」と解釈するとバックアップスクリプトにまだ存在しないパスを渡すことになります。
 
 `nvecdclient_save` の `filepath` は `NULL` でもよく、その場合はサーバーの設定済みの既定ファイル名を使います。`load`、`verify`、`dump_info` では必須です。
+
+ハンドルが `NULL` でない呼び出しが `-1` を返したときは、引数検査の失敗を含め、必ずその呼び出しを説明するメッセージが `nvecdclient_get_last_error` に残ります。出力パラメータ（`*result`、`*info`、`*saved_path` などの文字列出力）は、失敗のたびに `NULL` に設定されます。
 
 ### 所有権
 
