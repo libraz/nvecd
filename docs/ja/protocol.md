@@ -76,7 +76,7 @@ $ printf 'INFO\n' | nc -U /var/run/nvecd.sock
 AUTH <password>
 ```
 
-パスワードは最初の空白またはタブ以降のすべてで、不透明なバイト列として扱われます。トリムも分割も大文字化もしないため、空白を含むパスワードも設定どおりに認証できます。比較は定数時間です。
+パスワードは `AUTH` キーワードを終える 1 個の空白またはタブより後のすべてのバイトで（キーワードの前の空白は無視されます）、不透明なバイト列として扱われます。トリムも分割も大文字化もしないため、空白を含むパスワードも設定どおりに認証できます。比較は定数時間です。
 
 ```text
 > AUTH s3cret
@@ -103,7 +103,7 @@ EVENT <ctx> SET <id> <score> [timestamp=<epoch_sec>]
 EVENT <ctx> DEL <id> [timestamp=<epoch_sec>]
 ```
 
-アイテム `<id>` がコンテキスト `<ctx>` に現れたことを記録します。`ADD` と `SET` はスコアを取り、`DEL` は取りません。スコアは 0〜100 の範囲の整数（両端を含む）で、サブコマンドのキーワードは大文字小文字を区別しません。`timestamp=` は符号なしの epoch 秒を取り、省略した場合はサーバー自身の時計で刻印します。3 つの形すべてが `OK EVENT` を返します。これは何も変えない重複排除済みの再送でも同じです。
+アイテム `<id>` がコンテキスト `<ctx>` に現れたことを記録します。`ADD` と `SET` はスコアを取り、`DEL` は取りません。スコアは 0〜100 の範囲の整数（両端を含む）で、サブコマンドのキーワードは大文字小文字を区別しません。`timestamp=` は 10 進数字だけで書いた符号なしの epoch 秒を取ります。符号、小数部、2^64−1 を超える値は拒否され、HTTP 面が受け付ける集合と一致します。省略した場合はサーバー自身の時計で刻印します。3 つの形すべてが `OK EVENT` を返します。これは何も変えない重複排除済みの再送でも同じです。
 
 ```text
 > EVENT user_alice ADD item1 100
@@ -162,7 +162,7 @@ ERROR Vector not found: nope
 METASET <id> <key:value[,key:value...]>
 ```
 
-すでにベクトルを持つアイテムにメタデータを付けます。組は空白を含まない 1 トークンで、`filter=` と同じ式の文法をここでも受け付け、各条件のフィールドと値がメタデータの 1 エントリになります。値は綴りから型付けされます。`true`／`false` は真偽値、裸の整数は整数、裸の小数は倍精度浮動小数点、それ以外は文字列のままです。
+すでにベクトルを持つアイテムにメタデータを付けます。組は空白を含まない 1 トークンで、`key:value` または `key=value` を `,` で区切って並べ、それぞれがメタデータの 1 エントリになります。比較演算子、`in(...)` の値、空の並びは、保存値に縮めずに拒否されます。値は綴りから型付けされます。`true`／`false` は真偽値、裸の整数は整数、有限の 10 進リテラル（符号、数字、省略可能な小数部と指数部）は倍精度浮動小数点（64 ビットに収まらない整数も含みます）になり、`nan`、`inf`、16 進表記を含むそれ以外は文字列のままです。
 
 ```text
 > METASET item1 category:books,price:12,active:true
@@ -434,7 +434,7 @@ has_statistics: false
 END
 ```
 
-保存や読み込みの実行中は、ストアに触れるコマンドが `ERROR READONLY Snapshot in progress` または `ERROR LOADING Snapshot load in progress` で拒否されます。仕組みは [persistence.md](./persistence.md) で扱います。
+`lock` モードの保存がストアを掴んでいる間は、`EVENT`、`VECSET`、`VECDEL`、`METASET` が `ERROR READONLY Snapshot in progress` で拒否されます。読み込みの反映中は、これらに加えて `SIM`／`SIMV` が `ERROR LOADING Snapshot load in progress` で拒否されます。診断コマンドと管理コマンドは動き続け、競合はそれぞれが報告します。受け付けた書き込みの WAL 追記が失敗すると、サーバーはフェイルストップ状態に入り、再起動するまで同じ 4 つの書き込みを `ERROR READONLY Persistence failure; writes are refused until restart` で拒否します。仕組みは [persistence.md](./persistence.md) で扱います。
 
 ### `CACHE`
 
@@ -557,8 +557,8 @@ $40
 cache.eviction_batch_size=10 (immutable)
 $34
 cache.max_memory_mb=32 (immutable)
-$43
-cache.min_query_cost_ms=10.000000 (mutable)
+$36
+cache.min_query_cost_ms=10 (mutable)
 $31
 cache.ttl_seconds=600 (mutable)
 ```
@@ -581,19 +581,24 @@ cache.ttl_seconds=600 (mutable)
 | `NOAUTH Authentication required` | 未認証接続での書き込み／管理コマンド |
 | `ERR invalid password` | `AUTH` のパスワード誤り |
 | `LOADING Snapshot load in progress` | `DUMP LOAD` が反映中 |
-| `READONLY Snapshot in progress` | `lock` モードの `DUMP SAVE` が実行中 |
+| `READONLY Snapshot in progress` | `lock` モードの `DUMP SAVE` がストアを掴んでいる間の `EVENT`、`VECSET`、`VECDEL`、`METASET` |
+| `READONLY Persistence failure; writes are refused until restart` | WAL 追記の失敗後の同じ書き込み。再起動でしか解除されない |
+| `AUTH requires 1 argument: <password>` | 区切りの後に何もない `AUTH` |
 | `EVENT requires at least 3 arguments: <ctx> <type> <id> [<score>]` | `EVENT` の引数個数 |
 | `EVENT ADD requires 4-5 arguments: <ctx> ADD <id> <score> [timestamp=<value>]` | `EVENT ADD` の引数個数 |
+| `EVENT SET requires 4-5 arguments: <ctx> SET <id> <score> [timestamp=<value>]` | `EVENT SET` の引数個数 |
+| `EVENT DEL requires 3-4 arguments: <ctx> DEL <id> [timestamp=<value>]` | `EVENT DEL` の引数個数 |
 | `Invalid EVENT type: <T> (must be ADD, SET, or DEL)` | `EVENT` のサブコマンドが未知 |
 | `Score must be in range [0, 100], got <n>` | イベントスコアが範囲外 |
 | `Invalid integer: <t>` | 末尾に余分な文字が付いた整数トークン（小数のスコアや `top_k` など） |
 | `Failed to parse integer: <t>` | そもそも数値でない整数トークン |
-| `Failed to parse timestamp: <v>` | `timestamp=` が数値でない |
+| `Invalid timestamp value: <v>` | `timestamp=` が 64 ビットに収まる符号なし 10 進数字でない |
+| `Invalid option: <t> (expected timestamp=<value>)` | スコアの後（`DEL` では ID の後）のトークンが `timestamp=` でない |
 | `Context cannot be empty` ／ `ID cannot be empty` | `EVENT` のコンテキストまたはアイテム ID が空 |
 | `Context must not contain whitespace or control characters` | `EVENT` のコンテキストに `0x20` 以下または `0x7F` のバイトがある |
 | `ID must not contain whitespace or control characters` | `EVENT` のアイテム ID または `VECSET` の ID に対する同じ規則 |
 | `VECSET requires at least 2 arguments: <id> <floats>` | `VECSET` の引数個数 |
-| `Invalid float: <t>` | 末尾に余分な文字が付いた浮動小数点トークン、または `nan` や `inf` などの非有限の綴り |
+| `Invalid float: <t>` | 末尾に余分な文字が付いた浮動小数点トークン（16 進表記を含む）、`nan` や `inf` などの非有限の綴り、または浮動小数点の範囲を超える大きさ |
 | `Failed to parse float: <t>` | そもそも数値でない浮動小数点トークン |
 | `ID cannot be empty` | アイテム ID が空の `VECSET` |
 | `Vector cannot be empty` | 成分のない `VECSET` |
@@ -607,11 +612,13 @@ cache.ttl_seconds=600 (mutable)
 | `Vector not found: <id>` | 未知の ID への `VECDEL` |
 | `Vector not found for metadata: <id>` | ベクトルのないアイテムへの `METASET` |
 | `METASET requires 2 arguments: <id> <key:value[,key:value...]>` | `METASET` の引数個数 |
+| `METASET requires at least one key:value pair` | 組の並びが空の `METASET` |
+| `METASET accepts only key:value pairs, got '<key>' with a comparison or in(...) value` | `>`、`<`、`>=`、`<=`、`!=`、`in(...)` を使った `METASET` の組 |
 | `SIM requires at least 2 arguments: <id> <top_k>` | `SIM` の引数個数 |
 | `SIMV requires at least 2 arguments: <top_k> <floats>` | `SIMV` の引数個数 |
 | `SIMV requires at least one vector float` | トークンがすべてオプションだった `SIMV` |
 | `top_k must be positive, got <n>` | `top_k` が正でない |
-| `top_k <n> exceeds maximum allowed: <m>` | `top_k` が `similarity.max_top_k` 超過 |
+| `top_k <n> exceeds maximum allowed: <m>` | `top_k` が `similarity.max_top_k` 超過（値の大きさを問わない） |
 | `Invalid using value: <v> (must be events, vectors, or fusion)` | モードが未知 |
 | `Invalid adaptive value: <v> (must be on or off)` | `adaptive=` の値が未知 |
 | `Invalid SIM option: <t>` ／ `Invalid SIMV option: <t>` | オプショントークンが未知 |
@@ -623,6 +630,7 @@ cache.ttl_seconds=600 (mutable)
 | `Unknown CONFIG subcommand: <S>` | `CONFIG` のサブコマンドが未知 |
 | `Configuration file is not accessible` | `CONFIG VERIFY` のパスが許可ルート外 |
 | `DUMP requires subcommand: SAVE\|LOAD\|VERIFY\|INFO\|STATUS` | `DUMP` の引数個数 |
+| `Unknown DUMP subcommand: <S>` | `DUMP` のサブコマンドが未知 |
 | `DUMP LOAD requires a filepath` | 引数のない `DUMP LOAD` |
 | `DUMP VERIFY requires a filepath` | 引数のない `DUMP VERIFY` |
 | `DUMP INFO requires a filepath` | 引数のない `DUMP INFO` |
@@ -635,10 +643,15 @@ cache.ttl_seconds=600 (mutable)
 | `A snapshot save is already in progress` | 保存がストアを掴んでいる間の `DUMP LOAD` |
 | `Cannot save snapshot while a snapshot load is in progress` | 読み込み中の `DUMP SAVE` |
 | `CACHE requires subcommand: STATS\|CLEAR\|ENABLE\|DISABLE` | `CACHE` の引数個数 |
+| `Unknown CACHE subcommand: <S>` | `CACHE` のサブコマンドが未知 |
 | `Cache controller is not initialized` | キャッシュコントローラのないサーバーでの `CACHE STATS` または `CACHE CLEAR` |
 | `Runtime variable manager is not initialized` | 変数マネージャがない状態での `CACHE ENABLE` または `CACHE DISABLE` |
 | `DEBUG requires exactly one argument: ON\|OFF` | `DEBUG` の引数個数 |
+| `DEBUG requires ON or OFF, got: <A>` | `DEBUG` の引数が `ON` でも `OFF` でもない |
 | `SET requires 2 arguments: <variable_name> <value>` | `SET` の引数個数 |
+| `GET requires 1 argument: <variable_name>` | `GET` の引数個数 |
+| `SHOW requires subcommand: VARIABLES` | `SHOW` の引数個数 |
+| `Unknown SHOW subcommand: <S>` | `SHOW` の後が `VARIABLES` でない |
 | `Unknown variable: <name>` | 実行時変数が未知 |
 | `Variable '<name>' is immutable (requires restart)` | 変更不可の変数への書き込み |
 

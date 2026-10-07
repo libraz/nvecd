@@ -273,8 +273,10 @@ class PrivateStorageTarget {
   Expected<SecureFileDescriptor, Error> OpenRegularFileReadOnly() const {
     const int fd = ::openat(directory_fd_, filename_.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0) {
-      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError,
-                                      "Failed to securely open storage file: " + std::string(std::strerror(errno))));
+      const int open_errno = errno;
+      const auto code = open_errno == ENOENT ? ErrorCode::kStorageFileNotFound : ErrorCode::kStorageDumpReadError;
+      return MakeUnexpected(
+          MakeError(code, "Failed to securely open storage file: " + std::string(std::strerror(open_errno))));
     }
     struct stat info {};
     if (::fstat(fd, &info) != 0 || !S_ISREG(info.st_mode) || info.st_uid != ::geteuid() ||

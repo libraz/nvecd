@@ -227,6 +227,13 @@ TEST_F(EdgeCaseE2ETest, UnknownSubcommand) {
 
 TEST_F(EdgeCaseE2ETest, StatCountersVerification) {
   TcpClient client("127.0.0.1", port_);
+  // A documented counter missing from INFO fails the test rather than being skipped.
+  auto counter = [](const std::string& response, const std::string& field) -> uint64_t {
+    const std::string value = ParseResponseField(response, field);
+    EXPECT_FALSE(value.empty()) << field << " missing from INFO";
+    return value.empty() ? 0 : std::stoull(value);
+  };
+  const std::string before = client.SendCommand("INFO");
 
   // Send 5 EVENT ADD commands
   for (int i = 0; i < 5; ++i) {
@@ -243,35 +250,14 @@ TEST_F(EdgeCaseE2ETest, StatCountersVerification) {
   client.SendCommand("SIM item_0 10 using=events");
   client.SendCommand("SIM item_0 10 using=vectors");
 
-  // Send 1 INFO command (this one counts too)
+  // INFO counts itself on entry.
   auto resp = client.SendCommand("INFO");
-  ASSERT_TRUE(ContainsOK(resp) || resp.find("INFO") != std::string::npos) << "INFO should succeed";
+  ASSERT_NE(resp.find("OK INFO"), std::string::npos) << "INFO should succeed";
 
-  // Parse stat counters from INFO response
-  std::string event_count_str = ParseResponseField(resp, "event_commands");
-  std::string vecset_count_str = ParseResponseField(resp, "vecset_commands");
-  std::string sim_count_str = ParseResponseField(resp, "sim_commands");
-  std::string info_count_str = ParseResponseField(resp, "info_commands");
-
-  if (!event_count_str.empty()) {
-    int event_count = std::stoi(event_count_str);
-    EXPECT_GE(event_count, 5) << "event_commands should be >= 5, got: " + event_count_str;
-  }
-
-  if (!vecset_count_str.empty()) {
-    int vecset_count = std::stoi(vecset_count_str);
-    EXPECT_GE(vecset_count, 3) << "vecset_commands should be >= 3, got: " + vecset_count_str;
-  }
-
-  if (!sim_count_str.empty()) {
-    int sim_count = std::stoi(sim_count_str);
-    EXPECT_GE(sim_count, 2) << "sim_commands should be >= 2, got: " + sim_count_str;
-  }
-
-  if (!info_count_str.empty()) {
-    int info_count = std::stoi(info_count_str);
-    EXPECT_GE(info_count, 1) << "info_commands should be >= 1, got: " + info_count_str;
-  }
+  EXPECT_EQ(counter(resp, "event_commands"), counter(before, "event_commands") + 5);
+  EXPECT_EQ(counter(resp, "vecset_commands"), counter(before, "vecset_commands") + 3);
+  EXPECT_EQ(counter(resp, "sim_commands"), counter(before, "sim_commands") + 2);
+  EXPECT_EQ(counter(resp, "total_commands_processed"), counter(before, "total_commands_processed") + 5 + 3 + 2 + 1);
 }
 
 // ---------------------------------------------------------------------------

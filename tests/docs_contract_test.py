@@ -398,26 +398,27 @@ def check_client_api_signatures(source_root: Path) -> None:
 def check_language_parity(source_root: Path) -> None:
     """The English and Japanese guides state the same set of facts."""
     english_dir = source_root / "docs" / "en"
-    for path in sorted(english_dir.glob("*.md")):
-        counterpart = source_root / "docs" / "ja" / path.name
+    for path in sorted(english_dir.rglob("*.md")):
+        relative = path.relative_to(english_dir)
+        counterpart = source_root / "docs" / "ja" / relative
         if not counterpart.exists():
-            fail(f"docs/ja is missing a counterpart for {path.name}")
+            fail(f"docs/ja is missing a counterpart for {relative}")
             continue
         english = path.read_text(encoding="utf-8")
         japanese = counterpart.read_text(encoding="utf-8")
 
         if headings(english) != headings(japanese):
             fail(
-                f"{path.name}: heading structure differs between en and ja "
+                f"{relative}: heading structure differs between en and ja "
                 f"({len(headings(english))} vs {len(headings(japanese))} headings)"
             )
 
         english_tokens = {t for t in backticked(english) if IDENTIFIER.match(t)}
         japanese_tokens = {t for t in backticked(japanese) if IDENTIFIER.match(t)}
         for token in sorted(english_tokens - japanese_tokens):
-            fail(f"{path.name}: documented in en but not in ja: {token}")
+            fail(f"{relative}: documented in en but not in ja: {token}")
         for token in sorted(japanese_tokens - english_tokens):
-            fail(f"{path.name}: documented in ja but not in en: {token}")
+            fail(f"{relative}: documented in ja but not in en: {token}")
 
 
 def make_error_arguments(sources: str) -> list[str]:

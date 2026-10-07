@@ -28,28 +28,24 @@
 #include <string_view>
 #include <unordered_map>
 
-#include "cache/cache_key.h"
-#include "cache/cache_key_generator.h"
 #include "cache/similarity_cache.h"
 #include "cache/similarity_cache_controller.h"
 #include "config/runtime_variable_manager.h"
 #include "events/co_occurrence_index.h"
 #include "events/event_store.h"
+#include "server/argument_validation.h"
 #include "server/command_parser.h"
 #include "server/filter_parser.h"
 #include "server/handlers/dump_handler.h"
 #include "server/request_dispatcher.h"
 #include "server/score_format.h"
-#include "server/similarity_result_utils.h"
 #include "server/wal_codec.h"
-#include "similarity/similarity_engine.h"
 #include "storage/snapshot_fork.h"
 #include "storage/wal.h"
 #include "utils/memory_utils.h"
 #include "utils/network_utils.h"
 #include "utils/string_utils.h"
 #include "utils/structured_log.h"
-#include "vectors/metadata_store.h"
 #include "vectors/vector_store.h"
 #include "version.h"
 
@@ -158,8 +154,10 @@ std::optional<std::string> Base64Decode(const std::string& input) {
     lookup[static_cast<unsigned char>(kAlphabet[i])] = static_cast<int>(i);
   }
 
+  // The accumulator holds only the bits not yet emitted (at most 14), so the
+  // unsigned shift never overflows whatever the input length.
   std::string out;
-  int accum = 0;
+  uint32_t accum = 0;
   int bits = 0;
   for (char ch : input) {
     if (ch == '=') {
@@ -169,11 +167,12 @@ std::optional<std::string> Base64Decode(const std::string& input) {
     if (value < 0) {
       return std::nullopt;
     }
-    accum = (accum << 6) | value;
+    accum = (accum << 6) | static_cast<uint32_t>(value);
     bits += 6;
     if (bits >= 8) {
       bits -= 8;
-      out.push_back(static_cast<char>((accum >> bits) & 0xFF));
+      out.push_back(static_cast<char>((accum >> bits) & 0xFFU));
+      accum &= (1U << bits) - 1U;
     }
   }
   return out;
@@ -200,6 +199,8 @@ int ErrorCodeToHttpStatus(utils::ErrorCode code) {
     case utils::ErrorCode::kCommandSyntaxError:
     case utils::ErrorCode::kCommandParseError:
     case utils::ErrorCode::kEventInvalidScore:
+    // Raised by the identifier rules for EVENT context and item ids.
+    case utils::ErrorCode::kEventStoreError:
     case utils::ErrorCode::kVectorDimensionMismatch:
     case utils::ErrorCode::kVectorInvalidDimension:
       return kHttpBadRequest;
@@ -244,31 +245,148 @@ bool JsonNumberIsFinite(const json& value) {
   return std::isfinite(value.get<double>());
 }
 
+/// Read a JSON integer as int64, saturating unsigned values above INT64_MAX so
+/// range checks reject them instead of seeing a wrapped value.
+std::optional<int64_t> JsonInteger(const json& value) {
+  if (value.is_number_unsigned()) {
+    return static_cast<int64_t>(
+        std::min<uint64_t>(value.get<uint64_t>(), static_cast<uint64_t>(std::numeric_limits<int64_t>::max())));
+  }
+  if (value.is_number_integer()) {
+    return value.get<int64_t>();
+  }
+  return std::nullopt;
+}
+
+utils::Error FieldError(const std::string& message) {
+  return utils::MakeError(utils::ErrorCode::kCommandInvalidArgument, message);
+}
+
+/**
+ * @brief Parse a request body that must be a JSON object
+ *
+ * @param body Raw request body
+ * @param allow_empty Treat an empty body as an empty object
+ */
+utils::Expected<json, utils::Error> ParseObjectBody(const std::string& body, bool allow_empty = false) {
+  if (allow_empty && body.empty()) {
+    return json::object();
+  }
+  auto parsed = json::parse(body, nullptr, false);
+  if (parsed.is_discarded()) {
+    return utils::MakeUnexpected(FieldError("Invalid JSON body"));
+  }
+  if (!parsed.is_object()) {
+    return utils::MakeUnexpected(FieldError("Request body must be a JSON object"));
+  }
+  return parsed;
+}
+
+/// Read an optional string field; absent yields nullopt, any other type is an error.
+utils::Expected<std::optional<std::string>, utils::Error> OptionalString(const json& body, const char* field) {
+  const auto it = body.find(field);
+  if (it == body.end()) {
+    return std::optional<std::string>();
+  }
+  if (!it->is_string()) {
+    return utils::MakeUnexpected(FieldError("Field '" + std::string(field) + "' must be a string"));
+  }
+  return std::optional<std::string>(it->get<std::string>());
+}
+
+/// Read a required string field.
+utils::Expected<std::string, utils::Error> RequiredString(const json& body, const char* field) {
+  auto value = OptionalString(body, field);
+  if (!value) {
+    return utils::MakeUnexpected(value.error());
+  }
+  if (!value->has_value()) {
+    return utils::MakeUnexpected(FieldError("Missing required field: " + std::string(field)));
+  }
+  return std::move(**value);
+}
+
+/// Read an optional top_k, validated by the same check TCP SIM/SIMV use.
+utils::Expected<int, utils::Error> TopKField(const json& body, int default_top_k, uint32_t max_top_k) {
+  const auto it = body.find("top_k");
+  if (it == body.end()) {
+    return ValidateTopK(default_top_k, max_top_k);
+  }
+  const auto value = JsonInteger(*it);
+  if (!value) {
+    return utils::MakeUnexpected(FieldError("Field 'top_k' must be an integer"));
+  }
+  return ValidateTopK(*value, max_top_k);
+}
+
+/// Read an optional min_score, narrowed by the same check TCP float tokens use.
+utils::Expected<float, utils::Error> MinScoreField(const json& body) {
+  const auto it = body.find("min_score");
+  if (it == body.end()) {
+    return 0.0F;
+  }
+  if (!JsonNumberIsFinite(*it)) {
+    return utils::MakeUnexpected(FieldError("Field 'min_score' must be a finite number"));
+  }
+  return NarrowToFiniteFloat(it->get<double>(), "Field 'min_score'");
+}
+
+/// Read an optional filter expression into the command.
+utils::Expected<void, utils::Error> FilterField(const json& body, Command& command) {
+  auto filter_expr = OptionalString(body, "filter");
+  if (!filter_expr) {
+    return utils::MakeUnexpected(filter_expr.error());
+  }
+  if (!filter_expr->has_value()) {
+    return {};
+  }
+  command.filter_expr = std::move(**filter_expr);
+  auto filter = ParseSimpleFilter(command.filter_expr);
+  if (!filter) {
+    return utils::MakeUnexpected(filter.error());
+  }
+  command.filter = std::move(*filter);
+  return {};
+}
+
 utils::Expected<std::vector<float>, utils::Error> ParseFiniteFloatVector(const json& value) {
+  const auto vector_error = [](const std::string& message) {
+    return utils::MakeError(utils::ErrorCode::kCommandInvalidVector, message);
+  };
   if (!value.is_array()) {
-    return utils::MakeUnexpected(
-        utils::MakeError(utils::ErrorCode::kInvalidArgument, "Field 'vector' must be an array of numbers"));
+    return utils::MakeUnexpected(vector_error("Field 'vector' must be an array of numbers"));
   }
   std::vector<float> result;
   result.reserve(value.size());
   for (const auto& element : value) {
     if (!JsonNumberIsFinite(element)) {
-      return utils::MakeUnexpected(
-          utils::MakeError(utils::ErrorCode::kInvalidArgument, "Field 'vector' must contain only finite numbers"));
+      return utils::MakeUnexpected(vector_error("Field 'vector' must contain only finite numbers"));
     }
-    const float component = static_cast<float>(element.get<double>());
-    if (!std::isfinite(component)) {
-      return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kInvalidArgument,
-                                                    "Field 'vector' component exceeds the finite float range"));
+    auto component = NarrowToFiniteFloat(element.get<double>(), "Field 'vector' component");
+    if (!component) {
+      return utils::MakeUnexpected(vector_error(component.error().message()));
     }
-    result.push_back(component);
+    result.push_back(*component);
   }
   return result;
 }
 
-bool WritesBlocked(const HandlerContext* handler_context) {
-  return handler_context != nullptr && (handler_context->read_only.load(std::memory_order_acquire) ||
-                                        handler_context->loading.load(std::memory_order_acquire));
+/**
+ * @brief Admission for a store write on the HTTP surface
+ *
+ * Loading is checked here; the read-only decision is the one TCP uses.
+ *
+ * @return true when the write must be refused, with the reason in @p message
+ */
+bool WriteRefused(const HandlerContext* handler_context, CommandType type, std::string* message) {
+  if (handler_context == nullptr) {
+    return false;
+  }
+  if (handler_context->loading.load(std::memory_order_acquire)) {
+    *message = "Server is loading, please try again later";
+    return true;
+  }
+  return IsBlockedByReadOnly(*handler_context, type, message);
 }
 
 bool LoadInProgress(const HandlerContext* handler_context) {
@@ -282,41 +400,34 @@ std::shared_lock<std::shared_mutex> AcquireSnapshotWriteGuard(const HandlerConte
   return std::shared_lock(*handler_context->snapshot_write_gate);
 }
 
-std::unique_lock<std::mutex> AcquireWriteSerializationGuard(const HandlerContext* handler_context) {
-  if (handler_context == nullptr || handler_context->write_serialization_gate == nullptr) {
-    return {};
-  }
-  return std::unique_lock(*handler_context->write_serialization_gate);
-}
-
 utils::Expected<vectors::Metadata, utils::Error> ParseMetadataJson(const json& value) {
   if (!value.is_object()) {
-    return utils::MakeUnexpected(
-        utils::MakeError(utils::ErrorCode::kCommandInvalidArgument, "Field 'metadata' must be an object"));
+    return utils::MakeUnexpected(FieldError("Field 'metadata' must be an object"));
   }
 
   vectors::Metadata metadata;
   for (const auto& [key, item] : value.items()) {
     if (key.empty()) {
-      return utils::MakeUnexpected(
-          utils::MakeError(utils::ErrorCode::kCommandInvalidArgument, "Metadata keys must not be empty"));
+      return utils::MakeUnexpected(FieldError("Metadata keys must not be empty"));
     }
     if (item.is_string()) {
       metadata[key] = item.get<std::string>();
     } else if (item.is_boolean()) {
       metadata[key] = item.get<bool>();
+    } else if (item.is_number_unsigned() &&
+               item.get<uint64_t>() > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+      // Beyond int64: stored as a double, the type TCP gives the same spelling.
+      metadata[key] = static_cast<double>(item.get<uint64_t>());
     } else if (item.is_number_integer()) {
       metadata[key] = item.get<int64_t>();
     } else if (item.is_number_float()) {
       double number = item.get<double>();
       if (!std::isfinite(number)) {
-        return utils::MakeUnexpected(
-            utils::MakeError(utils::ErrorCode::kCommandInvalidArgument, "Metadata numeric values must be finite"));
+        return utils::MakeUnexpected(FieldError("Metadata numeric values must be finite"));
       }
       metadata[key] = number;
     } else {
-      return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandInvalidArgument,
-                                                    "Metadata values must be string, integer, float, or bool"));
+      return utils::MakeUnexpected(FieldError("Metadata values must be string, integer, float, or bool"));
     }
   }
 
@@ -942,7 +1053,7 @@ void HttpServer::HandleInfo(const httplib::Request& /*req*/, httplib::Response& 
 
   } catch (const std::exception& e) {
     spdlog::error("Unexpected exception in HandleInfo: {}", e.what());
-    SendError(res, kHttpInternalServerError, R"({"error":"Internal server error"})");
+    SendError(res, kHttpInternalServerError, "Internal server error");
   }
 }
 
@@ -989,7 +1100,7 @@ void HttpServer::HandleConfig(const httplib::Request& /*req*/, httplib::Response
 
   } catch (const std::exception& e) {
     spdlog::error("Unexpected exception in HandleConfig: {}", e.what());
-    SendError(res, kHttpInternalServerError, R"({"error":"Internal server error"})");
+    SendError(res, kHttpInternalServerError, "Internal server error");
   }
 }
 
@@ -1000,97 +1111,84 @@ void HttpServer::HandleConfig(const httplib::Request& /*req*/, httplib::Response
 //
 
 void HttpServer::HandleEvent(const httplib::Request& req, httplib::Response& res) {
-  if (WritesBlocked(handler_context_)) {
-    SendError(res, kHttpServiceUnavailable, "Server is read-only or loading");
+  std::string refusal;
+  if (WriteRefused(handler_context_, CommandType::kEvent, &refusal)) {
+    SendError(res, kHttpServiceUnavailable, refusal);
     return;
   }
   auto snapshot_write_guard = AcquireSnapshotWriteGuard(handler_context_);
-  if (WritesBlocked(handler_context_)) {
-    SendError(res, kHttpServiceUnavailable, "Server is read-only or loading");
-    return;
-  }
-
-  // Check if server is loading
-  if (loading_ != nullptr && loading_->load()) {
-    SendError(res, kHttpServiceUnavailable, "Server is loading, please try again later");
+  if (WriteRefused(handler_context_, CommandType::kEvent, &refusal)) {
+    SendError(res, kHttpServiceUnavailable, refusal);
     return;
   }
 
   // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
-    // Parse JSON body (non-throwing)
-    auto body = json::parse(req.body, nullptr, false);
-    if (body.is_discarded()) {
-      SendError(res, kHttpBadRequest, "Invalid JSON body");
+    auto body = ParseObjectBody(req.body);
+    if (!body) {
+      SendError(res, kHttpBadRequest, body.error().message());
       return;
     }
-
-    // Validate required fields
-    if (!body.contains("ctx") || !body.contains("id") || !body.contains("type")) {
-      SendError(res, kHttpBadRequest, "Missing required fields: ctx, id, type");
-      return;
+    auto ctx = RequiredString(*body, "ctx");
+    auto id = RequiredString(*body, "id");
+    auto type_str = RequiredString(*body, "type");
+    for (const auto* field : {&ctx, &id, &type_str}) {
+      if (!*field) {
+        SendError(res, kHttpBadRequest, field->error().message());
+        return;
+      }
     }
-
-    if (!body["ctx"].is_string() || !body["id"].is_string() || !body["type"].is_string()) {
-      SendError(res, kHttpBadRequest, "Fields ctx, id, type must be strings");
-      return;
-    }
-
-    std::string ctx = body["ctx"];
-    std::string id = body["id"];
-    std::string type_str = body["type"];
 
     // Parse event type
     events::EventType event_type;
-    if (type_str == "ADD" || type_str == "add") {
+    if (*type_str == "ADD" || *type_str == "add") {
       event_type = events::EventType::ADD;
-      if (!body.contains("score")) {
-        SendError(res, kHttpBadRequest, "ADD type requires 'score' field");
-        return;
-      }
-    } else if (type_str == "SET" || type_str == "set") {
+    } else if (*type_str == "SET" || *type_str == "set") {
       event_type = events::EventType::SET;
-      if (!body.contains("score")) {
-        SendError(res, kHttpBadRequest, "SET type requires 'score' field");
-        return;
-      }
-    } else if (type_str == "DEL" || type_str == "del") {
+    } else if (*type_str == "DEL" || *type_str == "del") {
       event_type = events::EventType::DEL;
     } else {
-      SendError(res, kHttpBadRequest, "Invalid type: " + type_str + " (must be ADD, SET, or DEL)");
+      SendError(res, kHttpBadRequest, "Invalid type: " + *type_str + " (must be ADD, SET, or DEL)");
       return;
     }
 
     int score = 0;
     if (event_type != events::EventType::DEL) {
+      const auto score_field = body->find("score");
+      if (score_field == body->end()) {
+        SendError(res, kHttpBadRequest, *type_str + " type requires 'score' field");
+        return;
+      }
       // Scores are integers. Reject non-integer (float) values instead of
       // silently truncating, to match the TCP integer contract; the value range
       // itself is enforced by the shared write path.
-      if (!body["score"].is_number_integer()) {
+      const auto raw_score = JsonInteger(*score_field);
+      if (!raw_score) {
         SendError(res, kHttpBadRequest, "Field 'score' must be an integer");
         return;
       }
-      int64_t raw_score = body["score"].get<int64_t>();
-      if (raw_score < std::numeric_limits<int>::min() || raw_score > std::numeric_limits<int>::max()) {
-        SendError(res, kHttpBadRequest, "Field 'score' is out of range, got " + std::to_string(raw_score));
+      if (*raw_score < std::numeric_limits<int>::min() || *raw_score > std::numeric_limits<int>::max()) {
+        SendError(res, kHttpBadRequest, "Field 'score' is out of range, got " + score_field->dump());
         return;
       }
-      score = static_cast<int>(raw_score);
+      score = static_cast<int>(*raw_score);
     }
 
     uint64_t timestamp = 0;
-    if (body.contains("timestamp")) {
-      if (!body["timestamp"].is_number_unsigned()) {
+    if (const auto timestamp_field = body->find("timestamp"); timestamp_field != body->end()) {
+      // A JSON unsigned integer admits exactly the uint64 set ParseTimestamp
+      // admits on TCP.
+      if (!timestamp_field->is_number_unsigned()) {
         SendError(res, kHttpBadRequest, "Field 'timestamp' must be an unsigned integer");
         return;
       }
-      timestamp = body["timestamp"];
+      timestamp = timestamp_field->get<uint64_t>();
     }
 
     Command command;
     command.type = CommandType::kEvent;
-    command.ctx = ctx;
-    command.id = id;
+    command.ctx = std::move(*ctx);
+    command.id = std::move(*id);
     command.score = score;
     command.event_type = event_type;
     command.timestamp = timestamp;
@@ -1107,61 +1205,52 @@ void HttpServer::HandleEvent(const httplib::Request& req, httplib::Response& res
 
   } catch (const std::exception& e) {
     spdlog::error("Unexpected exception in HandleEvent: {}", e.what());
-    SendError(res, kHttpInternalServerError, R"({"error":"Internal server error"})");
+    SendError(res, kHttpInternalServerError, "Internal server error");
   }
 }
 
 void HttpServer::HandleVecset(const httplib::Request& req, httplib::Response& res) {
-  if (WritesBlocked(handler_context_)) {
-    SendError(res, kHttpServiceUnavailable, "Server is read-only or loading");
+  std::string refusal;
+  if (WriteRefused(handler_context_, CommandType::kVecset, &refusal)) {
+    SendError(res, kHttpServiceUnavailable, refusal);
     return;
   }
   auto snapshot_write_guard = AcquireSnapshotWriteGuard(handler_context_);
-  if (WritesBlocked(handler_context_)) {
-    SendError(res, kHttpServiceUnavailable, "Server is read-only or loading");
-    return;
-  }
-
-  // Check if server is loading
-  if (loading_ != nullptr && loading_->load()) {
-    SendError(res, kHttpServiceUnavailable, "Server is loading, please try again later");
+  if (WriteRefused(handler_context_, CommandType::kVecset, &refusal)) {
+    SendError(res, kHttpServiceUnavailable, refusal);
     return;
   }
 
   // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
-    // Parse JSON body (non-throwing)
-    auto body = json::parse(req.body, nullptr, false);
-    if (body.is_discarded()) {
-      SendError(res, kHttpBadRequest, "Invalid JSON body");
+    auto body = ParseObjectBody(req.body);
+    if (!body) {
+      SendError(res, kHttpBadRequest, body.error().message());
       return;
     }
-
-    // Validate required fields
-    if (!body.contains("id") || !body.contains("vector")) {
-      SendError(res, kHttpBadRequest, "Missing required fields: id, vector");
+    auto id = RequiredString(*body, "id");
+    if (!id) {
+      SendError(res, kHttpBadRequest, id.error().message());
       return;
     }
-
-    if (!body["id"].is_string()) {
-      SendError(res, kHttpBadRequest, "Field 'id' must be a string");
+    const auto vector_field = body->find("vector");
+    if (vector_field == body->end()) {
+      SendError(res, kHttpBadRequest, "Missing required field: vector");
       return;
     }
-
-    std::string id = body["id"];
-    auto vector_result = ParseFiniteFloatVector(body["vector"]);
+    auto vector_result = ParseFiniteFloatVector(*vector_field);
     if (!vector_result) {
       SendError(res, kHttpBadRequest, vector_result.error().message());
       return;
     }
     Command command;
     command.type = CommandType::kVecset;
-    command.id = id;
+    command.id = std::move(*id);
     command.vector = std::move(vector_result.value());
     command.dimension = static_cast<int>(command.vector.size());
 
-    if (body.contains("metadata")) {
-      auto metadata_result = ParseMetadataJson(body["metadata"]);
+    if (const auto metadata_field = body->find("metadata"); metadata_field != body->end()) {
+      auto metadata_result = ParseMetadataJson(*metadata_field);
       if (!metadata_result) {
         SendError(res, kHttpBadRequest, metadata_result.error().message());
         return;
@@ -1182,31 +1271,38 @@ void HttpServer::HandleVecset(const httplib::Request& req, httplib::Response& re
 
   } catch (const std::exception& e) {
     spdlog::error("Unexpected exception in HandleVecset: {}", e.what());
-    SendError(res, kHttpInternalServerError, R"({"error":"Internal server error"})");
+    SendError(res, kHttpInternalServerError, "Internal server error");
   }
 }
 
 void HttpServer::HandleVecdel(const httplib::Request& req, httplib::Response& res) {
-  if (WritesBlocked(handler_context_)) {
-    SendError(res, kHttpServiceUnavailable, "Server is read-only or loading");
+  std::string refusal;
+  if (WriteRefused(handler_context_, CommandType::kVecdel, &refusal)) {
+    SendError(res, kHttpServiceUnavailable, refusal);
     return;
   }
   auto snapshot_write_guard = AcquireSnapshotWriteGuard(handler_context_);
-  if (WritesBlocked(handler_context_)) {
-    SendError(res, kHttpServiceUnavailable, "Server is read-only or loading");
+  if (WriteRefused(handler_context_, CommandType::kVecdel, &refusal)) {
+    SendError(res, kHttpServiceUnavailable, refusal);
     return;
   }
 
+  // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
-    const auto body = json::parse(req.body, nullptr, false);
-    if (body.is_discarded() || !body.contains("id") || !body["id"].is_string()) {
-      SendError(res, kHttpBadRequest, "Missing or invalid required field: id");
+    auto body = ParseObjectBody(req.body);
+    if (!body) {
+      SendError(res, kHttpBadRequest, body.error().message());
+      return;
+    }
+    auto id = RequiredString(*body, "id");
+    if (!id) {
+      SendError(res, kHttpBadRequest, id.error().message());
       return;
     }
 
     Command command;
     command.type = CommandType::kVecdel;
-    command.id = body["id"];
+    command.id = std::move(*id);
     if (command.id.empty()) {
       SendError(res, kHttpBadRequest, "Field 'id' must not be empty");
       return;
@@ -1223,47 +1319,40 @@ void HttpServer::HandleVecdel(const httplib::Request& req, httplib::Response& re
     SendJson(res, kHttpOk, response);
   } catch (const std::exception& e) {
     spdlog::error("Unexpected exception in HandleVecdel: {}", e.what());
-    SendError(res, kHttpInternalServerError, R"({"error":"Internal server error"})");
+    SendError(res, kHttpInternalServerError, "Internal server error");
   }
 }
 
 void HttpServer::HandleMetaset(const httplib::Request& req, httplib::Response& res) {
-  if (WritesBlocked(handler_context_)) {
-    SendError(res, kHttpServiceUnavailable, "Server is read-only or loading");
+  std::string refusal;
+  if (WriteRefused(handler_context_, CommandType::kMetaset, &refusal)) {
+    SendError(res, kHttpServiceUnavailable, refusal);
     return;
   }
   auto snapshot_write_guard = AcquireSnapshotWriteGuard(handler_context_);
-  if (WritesBlocked(handler_context_)) {
-    SendError(res, kHttpServiceUnavailable, "Server is read-only or loading");
-    return;
-  }
-
-  // Check if server is loading
-  if (loading_ != nullptr && loading_->load()) {
-    SendError(res, kHttpServiceUnavailable, "Server is loading, please try again later");
+  if (WriteRefused(handler_context_, CommandType::kMetaset, &refusal)) {
+    SendError(res, kHttpServiceUnavailable, refusal);
     return;
   }
 
   // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
-    // Parse JSON body (non-throwing)
-    auto body = json::parse(req.body, nullptr, false);
-    if (body.is_discarded()) {
-      SendError(res, kHttpBadRequest, "Invalid JSON body");
+    auto body = ParseObjectBody(req.body);
+    if (!body) {
+      SendError(res, kHttpBadRequest, body.error().message());
       return;
     }
-
-    // Validate required fields
-    if (!body.contains("id") || !body.contains("metadata")) {
-      SendError(res, kHttpBadRequest, "Missing required fields: id, metadata");
+    auto id = RequiredString(*body, "id");
+    if (!id) {
+      SendError(res, kHttpBadRequest, id.error().message());
       return;
     }
-    if (!body["id"].is_string()) {
-      SendError(res, kHttpBadRequest, "Field 'id' must be a string");
+    const auto metadata_field = body->find("metadata");
+    if (metadata_field == body->end()) {
+      SendError(res, kHttpBadRequest, "Missing required field: metadata");
       return;
     }
-
-    auto metadata_result = ParseMetadataJson(body["metadata"]);
+    auto metadata_result = ParseMetadataJson(*metadata_field);
     if (!metadata_result) {
       SendError(res, kHttpBadRequest, metadata_result.error().message());
       return;
@@ -1271,7 +1360,7 @@ void HttpServer::HandleMetaset(const httplib::Request& req, httplib::Response& r
 
     Command command;
     command.type = CommandType::kMetaset;
-    command.id = body["id"];
+    command.id = std::move(*id);
     command.metadata = std::move(*metadata_result);
 
     auto outcome = ApplyWrite(*handler_context_, command);
@@ -1286,9 +1375,24 @@ void HttpServer::HandleMetaset(const httplib::Request& req, httplib::Response& r
 
   } catch (const std::exception& e) {
     spdlog::error("Unexpected exception in HandleMetaset: {}", e.what());
-    SendError(res, kHttpInternalServerError, R"({"error":"Internal server error"})");
+    SendError(res, kHttpInternalServerError, "Internal server error");
   }
 }
+
+namespace {
+/// Render search results with the shared score precision, so JSON scores match
+/// the TCP surface.
+json SearchResultsJson(const std::vector<std::pair<std::string, float>>& results) {
+  json results_array = json::array();
+  for (const auto& [item_id, score] : results) {
+    json item;
+    item["id"] = item_id;
+    item["score"] = RoundScore(score);
+    results_array.push_back(item);
+  }
+  return results_array;
+}
+}  // namespace
 
 void HttpServer::HandleSim(const httplib::Request& req, httplib::Response& res) {
   if (LoadInProgress(handler_context_)) {
@@ -1303,189 +1407,77 @@ void HttpServer::HandleSim(const httplib::Request& req, httplib::Response& res) 
 
   // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
-    // Parse JSON body (non-throwing)
-    auto body = json::parse(req.body, nullptr, false);
-    if (body.is_discarded()) {
-      SendError(res, kHttpBadRequest, "Invalid JSON body");
+    auto body = ParseObjectBody(req.body);
+    if (!body) {
+      SendError(res, kHttpBadRequest, body.error().message());
       return;
     }
 
-    // Validate required fields
-    if (!body.contains("id")) {
-      SendError(res, kHttpBadRequest, "Missing required field: id");
+    Command command;
+    command.type = CommandType::kSim;
+    auto id = RequiredString(*body, "id");
+    if (!id) {
+      SendError(res, kHttpBadRequest, id.error().message());
       return;
     }
+    command.id = std::move(*id);
 
-    if (!body["id"].is_string()) {
-      SendError(res, kHttpBadRequest, "Field 'id' must be a string");
+    const auto& similarity_config = handler_context_->config->similarity;
+    auto top_k = TopKField(*body, similarity_config.default_top_k, similarity_config.max_top_k);
+    if (!top_k) {
+      SendError(res, ErrorCodeToHttpStatus(top_k.error().code()), top_k.error().message());
       return;
     }
+    command.top_k = *top_k;
 
-    if (body.contains("top_k") && !body["top_k"].is_number_integer()) {
-      SendError(res, kHttpBadRequest, "Field 'top_k' must be an integer");
+    auto mode = OptionalString(*body, "mode");
+    if (!mode) {
+      SendError(res, kHttpBadRequest, mode.error().message());
       return;
     }
-    if (body.contains("mode") && !body["mode"].is_string()) {
-      SendError(res, kHttpBadRequest, "Field 'mode' must be a string");
-      return;
-    }
-    if (body.contains("min_score") && !JsonNumberIsFinite(body["min_score"])) {
-      SendError(res, kHttpBadRequest, "Field 'min_score' must be a finite number");
-      return;
-    }
-    std::string id = body["id"];
-    int top_k = body.value("top_k", handler_context_->config->similarity.default_top_k);
-    std::string mode = body.value("mode", "fusion");
-    float min_score = body.value("min_score", 0.0F);
-
-    std::string filter_expr;
-    vectors::MetadataFilter filter;
-    if (body.contains("filter")) {
-      if (!body["filter"].is_string()) {
-        SendError(res, kHttpBadRequest, "Field 'filter' must be a string");
-        return;
-      }
-      filter_expr = body["filter"].get<std::string>();
-      auto filter_result = ParseSimpleFilter(filter_expr);
-      if (!filter_result) {
-        SendError(res, kHttpBadRequest, filter_result.error().message());
-        return;
-      }
-      filter = std::move(*filter_result);
-    }
-
-    std::optional<bool> adaptive;
-    if (body.contains("adaptive")) {
-      if (!body["adaptive"].is_boolean()) {
-        SendError(res, kHttpBadRequest, "Field 'adaptive' must be a boolean");
-        return;
-      }
-      adaptive = body["adaptive"].get<bool>();
-    }
-
-    if (mode != "events" && mode != "vectors" && mode != "fusion") {
+    command.mode = mode->value_or("fusion");
+    if (command.mode != "events" && command.mode != "vectors" && command.mode != "fusion") {
       SendError(res, kHttpBadRequest, "Invalid mode. Must be one of: events, vectors, fusion");
       return;
     }
 
-    // Check if similarity engine is initialized
-    if (!handler_context_->similarity_engine) {
-      SendError(res, kHttpInternalServerError, "Similarity engine not initialized");
+    auto min_score = MinScoreField(*body);
+    if (!min_score) {
+      SendError(res, kHttpBadRequest, min_score.error().message());
+      return;
+    }
+    command.min_score = *min_score;
+
+    auto filter = FilterField(*body, command);
+    if (!filter) {
+      SendError(res, kHttpBadRequest, filter.error().message());
       return;
     }
 
-    // Cache lookup (same key components and search type as the TCP path).
-    auto* cache_ptr = handler_context_->cache.load(std::memory_order_acquire);
-    const bool cache_enabled = (cache_ptr != nullptr && cache_ptr->IsEnabled());
-    auto search_type = filter_expr.empty() ? cache::SearchType::kItemSearch : cache::SearchType::kFilteredSearch;
-    cache::CacheKey cache_key;
-    uint64_t captured_cooccurrence_generation = 0;
-    uint64_t captured_vector_generation = 0;
-    uint64_t captured_metadata_generation = 0;
-    uint64_t captured_dataset_generation = 0;
-
-    if (cache_enabled) {
-      captured_cooccurrence_generation =
-          handler_context_->co_index != nullptr ? handler_context_->co_index->GetGeneration() : 0;
-      captured_vector_generation = handler_context_->vector_generation.load(std::memory_order_acquire);
-      captured_metadata_generation = handler_context_->metadata_generation.load(std::memory_order_acquire);
-      captured_dataset_generation = handler_context_->dataset_generation.load(std::memory_order_acquire);
-      cache_key = cache::GenerateSimCacheKey({id, top_k, mode, adaptive, captured_cooccurrence_generation,
-                                              captured_vector_generation, filter_expr, captured_metadata_generation,
-                                              captured_dataset_generation});
-
-      auto cached = cache_ptr->Lookup(cache_key, search_type);
-      if (cached.has_value()) {
-        json response;
-        response["status"] = "ok";
-        auto cached_results = ApplyMinScore(*cached, min_score);
-        response["count"] = cached_results.size();
-        response["mode"] = mode;
-        json results_array = json::array();
-        for (const auto& sim_result : cached_results) {
-          json item;
-          item["id"] = sim_result.first;
-          // Round to the shared score precision so JSON scores match the TCP
-          // surface (which renders with the same fixed precision).
-          item["score"] = RoundScore(sim_result.second);
-          results_array.push_back(item);
-        }
-        response["results"] = results_array;
-        SendJson(res, kHttpOk, response);
+    if (const auto adaptive_field = body->find("adaptive"); adaptive_field != body->end()) {
+      if (!adaptive_field->is_boolean()) {
+        SendError(res, kHttpBadRequest, "Field 'adaptive' must be a boolean");
         return;
       }
+      command.adaptive = adaptive_field->get<bool>();
     }
 
-    auto start = std::chrono::steady_clock::now();
-
-    // Call appropriate search method based on mode
-    utils::Expected<std::vector<similarity::SimilarityResult>, utils::Error> result;
-    if (mode == "events") {
-      result = handler_context_->similarity_engine->SearchByIdEvents(id, top_k, filter);
-    } else if (mode == "vectors") {
-      result = handler_context_->similarity_engine->SearchByIdVectors(id, top_k, filter);
-    } else {  // fusion
-      result = handler_context_->similarity_engine->SearchByIdFusion(id, top_k, adaptive, filter);
-    }
-
-    if (!result) {
-      if (result.error().code() == utils::ErrorCode::kVectorNotFound) {
-        SendError(res, kHttpNotFound, result.error().message());
-      } else {
-        SendError(res, ErrorCodeToHttpStatus(result.error().code()), result.error().message());
-      }
+    auto outcome = ExecuteSearch(*handler_context_, command);
+    if (!outcome) {
+      SendError(res, ErrorCodeToHttpStatus(outcome.error().code()), outcome.error().message());
       return;
     }
-    if (mode != "events") {
-      // Non-events modes already filter inside the engine; events mode was
-      // filtered above with over-fetch.
-      *result = ApplyMetadataFilter(*result, handler_context_->metadata_store, filter);
-    }
 
-    // Cache store (mirrors the TCP path: cache full results, register items).
-    if (cache_enabled) {
-      auto generation_guard = AcquireWriteSerializationGuard(handler_context_);
-      if (cache_ptr == handler_context_->cache.load(std::memory_order_acquire) && cache_ptr->IsEnabled() &&
-          captured_cooccurrence_generation ==
-              (handler_context_->co_index != nullptr ? handler_context_->co_index->GetGeneration() : 0) &&
-          captured_vector_generation == handler_context_->vector_generation.load(std::memory_order_acquire) &&
-          captured_metadata_generation == handler_context_->metadata_generation.load(std::memory_order_acquire) &&
-          captured_dataset_generation == handler_context_->dataset_generation.load(std::memory_order_acquire)) {
-        auto elapsed = std::chrono::steady_clock::now() - start;
-        double elapsed_ms = std::chrono::duration<double, std::milli>(elapsed).count();
-        std::vector<std::string> item_ids;
-        item_ids.reserve(result->size() + 1);
-        item_ids.push_back(id);
-        for (const auto& item : *result) {
-          item_ids.push_back(item.item_id);
-        }
-        cache_ptr->InsertAndRegister(cache_key, *result, item_ids, elapsed_ms, search_type);
-      }
-    }
-
-    // Build JSON response
     json response;
     response["status"] = "ok";
-    auto filtered_results = ApplyMinScore(*result, min_score);
-    response["count"] = filtered_results.size();
-    response["mode"] = mode;
-
-    json results_array = json::array();
-    for (const auto& sim_result : filtered_results) {
-      json item;
-      item["id"] = sim_result.first;
-      // Round to the shared score precision so JSON scores match the TCP
-      // surface (which renders with the same fixed precision).
-      item["score"] = RoundScore(sim_result.second);
-      results_array.push_back(item);
-    }
-    response["results"] = results_array;
-
+    response["count"] = outcome->results.size();
+    response["mode"] = command.mode;
+    response["results"] = SearchResultsJson(outcome->results);
     SendJson(res, kHttpOk, response);
 
   } catch (const std::exception& e) {
     spdlog::error("Unexpected exception in HandleSim: {}", e.what());
-    SendError(res, kHttpInternalServerError, R"({"error":"Internal server error"})");
+    SendError(res, kHttpInternalServerError, "Internal server error");
   }
 }
 
@@ -1502,147 +1494,65 @@ void HttpServer::HandleSimv(const httplib::Request& req, httplib::Response& res)
 
   // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
-    // Parse JSON body (non-throwing)
-    auto body = json::parse(req.body, nullptr, false);
-    if (body.is_discarded()) {
-      SendError(res, kHttpBadRequest, "Invalid JSON body");
+    auto body = ParseObjectBody(req.body);
+    if (!body) {
+      SendError(res, kHttpBadRequest, body.error().message());
       return;
     }
 
-    // Validate required fields
-    if (!body.contains("vector")) {
+    Command command;
+    command.type = CommandType::kSimv;
+    const auto vector_field = body->find("vector");
+    if (vector_field == body->end()) {
       SendError(res, kHttpBadRequest, "Missing required field: vector");
       return;
     }
 
-    if (body.contains("top_k") && !body["top_k"].is_number_integer()) {
-      SendError(res, kHttpBadRequest, "Field 'top_k' must be an integer");
+    const auto& similarity_config = handler_context_->config->similarity;
+    auto top_k = TopKField(*body, similarity_config.default_top_k, similarity_config.max_top_k);
+    if (!top_k) {
+      SendError(res, ErrorCodeToHttpStatus(top_k.error().code()), top_k.error().message());
       return;
     }
-    if (body.contains("min_score") && !JsonNumberIsFinite(body["min_score"])) {
-      SendError(res, kHttpBadRequest, "Field 'min_score' must be a finite number");
+    command.top_k = *top_k;
+
+    auto min_score = MinScoreField(*body);
+    if (!min_score) {
+      SendError(res, kHttpBadRequest, min_score.error().message());
       return;
     }
-    auto vector_result = ParseFiniteFloatVector(body["vector"]);
+    command.min_score = *min_score;
+
+    auto vector_result = ParseFiniteFloatVector(*vector_field);
     if (!vector_result) {
       SendError(res, kHttpBadRequest, vector_result.error().message());
       return;
     }
-    std::vector<float> vector = std::move(vector_result.value());
-    int top_k = body.value("top_k", handler_context_->config->similarity.default_top_k);
-    float min_score = body.value("min_score", 0.0F);
+    command.vector = std::move(vector_result.value());
+    command.dimension = static_cast<int>(command.vector.size());
 
-    std::string filter_expr;
-    vectors::MetadataFilter filter;
-    if (body.contains("filter")) {
-      if (!body["filter"].is_string()) {
-        SendError(res, kHttpBadRequest, "Field 'filter' must be a string");
-        return;
-      }
-      filter_expr = body["filter"].get<std::string>();
-      auto filter_result = ParseSimpleFilter(filter_expr);
-      if (!filter_result) {
-        SendError(res, kHttpBadRequest, filter_result.error().message());
-        return;
-      }
-      filter = std::move(*filter_result);
-    }
-
-    // Check if similarity engine is initialized
-    if (!handler_context_->similarity_engine) {
-      SendError(res, kHttpInternalServerError, "Similarity engine not initialized");
+    auto filter = FilterField(*body, command);
+    if (!filter) {
+      SendError(res, kHttpBadRequest, filter.error().message());
       return;
     }
 
-    // Cache lookup (same key components and search type as the TCP path).
-    auto* cache_ptr = handler_context_->cache.load(std::memory_order_acquire);
-    const bool cache_enabled = (cache_ptr != nullptr && cache_ptr->IsEnabled());
-    auto search_type = filter_expr.empty() ? cache::SearchType::kVectorSearch : cache::SearchType::kFilteredSearch;
-    cache::CacheKey cache_key;
-    uint64_t captured_vector_generation = 0;
-    uint64_t captured_metadata_generation = 0;
-    uint64_t captured_dataset_generation = 0;
-
-    if (cache_enabled) {
-      captured_vector_generation = handler_context_->vector_generation.load(std::memory_order_acquire);
-      captured_metadata_generation = handler_context_->metadata_generation.load(std::memory_order_acquire);
-      captured_dataset_generation = handler_context_->dataset_generation.load(std::memory_order_acquire);
-      cache_key = cache::GenerateSimvCacheKey({vector, top_k, captured_vector_generation, filter_expr,
-                                               captured_metadata_generation, captured_dataset_generation});
-
-      auto cached = cache_ptr->Lookup(cache_key, search_type);
-      if (cached.has_value()) {
-        json response;
-        response["status"] = "ok";
-        auto cached_results = ApplyMinScore(*cached, min_score);
-        response["count"] = cached_results.size();
-        response["dimension"] = vector.size();
-        json results_array = json::array();
-        for (const auto& sim_result : cached_results) {
-          json item;
-          item["id"] = sim_result.first;
-          // Round to the shared score precision so JSON scores match the TCP
-          // surface (which renders with the same fixed precision).
-          item["score"] = RoundScore(sim_result.second);
-          results_array.push_back(item);
-        }
-        response["results"] = results_array;
-        SendJson(res, kHttpOk, response);
-        return;
-      }
-    }
-
-    auto start = std::chrono::steady_clock::now();
-
-    // Search by vector
-    auto result = handler_context_->similarity_engine->SearchByVector(vector, top_k, filter);
-    if (!result) {
-      SendError(res, ErrorCodeToHttpStatus(result.error().code()), result.error().message());
+    auto outcome = ExecuteSearch(*handler_context_, command);
+    if (!outcome) {
+      SendError(res, ErrorCodeToHttpStatus(outcome.error().code()), outcome.error().message());
       return;
     }
-    *result = ApplyMetadataFilter(*result, handler_context_->metadata_store, filter);
 
-    // Cache store (mirrors the TCP path).
-    if (cache_enabled) {
-      auto generation_guard = AcquireWriteSerializationGuard(handler_context_);
-      if (cache_ptr == handler_context_->cache.load(std::memory_order_acquire) && cache_ptr->IsEnabled() &&
-          captured_vector_generation == handler_context_->vector_generation.load(std::memory_order_acquire) &&
-          captured_metadata_generation == handler_context_->metadata_generation.load(std::memory_order_acquire) &&
-          captured_dataset_generation == handler_context_->dataset_generation.load(std::memory_order_acquire)) {
-        auto elapsed = std::chrono::steady_clock::now() - start;
-        double elapsed_ms = std::chrono::duration<double, std::milli>(elapsed).count();
-        std::vector<std::string> item_ids;
-        item_ids.reserve(result->size());
-        for (const auto& item : *result) {
-          item_ids.push_back(item.item_id);
-        }
-        cache_ptr->InsertAndRegister(cache_key, *result, item_ids, elapsed_ms, search_type);
-      }
-    }
-
-    // Build JSON response
     json response;
     response["status"] = "ok";
-    auto filtered_results = ApplyMinScore(*result, min_score);
-    response["count"] = filtered_results.size();
-    response["dimension"] = vector.size();
-
-    json results_array = json::array();
-    for (const auto& sim_result : filtered_results) {
-      json item;
-      item["id"] = sim_result.first;
-      // Round to the shared score precision so JSON scores match the TCP
-      // surface (which renders with the same fixed precision).
-      item["score"] = RoundScore(sim_result.second);
-      results_array.push_back(item);
-    }
-    response["results"] = results_array;
-
+    response["count"] = outcome->results.size();
+    response["dimension"] = command.vector.size();
+    response["results"] = SearchResultsJson(outcome->results);
     SendJson(res, kHttpOk, response);
 
   } catch (const std::exception& e) {
     spdlog::error("Unexpected exception in HandleSimv: {}", e.what());
-    SendError(res, kHttpInternalServerError, R"({"error":"Internal server error"})");
+    SendError(res, kHttpInternalServerError, "Internal server error");
   }
 }
 
@@ -1654,36 +1564,43 @@ void HttpServer::HandleSimv(const httplib::Request& req, httplib::Response& res)
 //
 
 namespace {
-/// Extract the resolved path token that the dump handlers append after their
-/// status keyword (e.g. "OK DUMP_SAVED <path>\r\n").
+/// Extract the resolved path the dump handlers append after their status
+/// keyword ("OK <VERB> <path>\r\n"). The path is the rest of the line, so a
+/// path containing whitespace is returned whole.
 std::string ExtractDumpPath(const std::string& response, const std::string& fallback) {
-  std::istringstream iss(response);
-  std::string keyword;
-  std::string verb;
-  std::string path;
-  // Response shape: "OK <VERB> <path>"
-  if ((iss >> keyword >> verb >> path) && keyword == "OK" && !path.empty()) {
-    return path;
+  static constexpr std::string_view kOkPrefix = "OK ";
+  if (response.compare(0, kOkPrefix.size(), kOkPrefix) != 0) {
+    return fallback;
   }
-  return fallback;
+  const size_t verb_end = response.find(' ', kOkPrefix.size());
+  if (verb_end == std::string::npos) {
+    return fallback;
+  }
+  std::string path = response.substr(verb_end + 1);
+  while (!path.empty() && (path.back() == '\r' || path.back() == '\n')) {
+    path.pop_back();
+  }
+  return path.empty() ? fallback : path;
 }
 }  // namespace
 
 void HttpServer::HandleDumpSave(const httplib::Request& req, httplib::Response& res) {
   // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
-    // Parse JSON body (filepath is optional)
-    std::string filepath;
-    if (!req.body.empty()) {
-      auto body = json::parse(req.body, nullptr, false);
-      if (body.is_discarded()) {
-        SendError(res, kHttpBadRequest, "Invalid JSON body");
-        return;
-      }
-      filepath = body.value("filepath", "");
+    // The body and its filepath are optional.
+    auto body = ParseObjectBody(req.body, /*allow_empty=*/true);
+    if (!body) {
+      SendError(res, kHttpBadRequest, body.error().message());
+      return;
     }
+    auto filepath = OptionalString(*body, "filepath");
+    if (!filepath) {
+      SendError(res, kHttpBadRequest, filepath.error().message());
+      return;
+    }
+    const std::string requested = filepath->value_or("");
 
-    auto result = handlers::HandleDumpSave(*handler_context_, filepath);
+    auto result = handlers::HandleDumpSave(*handler_context_, requested);
     if (!result) {
       SendError(res, ErrorCodeToHttpStatus(result.error().code()), result.error().message());
       return;
@@ -1691,38 +1608,30 @@ void HttpServer::HandleDumpSave(const httplib::Request& req, httplib::Response& 
 
     json response;
     response["status"] = "ok";
-    response["filepath"] = ExtractDumpPath(*result, filepath);
+    response["filepath"] = ExtractDumpPath(*result, requested);
     SendJson(res, kHttpOk, response);
 
   } catch (const std::exception& e) {
     spdlog::error("Unexpected exception in HandleDumpSave: {}", e.what());
-    SendError(res, kHttpInternalServerError, R"({"error":"Internal server error"})");
+    SendError(res, kHttpInternalServerError, "Internal server error");
   }
 }
 
 void HttpServer::HandleDumpLoad(const httplib::Request& req, httplib::Response& res) {
   // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
-    // Parse JSON body (non-throwing)
-    auto body = json::parse(req.body, nullptr, false);
-    if (body.is_discarded()) {
-      SendError(res, kHttpBadRequest, "Invalid JSON body");
+    auto body = ParseObjectBody(req.body);
+    if (!body) {
+      SendError(res, kHttpBadRequest, body.error().message());
+      return;
+    }
+    auto filepath = RequiredString(*body, "filepath");
+    if (!filepath) {
+      SendError(res, kHttpBadRequest, filepath.error().message());
       return;
     }
 
-    if (!body.contains("filepath")) {
-      SendError(res, kHttpBadRequest, "Missing required field: filepath");
-      return;
-    }
-
-    if (!body["filepath"].is_string()) {
-      SendError(res, kHttpBadRequest, "Field 'filepath' must be a string");
-      return;
-    }
-
-    std::string filepath = body["filepath"];
-
-    auto result = handlers::HandleDumpLoad(*handler_context_, filepath);
+    auto result = handlers::HandleDumpLoad(*handler_context_, *filepath);
     if (!result) {
       SendError(res, ErrorCodeToHttpStatus(result.error().code()), result.error().message());
       return;
@@ -1730,43 +1639,35 @@ void HttpServer::HandleDumpLoad(const httplib::Request& req, httplib::Response& 
 
     json response;
     response["status"] = "ok";
-    response["filepath"] = ExtractDumpPath(*result, filepath);
+    response["filepath"] = ExtractDumpPath(*result, *filepath);
     SendJson(res, kHttpOk, response);
 
   } catch (const std::exception& e) {
     spdlog::error("Unexpected exception in HandleDumpLoad: {}", e.what());
-    SendError(res, kHttpInternalServerError, R"({"error":"Internal server error"})");
+    SendError(res, kHttpInternalServerError, "Internal server error");
   }
 }
 
 void HttpServer::HandleDumpVerify(const httplib::Request& req, httplib::Response& res) {
   // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
-    // Parse JSON body (non-throwing)
-    auto body = json::parse(req.body, nullptr, false);
-    if (body.is_discarded()) {
-      SendError(res, kHttpBadRequest, "Invalid JSON body");
+    auto body = ParseObjectBody(req.body);
+    if (!body) {
+      SendError(res, kHttpBadRequest, body.error().message());
+      return;
+    }
+    auto filepath = RequiredString(*body, "filepath");
+    if (!filepath) {
+      SendError(res, kHttpBadRequest, filepath.error().message());
       return;
     }
 
-    if (!body.contains("filepath")) {
-      SendError(res, kHttpBadRequest, "Missing required field: filepath");
-      return;
-    }
-
-    if (!body["filepath"].is_string()) {
-      SendError(res, kHttpBadRequest, "Field 'filepath' must be a string");
-      return;
-    }
-
-    std::string filepath = body["filepath"];
-
-    auto result = handlers::HandleDumpVerify(handler_context_->dump_dir, filepath);
+    auto result = handlers::HandleDumpVerify(handler_context_->dump_dir, *filepath);
     if (!result) {
       // Verification failed: report a concrete, non-success response.
       json response;
       response["status"] = "error";
-      response["filepath"] = filepath;
+      response["filepath"] = *filepath;
       response["valid"] = false;
       response["error"] = result.error().message();
       SendJson(res, ErrorCodeToHttpStatus(result.error().code()), response);
@@ -1775,39 +1676,31 @@ void HttpServer::HandleDumpVerify(const httplib::Request& req, httplib::Response
 
     json response;
     response["status"] = "ok";
-    response["filepath"] = ExtractDumpPath(*result, filepath);
+    response["filepath"] = ExtractDumpPath(*result, *filepath);
     response["valid"] = true;
     SendJson(res, kHttpOk, response);
 
   } catch (const std::exception& e) {
     spdlog::error("Unexpected exception in HandleDumpVerify: {}", e.what());
-    SendError(res, kHttpInternalServerError, R"({"error":"Internal server error"})");
+    SendError(res, kHttpInternalServerError, "Internal server error");
   }
 }
 
 void HttpServer::HandleDumpInfo(const httplib::Request& req, httplib::Response& res) {
   // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
-    // Parse JSON body (non-throwing)
-    auto body = json::parse(req.body, nullptr, false);
-    if (body.is_discarded()) {
-      SendError(res, kHttpBadRequest, "Invalid JSON body");
+    auto body = ParseObjectBody(req.body);
+    if (!body) {
+      SendError(res, kHttpBadRequest, body.error().message());
+      return;
+    }
+    auto filepath = RequiredString(*body, "filepath");
+    if (!filepath) {
+      SendError(res, kHttpBadRequest, filepath.error().message());
       return;
     }
 
-    if (!body.contains("filepath")) {
-      SendError(res, kHttpBadRequest, "Missing required field: filepath");
-      return;
-    }
-
-    if (!body["filepath"].is_string()) {
-      SendError(res, kHttpBadRequest, "Field 'filepath' must be a string");
-      return;
-    }
-
-    std::string filepath = body["filepath"];
-
-    auto result = handlers::HandleDumpInfo(handler_context_->dump_dir, filepath);
+    auto result = handlers::HandleDumpInfo(handler_context_->dump_dir, *filepath);
     if (!result) {
       SendError(res, ErrorCodeToHttpStatus(result.error().code()), result.error().message());
       return;
@@ -1831,13 +1724,13 @@ void HttpServer::HandleDumpInfo(const httplib::Request& req, httplib::Response& 
 
     json response;
     response["status"] = "ok";
-    response["filepath"] = filepath;
+    response["filepath"] = *filepath;
     response["info"] = info;
     SendJson(res, kHttpOk, response);
 
   } catch (const std::exception& e) {
     spdlog::error("Unexpected exception in HandleDumpInfo: {}", e.what());
-    SendError(res, kHttpInternalServerError, R"({"error":"Internal server error"})");
+    SendError(res, kHttpInternalServerError, "Internal server error");
   }
 }
 
@@ -1953,7 +1846,7 @@ void HttpServer::HandleMetrics(const httplib::Request& /*req*/, httplib::Respons
 
   } catch (const std::exception& e) {
     spdlog::error("Unexpected exception in HandleMetrics: {}", e.what());
-    SendError(res, kHttpInternalServerError, R"({"error":"Internal server error"})");
+    SendError(res, kHttpInternalServerError, "Internal server error");
   }
 }
 
@@ -1996,7 +1889,7 @@ void HttpServer::HandleCacheStats(const httplib::Request& /*req*/, httplib::Resp
 
   } catch (const std::exception& e) {
     spdlog::error("Unexpected exception in HandleCacheStats: {}", e.what());
-    SendError(res, kHttpInternalServerError, R"({"error":"Internal server error"})");
+    SendError(res, kHttpInternalServerError, "Internal server error");
   }
 }
 
@@ -2051,7 +1944,7 @@ void HttpServer::HandleCacheClear(const httplib::Request& req, httplib::Response
 
   } catch (const std::exception& e) {
     spdlog::error("Unexpected exception in HandleCacheClear: {}", e.what());
-    SendError(res, kHttpInternalServerError, R"({"error":"Internal server error"})");
+    SendError(res, kHttpInternalServerError, "Internal server error");
   }
 }
 
@@ -2077,7 +1970,7 @@ void HttpServer::HandleCacheEnable(const httplib::Request& /*req*/, httplib::Res
 
   } catch (const std::exception& e) {
     spdlog::error("Unexpected exception in HandleCacheEnable: {}", e.what());
-    SendError(res, kHttpInternalServerError, R"({"error":"Internal server error"})");
+    SendError(res, kHttpInternalServerError, "Internal server error");
   }
 }
 
@@ -2103,7 +1996,7 @@ void HttpServer::HandleCacheDisable(const httplib::Request& /*req*/, httplib::Re
 
   } catch (const std::exception& e) {
     spdlog::error("Unexpected exception in HandleCacheDisable: {}", e.what());
-    SendError(res, kHttpInternalServerError, R"({"error":"Internal server error"})");
+    SendError(res, kHttpInternalServerError, "Internal server error");
   }
 }
 
@@ -2149,7 +2042,7 @@ void HttpServer::HandleDumpStatus(const httplib::Request& /*req*/, httplib::Resp
 
   } catch (const std::exception& e) {
     spdlog::error("Unexpected exception in HandleDumpStatus: {}", e.what());
-    SendError(res, kHttpInternalServerError, R"({"error":"Internal server error"})");
+    SendError(res, kHttpInternalServerError, "Internal server error");
   }
 }
 

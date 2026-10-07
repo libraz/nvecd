@@ -82,11 +82,15 @@ utils::Expected<Command, utils::Error> DecodeWalRecord(const storage::WalRecord&
  * was configured this way unable to start again, with no recovery other than
  * deleting the WAL by hand.
  *
- * The tolerated set is deliberately narrow. Only a missing vector, and only for
- * the two operations whose subject the configuration is allowed to omit, is a
- * gap. Every other operation, and every other error — CRC mismatch, truncation,
- * decode failure, an invalid payload — stays fail-closed, because those mean the
- * log does not say what the server wrote.
+ * The second gap is a record that input validation added since it was logged
+ * now rejects: a VECSET whose id or components the store refuses
+ * (kInvalidArgument), or a legacy text METASET whose pairs the METASET grammar
+ * refuses. Applying either would store what no current surface accepts.
+ *
+ * The tolerated set is deliberately narrow. Every other operation, and every
+ * other error — CRC mismatch, truncation, decode failure, a dimension mismatch —
+ * stays fail-closed, because those mean the log does not say what the server
+ * wrote.
  *
  * @param op WAL operation type of the record being replayed
  * @param code Error code returned by the handler that applied the record

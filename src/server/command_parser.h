@@ -23,6 +23,7 @@
 #include "utils/error.h"
 #include "utils/expected.h"
 #include "vectors/metadata.h"
+#include "vectors/metadata_filter.h"
 
 namespace nvecd::server {
 
@@ -46,9 +47,11 @@ struct Command {
   std::string mode = "fusion";        // Similarity mode: events, vectors, fusion
   std::optional<uint64_t> timestamp;  // Optional timestamp for EVENT (epoch seconds)
   std::optional<bool> adaptive;       // Optional adaptive flag for SIM
-  std::string filter_expr;            // Filter or metadata expression (e.g., "status:active,type:news")
-  // Typed metadata is used by HTTP WAL records. TCP METASET continues to use
-  // filter_expr so its text protocol remains unchanged.
+  std::string filter_expr;            // SIM/SIMV filter text as sent; part of the cache key
+  vectors::MetadataFilter filter;     // filter_expr parsed by the surface that received it
+  // METASET pairs (and HTTP VECSET metadata), already typed by the surface
+  // that received them. A legacy METASET WAL record decodes to filter_expr
+  // instead and is converted during replay.
   std::optional<vectors::Metadata> metadata;
   float min_score = 0.0F;  // Minimum score threshold
 
@@ -87,14 +90,5 @@ struct Command {
  * @return Expected<Command, Error> Parsed command or error
  */
 utils::Expected<Command, utils::Error> ParseCommand(const std::string& request, uint32_t max_top_k = 0);
-
-/**
- * @brief Parse a vector from string (space-separated floats)
- *
- * @param vec_str String containing space-separated floats
- * @param expected_dim Expected dimension (0 = any dimension)
- * @return Expected<vector<float>, Error> Parsed vector or error
- */
-utils::Expected<std::vector<float>, utils::Error> ParseVector(const std::string& vec_str, int expected_dim = 0);
 
 }  // namespace nvecd::server

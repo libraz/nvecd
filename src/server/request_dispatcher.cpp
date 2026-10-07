@@ -20,6 +20,7 @@
 #include "cache/cache_key.h"
 #include "cache/cache_key_generator.h"
 #include "cache/similarity_cache.h"
+#include "config/runtime_variable_manager.h"
 #include "events/co_occurrence_index.h"
 #include "events/event_store.h"
 #include "server/filter_parser.h"
@@ -54,6 +55,12 @@ bool IsSnapshotProtectedCommand(CommandType type) {
   return IsSnapshotProtectedWrite(type) || type == CommandType::kSim || type == CommandType::kSimv;
 }
 
+/// Latch the fail-stop state after a durability step failed for an admitted
+/// write; writes stay refused until restart.
+void LatchDurabilityFailure(HandlerContext& ctx) {
+  ctx.durability_failed.store(true, std::memory_order_release);
+}
+
 /**
  * @brief Append a write command to the WAL
  *
@@ -69,16 +76,24 @@ utils::Expected<void, utils::Error> AppendToWal(HandlerContext& ctx, const Comma
   }
 
   // Operators can opt out of retaining vector payloads in the WAL when
-  // snapshots are their chosen vector durability boundary. Keep all other
-  // mutations in the log so event and metadata recovery semantics are intact.
+  // snapshots are their chosen vector durability boundary. Only the payload is
+  // omitted: metadata supplied with the vector is logged as the METASET it is
+  // equivalent to, so event and metadata recovery semantics are intact.
   if (cmd.type == CommandType::kVecset && ctx.config != nullptr && !ctx.config->wal.include_vectors) {
-    return {};
+    if (!cmd.metadata.has_value()) {
+      return {};
+    }
+    Command metaset;
+    metaset.type = CommandType::kMetaset;
+    metaset.id = cmd.id;
+    metaset.metadata = cmd.metadata;
+    return AppendToWal(ctx, metaset);
   }
 
   std::vector<uint8_t> payload = EncodeCommand(cmd);
   auto appended = ctx.wal->Append(WalOpForCommand(cmd), payload.data(), payload.size());
   if (!appended) {
-    ctx.read_only.store(true, std::memory_order_release);
+    LatchDurabilityFailure(ctx);
     utils::StructuredLog()
         .Event("wal_append_failed")
         .Field("command", CommandTypeToString(cmd.type))
@@ -105,7 +120,7 @@ utils::Expected<WriteOutcome, utils::Error> ApplyEvent(HandlerContext& ctx, cons
     auto duplicate =
         ctx.event_store->AddEventAndGetPrior(cmd.ctx, cmd.id, cmd.score, cmd.event_type, prepared->event.timestamp);
     if (!duplicate || !duplicate->deduped) {
-      ctx.read_only.store(true, std::memory_order_release);
+      LatchDurabilityFailure(ctx);
       return utils::MakeUnexpected(
           utils::MakeError(utils::ErrorCode::kInternalError, "Event dedup state changed during acceptance"));
     }
@@ -126,7 +141,7 @@ utils::Expected<WriteOutcome, utils::Error> ApplyEvent(HandlerContext& ctx, cons
   auto result = ctx.event_store->AddEventAndGetPrior(cmd.ctx, cmd.id, prepared->event.score, prepared->event.type,
                                                      prepared->event.timestamp);
   if (!result || result->deduped) {
-    ctx.read_only.store(true, std::memory_order_release);
+    LatchDurabilityFailure(ctx);
     return utils::MakeUnexpected(
         utils::MakeError(utils::ErrorCode::kInternalError, "Event apply diverged after WAL acceptance"));
   }
@@ -171,7 +186,7 @@ utils::Expected<WriteOutcome, utils::Error> ApplyVecset(HandlerContext& ctx, con
 
   auto result = ctx.vector_store->SetVector(cmd.id, cmd.vector);
   if (!result) {
-    ctx.read_only.store(true, std::memory_order_release);
+    LatchDurabilityFailure(ctx);
     return utils::MakeUnexpected(result.error());
   }
   if (cmd.metadata.has_value() && ctx.metadata_store != nullptr) {
@@ -243,7 +258,7 @@ utils::Expected<WriteOutcome, utils::Error> ApplyVecdel(HandlerContext& ctx, con
   }
   const size_t rows_before = ctx.vector_store->GetCompactCount();
   if (!ctx.vector_store->DeleteVector(cmd.id)) {
-    ctx.read_only.store(true, std::memory_order_release);
+    LatchDurabilityFailure(ctx);
     return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kVectorNotFound, "Vector not found: " + cmd.id));
   }
 
@@ -286,29 +301,15 @@ utils::Expected<WriteOutcome, utils::Error> ApplyMetaset(HandlerContext& ctx, co
         utils::MakeError(utils::ErrorCode::kVectorNotFound, "Vector not found for metadata: " + cmd.id));
   }
 
-  // Typed metadata arrives from the JSON surface and from WAL replay; the TCP
-  // text protocol carries the same pairs as a filter expression.
-  vectors::Metadata metadata;
-  if (cmd.metadata.has_value()) {
-    metadata = *cmd.metadata;
-  } else {
-    auto parsed = ParseSimpleFilter(cmd.filter_expr);
-    if (!parsed) {
-      return utils::MakeUnexpected(parsed.error());
-    }
-    for (const auto& condition : parsed->conditions) {
-      if (condition.field.empty()) {
-        return utils::MakeUnexpected(
-            utils::MakeError(utils::ErrorCode::kCommandInvalidArgument, "Metadata key must not be empty"));
-      }
-      metadata[condition.field] = condition.value;
-    }
+  // Every surface types the pairs before the command reaches here.
+  if (!cmd.metadata.has_value()) {
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kInternalError, "METASET carries no metadata"));
   }
   auto wal_result = AppendToWal(ctx, cmd);
   if (!wal_result) {
     return utils::MakeUnexpected(wal_result.error());
   }
-  ctx.metadata_store->Set(cmd.id, std::move(metadata));
+  ctx.metadata_store->Set(cmd.id, *cmd.metadata);
   ctx.metadata_generation.fetch_add(1, std::memory_order_acq_rel);
 
   // Metadata changes affect filtered results broadly, so the whole cache goes.
@@ -372,6 +373,137 @@ utils::Expected<WriteOutcome, utils::Error> ApplyWrite(HandlerContext& ctx, cons
                                                 "Not a write command: " + std::string(CommandTypeToString(cmd.type))));
 }
 
+bool IsBlockedByReadOnly(const HandlerContext& ctx, CommandType type, std::string* message) {
+  if (!IsSnapshotProtectedWrite(type)) {
+    return false;
+  }
+  if (ctx.durability_failed.load(std::memory_order_acquire)) {
+    *message = "READONLY Persistence failure; writes are refused until restart";
+    return true;
+  }
+  if (ctx.read_only.load(std::memory_order_acquire)) {
+    *message = "READONLY Snapshot in progress";
+    return true;
+  }
+  return false;
+}
+
+namespace {
+
+/// Store generations a cached search result depends on.
+struct SearchGenerations {
+  uint64_t cooccurrence = 0;
+  uint64_t vector = 0;
+  uint64_t metadata = 0;
+  uint64_t dataset = 0;
+
+  bool operator==(const SearchGenerations& other) const {
+    return cooccurrence == other.cooccurrence && vector == other.vector && metadata == other.metadata &&
+           dataset == other.dataset;
+  }
+};
+
+/// SIMV results do not depend on co-occurrence, so it stays out of their key.
+SearchGenerations CaptureGenerations(const HandlerContext& ctx, bool by_vector) {
+  SearchGenerations generations;
+  if (!by_vector && ctx.co_index != nullptr) {
+    generations.cooccurrence = ctx.co_index->GetGeneration();
+  }
+  generations.vector = ctx.vector_generation.load(std::memory_order_acquire);
+  generations.metadata = ctx.metadata_generation.load(std::memory_order_acquire);
+  generations.dataset = ctx.dataset_generation.load(std::memory_order_acquire);
+  return generations;
+}
+
+}  // namespace
+
+utils::Expected<SearchOutcome, utils::Error> ExecuteSearch(HandlerContext& ctx, const Command& cmd) {
+  if (cmd.type != CommandType::kSim && cmd.type != CommandType::kSimv) {
+    return utils::MakeUnexpected(utils::MakeError(
+        utils::ErrorCode::kCommandUnknown, "Not a search command: " + std::string(CommandTypeToString(cmd.type))));
+  }
+  if (ctx.similarity_engine == nullptr) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kInternalError, "SimilarityEngine not initialized"));
+  }
+  const bool by_vector = cmd.type == CommandType::kSimv;
+
+  auto* cache_ptr = ctx.cache.load(std::memory_order_acquire);
+  const bool cache_enabled = cache_ptr != nullptr && cache_ptr->IsEnabled();
+  auto search_type = by_vector ? cache::SearchType::kVectorSearch : cache::SearchType::kItemSearch;
+  if (!cmd.filter_expr.empty()) {
+    search_type = cache::SearchType::kFilteredSearch;
+  }
+  cache::CacheKey cache_key;
+  SearchGenerations captured;
+
+  if (cache_enabled) {
+    captured = CaptureGenerations(ctx, by_vector);
+    cache_key =
+        by_vector ? cache::GenerateSimvCacheKey(
+                        {cmd.vector, cmd.top_k, captured.vector, cmd.filter_expr, captured.metadata, captured.dataset})
+                  : cache::GenerateSimCacheKey({cmd.id, cmd.top_k, cmd.mode, cmd.adaptive, captured.cooccurrence,
+                                                captured.vector, cmd.filter_expr, captured.metadata, captured.dataset});
+    auto cached = cache_ptr->Lookup(cache_key, search_type);
+    if (cached.has_value()) {
+      SearchOutcome outcome;
+      outcome.results = ApplyMinScore(*cached, cmd.min_score);
+      outcome.candidate_count = cached->size();
+      return outcome;
+    }
+  }
+
+  auto start = std::chrono::steady_clock::now();
+
+  utils::Expected<std::vector<similarity::SimilarityResult>, utils::Error> result;
+  if (by_vector) {
+    result = ctx.similarity_engine->SearchByVector(cmd.vector, cmd.top_k, cmd.filter);
+  } else if (cmd.mode == "events") {
+    result = ctx.similarity_engine->SearchByIdEvents(cmd.id, cmd.top_k, cmd.filter);
+  } else if (cmd.mode == "vectors") {
+    result = ctx.similarity_engine->SearchByIdVectors(cmd.id, cmd.top_k, cmd.filter);
+  } else {  // fusion (default)
+    result = ctx.similarity_engine->SearchByIdFusion(cmd.id, cmd.top_k, cmd.adaptive, cmd.filter);
+  }
+  if (!result) {
+    return utils::MakeUnexpected(result.error());
+  }
+  if (by_vector || cmd.mode != "events") {
+    // Non-events modes already apply the filter inside the engine; this second
+    // pass enforces it consistently for results that bypassed engine filtering.
+    *result = ApplyMetadataFilter(*result, ctx.metadata_store, cmd.filter);
+  }
+
+  // The stored cost covers the engine call and post-filter only, measured
+  // before the gate below so lock waits never count as query cost.
+  const double elapsed_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+
+  if (cache_enabled) {
+    std::unique_lock<std::mutex> generation_guard;
+    if (ctx.write_serialization_gate != nullptr) {
+      generation_guard = std::unique_lock(*ctx.write_serialization_gate);
+    }
+    if (cache_ptr == ctx.cache.load(std::memory_order_acquire) && cache_ptr->IsEnabled() &&
+        captured == CaptureGenerations(ctx, by_vector)) {
+      std::vector<std::string> item_ids;
+      item_ids.reserve(result->size() + 1);
+      if (!by_vector) {
+        item_ids.push_back(cmd.id);  // Query ID itself
+      }
+      for (const auto& item : *result) {
+        item_ids.push_back(item.item_id);
+      }
+      cache_ptr->InsertAndRegister(cache_key, *result, item_ids, elapsed_ms, search_type);
+    }
+  }
+
+  SearchOutcome outcome;
+  outcome.results = ApplyMinScore(*result, cmd.min_score);
+  outcome.candidate_count = result->size();
+  outcome.elapsed_ms = elapsed_ms;
+  return outcome;
+}
+
 RequestDispatcher::RequestDispatcher(HandlerContext& handler_ctx) : ctx_(handler_ctx) {}
 
 std::string RequestDispatcher::Dispatch(const std::string& request, ConnectionContext& conn_ctx) {
@@ -417,8 +549,9 @@ std::string RequestDispatcher::Dispatch(const std::string& request, ConnectionCo
   // Lock-mode snapshots set read_only before taking their store-lock barrier.
   // Reject a write before it can enter a store mutation path so the snapshot is
   // a true point-in-time image rather than a mix of pre/post-barrier updates.
-  if (GetCommandPrivilege(cmd->type) != CommandPrivilege::kRead && ctx_.read_only.load(std::memory_order_acquire)) {
-    return FormatError("READONLY Snapshot in progress");
+  std::string refusal;
+  if (IsBlockedByReadOnly(ctx_, cmd->type, &refusal)) {
+    return FormatError(refusal);
   }
 
   // Keep the shared gate for the full store-mutation and WAL append sequence.
@@ -431,8 +564,8 @@ std::string RequestDispatcher::Dispatch(const std::string& request, ConnectionCo
     if (ctx_.loading.load(std::memory_order_acquire)) {
       return FormatError("LOADING Snapshot load in progress");
     }
-    if (ctx_.read_only.load(std::memory_order_acquire) && IsSnapshotProtectedWrite(cmd->type)) {
-      return FormatError("READONLY Snapshot in progress");
+    if (IsBlockedByReadOnly(ctx_, cmd->type, &refusal)) {
+      return FormatError(refusal);
     }
   }
 
@@ -450,11 +583,8 @@ std::string RequestDispatcher::Dispatch(const std::string& request, ConnectionCo
       break;
 
     case CommandType::kSim:
-      result = HandleSim(*cmd, conn_ctx);
-      break;
-
     case CommandType::kSimv:
-      result = HandleSimv(*cmd, conn_ctx);
+      result = HandleSearch(*cmd, conn_ctx);
       break;
 
     case CommandType::kInfo:
@@ -573,194 +703,17 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleWrite(const 
       utils::MakeError(utils::ErrorCode::kInternalError, "Write produced an unformattable outcome"));
 }
 
-utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSim(const Command& cmd,
-                                                                        ConnectionContext& conn_ctx) const {
-  if (ctx_.similarity_engine == nullptr) {
-    return utils::MakeUnexpected(
-        utils::MakeError(utils::ErrorCode::kInternalError, "SimilarityEngine not initialized"));
+utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSearch(const Command& cmd,
+                                                                           ConnectionContext& conn_ctx) const {
+  auto outcome = ExecuteSearch(ctx_, cmd);
+  if (!outcome) {
+    return utils::MakeUnexpected(outcome.error());
   }
-
-  // Cache lookup
-  auto* cache_ptr = ctx_.cache.load(std::memory_order_acquire);
-  cache::CacheKey cache_key;
-  bool cache_enabled = (cache_ptr != nullptr && cache_ptr->IsEnabled());
-  auto search_type = cache::SearchType::kItemSearch;
-  uint64_t captured_cooccurrence_generation = 0;
-  uint64_t captured_vector_generation = 0;
-  uint64_t captured_metadata_generation = 0;
-  uint64_t captured_dataset_generation = 0;
-
-  // Parse filter expression if provided
-  vectors::MetadataFilter filter;
-  if (!cmd.filter_expr.empty()) {
-    auto filter_result = ParseSimpleFilter(cmd.filter_expr);
-    if (!filter_result) {
-      return utils::MakeUnexpected(filter_result.error());
-    }
-    filter = std::move(*filter_result);
-    search_type = cache::SearchType::kFilteredSearch;
-  }
-
-  if (cache_enabled) {
-    captured_cooccurrence_generation = ctx_.co_index != nullptr ? ctx_.co_index->GetGeneration() : 0;
-    captured_vector_generation = ctx_.vector_generation.load(std::memory_order_acquire);
-    captured_metadata_generation = ctx_.metadata_generation.load(std::memory_order_acquire);
-    captured_dataset_generation = ctx_.dataset_generation.load(std::memory_order_acquire);
-    cache_key = cache::GenerateSimCacheKey({cmd.id, cmd.top_k, cmd.mode, cmd.adaptive, captured_cooccurrence_generation,
-                                            captured_vector_generation, cmd.filter_expr, captured_metadata_generation,
-                                            captured_dataset_generation});
-    auto cached = cache_ptr->Lookup(cache_key, search_type);
-    if (cached.has_value()) {
-      auto pairs = ApplyMinScore(*cached, cmd.min_score);
-      std::string response = FormatSimResults(pairs, static_cast<int>(pairs.size()));
-      if (conn_ctx.debug_mode) {
-        // Cache hit: timing reflects the lookup only and the candidate count
-        // equals the cached result count.
-        response += handlers::FormatSimDebugBlock(cmd.mode, 0.0, static_cast<int>(cached->size()),
-                                                  static_cast<int>(pairs.size()));
-      }
-      return response;
-    }
-  }
-
-  auto start = std::chrono::steady_clock::now();
-
-  // Select search method based on mode.
-  utils::Expected<std::vector<similarity::SimilarityResult>, utils::Error> result;
-  if (cmd.mode == "events") {
-    result = ctx_.similarity_engine->SearchByIdEvents(cmd.id, cmd.top_k, filter);
-  } else if (cmd.mode == "vectors") {
-    result = ctx_.similarity_engine->SearchByIdVectors(cmd.id, cmd.top_k, filter);
-  } else {  // fusion (default)
-    result = ctx_.similarity_engine->SearchByIdFusion(cmd.id, cmd.top_k, cmd.adaptive, filter);
-  }
-
-  if (!result) {
-    return utils::MakeUnexpected(result.error());
-  }
-  if (cmd.mode != "events") {
-    // Non-events modes already apply the filter inside the engine; this second
-    // pass enforces it consistently for results that bypassed engine filtering.
-    *result = ApplyMetadataFilter(*result, ctx_.metadata_store, filter);
-  }
-
-  auto elapsed = std::chrono::steady_clock::now() - start;
-  double elapsed_ms = std::chrono::duration<double, std::milli>(elapsed).count();
-
-  // Cache store
-  if (cache_enabled) {
-    std::unique_lock<std::mutex> generation_guard;
-    if (ctx_.write_serialization_gate != nullptr) {
-      generation_guard = std::unique_lock(*ctx_.write_serialization_gate);
-    }
-    if (cache_ptr == ctx_.cache.load(std::memory_order_acquire) && cache_ptr->IsEnabled() &&
-        captured_cooccurrence_generation == (ctx_.co_index != nullptr ? ctx_.co_index->GetGeneration() : 0) &&
-        captured_vector_generation == ctx_.vector_generation.load(std::memory_order_acquire) &&
-        captured_metadata_generation == ctx_.metadata_generation.load(std::memory_order_acquire) &&
-        captured_dataset_generation == ctx_.dataset_generation.load(std::memory_order_acquire)) {
-      std::vector<std::string> item_ids;
-      item_ids.reserve(result->size() + 1);
-      item_ids.push_back(cmd.id);  // Query ID itself
-      for (const auto& item : *result) {
-        item_ids.push_back(item.item_id);
-      }
-      cache_ptr->InsertAndRegister(cache_key, *result, item_ids, elapsed_ms, search_type);
-    }
-  }
-
-  // Apply min_score filter and convert to pair<string, float>
-  auto pairs = ApplyMinScore(*result, cmd.min_score);
-
-  std::string response = FormatSimResults(pairs, static_cast<int>(pairs.size()));
+  std::string response = FormatSimResults(outcome->results, static_cast<int>(outcome->results.size()));
   if (conn_ctx.debug_mode) {
-    response += handlers::FormatSimDebugBlock(cmd.mode, elapsed_ms, static_cast<int>(result->size()),
-                                              static_cast<int>(pairs.size()));
-  }
-  return response;
-}
-
-utils::Expected<std::string, utils::Error> RequestDispatcher::HandleSimv(const Command& cmd,
-                                                                         ConnectionContext& conn_ctx) const {
-  if (ctx_.similarity_engine == nullptr) {
-    return utils::MakeUnexpected(
-        utils::MakeError(utils::ErrorCode::kInternalError, "SimilarityEngine not initialized"));
-  }
-
-  // Cache lookup
-  auto* cache_ptr = ctx_.cache.load(std::memory_order_acquire);
-  cache::CacheKey cache_key;
-  bool cache_enabled = (cache_ptr != nullptr && cache_ptr->IsEnabled());
-  auto search_type = cache::SearchType::kVectorSearch;
-  uint64_t captured_vector_generation = 0;
-  uint64_t captured_metadata_generation = 0;
-  uint64_t captured_dataset_generation = 0;
-
-  // Parse filter expression if provided
-  vectors::MetadataFilter filter;
-  if (!cmd.filter_expr.empty()) {
-    auto filter_result = ParseSimpleFilter(cmd.filter_expr);
-    if (!filter_result) {
-      return utils::MakeUnexpected(filter_result.error());
-    }
-    filter = std::move(*filter_result);
-    search_type = cache::SearchType::kFilteredSearch;
-  }
-
-  if (cache_enabled) {
-    captured_vector_generation = ctx_.vector_generation.load(std::memory_order_acquire);
-    captured_metadata_generation = ctx_.metadata_generation.load(std::memory_order_acquire);
-    captured_dataset_generation = ctx_.dataset_generation.load(std::memory_order_acquire);
-    cache_key = cache::GenerateSimvCacheKey({cmd.vector, cmd.top_k, captured_vector_generation, cmd.filter_expr,
-                                             captured_metadata_generation, captured_dataset_generation});
-    auto cached = cache_ptr->Lookup(cache_key, search_type);
-    if (cached.has_value()) {
-      auto pairs = ApplyMinScore(*cached, cmd.min_score);
-      std::string response = FormatSimResults(pairs, static_cast<int>(pairs.size()));
-      if (conn_ctx.debug_mode) {
-        response += handlers::FormatSimDebugBlock("vector", 0.0, static_cast<int>(cached->size()),
-                                                  static_cast<int>(pairs.size()));
-      }
-      return response;
-    }
-  }
-
-  auto start = std::chrono::steady_clock::now();
-
-  auto result = ctx_.similarity_engine->SearchByVector(cmd.vector, cmd.top_k, filter);
-  if (!result) {
-    return utils::MakeUnexpected(result.error());
-  }
-  *result = ApplyMetadataFilter(*result, ctx_.metadata_store, filter);
-
-  auto elapsed = std::chrono::steady_clock::now() - start;
-  double elapsed_ms = std::chrono::duration<double, std::milli>(elapsed).count();
-
-  // Cache store
-  if (cache_enabled) {
-    std::unique_lock<std::mutex> generation_guard;
-    if (ctx_.write_serialization_gate != nullptr) {
-      generation_guard = std::unique_lock(*ctx_.write_serialization_gate);
-    }
-    if (cache_ptr == ctx_.cache.load(std::memory_order_acquire) && cache_ptr->IsEnabled() &&
-        captured_vector_generation == ctx_.vector_generation.load(std::memory_order_acquire) &&
-        captured_metadata_generation == ctx_.metadata_generation.load(std::memory_order_acquire) &&
-        captured_dataset_generation == ctx_.dataset_generation.load(std::memory_order_acquire)) {
-      std::vector<std::string> item_ids;
-      item_ids.reserve(result->size());
-      for (const auto& item : *result) {
-        item_ids.push_back(item.item_id);
-      }
-      cache_ptr->InsertAndRegister(cache_key, *result, item_ids, elapsed_ms, search_type);
-    }
-  }
-
-  // Apply min_score filter and convert to pair<string, float>
-  auto pairs = ApplyMinScore(*result, cmd.min_score);
-
-  std::string response = FormatSimResults(pairs, static_cast<int>(pairs.size()));
-  if (conn_ctx.debug_mode) {
-    response += handlers::FormatSimDebugBlock("vector", elapsed_ms, static_cast<int>(result->size()),
-                                              static_cast<int>(pairs.size()));
+    const std::string mode = cmd.type == CommandType::kSimv ? "vector" : cmd.mode;
+    response += handlers::FormatSimDebugBlock(mode, outcome->elapsed_ms, static_cast<int>(outcome->candidate_count),
+                                              static_cast<int>(outcome->results.size()));
   }
   return response;
 }
@@ -774,9 +727,14 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleConfigHelp(c
 }
 
 utils::Expected<std::string, utils::Error> RequestDispatcher::HandleConfigShow(const Command& cmd) {
-  // Build ServerContext from HandlerContext members
+  // Build ServerContext from HandlerContext members. The configuration shown
+  // is the running one, with runtime SETs applied.
+  std::optional<config::Config> effective_config;
+  if (ctx_.variable_manager != nullptr) {
+    effective_config = ctx_.variable_manager->EffectiveConfig();
+  }
   ServerContext server_ctx;
-  server_ctx.config = ctx_.config;
+  server_ctx.config = effective_config.has_value() ? &*effective_config : ctx_.config;
   server_ctx.uptime_seconds = ctx_.stats.GetUptimeSeconds();
   server_ctx.connections_total = ctx_.stats.total_connections.load();
   server_ctx.connections_current = ctx_.stats.active_connections.load();
@@ -905,7 +863,7 @@ utils::Expected<void, utils::Error> RequestDispatcher::ReplayRecord(const storag
     double alpha = 0.0;
     std::memcpy(&alpha, record.payload.data(), sizeof(alpha));
     const uint8_t prune = record.payload[sizeof(alpha)];
-    if (!std::isfinite(alpha) || alpha <= 0.0 || alpha > 1.0 || prune > 1) {
+    if (!events::IsValidDecayAlpha(alpha) || prune > 1) {
       return utils::MakeUnexpected(
           utils::MakeError(utils::ErrorCode::kWalCorrupted, "Invalid co-occurrence maintenance WAL payload"));
     }
@@ -926,19 +884,32 @@ utils::Expected<void, utils::Error> RequestDispatcher::ReplayRecord(const storag
     return utils::MakeUnexpected(decoded.error());
   }
 
+  // A legacy METASET record carries its pairs as text; type them with the same
+  // parser TCP uses before applying.
+  utils::Expected<WriteOutcome, utils::Error> applied = WriteOutcome{};
+  if (decoded->type == CommandType::kMetaset && !decoded->metadata.has_value()) {
+    auto metadata = ParseMetadataPairs(decoded->filter_expr);
+    if (metadata) {
+      decoded->metadata = std::move(*metadata);
+    } else {
+      applied = utils::MakeUnexpected(metadata.error());
+    }
+  }
+
   // Re-apply through the same write choke point live traffic uses, so recovery
   // reconstructs exactly the state the original command produced. ctx_.wal is
   // null during replay, so the record is not appended a second time.
-  auto applied = ApplyWrite(ctx_, *decoded);
+  if (applied) {
+    applied = ApplyWrite(ctx_, *decoded);
+  }
 
   if (!applied) {
     if (IsIntendedReplayGap(record.op, applied.error().code())) {
-      // The configuration that produced this log cannot restore this record's
-      // subject. Skipping keeps recovery moving; aborting would make a server
-      // configured with `wal.include_vectors: false` permanently unstartable
-      // after any VECDEL or metadata write. Every skip is reported so the gap
-      // is visible rather than silent, and the running total is reported by
-      // INFO so the size of the gap survives log rotation.
+      // This record's subject cannot be restored, or validation added since
+      // it was logged rejects it. Skipping keeps recovery moving; aborting
+      // would make the server permanently unstartable. Every skip is reported
+      // so the gap is visible rather than silent, and the running total is
+      // reported by INFO so the size of the gap survives log rotation.
       const uint64_t skipped_total = ctx_.stats.wal_replay_records_skipped.fetch_add(1) + 1;
       utils::StructuredLog()
           .Event("wal_replay_record_skipped")

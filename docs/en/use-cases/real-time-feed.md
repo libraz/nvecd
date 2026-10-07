@@ -63,7 +63,7 @@ Nothing in a continuous write stream stops the index growing. These five keys ar
 
 `max_contexts` is the one that scales with audience and is unlimited by default. A feed with one context per viewer accumulates one entry per viewer who has ever been seen, so set it to the number of active viewers the process should hold rather than leaving it open.
 
-`min_support` and global decay work as a pair: decay pushes stale edges towards zero on a timer, and `min_support` is what removes them once they get there. With `min_support` at its default of `0`, decayed edges shrink but never leave, and the index only ever grows.
+`min_support` and global decay work as a pair: decay pushes stale edges towards zero on a timer, and `min_support` is what removes them once they get there. With `min_support` at its default of `0`, a decay pass still erases an edge once its score falls below `1e-6`, so only edges decayed to effectively nothing leave; a meaningful `min_support` is what removes stale edges while they still carry weight.
 
 ## A worked session
 

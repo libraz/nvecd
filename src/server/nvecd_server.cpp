@@ -668,7 +668,8 @@ utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
         {
           std::shared_lock snapshot_guard(snapshot_write_gate_);
           std::lock_guard write_guard(write_serialization_gate_);
-          if (read_only_.load(std::memory_order_acquire)) {
+          if (read_only_.load(std::memory_order_acquire) ||
+              handler_ctx_.durability_failed.load(std::memory_order_acquire)) {
             return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kEventDecayFailed,
                                                           "Server is read-only; decay maintenance skipped"));
           }
@@ -680,7 +681,7 @@ utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
             auto appended =
                 handler_ctx_.wal->Append(storage::WalOpType::kCoOccurrenceMaintenance, payload.data(), payload.size());
             if (!appended) {
-              read_only_.store(true, std::memory_order_release);
+              handler_ctx_.durability_failed.store(true, std::memory_order_release);
               return utils::MakeUnexpected(appended.error());
             }
           }

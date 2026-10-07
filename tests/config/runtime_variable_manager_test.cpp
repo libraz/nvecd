@@ -101,8 +101,31 @@ TEST(RuntimeVariableManagerTest, GetVariable_CacheMinQueryCostMs) {
 
   auto val = manager->GetVariable("cache.min_query_cost_ms");
   ASSERT_TRUE(val) << val.error().message();
-  // std::to_string(10.0) produces "10.000000"
-  EXPECT_EQ(*val, std::to_string(10.0));
+  // The shortest round-trippable spelling, the same one SET stores.
+  EXPECT_EQ(*val, "10");
+}
+
+TEST(RuntimeVariableManagerTest, DoubleVariablesRoundTripBeforeAndAfterSet) {
+  Config config = MakeDefaultConfig();
+  config.events.decay_alpha = 0.99;
+  config.events.min_support = 0.0000005;
+  auto manager = *RuntimeVariableManager::Create(config);
+
+  auto alpha = manager->GetVariable("events.decay_alpha");
+  ASSERT_TRUE(alpha) << alpha.error().message();
+  EXPECT_EQ(*alpha, "0.99");
+  auto support = manager->GetVariable("events.min_support");
+  ASSERT_TRUE(support) << support.error().message();
+  EXPECT_EQ(std::stod(*support), 0.0000005);
+
+  std::atomic<nvecd::cache::SimilarityCache*> publication{nullptr};
+  auto controller = AttachCacheController(*manager, config, publication);
+  auto initial = manager->GetVariable("cache.min_query_cost_ms");
+  ASSERT_TRUE(initial);
+  ASSERT_TRUE(manager->SetVariable("cache.min_query_cost_ms", *initial));
+  auto after = manager->GetVariable("cache.min_query_cost_ms");
+  ASSERT_TRUE(after);
+  EXPECT_EQ(*after, *initial);
 }
 
 TEST(RuntimeVariableManagerTest, GetVariable_CacheTtlSeconds) {

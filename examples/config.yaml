@@ -35,7 +35,7 @@ events:
 
 # Vector store configuration
 vectors:
-  # Default vector dimension (number of features per vector) [1-4096]
+  # Dimension the ANN index is pre-sized for; the first stored vector fixes the dimension the store accepts [1-4096]
   default_dimension: 768
   # Distance metric for similarity search [cosine dot l2]
   distance_metric: "cosine"
@@ -78,7 +78,7 @@ similarity:
   hnsw_ef_construction: 200
   # HNSW search width during query; the maximum is the range of the type it is read into, not a tuning limit [1-4294967295]
   hnsw_ef_search: 50
-  # HNSW pre-allocated capacity (0 = dynamic growth); the value is reserved at startup and the maximum is the largest index the snapshot loader accepts, so reserving beyond it produces an index that cannot be reloaded [0-10000000]
+  # HNSW pre-allocated capacity (0 = dynamic growth); the value is reserved at startup, and the maximum is a plain capacity bound [0-10000000]
   hnsw_max_elements: 0
 
 # Snapshot persistence configuration
@@ -204,5 +204,5 @@ wal:
   sync_on_write: false
   # Batch fsync interval in milliseconds when sync_on_write is false (0 = fsync on every append); the maximum is the range of the type it is read into, not a tuning limit [0-4294967295]
   sync_interval_ms: 100
-  # Persist vector bodies in VECSET WAL records; disable only when snapshots provide the required vector durability
+  # Persist vector bodies in VECSET WAL records (metadata sent with a VECSET is logged either way); disable only when snapshots provide the required vector durability
   include_vectors: true

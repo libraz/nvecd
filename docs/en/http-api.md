@@ -1,6 +1,6 @@
 # HTTP API
 
-The HTTP server exposes the same operations as the [TCP protocol](./protocol.md) as JSON routes, plus health probes and a Prometheus scrape endpoint. It is disabled by default and is enabled with `api.http.enable`.
+The HTTP server exposes the data, search, cache and snapshot commands of the [TCP protocol](./protocol.md) as JSON routes, plus health probes and a Prometheus scrape endpoint. `AUTH`, the runtime-variable commands (`SET`, `GET`, `SHOW VARIABLES`), `CONFIG HELP` and `CONFIG VERIFY` have no HTTP route. It is disabled by default and is enabled with `api.http.enable`.
 
 ## Enabling the server
 
@@ -85,18 +85,17 @@ with status `401`. The check runs before the handler reads any state or assemble
 |---|---|
 | `200` | success |
 | `204` | CORS preflight (`OPTIONS`) |
-| `400` | malformed JSON, missing or mistyped field, invalid `top_k`, dimension mismatch, invalid filter, invalid event score, snapshot path traversal, unsupported cache scope |
+| `400` | malformed JSON, a body that is not a JSON object, missing or mistyped field, `top_k` outside 1–`similarity.max_top_k` (however large), `min_score` or a vector component beyond the float range, dimension mismatch, invalid filter, invalid event score, an item or context ID that is empty or carries whitespace or a control character, snapshot path traversal, unsupported cache scope |
 | `401` | credentials missing or wrong on a gated route |
 | `403` | source address outside `network.allow_cidrs`, or a permission-denied error from a handler |
 | `404` | unknown route or method; unknown item ID; snapshot or configuration file not found |
 | `410` | `/debug/on` and `/debug/off` |
+| `413` | request body larger than `performance.max_query_length` |
 | `429` | rate limit exceeded |
 | `500` | any other handler error, including snapshot read and integrity failures |
-| `503` | server is loading or read-only; a write the WAL could not accept |
+| `503` | server is loading; a write route while a lock-mode snapshot holds the stores or after the persistence fail-stop latched (the `error` text is the TCP `READONLY` message); a write the WAL could not accept |
 
 Handler errors are mapped from the typed error code rather than sniffed from a message, so the same failure produces the same status on every route. Domain errors map as follows: item and file not-found conditions to `404`; argument, parsing, dimension, `top_k` and event-score errors to `400`; permission-denied to `403`; WAL write, rotation and not-open errors to `503`; everything else to `500`.
-
-Two families of client mistake land on `500` rather than `400` because their error code is not in that map. A `POST /event` whose `ctx` or `id` is empty, or carries whitespace or a control character, is answered `500` with `Context cannot be empty`, `ID cannot be empty`, or `… must not contain whitespace or control characters`. A `POST /dump/load`, `/dump/verify` or `/dump/info` naming a file that does not exist is likewise `500`, because the underlying failure is a storage open error rather than a not-found code. Both are request defects; a client that classifies purely on status will read them as server faults.
 
 Every error body is a single-field object:
 
@@ -138,7 +137,7 @@ A float `score` is rejected rather than truncated, so the integer contract match
 |---|---|---|---|
 | `id` | string | yes | item ID |
 | `vector` | array of numbers | yes | every element must be finite and within float range |
-| `metadata` | object | no | values may be string, integer, float or boolean; keys must not be empty |
+| `metadata` | object | no | values may be string, integer, float or boolean; keys must not be empty; an integer beyond the signed 64-bit range is stored as a double, as TCP stores the same spelling |
 
 ```json
 {"dimension":4,"status":"ok"}
@@ -193,7 +192,7 @@ The ID is read from a JSON body, not from the path or query string, so a client 
 
 `count` is the number of entries in `results` after `min_score` has been applied. Scores are rounded to four decimal places, the same precision the TCP surface renders.
 
-`top_k` must be positive and must not exceed `similarity.max_top_k`; both violations are `400`. `filter` uses the same grammar as the TCP `filter=` option — `=`, `:`, `!=`, `>`, `<`, `>=`, `<=` and `in(a|b|c)` — documented in [protocol.md](./protocol.md). An `id` with no vector is `404` with `Query vector not found: <id>`.
+`top_k` must be positive and must not exceed `similarity.max_top_k`; both violations are `400` with the message TCP gives for the same value, and a value outside the integer range is rejected rather than wrapped. A `min_score` beyond the float range is `400`. `filter` uses the same grammar as the TCP `filter=` option — `=`, `:`, `!=`, `>`, `<`, `>=`, `<=` and `in(a|b|c)` — documented in [protocol.md](./protocol.md). An `id` with no vector is `404` with `Query vector not found: <id>`.
 
 ### `POST /simv`
 
@@ -359,7 +358,7 @@ Both set the `cache.enabled` runtime variable, so the change survives until it i
 {"filepath": "nvecd.nvec"}
 ```
 
-`filepath` is optional; an empty body or an omitted field uses `snapshot.default_filename`. The path is resolved inside `snapshot.dir` and one that escapes it is `400`.
+`filepath` is optional; an empty body or an omitted field uses `snapshot.default_filename`. A body that is not a JSON object, or a `filepath` that is not a string, is `400`. The path is resolved inside `snapshot.dir` and one that escapes it is `400`.
 
 ```json
 {"filepath":"/var/lib/nvecd/snapshots/nvecd.nvec","status":"ok"}
@@ -379,7 +378,7 @@ Both set the `cache.enabled` runtime variable, so the change survives until it i
 {"filepath":"/var/lib/nvecd/snapshots/nvecd.nvec","status":"ok"}
 ```
 
-A missing file is `500`, with the underlying open failure in the message. A path that escapes `snapshot.dir` is `400`.
+A missing file is `404`, with the underlying open failure in the message. A path that escapes `snapshot.dir` is `400`.
 
 ### `POST /dump/verify`
 
@@ -402,7 +401,7 @@ A failed verification does not collapse to a bare `error` object; it reports the
 }
 ```
 
-The status is the mapped error status, `500` for an unreadable or corrupt file.
+The status is the mapped error status: `404` for a missing file, `500` for an unreadable or corrupt one.
 
 ### `POST /dump/info`
 

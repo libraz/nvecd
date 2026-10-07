@@ -5,45 +5,29 @@
 
 #include "server/filter_parser.h"
 
-#include <cerrno>
-#include <cstdlib>
 #include <string_view>
+
+#include "server/argument_validation.h"
 
 namespace nvecd::server {
 
 namespace {
 
-/// Try to parse a value string as the most specific type possible
+/// Type a value by its spelling: true/false, then a decimal integer, then a
+/// finite decimal literal; anything else (nan, inf, hex) stays a string.
 vectors::MetadataValue ParseValue(const std::string& val) {
-  // Try bool
   if (val == "true") {
     return true;
   }
   if (val == "false") {
     return false;
   }
-
-  // Try int64
-  {
-    char* end = nullptr;
-    errno = 0;
-    long long int_val = std::strtoll(val.c_str(), &end, 10);  // NOLINT(runtime/int)
-    if (end != val.c_str() && *end == '\0' && errno == 0) {
-      return static_cast<int64_t>(int_val);
-    }
+  if (auto integer = ParseDecimalInteger(val)) {
+    return *integer;
   }
-
-  // Try double
-  {
-    char* end = nullptr;
-    errno = 0;
-    double dbl_val = std::strtod(val.c_str(), &end);
-    if (end != val.c_str() && *end == '\0' && errno == 0) {
-      return dbl_val;
-    }
+  if (auto number = ParseDecimalNumber(val)) {
+    return *number;
   }
-
-  // Default: string
   return val;
 }
 
@@ -136,6 +120,29 @@ utils::Expected<vectors::MetadataFilter, utils::Error> ParseSimpleFilter(const s
   }
 
   return filter;
+}
+
+utils::Expected<vectors::Metadata, utils::Error> ParseMetadataPairs(const std::string& expr) {
+  auto parsed = ParseSimpleFilter(expr);
+  if (!parsed) {
+    return utils::MakeUnexpected(parsed.error());
+  }
+  if (parsed->conditions.empty()) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kCommandInvalidArgument, "METASET requires at least one key:value pair"));
+  }
+  vectors::Metadata metadata;
+  for (auto& condition : parsed->conditions) {
+    // A stored value is a single value: comparisons and in(...) lists have no
+    // metadata meaning, so they are rejected rather than reduced to one.
+    if (condition.op != vectors::FilterOp::kEq) {
+      return utils::MakeUnexpected(utils::MakeError(
+          utils::ErrorCode::kCommandInvalidArgument,
+          "METASET accepts only key:value pairs, got '" + condition.field + "' with a comparison or in(...) value"));
+    }
+    metadata[condition.field] = std::move(condition.value);
+  }
+  return metadata;
 }
 
 }  // namespace nvecd::server

@@ -645,6 +645,38 @@ TEST_F(HandlerTest, DumpSave_WithValidData_Succeeds) {
   std::filesystem::remove(dump_path);
 }
 
+// A writer admitted before a lock-mode save latches the fail-stop while the
+// save waits for it; the save releasing its own flag must not reopen writes.
+TEST_F(HandlerTest, DumpSave_LockModeDoesNotClearADurabilityLatchSetDuringTheSave) {
+  config_->snapshot.mode = "lock";
+  config_->snapshot.dir = dump_dir_.string();
+  const std::string dump_path = (dump_dir_ / "latched.nvec").string();
+
+  std::shared_lock admitted_writer(snapshot_write_gate_);
+  auto save = std::async(std::launch::async, [this, &dump_path] { return HandleDumpSave(*ctx_, dump_path); });
+  while (!read_only_.load(std::memory_order_acquire)) {
+    std::this_thread::yield();
+  }
+
+  nvecd::storage::WriteAheadLog closed_wal;
+  ctx_->wal = &closed_wal;
+  Command write;
+  write.type = CommandType::kVecset;
+  write.id = "in_flight";
+  write.vector = {1.0F, 0.0F, 0.0F};
+  ASSERT_FALSE(ApplyWrite(*ctx_, write).has_value());
+  ctx_->wal = nullptr;
+  admitted_writer.unlock();
+
+  auto saved = save.get();
+  ASSERT_TRUE(saved.has_value()) << saved.error().message();
+  EXPECT_FALSE(read_only_.load(std::memory_order_acquire));
+  EXPECT_TRUE(ctx_->durability_failed.load(std::memory_order_acquire));
+  std::string refusal;
+  EXPECT_TRUE(IsBlockedByReadOnly(*ctx_, CommandType::kVecset, &refusal));
+  EXPECT_THAT(refusal, HasSubstr("Persistence failure"));
+}
+
 TEST_F(HandlerTest, DumpSave_WithoutPath_UsesConfiguredDefaultFilename) {
   vector_store_->SetVector("item1", {0.1f, 0.2f, 0.3f});
   config_->snapshot.mode = "lock";
@@ -852,7 +884,7 @@ TEST_F(HandlerTest, DumpLoadDurabilityFailureEntersFailStop) {
 
   ASSERT_FALSE(result.has_value());
   EXPECT_TRUE(loading_.load(std::memory_order_acquire));
-  EXPECT_TRUE(read_only_.load(std::memory_order_acquire));
+  EXPECT_TRUE(ctx_->durability_failed.load(std::memory_order_acquire));
   EXPECT_TRUE(vector_store_->HasVector("snapshot-item"));
   EXPECT_FALSE(vector_store_->HasVector("live-item"));
   wal.Close();

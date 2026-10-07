@@ -35,6 +35,11 @@ namespace nvecd::server::handlers {
 
 namespace {
 constexpr int kFilepathBufferSize = 256;
+
+// A missing snapshot file stays a not-found error so callers can tell it from a damaged file.
+utils::ErrorCode SnapshotFailureCode(const utils::Error& cause, utils::ErrorCode fallback) {
+  return cause.code() == utils::ErrorCode::kStorageFileNotFound ? cause.code() : fallback;
+}
 }  // namespace
 
 utils::Expected<void, utils::Error> StartForkSnapshot(HandlerContext& ctx, const std::string& resolved_path) {
@@ -220,7 +225,8 @@ utils::Expected<std::string, utils::Error> HandleDumpLoad(HandlerContext& ctx, c
       error_msg += " (" + integrity_error.message + ")";
     }
     utils::LogStorageError("dump_load", resolved_path, error_msg);
-    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kSnapshotLoadFailed, error_msg));
+    return utils::MakeUnexpected(
+        utils::MakeError(SnapshotFailureCode(result.error(), utils::ErrorCode::kSnapshotLoadFailed), error_msg));
   }
 
   // Drain all mutations and similarity queries only for the short publication
@@ -266,9 +272,10 @@ utils::Expected<std::string, utils::Error> HandleDumpLoad(HandlerContext& ctx, c
 
   auto fail_stop = [&](const utils::Error& error) -> utils::Expected<std::string, utils::Error> {
     // Publication has already occurred. If any durability step fails, do not
-    // reopen the server on a state whose recovery base is uncertain. Keep both
-    // lifecycle flags set until an operator restarts after fixing storage.
-    ctx.read_only.store(true, std::memory_order_release);
+    // reopen the server on a state whose recovery base is uncertain. Latch the
+    // fail-stop and keep loading set until an operator restarts after fixing
+    // storage.
+    ctx.durability_failed.store(true, std::memory_order_release);
     ctx.loading.store(true, std::memory_order_release);
     loading_guard.KeepSet();
     utils::LogStorageError("dump_load_fail_stop", resolved_path, error.message());
@@ -329,7 +336,8 @@ utils::Expected<std::string, utils::Error> HandleDumpVerify(const std::string& d
     error_msg += " (" + integrity_error.message + ")";
   }
   utils::LogStorageError("dump_verify", resolved_path, error_msg);
-  return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kSnapshotVerifyFailed, error_msg));
+  return utils::MakeUnexpected(
+      utils::MakeError(SnapshotFailureCode(result.error(), utils::ErrorCode::kSnapshotVerifyFailed), error_msg));
 }
 
 utils::Expected<std::string, utils::Error> HandleDumpInfo(const std::string& dump_dir, const std::string& filepath) {
@@ -350,7 +358,7 @@ utils::Expected<std::string, utils::Error> HandleDumpInfo(const std::string& dum
 
   if (!info_result) {
     return utils::MakeUnexpected(
-        utils::MakeError(utils::ErrorCode::kSnapshotInfoFailed,
+        utils::MakeError(SnapshotFailureCode(info_result.error(), utils::ErrorCode::kSnapshotInfoFailed),
                          "Failed to read snapshot info from " + resolved_path + ": " + info_result.error().message()));
   }
 

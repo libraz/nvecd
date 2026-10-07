@@ -112,6 +112,13 @@ class RuntimeVariableManager {
   utils::Expected<std::string, utils::Error> GetVariable(const std::string& variable_name) const;
 
   /**
+   * @brief The running configuration: startup values with every SET applied
+   *
+   * What CONFIG SHOW prints, so it agrees with GET for each mutable variable.
+   */
+  Config EffectiveConfig() const;
+
+  /**
    * @brief Get all variables with mutability info (SHOW VARIABLES)
    * @param prefix Optional prefix filter (e.g., "logging", "cache")
    * @return Map of variable_name -> VariableInfo
@@ -144,7 +151,7 @@ class RuntimeVariableManager {
   // Current runtime values (only mutable variables)
   std::map<std::string, std::string> runtime_values_;
 
-  // Original config (immutable variables + defaults)
+  // Running config: startup values, with mutable variables updated on SET
   Config base_config_;
 
   // Component reference. Registered once during server initialization.

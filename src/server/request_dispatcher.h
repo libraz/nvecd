@@ -9,6 +9,8 @@
 #pragma once
 
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "server/command_parser.h"
 #include "server/server_types.h"
@@ -56,6 +58,50 @@ struct WriteOutcome {
  * @return Outcome of the write, or the error the client must be told about
  */
 utils::Expected<WriteOutcome, utils::Error> ApplyWrite(HandlerContext& ctx, const Command& cmd);
+
+/**
+ * @brief Whether the read-only state refuses a command, on either surface
+ *
+ * The one admission decision for both TCP and HTTP. Only store-mutating
+ * commands (EVENT, VECSET, VECDEL, METASET) are refused; reads and admin
+ * commands reach their handlers, which report their own concurrency errors.
+ * The refusal names the actual cause: a lock-mode snapshot holding the write
+ * barrier, or the durability fail-stop latch.
+ *
+ * @param ctx Handler context holding both flags
+ * @param type Command being admitted
+ * @param message Receives the refusal text when the command is refused
+ * @return true when the command must be refused
+ */
+bool IsBlockedByReadOnly(const HandlerContext& ctx, CommandType type, std::string* message);
+
+/**
+ * @brief Result of a SIM or SIMV search, before surface formatting
+ */
+struct SearchOutcome {
+  /// Results that passed min_score, in rank order.
+  std::vector<std::pair<std::string, float>> results;
+
+  /// Results before min_score was applied (the candidate count DEBUG reports).
+  size_t candidate_count = 0;
+
+  /// Engine search plus post-filter time; 0 when served from the cache.
+  double elapsed_ms = 0.0;
+};
+
+/**
+ * @brief Run a SIM or SIMV command through the cache and the engine
+ *
+ * The single search path for both surfaces, so the cache key, the cache
+ * admission check and the stored query cost cannot differ by surface. The
+ * caller has already parsed the filter into Command::filter and keeps the
+ * snapshot admission, exactly as for ApplyWrite.
+ *
+ * @param ctx Handler context owning the engine and cache
+ * @param cmd Parsed SIM or SIMV command
+ * @return The search outcome, or the error the client must be told about
+ */
+utils::Expected<SearchOutcome, utils::Error> ExecuteSearch(HandlerContext& ctx, const Command& cmd);
 
 /**
  * @brief Request dispatcher
@@ -110,18 +156,17 @@ class RequestDispatcher {
    * skipped.
    *
    * Recovery is fail-closed. A decode failure, a CRC mismatch, a torn record
-   * or any apply error other than the one case below is corruption: it is
+   * or any apply error other than the cases below is corruption: it is
    * returned as an error and aborts replay rather than being skipped, because
    * continuing past it would substitute silent state divergence for a visible
    * startup failure.
    *
-   * The single exception is a record whose subject this configuration cannot
-   * restore, as classified by IsIntendedReplayGap(): a kVectorNotFound on a
-   * replayed VECDEL or METASET, which is what a log written under
-   * `wal.include_vectors: false` necessarily produces. Skipping only that case
-   * keeps such a server startable; treating it as corruption would make it
-   * permanently unstartable after any VECDEL or metadata write. Every skip is
-   * logged with a running total, which INFO also reports.
+   * The exceptions are the records IsIntendedReplayGap() classifies: one whose
+   * subject this configuration cannot restore (a kVectorNotFound on a replayed
+   * VECDEL or METASET, which a log written under `wal.include_vectors: false`
+   * necessarily produces), and one that validation added after it was logged
+   * now rejects. Skipping only those keeps such a server startable. Every skip
+   * is logged with a running total, which INFO also reports.
    *
    * @param record WAL record produced by WriteAheadLog::Replay
    * @return Empty on success or on an intended gap; an error on corruption
@@ -137,9 +182,12 @@ class RequestDispatcher {
    */
   utils::Expected<std::string, utils::Error> HandleWrite(const Command& cmd) const;
 
+  /**
+   * @brief Run SIM or SIMV through ExecuteSearch and render its TCP response
+   */
+  utils::Expected<std::string, utils::Error> HandleSearch(const Command& cmd, ConnectionContext& conn_ctx) const;
+
   // Handler methods
-  utils::Expected<std::string, utils::Error> HandleSim(const Command& cmd, ConnectionContext& conn_ctx) const;
-  utils::Expected<std::string, utils::Error> HandleSimv(const Command& cmd, ConnectionContext& conn_ctx) const;
   utils::Expected<std::string, utils::Error> HandleInfo(const Command& cmd);
   utils::Expected<std::string, utils::Error> HandleConfigHelp(const Command& cmd);
   utils::Expected<std::string, utils::Error> HandleConfigShow(const Command& cmd);

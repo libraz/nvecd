@@ -6,10 +6,23 @@
 #include "vectors/metadata_filter.h"
 
 #include <algorithm>
+#include <cmath>
 
 namespace nvecd::vectors {
 
 namespace {
+
+/// Three-way double comparison; NaN (which an older snapshot may still hold)
+/// is unordered against everything, so it never compares equal.
+int CompareDoubles(double lhs, double rhs) {
+  if (std::isnan(lhs) || std::isnan(rhs))
+    return -2;  // Sentinel for "not comparable"
+  if (lhs < rhs)
+    return -1;
+  if (lhs > rhs)
+    return 1;
+  return 0;
+}
 
 /// Compare two MetadataValue instances using < ordering.
 /// Returns -1, 0, or 1 (like strcmp).
@@ -19,22 +32,10 @@ int CompareValues(const MetadataValue& lhs, const MetadataValue& rhs) {
   if (lhs.index() != rhs.index()) {
     // int64 vs double
     if (std::holds_alternative<int64_t>(lhs) && std::holds_alternative<double>(rhs)) {
-      auto l = static_cast<double>(std::get<int64_t>(lhs));
-      double r = std::get<double>(rhs);
-      if (l < r)
-        return -1;
-      if (l > r)
-        return 1;
-      return 0;
+      return CompareDoubles(static_cast<double>(std::get<int64_t>(lhs)), std::get<double>(rhs));
     }
     if (std::holds_alternative<double>(lhs) && std::holds_alternative<int64_t>(rhs)) {
-      double l = std::get<double>(lhs);
-      auto r = static_cast<double>(std::get<int64_t>(rhs));
-      if (l < r)
-        return -1;
-      if (l > r)
-        return 1;
-      return 0;
+      return CompareDoubles(std::get<double>(lhs), static_cast<double>(std::get<int64_t>(rhs)));
     }
     // Other type mismatches: not comparable
     return -2;  // Sentinel for "not comparable"
@@ -44,7 +45,9 @@ int CompareValues(const MetadataValue& lhs, const MetadataValue& rhs) {
       [](const auto& l, const auto& r) -> int {
         using L = std::decay_t<decltype(l)>;
         using R = std::decay_t<decltype(r)>;
-        if constexpr (std::is_same_v<L, R>) {
+        if constexpr (std::is_same_v<L, double> && std::is_same_v<R, double>) {
+          return CompareDoubles(l, r);
+        } else if constexpr (std::is_same_v<L, R>) {
           if (l < r)
             return -1;
           if (r < l)

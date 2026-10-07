@@ -181,3 +181,36 @@ TEST(DecayMaintenanceRecovery, WalOnDecayIsReplayedAfterRestart) {
   EXPECT_DOUBLE_EQ(RecoveredScore(config), decayed);
   fs::remove_all(root);
 }
+
+TEST(DecayMaintenanceRecovery, WalOnZeroAlphaClearIsReplayedAndLaterWritesSurvive) {
+  const auto root = MakeRoot("nvecd_decay_zero_alpha");
+  auto config = MakeConfig(root, /*wal_enabled=*/true);
+  config.events.decay_alpha = 0.0;  // documented: clears the index each pass
+
+  {
+    nvecd::server::NvecdServer server(config);
+    ASSERT_TRUE(server.Start());
+    TcpClient client("127.0.0.1", server.GetPort());
+    Ingest(client);
+    const double initial = EventScore(client, "item_a", "item_b");
+    ASSERT_GT(initial, 0.0);
+    ASSERT_LT(WaitForDecay(client, initial), 0.0);  // the pair is gone
+    ASSERT_EQ(client.SendCommand("VECSET after_clear 1 0").rfind("OK", 0), 0U);
+    client.Close();
+    server.Stop();
+  }
+
+  // Recovery replays the alpha-0 record instead of stopping at it, so the
+  // write acknowledged after it is still there.
+  config.events.decay_interval_sec = 0;
+  nvecd::server::NvecdServer restarted(config);
+  ASSERT_TRUE(restarted.Start());
+  {
+    TcpClient client("127.0.0.1", restarted.GetPort());
+    EXPECT_LT(EventScore(client, "item_a", "item_b"), 0.0);
+    const std::string reply = client.SendCommand("SIM after_clear 1 using=vectors");
+    EXPECT_EQ(reply.rfind("OK", 0), 0U) << reply;
+  }
+  restarted.Stop();
+  fs::remove_all(root);
+}

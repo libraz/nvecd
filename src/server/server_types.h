@@ -270,6 +270,7 @@ struct HandlerContext {
   ServerStats& stats;
   const config::Config* config = nullptr;
   std::atomic<bool>& loading;
+  /// Set only while a lock-mode snapshot holds the write barrier.
   std::atomic<bool>& read_only;
 
   // Snapshot directory
@@ -329,6 +330,11 @@ struct HandlerContext {
 
   /// Single source of truth for cache ownership, publication, and tuning.
   cache::SimilarityCacheController* cache_controller = nullptr;
+
+  /// Fail-stop latch: set when a durability step fails after a write was
+  /// admitted, and never cleared until restart. Kept apart from read_only so a
+  /// snapshot releasing its own flag cannot reopen writes.
+  std::atomic<bool> durability_failed{false};
 
   // NOLINTEND(cppcoreguidelines-avoid-const-or-ref-data-members)
 };

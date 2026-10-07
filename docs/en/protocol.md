@@ -76,7 +76,7 @@ Authentication is per connection and is not carried across reconnects.
 AUTH <password>
 ```
 
-The password is everything after the first space or tab, taken as opaque bytes: it is not trimmed, split or upper-cased, so a password containing spaces authenticates as configured. Comparison is constant-time.
+The password is every byte after the single space or tab that ends the `AUTH` keyword (blanks before the keyword are ignored), taken as opaque bytes: it is not trimmed, split or upper-cased, so a password containing spaces authenticates as configured. Comparison is constant-time.
 
 ```text
 > AUTH s3cret
@@ -103,7 +103,7 @@ EVENT <ctx> SET <id> <score> [timestamp=<epoch_sec>]
 EVENT <ctx> DEL <id> [timestamp=<epoch_sec>]
 ```
 
-Records that item `<id>` occurred in context `<ctx>`. `ADD` and `SET` take a score; `DEL` does not. The score is an integer in the inclusive range 0–100, and the subcommand keyword is case-insensitive. `timestamp=` takes unsigned epoch seconds and, when omitted, the server stamps the event with its own clock. All three forms answer `OK EVENT`, including a deduplicated repeat that changes nothing.
+Records that item `<id>` occurred in context `<ctx>`. `ADD` and `SET` take a score; `DEL` does not. The score is an integer in the inclusive range 0–100, and the subcommand keyword is case-insensitive. `timestamp=` takes unsigned epoch seconds written as decimal digits only — a sign, a fraction or a value beyond 2^64−1 is rejected, the same set the HTTP surface accepts — and, when omitted, the server stamps the event with its own clock. All three forms answer `OK EVENT`, including a deduplicated repeat that changes nothing.
 
 ```text
 > EVENT user_alice ADD item1 100
@@ -162,7 +162,7 @@ ERROR Vector not found: nope
 METASET <id> <key:value[,key:value...]>
 ```
 
-Attaches metadata to an item that already has a vector. The pairs are one whitespace-free token; the same expression grammar `filter=` uses is accepted here, and each condition's field and value become one metadata entry. Values are typed by their spelling: `true`/`false` become booleans, a bare integer becomes an integer, a bare decimal becomes a double, anything else stays a string.
+Attaches metadata to an item that already has a vector. The pairs are one whitespace-free token of `key:value` or `key=value` entries separated by `,`; each becomes one metadata entry. A comparison operator, an `in(...)` value or an empty list is rejected rather than reduced to a stored value. Values are typed by their spelling: `true`/`false` become booleans, a bare integer becomes an integer, a finite decimal literal (optional sign, digits, optional fraction and exponent) becomes a double — including an integer too large for 64 bits — and anything else, `nan`, `inf` and hex spellings included, stays a string.
 
 ```text
 > METASET item1 category:books,price:12,active:true
@@ -434,7 +434,7 @@ has_statistics: false
 END
 ```
 
-While a save or load is running, commands that touch the stores are refused with `ERROR READONLY Snapshot in progress` or `ERROR LOADING Snapshot load in progress`. [persistence.md](./persistence.md) covers the mechanics.
+While a lock-mode save holds the stores, `EVENT`, `VECSET`, `VECDEL` and `METASET` are refused with `ERROR READONLY Snapshot in progress`; while a load is publishing, those and `SIM`/`SIMV` are refused with `ERROR LOADING Snapshot load in progress`. Diagnostic and admin commands keep working and report their own conflicts. A failed WAL append for an admitted write latches the server into a fail-stop state, in which the same four writes are refused with `ERROR READONLY Persistence failure; writes are refused until restart` until it is restarted. [persistence.md](./persistence.md) covers the mechanics.
 
 ### `CACHE`
 
@@ -557,8 +557,8 @@ $40
 cache.eviction_batch_size=10 (immutable)
 $34
 cache.max_memory_mb=32 (immutable)
-$43
-cache.min_query_cost_ms=10.000000 (mutable)
+$36
+cache.min_query_cost_ms=10 (mutable)
 $31
 cache.ttl_seconds=600 (mutable)
 ```
@@ -581,19 +581,24 @@ Every failure is a single `ERROR <message>` line. A rejected command still count
 | `NOAUTH Authentication required` | write or admin command on an unauthenticated connection |
 | `ERR invalid password` | `AUTH` with the wrong password |
 | `LOADING Snapshot load in progress` | `DUMP LOAD` is publishing |
-| `READONLY Snapshot in progress` | lock-mode `DUMP SAVE` is running |
+| `READONLY Snapshot in progress` | `EVENT`, `VECSET`, `VECDEL` or `METASET` while a lock-mode `DUMP SAVE` holds the stores |
+| `READONLY Persistence failure; writes are refused until restart` | the same writes after a WAL append failed; only a restart clears it |
+| `AUTH requires 1 argument: <password>` | `AUTH` with nothing after the separator |
 | `EVENT requires at least 3 arguments: <ctx> <type> <id> [<score>]` | `EVENT` arity |
 | `EVENT ADD requires 4-5 arguments: <ctx> ADD <id> <score> [timestamp=<value>]` | `EVENT ADD` arity |
+| `EVENT SET requires 4-5 arguments: <ctx> SET <id> <score> [timestamp=<value>]` | `EVENT SET` arity |
+| `EVENT DEL requires 3-4 arguments: <ctx> DEL <id> [timestamp=<value>]` | `EVENT DEL` arity |
 | `Invalid EVENT type: <T> (must be ADD, SET, or DEL)` | unknown `EVENT` subcommand |
 | `Score must be in range [0, 100], got <n>` | event score out of range |
 | `Invalid integer: <t>` | integer token with trailing characters, such as a decimal score or `top_k` |
 | `Failed to parse integer: <t>` | integer token that is not a number at all |
-| `Failed to parse timestamp: <v>` | non-numeric `timestamp=` |
+| `Invalid timestamp value: <v>` | `timestamp=` that is not unsigned decimal digits fitting 64 bits |
+| `Invalid option: <t> (expected timestamp=<value>)` | the token after the score (or after the ID for `DEL`) is not `timestamp=` |
 | `Context cannot be empty` / `ID cannot be empty` | empty `EVENT` context or item ID |
 | `Context must not contain whitespace or control characters` | `EVENT` context carrying a byte at or below `0x20`, or `0x7F` |
 | `ID must not contain whitespace or control characters` | the same rule for an `EVENT` item ID or a `VECSET` ID |
 | `VECSET requires at least 2 arguments: <id> <floats>` | `VECSET` arity |
-| `Invalid float: <t>` | float token with trailing characters, or a non-finite spelling such as `nan` or `inf` |
+| `Invalid float: <t>` | float token with trailing characters (a hex spelling included), a non-finite spelling such as `nan` or `inf`, or a magnitude beyond the float range |
 | `Failed to parse float: <t>` | float token that is not a number at all |
 | `ID cannot be empty` | `VECSET` with an empty item ID |
 | `Vector cannot be empty` | `VECSET` with no components |
@@ -607,11 +612,13 @@ Every failure is a single `ERROR <message>` line. A rejected command still count
 | `Vector not found: <id>` | `VECDEL` on an unknown ID |
 | `Vector not found for metadata: <id>` | `METASET` on an item with no vector |
 | `METASET requires 2 arguments: <id> <key:value[,key:value...]>` | `METASET` arity |
+| `METASET requires at least one key:value pair` | `METASET` whose pair list is empty |
+| `METASET accepts only key:value pairs, got '<key>' with a comparison or in(...) value` | `METASET` pair using `>`, `<`, `>=`, `<=`, `!=` or `in(...)` |
 | `SIM requires at least 2 arguments: <id> <top_k>` | `SIM` arity |
 | `SIMV requires at least 2 arguments: <top_k> <floats>` | `SIMV` arity |
 | `SIMV requires at least one vector float` | `SIMV` whose tokens were all options |
 | `top_k must be positive, got <n>` | non-positive `top_k` |
-| `top_k <n> exceeds maximum allowed: <m>` | `top_k` above `similarity.max_top_k` |
+| `top_k <n> exceeds maximum allowed: <m>` | `top_k` above `similarity.max_top_k`, however large |
 | `Invalid using value: <v> (must be events, vectors, or fusion)` | unknown mode |
 | `Invalid adaptive value: <v> (must be on or off)` | unknown `adaptive=` value |
 | `Invalid SIM option: <t>` / `Invalid SIMV option: <t>` | unknown option token |
@@ -623,6 +630,7 @@ Every failure is a single `ERROR <message>` line. A rejected command still count
 | `Unknown CONFIG subcommand: <S>` | unknown `CONFIG` subcommand |
 | `Configuration file is not accessible` | `CONFIG VERIFY` path outside the allowed root |
 | `DUMP requires subcommand: SAVE\|LOAD\|VERIFY\|INFO\|STATUS` | `DUMP` arity |
+| `Unknown DUMP subcommand: <S>` | unknown `DUMP` subcommand |
 | `DUMP LOAD requires a filepath` | `DUMP LOAD` with no argument |
 | `DUMP VERIFY requires a filepath` | `DUMP VERIFY` with no argument |
 | `DUMP INFO requires a filepath` | `DUMP INFO` with no argument |
@@ -635,10 +643,15 @@ Every failure is a single `ERROR <message>` line. A rejected command still count
 | `A snapshot save is already in progress` | `DUMP LOAD` while a save holds the store |
 | `Cannot save snapshot while a snapshot load is in progress` | `DUMP SAVE` during a load |
 | `CACHE requires subcommand: STATS\|CLEAR\|ENABLE\|DISABLE` | `CACHE` arity |
+| `Unknown CACHE subcommand: <S>` | unknown `CACHE` subcommand |
 | `Cache controller is not initialized` | `CACHE STATS` or `CACHE CLEAR` on a server with no cache controller |
 | `Runtime variable manager is not initialized` | `CACHE ENABLE` or `CACHE DISABLE` with no variable manager |
 | `DEBUG requires exactly one argument: ON\|OFF` | `DEBUG` arity |
+| `DEBUG requires ON or OFF, got: <A>` | `DEBUG` argument other than `ON` or `OFF` |
 | `SET requires 2 arguments: <variable_name> <value>` | `SET` arity |
+| `GET requires 1 argument: <variable_name>` | `GET` arity |
+| `SHOW requires subcommand: VARIABLES` | `SHOW` arity |
+| `Unknown SHOW subcommand: <S>` | `SHOW` followed by anything but `VARIABLES` |
 | `Unknown variable: <name>` | unknown runtime variable |
 | `Variable '<name>' is immutable (requires restart)` | write to an immutable variable |
 

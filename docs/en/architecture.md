@@ -69,7 +69,7 @@ The scoring itself is covered by [Fusion](./fusion.md).
 
 **What `shared_mutex` buys.** A store's own lock is what makes concurrent reads possible: any number of `SIM` queries read the vector store at the same time, and a `VECSET` excludes them for the duration of the insert. The two server-wide gates are not about the stores' internal consistency — they exist so that a snapshot's point-in-time boundary is real, and so that WAL order matches dependency order across both protocol surfaces.
 
-**Where atomics replace a lock.** Counters that only need to be monotonic use atomics with relaxed ordering: the per-command statistics, the connection counts, the cache's hit and miss counters. The four generation counters and the lifecycle flags (`loading`, `read_only`) are atomics with acquire/release ordering, because a reader must see the state the writer published before bumping them. The published cache pointer is an atomic so that enabling or disabling the cache never requires a lock on the query path. A cache entry's invalidation flag is an atomic so it can be set without taking the cache's write lock.
+**Where atomics replace a lock.** Counters that only need to be monotonic use atomics with relaxed ordering: the per-command statistics, the connection counts, the cache's hit and miss counters. The four generation counters and the lifecycle flags (`loading`, `read_only`, `durability_failed`) are atomics with acquire/release ordering, because a reader must see the state the writer published before bumping them. The published cache pointer is an atomic so that enabling or disabling the cache never requires a lock on the query path. A cache entry's invalidation flag is an atomic so it can be set without taking the cache's write lock.
 
 **What a reader is promised during a concurrent write.** Each store gives a reader a consistent view of *that store*. A query that touches the co-occurrence index and the vector store takes their locks separately, so it can observe a write that landed in one but not yet in the other. Fusion is defined so that this is harmless: the two signals are independent, normalized separately, and a source with no candidate contributes nothing rather than a wrong value.
 
@@ -90,12 +90,12 @@ The one exception is the ANN index, which `SimilarityEngine` owns outright.
 1. The schedulers stop, so nothing starts a new snapshot or decay pass.
 2. Any in-flight fork child is waited for, within the configured shutdown budget.
 3. The HTTP server stops, then the acceptors, so no new connection is admitted.
-4. The reactor stops, unregistering every client while the server state its close callbacks touch is still valid.
-5. Active connections are given the shutdown timeout to finish.
+4. Requests already read from live connections finish and their responses flush while the event loop is still running, within `performance.shutdown_timeout_ms`.
+5. The reactor stops, unregistering every client while the server state its close callbacks touch is still valid.
 6. The thread pool is shut down, and this wait is deliberately unbounded: queued tasks hold raw pointers to the stores, and returning while a worker is still running would let it read freed memory. The acceptors and reactor are already stopped, so no new task can arrive and the queue is finite.
 7. The WAL is closed last, which flushes pending writes and joins its background fsync thread. By then every surface that could append is stopped.
 
-The WAL is declared last among the members so that destruction reaches it first, after the schedulers that reference it have been stopped.
+The close is explicit: `Stop()`, or `AbortStart()` after a failed startup, closes the WAL once the schedulers that reference it are joined, so member destruction order is not what keeps it valid.
 
 ## Error model
 
@@ -115,4 +115,4 @@ Every fallible operation returns `Expected<T, Error>`. There are no exceptions o
 | 7000–7999 | Client |
 | 8000–8999 | Cache |
 
-On the TCP surface an error becomes `ERROR <message>`. On the HTTP surface it becomes a JSON body with an HTTP status derived from the code. Some conditions are answered before a handler is reached and carry a distinct prefix: `NOAUTH` for an unauthenticated privileged command, `LOADING` while a `DUMP LOAD` is publishing, `READONLY` while a lock-mode snapshot holds the write gate.
+On the TCP surface an error becomes `ERROR <message>`. On the HTTP surface it becomes a JSON body with an HTTP status derived from the code. Some conditions are answered before a handler is reached and carry a distinct prefix: `NOAUTH` for an unauthenticated privileged command, `LOADING` while a `DUMP LOAD` is publishing, `READONLY` while a lock-mode snapshot holds the write gate or after a durability failure latched the fail-stop, with a message naming which.

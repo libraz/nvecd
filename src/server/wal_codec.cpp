@@ -271,22 +271,24 @@ std::vector<uint8_t> EncodeCommand(const Command& cmd) {
 }
 
 bool IsIntendedReplayGap(storage::WalOpType op, utils::ErrorCode code) {
-  if (code != utils::ErrorCode::kVectorNotFound) {
-    return false;
-  }
   // No default label: adding a WAL operation must not silently inherit either
   // answer. Whoever adds one has to state whether its subject can be absent by
-  // configuration.
+  // configuration, or rejected by validation that postdates the record.
   switch (op) {
     case WalOpType::kVecDel:
+      // A vector that `include_vectors: false` is allowed to have left out of
+      // the log. The record is unreplayable by design, not corrupt.
+      return code == utils::ErrorCode::kVectorNotFound;
     case WalOpType::kMetaSet:
-      // These name a vector that `include_vectors: false` is allowed to have
-      // left out of the log. The record is unreplayable by design, not corrupt.
-      return true;
+      // Same omission, plus a legacy text record whose pairs the METASET
+      // grammar now rejects (a comparison or in(...) value).
+      return code == utils::ErrorCode::kVectorNotFound || code == utils::ErrorCode::kCommandInvalidArgument ||
+             code == utils::ErrorCode::kCommandParseError;
     case WalOpType::kVecSet:
-      // VECSET carries its own payload, so a missing vector here means the
-      // handler rejected the record rather than that the log omitted it.
-      return false;
+      // VECSET carries its own payload, so a missing vector means the handler
+      // rejected the record rather than that the log omitted it. An id or
+      // component the store now rejects was logged before that validation.
+      return code == utils::ErrorCode::kInvalidArgument;
     case WalOpType::kEventAdd:
     case WalOpType::kEventDel:
     case WalOpType::kMetaDel:

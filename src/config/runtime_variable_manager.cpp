@@ -169,7 +169,7 @@ void RuntimeVariableManager::InitializeRuntimeValues() {
   runtime_values_["logging.level"] = base_config_.logging.level;
   runtime_values_["logging.json"] = base_config_.logging.json ? "true" : "false";
   runtime_values_["cache.enabled"] = base_config_.cache.enabled ? "true" : "false";
-  runtime_values_["cache.min_query_cost_ms"] = std::to_string(base_config_.cache.min_query_cost_ms);
+  runtime_values_["cache.min_query_cost_ms"] = CanonicalDouble(base_config_.cache.min_query_cost_ms);
   runtime_values_["cache.ttl_seconds"] = std::to_string(base_config_.cache.ttl_seconds);
 }
 
@@ -239,6 +239,19 @@ Expected<void, Error> RuntimeVariableManager::SetVariable(const std::string& var
   {
     std::unique_lock lock(mutex_);
     runtime_values_[canonical_name] = canonical_value;
+    // Keep the typed configuration in step so EffectiveConfig() reports what
+    // is applied, not what the server started with.
+    if (canonical_name == "logging.level") {
+      base_config_.logging.level = canonical_value;
+    } else if (canonical_name == "logging.json") {
+      base_config_.logging.json = canonical_value == "true";
+    } else if (canonical_name == "cache.enabled") {
+      base_config_.cache.enabled = canonical_value == "true";
+    } else if (canonical_name == "cache.min_query_cost_ms") {
+      base_config_.cache.min_query_cost_ms = std::stod(canonical_value);
+    } else if (canonical_name == "cache.ttl_seconds") {
+      base_config_.cache.ttl_seconds = std::stoi(canonical_value);
+    }
   }
 
   // Log the change
@@ -262,6 +275,11 @@ Expected<std::string, Error> RuntimeVariableManager::GetVariable(const std::stri
     return MakeUnexpected(MakeError(ErrorCode::kInternalError, "No value resolver for variable: " + canonical_name));
   }
   return *value;
+}
+
+Config RuntimeVariableManager::EffectiveConfig() const {
+  std::shared_lock lock(mutex_);
+  return base_config_;
 }
 
 std::map<std::string, VariableInfo> RuntimeVariableManager::GetAllVariables(const std::string& prefix) const {
@@ -432,10 +450,10 @@ std::optional<std::string> RuntimeVariableManager::GetVariableInternal(const std
     return std::to_string(base_config_.events.max_neighbors_per_item);
   }
   if (variable_name == "events.min_support") {
-    return std::to_string(base_config_.events.min_support);
+    return CanonicalDouble(base_config_.events.min_support);
   }
   if (variable_name == "events.decay_alpha") {
-    return std::to_string(base_config_.events.decay_alpha);
+    return CanonicalDouble(base_config_.events.decay_alpha);
   }
   if (variable_name == "events.decay_interval_sec") {
     return std::to_string(base_config_.events.decay_interval_sec);
@@ -463,10 +481,10 @@ std::optional<std::string> RuntimeVariableManager::GetVariableInternal(const std
 
   // Similarity
   if (variable_name == "similarity.fusion_alpha") {
-    return std::to_string(base_config_.similarity.fusion_alpha);
+    return CanonicalDouble(base_config_.similarity.fusion_alpha);
   }
   if (variable_name == "similarity.fusion_beta") {
-    return std::to_string(base_config_.similarity.fusion_beta);
+    return CanonicalDouble(base_config_.similarity.fusion_beta);
   }
   if (variable_name == "similarity.default_top_k") {
     return std::to_string(base_config_.similarity.default_top_k);
@@ -537,15 +555,15 @@ std::optional<std::string> RuntimeVariableManager::GetVariableInternal(const std
   if (variable_name == "api.unix_socket.path")
     return base_config_.api.unix_socket.path;
   if (variable_name == "events.temporal_half_life_sec")
-    return std::to_string(base_config_.events.temporal_half_life_sec);
+    return CanonicalDouble(base_config_.events.temporal_half_life_sec);
   if (variable_name == "events.negative_weight")
-    return std::to_string(base_config_.events.negative_weight);
+    return CanonicalDouble(base_config_.events.negative_weight);
   if (variable_name == "similarity.sample_size")
     return std::to_string(base_config_.similarity.sample_size);
   if (variable_name == "similarity.adaptive_min_alpha")
-    return std::to_string(base_config_.similarity.adaptive_min_alpha);
+    return CanonicalDouble(base_config_.similarity.adaptive_min_alpha);
   if (variable_name == "similarity.adaptive_max_alpha")
-    return std::to_string(base_config_.similarity.adaptive_max_alpha);
+    return CanonicalDouble(base_config_.similarity.adaptive_max_alpha);
   if (variable_name == "similarity.adaptive_maturity_threshold")
     return std::to_string(base_config_.similarity.adaptive_maturity_threshold);
   if (variable_name == "similarity.ivf_nlist")

@@ -249,7 +249,7 @@ event_count: 6
 
 ## 状態を保存する
 
-ここまでの状態はすべてメモリ上にあります。`DUMP SAVE` は、イベント・共起・ベクトル・メタデータのスナップショットを `snapshot.dir` に書き出します。起動時の復旧が候補にするのは名前が `.nvec` か `.dmp` で終わるファイルだけなので、その形式の名前を付けてください。同梱の `snapshot.default_filename` は `nvecd.snapshot` で、正しく書き出されはしますが次回の起動では読み込まれません。
+ここまでの状態はすべてメモリ上にあります。`DUMP SAVE` は、イベント・共起・ベクトル・メタデータのスナップショットを `snapshot.dir` に書き出します。起動時の復旧が候補にするのは名前が `.nvec` か `.dmp` で終わるファイルだけなので、`DUMP SAVE` はそれ以外の名前を拒否します。引数を省くと同梱の `snapshot.default_filename` である `nvecd.nvec` に書き出します。ここでは名前を明示します。
 
 ```bash
 ./build/bin/nvecd-cli -p 11017 DUMP SAVE nvecd.dmp

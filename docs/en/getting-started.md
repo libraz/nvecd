@@ -249,7 +249,7 @@ The cache stored nothing. Every query above ran far below `cache.min_query_cost_
 
 ## Keep the state
 
-Everything so far lives in memory. `DUMP SAVE` writes a snapshot of events, co-occurrence, vectors and metadata into `snapshot.dir`. Startup recovery only considers files whose name ends in `.nvec` or `.dmp`, so give the snapshot such a name — the shipped `snapshot.default_filename` is `nvecd.snapshot`, which is written correctly but is never picked up at the next start:
+Everything so far lives in memory. `DUMP SAVE` writes a snapshot of events, co-occurrence, vectors and metadata into `snapshot.dir`. Startup recovery only considers files whose name ends in `.nvec` or `.dmp`, so `DUMP SAVE` refuses any other name. Without an argument it writes the shipped `snapshot.default_filename`, `nvecd.nvec`; here the name is given explicitly:
 
 ```bash
 ./build/bin/nvecd-cli -p 11017 DUMP SAVE nvecd.dmp

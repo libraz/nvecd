@@ -13,6 +13,8 @@
 #include <cmath>
 #include <string_view>
 
+#include "server/argument_validation.h"
+#include "server/filter_parser.h"
 #include "utils/structured_log.h"
 
 namespace nvecd::server {
@@ -72,24 +74,6 @@ std::string ToUpper(std::string_view str) {
 }
 
 /**
- * @brief Parse integer from string
- */
-utils::Expected<int, utils::Error> ParseInt(const std::string& str) {
-  try {
-    size_t pos = 0;
-    int value = std::stoi(str, &pos);
-    if (pos != str.length()) {
-      return utils::MakeUnexpected(
-          utils::MakeError(utils::ErrorCode::kCommandInvalidArgument, "Invalid integer: " + str));
-    }
-    return value;
-  } catch (const std::exception& e) {
-    return utils::MakeUnexpected(
-        utils::MakeError(utils::ErrorCode::kCommandInvalidArgument, "Failed to parse integer: " + str));
-  }
-}
-
-/**
  * @brief Parse an event score and validate its documented [0, 100] range
  *
  * Scores are integers in the inclusive range [0, 100]. Negative or otherwise
@@ -100,109 +84,69 @@ utils::Expected<int, utils::Error> ParseInt(const std::string& str) {
  * @return Expected<int, Error> Validated score or error
  */
 utils::Expected<int, utils::Error> ParseEventScore(const std::string& str) {
-  auto value = ParseInt(str);
+  auto value = ParseIntegerToken(str);
   if (!value) {
     return utils::MakeUnexpected(value.error());
   }
   if (*value < kMinEventScore || *value > kMaxEventScore) {
-    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kEventInvalidScore,
-                                                  "Score must be in range [0, 100], got " + std::to_string(*value)));
-  }
-  return *value;
-}
-
-/**
- * @brief Parse float from string
- */
-utils::Expected<float, utils::Error> ParseFloat(const std::string& str) {
-  try {
-    size_t pos = 0;
-    float value = std::stof(str, &pos);
-    if (pos != str.length() || !std::isfinite(value)) {
-      return utils::MakeUnexpected(
-          utils::MakeError(utils::ErrorCode::kCommandInvalidArgument, "Invalid float: " + str));
-    }
-    return value;
-  } catch (const std::exception& e) {
     return utils::MakeUnexpected(
-        utils::MakeError(utils::ErrorCode::kCommandInvalidArgument, "Failed to parse float: " + str));
+        utils::MakeError(utils::ErrorCode::kEventInvalidScore, "Score must be in range [0, 100], got " + str));
   }
+  return static_cast<int>(*value);
 }
 
 /**
- * @brief Parse a top_k token and validate it against the configured maximum
- *
- * top_k must be a positive integer. When @p max_top_k is non-zero, values that
- * exceed it are rejected at parse time with kCommandInvalidTopK so the upper
- * bound is enforced before the request reaches the similarity engine.
- *
- * @param str Token to parse as top_k
- * @param max_top_k Maximum allowed top_k (0 = no upper-bound check)
- * @return Expected<int, Error> Validated top_k or error
+ * @brief Parse the optional "timestamp=<value>" EVENT token
  */
-utils::Expected<int, utils::Error> ParseTopK(const std::string& str, uint32_t max_top_k) {
-  auto value = ParseInt(str);
-  if (!value) {
-    return utils::MakeUnexpected(value.error());
-  }
-  if (*value <= 0) {
-    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandInvalidTopK,
-                                                  "top_k must be positive, got " + std::to_string(*value)));
-  }
-  if (max_top_k > 0 && static_cast<uint32_t>(*value) > max_top_k) {
-    return utils::MakeUnexpected(
-        utils::MakeError(utils::ErrorCode::kCommandInvalidTopK,
-                         "top_k " + std::to_string(*value) + " exceeds maximum allowed: " + std::to_string(max_top_k)));
-  }
-  return *value;
-}
-
-/**
- * @brief Parse timestamp from "timestamp=<value>" string
- */
-utils::Expected<uint64_t, utils::Error> ParseTimestamp(const std::string& str) {
+utils::Expected<uint64_t, utils::Error> ParseTimestampOption(const std::string& str) {
   if (str.rfind("timestamp=", 0) != 0) {
     return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandInvalidArgument,
                                                   "Invalid option: " + str + " (expected timestamp=<value>)"));
   }
-  std::string value_str = str.substr(kTimestampPrefixLength);
-  try {
-    size_t pos = 0;
-    unsigned long long value = std::stoull(value_str, &pos);
-    if (pos != value_str.length()) {
-      return utils::MakeUnexpected(
-          utils::MakeError(utils::ErrorCode::kCommandInvalidArgument, "Invalid timestamp value: " + value_str));
-    }
-    return static_cast<uint64_t>(value);
-  } catch (const std::exception& e) {
-    return utils::MakeUnexpected(
-        utils::MakeError(utils::ErrorCode::kCommandInvalidArgument, "Failed to parse timestamp: " + value_str));
+  return ParseTimestamp(std::string_view(str).substr(kTimestampPrefixLength));
+}
+
+/**
+ * @brief Parse a "filter=<expr>" option into the command
+ */
+utils::Expected<void, utils::Error> ParseFilterOption(const std::string& token, Command& cmd) {
+  cmd.filter_expr = token.substr(kFilterPrefixLength);
+  auto filter = ParseSimpleFilter(cmd.filter_expr);
+  if (!filter) {
+    return utils::MakeUnexpected(filter.error());
   }
+  cmd.filter = std::move(*filter);
+  return {};
+}
+
+/**
+ * @brief Recognise AUTH and extract its password
+ *
+ * The command word ends at the first space or tab after any leading blanks; the
+ * password is every byte after that single separator, untrimmed, so a password
+ * containing spaces authenticates as configured.
+ *
+ * @return The password, nullopt when the line is not AUTH, or a syntax error
+ */
+utils::Expected<std::optional<std::string>, utils::Error> ParseAuth(const std::string& line) {
+  const size_t word_start = line.find_first_not_of(" \t");
+  if (word_start == std::string::npos) {
+    return std::optional<std::string>();
+  }
+  const size_t word_end = line.find_first_of(" \t", word_start);
+  const std::string word =
+      line.substr(word_start, word_end == std::string::npos ? std::string::npos : word_end - word_start);
+  if (ToUpper(word) != "AUTH") {
+    return std::optional<std::string>();
+  }
+  if (word_end == std::string::npos || word_end + 1 >= line.size()) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "AUTH requires 1 argument: <password>"));
+  }
+  return std::optional<std::string>(line.substr(word_end + 1));
 }
 
 }  // namespace
-
-utils::Expected<std::vector<float>, utils::Error> ParseVector(const std::string& vec_str, int expected_dim) {
-  std::vector<float> vec;
-  std::stringstream stream(vec_str);
-  float value = 0.0F;
-
-  while (stream >> value) {
-    vec.push_back(value);
-  }
-
-  if (vec.empty()) {
-    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandInvalidVector, "Empty vector"));
-  }
-
-  if (expected_dim > 0 && static_cast<int>(vec.size()) != expected_dim) {
-    return utils::MakeUnexpected(utils::MakeError(
-        utils::ErrorCode::kCommandInvalidVector,
-        "Vector dimension mismatch: expected " + std::to_string(expected_dim) + ", got " + std::to_string(vec.size())));
-  }
-
-  return vec;
-}
 
 utils::Expected<Command, utils::Error> ParseCommand(const std::string& request, uint32_t max_top_k) {
   if (request.empty()) {
@@ -229,29 +173,27 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request, 
         utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "Command must be a single line"));
   }
 
-  // Parse the line. Keep an untrimmed copy for AUTH:
-  // passwords are opaque bytes after the first command separator, so collapsing
-  // or trimming whitespace would make valid configured secrets impossible to
-  // authenticate with over TCP.
+  // AUTH takes the raw line: passwords are opaque bytes after the command
+  // separator, so collapsing or trimming whitespace would make valid
+  // configured secrets impossible to authenticate with over TCP.
+  auto auth = ParseAuth(raw_first_line);
+  if (!auth) {
+    return utils::MakeUnexpected(auth.error());
+  }
+  Command cmd;
+  if (auth->has_value()) {
+    cmd.type = CommandType::kAuth;
+    cmd.variable_value = std::move(**auth);
+    return cmd;
+  }
+
   std::string first_line = Trim(raw_first_line);
   auto tokens = Split(first_line, ' ');
   if (tokens.empty()) {
     return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "Empty command"));
   }
 
-  Command cmd;
   std::string cmd_name = ToUpper(tokens[0]);
-
-  if (cmd_name == "AUTH") {
-    const size_t separator = raw_first_line.find_first_of(" \t");
-    if (separator == std::string::npos || separator + 1 >= raw_first_line.size()) {
-      return utils::MakeUnexpected(
-          utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "AUTH requires 1 argument: <password>"));
-    }
-    cmd.type = CommandType::kAuth;
-    cmd.variable_value = raw_first_line.substr(separator + 1);
-    return cmd;
-  }
 
   // Parse command type and arguments
   if (cmd_name == "EVENT") {
@@ -282,7 +224,7 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request, 
       }
       cmd.score = *score_result;
       if (tokens.size() == 6) {
-        auto ts_result = ParseTimestamp(tokens[5]);
+        auto ts_result = ParseTimestampOption(tokens[5]);
         if (!ts_result) {
           return utils::MakeUnexpected(ts_result.error());
         }
@@ -303,7 +245,7 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request, 
       }
       cmd.score = *score_result;
       if (tokens.size() == 6) {
-        auto ts_result = ParseTimestamp(tokens[5]);
+        auto ts_result = ParseTimestampOption(tokens[5]);
         if (!ts_result) {
           return utils::MakeUnexpected(ts_result.error());
         }
@@ -320,7 +262,7 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request, 
       cmd.id = tokens[3];
       cmd.score = 0;  // DEL doesn't use score
       if (tokens.size() == 5) {
-        auto ts_result = ParseTimestamp(tokens[4]);
+        auto ts_result = ParseTimestampOption(tokens[4]);
         if (!ts_result) {
           return utils::MakeUnexpected(ts_result.error());
         }
@@ -345,9 +287,10 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request, 
     std::vector<float> vec;
     vec.reserve(tokens.size() - 2);
     for (size_t i = 2; i < tokens.size(); ++i) {
-      auto val_result = ParseFloat(tokens[i]);
+      auto val_result = ParseFloatToken(tokens[i]);
       if (!val_result) {
-        return utils::MakeUnexpected(val_result.error());
+        return utils::MakeUnexpected(
+            utils::MakeError(utils::ErrorCode::kCommandInvalidVector, val_result.error().message()));
       }
       vec.push_back(*val_result);
     }
@@ -372,7 +315,11 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request, 
     }
     cmd.type = CommandType::kMetaset;
     cmd.id = tokens[1];
-    cmd.filter_expr = tokens[2];
+    auto metadata = ParseMetadataPairs(tokens[2]);
+    if (!metadata) {
+      return utils::MakeUnexpected(metadata.error());
+    }
+    cmd.metadata = std::move(*metadata);
 
   } else if (cmd_name == "SIM") {
     // SIM <id> <top_k> [using=mode]
@@ -409,9 +356,12 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request, 
                                                         "Invalid adaptive value: " + val + " (must be on or off)"));
         }
       } else if (tokens[i].rfind("filter=", 0) == 0) {
-        cmd.filter_expr = tokens[i].substr(kFilterPrefixLength);
+        auto filter = ParseFilterOption(tokens[i], cmd);
+        if (!filter) {
+          return utils::MakeUnexpected(filter.error());
+        }
       } else if (tokens[i].rfind("min_score=", 0) == 0) {
-        auto val = ParseFloat(tokens[i].substr(kMinScorePrefixLength));
+        auto val = ParseFloatToken(std::string_view(tokens[i]).substr(kMinScorePrefixLength));
         if (!val) {
           return utils::MakeUnexpected(val.error());
         }
@@ -450,9 +400,12 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request, 
         break;
       }
       if (tokens[i].rfind("filter=", 0) == 0) {
-        cmd.filter_expr = tokens[i].substr(kFilterPrefixLength);
+        auto filter = ParseFilterOption(tokens[i], cmd);
+        if (!filter) {
+          return utils::MakeUnexpected(filter.error());
+        }
       } else if (tokens[i].rfind("min_score=", 0) == 0) {
-        auto val = ParseFloat(tokens[i].substr(kMinScorePrefixLength));
+        auto val = ParseFloatToken(std::string_view(tokens[i]).substr(kMinScorePrefixLength));
         if (!val) {
           return utils::MakeUnexpected(val.error());
         }
@@ -474,9 +427,10 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request, 
     std::vector<float> vec;
     vec.reserve(tokens.size() - vec_start);
     for (size_t i = vec_start; i < tokens.size(); ++i) {
-      auto val_result = ParseFloat(tokens[i]);
+      auto val_result = ParseFloatToken(tokens[i]);
       if (!val_result) {
-        return utils::MakeUnexpected(val_result.error());
+        return utils::MakeUnexpected(
+            utils::MakeError(utils::ErrorCode::kCommandInvalidVector, val_result.error().message()));
       }
       vec.push_back(*val_result);
     }

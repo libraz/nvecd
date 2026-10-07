@@ -7,6 +7,8 @@
 
 #include <gtest/gtest.h>
 
+#include <limits>
+
 namespace nvecd::vectors {
 namespace {
 
@@ -52,6 +54,22 @@ TEST(FilterConditionTest, EqBool) {
 
   EXPECT_TRUE(cond.Match(MetadataValue(true)));
   EXPECT_FALSE(cond.Match(MetadataValue(false)));
+}
+
+TEST(FilterConditionTest, NanNeverComparesEqualOrOrdered) {
+  // An older snapshot or WAL may still hold a NaN metadata value.
+  const MetadataValue stored(std::numeric_limits<double>::quiet_NaN());
+  for (const FilterOp op : {FilterOp::kEq, FilterOp::kNe, FilterOp::kGt, FilterOp::kGe, FilterOp::kLt, FilterOp::kLe}) {
+    FilterCondition by_double;
+    by_double.field = "price";
+    by_double.op = op;
+    by_double.value = 10.0;
+    EXPECT_FALSE(by_double.Match(stored)) << static_cast<int>(op);
+
+    FilterCondition by_int = by_double;
+    by_int.value = int64_t{10};
+    EXPECT_FALSE(by_int.Match(stored)) << static_cast<int>(op);
+  }
 }
 
 TEST(FilterConditionTest, NeString) {

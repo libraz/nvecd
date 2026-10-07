@@ -21,11 +21,14 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <filesystem>
 #include <future>
 #include <mutex>
 #include <nlohmann/json.hpp>
 #include <string>
 #include <thread>
+#include <utility>
+#include <variant>
 #include <vector>
 
 #include "cache/similarity_cache.h"
@@ -34,6 +37,7 @@
 #include "config/runtime_variable_manager.h"
 #include "events/co_occurrence_index.h"
 #include "events/event_store.h"
+#include "server/request_dispatcher.h"
 #include "server/server_types.h"
 #include "similarity/similarity_engine.h"
 #include "storage/wal.h"
@@ -216,7 +220,8 @@ TEST_F(HttpServerTest, WalAppendFailureReturns503WithoutMutation) {
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 503);
   EXPECT_FALSE(vector_store_->HasVector("not-accepted"));
-  EXPECT_TRUE(read_only_.load(std::memory_order_acquire));
+  EXPECT_TRUE(handler_ctx_.durability_failed.load(std::memory_order_acquire));
+  EXPECT_FALSE(read_only_.load(std::memory_order_acquire));
 }
 
 TEST_F(HttpServerTest, HealthDetail) {
@@ -960,8 +965,10 @@ TEST_F(HttpServerTest, SimScoresUseFixedFourDecimalPrecision) {
   vec2["vector"] = {0.0f, 1.0f, 0.0f, 0.0f};
   ASSERT_EQ(client_->Post("/vecset", vec2.dump(), "application/json")->status, 200);
 
+  // Cosine([1,0,0,0], [0.9,0.1,0,0]) = 0.99388..., which only the shared
+  // rounding turns into the TCP-rendered 0.9939.
   json req_body;
-  req_body["vector"] = {1.0f, 0.0f, 0.0f, 0.0f};
+  req_body["vector"] = {0.9f, 0.1f, 0.0f, 0.0f};
   req_body["top_k"] = 1;
   req_body["min_score"] = 0.0;
   auto res = client_->Post("/simv", req_body.dump(), "application/json");
@@ -970,8 +977,183 @@ TEST_F(HttpServerTest, SimScoresUseFixedFourDecimalPrecision) {
 
   auto body = json::parse(res->body);
   ASSERT_GE(body["count"].get<int>(), 1);
-  // A self-identical cosine score rounds to 1.0 at the shared 4-decimal policy.
-  EXPECT_DOUBLE_EQ(body["results"][0]["score"].get<double>(), 1.0);
+  EXPECT_EQ(body["results"][0]["id"], "self");
+  EXPECT_DOUBLE_EQ(body["results"][0]["score"].get<double>(), 0.9939);
+}
+
+// ============================================================================
+// One validator, one error path, one search path shared with TCP
+// ============================================================================
+
+TEST_F(HttpServerTest, TcpAndHttpResolveTheSameQueryToOneCacheEntry) {
+  cache_->SetMinQueryCost(0.0);
+  vector_store_->SetVector("self", {1.0F, 0.0F, 0.0F, 0.0F});
+  vector_store_->SetVector("other", {0.9F, 0.1F, 0.0F, 0.0F});
+  metadata_store_->Set("other", {{"status", std::string("active")}});
+  server::RequestDispatcher dispatcher(handler_ctx_);
+  server::ConnectionContext conn;
+
+  ASSERT_EQ(dispatcher.Dispatch("SIM self 3 using=vectors\r\n", conn).rfind("OK RESULTS", 0), 0U);
+  const auto sim_hits = cache_->GetStatistics().cache_hits;
+  json sim = {{"id", "self"}, {"top_k", 3}, {"mode", "vectors"}};
+  auto sim_res = client_->Post("/sim", sim.dump(), "application/json");
+  ASSERT_TRUE(sim_res);
+  ASSERT_EQ(sim_res->status, 200) << sim_res->body;
+  EXPECT_EQ(cache_->GetStatistics().cache_hits, sim_hits + 1);
+
+  // Unfiltered SIMV is not cached by default, so the filtered form carries it.
+  ASSERT_EQ(dispatcher.Dispatch("SIMV 3 filter=status:active 1 0 0 0\r\n", conn).rfind("OK RESULTS", 0), 0U);
+  const auto simv_hits = cache_->GetStatistics().cache_hits;
+  json simv = {{"vector", {1.0, 0.0, 0.0, 0.0}}, {"top_k", 3}, {"filter", "status:active"}};
+  auto simv_res = client_->Post("/simv", simv.dump(), "application/json");
+  ASSERT_TRUE(simv_res);
+  ASSERT_EQ(simv_res->status, 200) << simv_res->body;
+  EXPECT_EQ(cache_->GetStatistics().cache_hits, simv_hits + 1);
+}
+
+TEST_F(HttpServerTest, ReadOnlyGateMatchesTcpAndNamesTheCause) {
+  vector_store_->SetVector("item", {1.0F, 0.0F, 0.0F, 0.0F});
+  json write = {{"id", "item"}, {"vector", {1.0, 0.0, 0.0, 0.0}}};
+
+  read_only_.store(true, std::memory_order_release);
+  auto refused = client_->Post("/vecset", write.dump(), "application/json");
+  ASSERT_TRUE(refused);
+  EXPECT_EQ(refused->status, 503);
+  EXPECT_EQ(json::parse(refused->body)["error"], "READONLY Snapshot in progress");
+  // Diagnostic and cache administration stay available, as on TCP.
+  EXPECT_EQ(client_->Get("/dump/status")->status, 200);
+  EXPECT_EQ(client_->Post("/cache/clear", "", "application/json")->status, 200);
+  json sim = {{"id", "item"}, {"top_k", 1}, {"mode", "vectors"}};
+  EXPECT_EQ(client_->Post("/sim", sim.dump(), "application/json")->status, 200);
+  read_only_.store(false, std::memory_order_release);
+
+  handler_ctx_.durability_failed.store(true, std::memory_order_release);
+  auto latched = client_->Post("/vecset", write.dump(), "application/json");
+  ASSERT_TRUE(latched);
+  EXPECT_EQ(latched->status, 503);
+  EXPECT_EQ(json::parse(latched->body)["error"].get<std::string>().rfind("READONLY Persistence failure", 0), 0U);
+  handler_ctx_.durability_failed.store(false, std::memory_order_release);
+}
+
+TEST_F(HttpServerTest, NonObjectBodiesAndMistypedFieldsAre400WithAPlainMessage) {
+  const std::vector<std::pair<std::string, std::string>> requests = {{"/event", "[1]"},
+                                                                     {"/vecset", "1"},
+                                                                     {"/metaset", "\"x\""},
+                                                                     {"/sim", "[]"},
+                                                                     {"/simv", "null"},
+                                                                     {"/dump/save", "[]"},
+                                                                     {"/dump/save", R"({"filepath":5})"},
+                                                                     {"/dump/load", "[]"},
+                                                                     {"/dump/verify", R"({"filepath":[]})"},
+                                                                     {"/dump/info", "1"},
+                                                                     {"/sim", R"({"id":"x","mode":7})"}};
+  for (const auto& [path, body] : requests) {
+    auto res = client_->Post(path, body, "application/json");
+    ASSERT_TRUE(res) << path;
+    EXPECT_EQ(res->status, 400) << path << " " << body << " -> " << res->body;
+    auto parsed = json::parse(res->body);
+    ASSERT_TRUE(parsed["error"].is_string()) << res->body;
+    EXPECT_NE(parsed["error"].get<std::string>().front(), '{') << res->body;
+  }
+  auto vecdel = client_->Delete("/vecset", "[1]", "application/json");
+  ASSERT_TRUE(vecdel);
+  EXPECT_EQ(vecdel->status, 400) << vecdel->body;
+}
+
+TEST_F(HttpServerTest, TopKAndMinScoreAreRejectedNotNarrowed) {
+  vector_store_->SetVector("item", {1.0F, 0.0F, 0.0F, 0.0F});
+  config_->similarity.max_top_k = 100;
+  for (const char* top_k : {"4294967297", "-4294967295", "18446744073709551615", "0", "101"}) {
+    const std::string sim = std::string(R"({"id":"item","mode":"vectors","top_k":)") + top_k + "}";
+    auto sim_res = client_->Post("/sim", sim, "application/json");
+    ASSERT_TRUE(sim_res);
+    EXPECT_EQ(sim_res->status, 400) << top_k << " -> " << sim_res->body;
+    EXPECT_NE(sim_res->body.find("top_k"), std::string::npos) << sim_res->body;
+
+    const std::string simv = std::string(R"({"vector":[1,0,0,0],"top_k":)") + top_k + "}";
+    auto simv_res = client_->Post("/simv", simv, "application/json");
+    ASSERT_TRUE(simv_res);
+    EXPECT_EQ(simv_res->status, 400) << top_k << " -> " << simv_res->body;
+  }
+  // The message matches the one TCP SIM gives for the same value.
+  auto over = client_->Post("/sim", R"({"id":"item","top_k":4294967297})", "application/json");
+  EXPECT_EQ(json::parse(over->body)["error"], "top_k 4294967297 exceeds maximum allowed: 100");
+
+  auto min_score = client_->Post("/sim", R"({"id":"item","min_score":1e300})", "application/json");
+  ASSERT_TRUE(min_score);
+  EXPECT_EQ(min_score->status, 400) << min_score->body;
+}
+
+TEST_F(HttpServerTest, MetadataIntegerBeyondInt64IsStoredAsTheDoubleTcpWouldStore) {
+  vector_store_->SetVector("item", {1.0F, 0.0F, 0.0F, 0.0F});
+  auto res = client_->Post("/metaset", R"({"id":"item","metadata":{"big":18446744073709551615}})", "application/json");
+  ASSERT_TRUE(res);
+  ASSERT_EQ(res->status, 200) << res->body;
+  const auto* metadata = metadata_store_->Get("item");
+  ASSERT_NE(metadata, nullptr);
+  EXPECT_DOUBLE_EQ(std::get<double>(metadata->at("big")), 18446744073709551615.0);
+}
+
+TEST_F(HttpServerTest, IdsThatWouldBreakTcpFramingAreRejectedWith400) {
+  for (const char* id : {"a b", "a\r\nb", "tab\there"}) {
+    json vecset = {{"id", id}, {"vector", {1.0, 0.0, 0.0, 0.0}}};
+    auto vecset_res = client_->Post("/vecset", vecset.dump(), "application/json");
+    ASSERT_TRUE(vecset_res);
+    EXPECT_EQ(vecset_res->status, 400) << vecset_res->body;
+
+    json event = {{"ctx", "ctx1"}, {"id", id}, {"type", "ADD"}, {"score", 10}};
+    auto event_res = client_->Post("/event", event.dump(), "application/json");
+    ASSERT_TRUE(event_res);
+    EXPECT_EQ(event_res->status, 400) << event_res->body;
+  }
+  EXPECT_EQ(vector_store_->GetVectorCount(), 0U);
+  EXPECT_FALSE(handler_ctx_.durability_failed.load());
+}
+
+TEST_F(HttpServerTest, DumpResponsesReportPathsContainingWhitespaceWhole) {
+  namespace fs = std::filesystem;
+  const fs::path dir = fs::temp_directory_path() / ("nvecd http dump " + std::to_string(::getpid()));
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+  fs::permissions(dir, fs::perms::owner_all, fs::perm_options::replace);
+  handler_ctx_.dump_dir = dir.string();
+  config_->snapshot.mode = "lock";
+  vector_store_->SetVector("item", {1.0F, 0.0F, 0.0F, 0.0F});
+
+  const std::string expected = fs::weakly_canonical(dir / "with space.nvec").string();
+  json body = {{"filepath", "with space.nvec"}};
+  for (const char* route : {"/dump/save", "/dump/verify", "/dump/load"}) {
+    auto res = client_->Post(route, body.dump(), "application/json");
+    ASSERT_TRUE(res) << route;
+    ASSERT_EQ(res->status, 200) << route << " -> " << res->body;
+    EXPECT_EQ(json::parse(res->body)["filepath"], expected) << route;
+  }
+  handler_ctx_.dump_dir = "";
+  fs::remove_all(dir);
+}
+
+TEST_F(HttpServerTest, ClientMistakesReturn4xxNot5xx) {
+  namespace fs = std::filesystem;
+  const fs::path dir = fs::temp_directory_path() / ("nvecd_http_missing_" + std::to_string(::getpid()));
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+  fs::permissions(dir, fs::perms::owner_all, fs::perm_options::replace);
+  handler_ctx_.dump_dir = dir.string();
+
+  json missing = {{"filepath", "absent.nvec"}};
+  for (const char* route : {"/dump/verify", "/dump/info", "/dump/load"}) {
+    auto res = client_->Post(route, missing.dump(), "application/json");
+    ASSERT_TRUE(res) << route;
+    EXPECT_EQ(res->status, 404) << route << " -> " << res->body;
+  }
+
+  json evt = {{"ctx", ""}, {"type", "ADD"}, {"id", "item"}, {"score", 10}};
+  auto res = client_->Post("/event", evt.dump(), "application/json");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(res->status, 400) << res->body;
+
+  handler_ctx_.dump_dir = "";
+  fs::remove_all(dir);
 }
 
 TEST_F(HttpServerTest, EventsModeFilterKeepsVectorlessMatches) {
@@ -1046,27 +1228,31 @@ TEST_F(HttpServerTest, FiniteDoubleOutsideFloatRangeIsRejectedWithoutMutation) {
   EXPECT_EQ(simv_response->status, 400);
 }
 
-TEST_F(HttpServerTest, VecsetWritesNoWalRecordWhenVectorPayloadsAreExcluded) {
-  // include_vectors=false makes snapshots the vector durability boundary, so
-  // no record is produced for a VECSET even when it carries metadata. A closed
-  // WAL therefore cannot fail the request: if this surface still synthesised a
-  // record of its own, the append would be rejected and the response would be
-  // 503 instead of 200. This is the same contract the TCP path is pinned to.
+TEST_F(HttpServerTest, ExcludedVectorPayloadsStillLogInlineMetadata) {
+  // include_vectors=false omits only the vector payload. A VECSET without
+  // metadata writes no record, so a closed WAL cannot fail it; one carrying
+  // metadata logs that metadata, so the closed WAL refuses it before any
+  // mutation, exactly as a METASET would be refused.
   config_->wal.include_vectors = false;
   storage::WriteAheadLog closed_wal;
   handler_ctx_.wal = &closed_wal;
 
-  json body;
-  body["id"] = "snapshot-backed";
-  body["vector"] = {1.0, 0.0, 0.0, 0.0};
-  body["metadata"] = {{"status", "active"}};
-
-  auto res = client_->Post("/vecset", body.dump(), "application/json");
-
-  ASSERT_TRUE(res);
-  EXPECT_EQ(res->status, 200) << res->body;
+  json plain;
+  plain["id"] = "snapshot-backed";
+  plain["vector"] = {1.0, 0.0, 0.0, 0.0};
+  auto plain_res = client_->Post("/vecset", plain.dump(), "application/json");
+  ASSERT_TRUE(plain_res);
+  EXPECT_EQ(plain_res->status, 200) << plain_res->body;
   EXPECT_TRUE(vector_store_->HasVector("snapshot-backed"));
-  EXPECT_FALSE(read_only_.load(std::memory_order_acquire));
+
+  json with_metadata = plain;
+  with_metadata["id"] = "with-metadata";
+  with_metadata["metadata"] = {{"status", "active"}};
+  auto metadata_res = client_->Post("/vecset", with_metadata.dump(), "application/json");
+  ASSERT_TRUE(metadata_res);
+  EXPECT_EQ(metadata_res->status, 503) << metadata_res->body;
+  EXPECT_FALSE(vector_store_->HasVector("with-metadata"));
+  EXPECT_EQ(metadata_store_->Get("with-metadata"), nullptr);
   handler_ctx_.wal = nullptr;
 }
 
@@ -1455,6 +1641,18 @@ TEST_F(HttpServerAuthTest, NonConformingAuthorizationValuesAreRejected) {
     EXPECT_EQ(res->status, 401) << "Authorization: [" << value << "]";
   }
   EXPECT_FALSE(vector_store_->HasVector("rejected"));
+}
+
+TEST_F(HttpServerAuthTest, BasicAuthDecodesLongCredentials) {
+  // A payload far longer than the decoder's bit buffer must decode exactly, or
+  // the password after the colon would not match.
+  const std::string credentials = std::string(40, 'u') + ":s3cret";
+  const std::string encoded = httplib::detail::base64_encode(credentials);
+  httplib::Headers headers = {{"Authorization", "Basic " + encoded}};
+  json body = {{"ctx", "ctx1"}, {"id", "item1"}, {"type", "ADD"}, {"score", 10}};
+  auto res = client_->Post("/event", headers, body.dump(), "application/json");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(res->status, 200) << res->body;
 }
 
 TEST_F(HttpServerAuthTest, BasicPayloadWithoutColonIsTreatedAsThePasswordItself) {

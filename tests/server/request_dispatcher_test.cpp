@@ -13,10 +13,13 @@
 #include <chrono>
 #include <cstring>
 #include <future>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
+#include <thread>
+#include <variant>
 
 #include "cache/similarity_cache.h"
 #include "config/config.h"
@@ -24,6 +27,7 @@
 #include "events/co_occurrence_index.h"
 #include "events/event_store.h"
 #include "server/server_types.h"
+#include "server/wal_codec.h"
 #include "similarity/similarity_engine.h"
 #include "storage/wal.h"
 #include "vectors/metadata_store.h"
@@ -163,7 +167,8 @@ TEST_F(RequestDispatcherTest, WalAppendFailureIsReturnedToClient) {
   EXPECT_NE(response.find("ERROR"), std::string::npos);
   EXPECT_NE(response.find("WAL is not open"), std::string::npos);
   EXPECT_FALSE(vector_store_->HasVector("durable_item"));
-  EXPECT_TRUE(read_only_.load(std::memory_order_acquire));
+  EXPECT_TRUE(ctx_->durability_failed.load(std::memory_order_acquire));
+  EXPECT_FALSE(read_only_.load(std::memory_order_acquire));
 }
 
 TEST_F(RequestDispatcherTest, WalFailureLeavesEveryMutationTypeUnchanged) {
@@ -172,11 +177,11 @@ TEST_F(RequestDispatcherTest, WalFailureLeavesEveryMutationTypeUnchanged) {
   nvecd::storage::WriteAheadLog closed_wal;
   ctx_->wal = &closed_wal;
 
-  EXPECT_NE(Dispatch("EVENT ctx ADD new 10\r\n").find("ERROR"), std::string::npos);
-  read_only_.store(false, std::memory_order_release);
-  EXPECT_NE(Dispatch("METASET existing state:after\r\n").find("ERROR"), std::string::npos);
-  read_only_.store(false, std::memory_order_release);
-  EXPECT_NE(Dispatch("VECDEL existing\r\n").find("ERROR"), std::string::npos);
+  EXPECT_NE(Dispatch("EVENT ctx ADD new 10\r\n").find("WAL is not open"), std::string::npos);
+  ctx_->durability_failed.store(false, std::memory_order_release);
+  EXPECT_NE(Dispatch("METASET existing state:after\r\n").find("WAL is not open"), std::string::npos);
+  ctx_->durability_failed.store(false, std::memory_order_release);
+  EXPECT_NE(Dispatch("VECDEL existing\r\n").find("WAL is not open"), std::string::npos);
 
   EXPECT_TRUE(event_store_->GetEvents("ctx").empty());
   ASSERT_NE(metadata_store_->Get("existing"), nullptr);
@@ -760,4 +765,178 @@ TEST_F(RequestDispatcherTest, DebugModeAppendsDebugBlockToSim) {
   EXPECT_NE(after.find("# DEBUG"), std::string::npos);
   EXPECT_NE(after.find("query_time_us:"), std::string::npos);
   EXPECT_NE(after.find("mode: vectors"), std::string::npos);
+}
+
+// ============================================================================
+// Read-only gate: one decision, store writes only, cause named
+// ============================================================================
+
+TEST_F(RequestDispatcherTest, SnapshotReadOnlyRefusesOnlyStoreWrites) {
+  ASSERT_TRUE(vector_store_->SetVector("item", {1.0F, 0.0F}).has_value());
+  read_only_.store(true, std::memory_order_release);
+
+  for (const char* write : {"EVENT ctx ADD item 10", "VECSET item 1 0", "VECDEL item", "METASET item k:v"}) {
+    EXPECT_EQ(Dispatch(std::string(write) + "\r\n"), "ERROR READONLY Snapshot in progress\r\n") << write;
+  }
+  // Diagnostic, admin and runtime commands reach their handlers.
+  for (const char* other : {"INFO", "DUMP STATUS", "CACHE STATS", "GET cache.enabled", "SET logging.level info",
+                            "SIM item 1 using=vectors"}) {
+    EXPECT_EQ(Dispatch(std::string(other) + "\r\n").find("READONLY"), std::string::npos) << other;
+  }
+}
+
+TEST_F(RequestDispatcherTest, DurabilityLatchNamesItsOwnCause) {
+  ctx_->durability_failed.store(true, std::memory_order_release);
+  const std::string reply = Dispatch("VECSET item 1 0\r\n");
+  EXPECT_NE(reply.find("READONLY Persistence failure"), std::string::npos) << reply;
+  EXPECT_EQ(reply.find("Snapshot"), std::string::npos) << reply;
+  EXPECT_EQ(Dispatch("DUMP STATUS\r\n").find("READONLY"), std::string::npos);
+
+  // A snapshot clearing its own flag does not reopen writes.
+  read_only_.store(true, std::memory_order_release);
+  read_only_.store(false, std::memory_order_release);
+  EXPECT_NE(Dispatch("EVENT ctx ADD item 10\r\n").find("READONLY Persistence failure"), std::string::npos);
+}
+
+// ============================================================================
+// Shared argument validation reaches the store
+// ============================================================================
+
+TEST_F(RequestDispatcherTest, NegativeTimestampIsRejectedBeforeTheStore) {
+  EXPECT_NE(Dispatch("EVENT ctx ADD item 10 timestamp=-1\r\n").find("ERROR Invalid timestamp value: -1"),
+            std::string::npos);
+  EXPECT_TRUE(event_store_->GetEvents("ctx").empty());
+}
+
+TEST_F(RequestDispatcherTest, MetasetRejectsNonEqualityPairsWithoutTouchingMetadata) {
+  ASSERT_TRUE(vector_store_->SetVector("item", {1.0F, 0.0F}).has_value());
+  metadata_store_->Set("item", {{"price", int64_t{5}}});
+  const uint64_t generation = ctx_->metadata_generation.load();
+
+  for (const char* request : {"METASET item price>10", "METASET item k=in(a|b)", "METASET item ,"}) {
+    EXPECT_EQ(Dispatch(std::string(request) + "\r\n").rfind("ERROR", 0), 0U) << request;
+  }
+  ASSERT_NE(metadata_store_->Get("item"), nullptr);
+  EXPECT_EQ(std::get<int64_t>(metadata_store_->Get("item")->at("price")), 5);
+  EXPECT_EQ(ctx_->metadata_generation.load(), generation);
+}
+
+TEST_F(RequestDispatcherTest, NanMetadataStaysAStringAndNeverMatchesARange) {
+  ASSERT_TRUE(vector_store_->SetVector("item", {1.0F, 0.0F}).has_value());
+  ASSERT_NE(Dispatch("METASET item price:nan\r\n").find("OK METASET"), std::string::npos);
+  EXPECT_EQ(std::get<std::string>(metadata_store_->Get("item")->at("price")), "nan");
+
+  const std::string reply = Dispatch("SIMV 5 filter=price>5 1 0\r\n");
+  EXPECT_EQ(reply, "OK RESULTS 0\r\n") << reply;
+}
+
+// ============================================================================
+// Query cost covers the engine call only
+// ============================================================================
+
+TEST_F(RequestDispatcherTest, GateWaitIsNotCountedAsQueryCost) {
+  ASSERT_TRUE(vector_store_->SetVector("item", {1.0F, 0.0F}).has_value());
+  // Run one SIM miss while the generation gate is held for 150 ms, against a
+  // cache admitting only queries that cost at least @p min_cost_ms.
+  auto entries_after_gated_miss = [this](double min_cost_ms) {
+    nvecd::cache::SimilarityCache cache(1024 * 1024, min_cost_ms, 0);
+    ctx_->cache.store(&cache, std::memory_order_release);
+    std::unique_lock gate(write_serialization_gate_);
+    auto query = std::async(std::launch::async, [this] { return Dispatch("SIM item 5 using=vectors\r\n"); });
+    while (cache.GetStatistics().total_queries == 0 &&
+           query.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+      std::this_thread::yield();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    gate.unlock();
+    EXPECT_NE(query.get().find("OK RESULTS"), std::string::npos);
+    ctx_->cache.store(cache_.get(), std::memory_order_release);
+    return cache.GetStatistics().current_entries;
+  };
+
+  EXPECT_EQ(entries_after_gated_miss(0.0), 1U);
+  EXPECT_EQ(entries_after_gated_miss(50.0), 0U);
+}
+
+// ============================================================================
+// WAL replay: decay domain, invalid logged ids, legacy METASET text
+// ============================================================================
+
+namespace {
+nvecd::storage::WalRecord MaintenanceRecord(double alpha) {
+  nvecd::storage::WalRecord record;
+  record.op = nvecd::storage::WalOpType::kCoOccurrenceMaintenance;
+  record.payload.resize(sizeof(alpha) + sizeof(uint8_t));
+  std::memcpy(record.payload.data(), &alpha, sizeof(alpha));
+  record.payload[sizeof(alpha)] = 0;
+  return record;
+}
+
+nvecd::storage::WalRecord CommandRecord(const Command& cmd) {
+  nvecd::storage::WalRecord record;
+  record.op = WalOpForCommand(cmd);
+  record.payload = EncodeCommand(cmd);
+  return record;
+}
+}  // namespace
+
+TEST_F(RequestDispatcherTest, ReplayAppliesEveryConfigValidDecayAlpha) {
+  // 0 is a config-valid alpha that clears the index; the live path logs it.
+  co_index_->SetScore("item1", "item2", 100.0F);
+  auto cleared = dispatcher_->ReplayRecord(MaintenanceRecord(0.0));
+  ASSERT_TRUE(cleared.has_value()) << cleared.error().message();
+  EXPECT_FLOAT_EQ(co_index_->GetScore("item1", "item2"), 0.0F);
+
+  co_index_->SetScore("item1", "item2", 100.0F);
+  ASSERT_TRUE(dispatcher_->ReplayRecord(MaintenanceRecord(1.0)).has_value());
+  EXPECT_FLOAT_EQ(co_index_->GetScore("item1", "item2"), 100.0F);
+
+  for (const double invalid : {-0.1, 1.5, std::numeric_limits<double>::quiet_NaN()}) {
+    auto rejected = dispatcher_->ReplayRecord(MaintenanceRecord(invalid));
+    ASSERT_FALSE(rejected.has_value()) << invalid;
+    EXPECT_EQ(rejected.error().code(), nvecd::utils::ErrorCode::kWalCorrupted);
+  }
+}
+
+TEST_F(RequestDispatcherTest, ReplaySkipsAndCountsALoggedVecsetWithAnInvalidId) {
+  Command bad;
+  bad.type = CommandType::kVecset;
+  bad.id = "a\r\nb";
+  bad.vector = {1.0F, 0.0F};
+  Command good = bad;
+  good.id = "good";
+
+  auto skipped = dispatcher_->ReplayRecord(CommandRecord(bad));
+  ASSERT_TRUE(skipped.has_value()) << skipped.error().message();
+  EXPECT_EQ(stats_.wal_replay_records_skipped.load(), 1U);
+  EXPECT_EQ(vector_store_->GetVectorCount(), 0U);
+
+  ASSERT_TRUE(dispatcher_->ReplayRecord(CommandRecord(good)).has_value());
+  EXPECT_TRUE(vector_store_->HasVector("good"));
+}
+
+TEST_F(RequestDispatcherTest, ReplayTypesLegacyMetasetTextWithTheMetasetGrammar) {
+  ASSERT_TRUE(vector_store_->SetVector("item", {1.0F, 0.0F}).has_value());
+  Command legacy;
+  legacy.type = CommandType::kMetaset;
+  legacy.id = "item";
+  legacy.filter_expr = "category:books,price:12";
+  ASSERT_TRUE(dispatcher_->ReplayRecord(CommandRecord(legacy)).has_value());
+  ASSERT_NE(metadata_store_->Get("item"), nullptr);
+  EXPECT_EQ(std::get<int64_t>(metadata_store_->Get("item")->at("price")), 12);
+
+  // A comparison was once reduced to its value; it is skipped, not stored.
+  legacy.filter_expr = "price>99";
+  ASSERT_TRUE(dispatcher_->ReplayRecord(CommandRecord(legacy)).has_value());
+  EXPECT_EQ(stats_.wal_replay_records_skipped.load(), 1U);
+  EXPECT_EQ(std::get<int64_t>(metadata_store_->Get("item")->at("price")), 12);
+}
+
+TEST_F(RequestDispatcherTest, ConfigShowReportsTheRunningValueAfterSet) {
+  ASSERT_NE(Dispatch("SET logging.level warn\r\n").find("OK"), std::string::npos);
+  const std::string shown = Dispatch("CONFIG SHOW logging.level\r\n");
+  const std::string got = Dispatch("GET logging.level\r\n");
+  Dispatch("SET logging.level info\r\n");
+  EXPECT_NE(shown.find("warn"), std::string::npos) << shown;
+  EXPECT_NE(got.find("warn"), std::string::npos) << got;
 }

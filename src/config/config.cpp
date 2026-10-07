@@ -21,6 +21,7 @@
 #include <utility>
 
 #include "config/config_schema_embedded.h"
+#include "events/co_occurrence_index.h"
 #include "utils/error.h"
 #include "utils/structured_log.h"
 
@@ -48,6 +49,12 @@ nlohmann::json YamlToJson(const YAML::Node& yaml_node) {
 
   if (yaml_node.IsScalar()) {
     const std::string& scalar = yaml_node.Scalar();
+
+    // Only a plain scalar is typed by its content; a quoted one (tag "!") is
+    // a string by YAML semantics, so "12345" stays a string for the schema.
+    if (yaml_node.Tag() != "?") {
+      return scalar;
+    }
 
     // Try bool (YAML 1.1 true/false variants)
     if (scalar == "true" || scalar == "True" || scalar == "TRUE") {
@@ -537,7 +544,6 @@ utils::Expected<void, utils::Error> ValidateConfigSchema(const nlohmann::json& c
     err_msg << "Configuration validation failed:\n";
     err_msg << "  " << e.what() << "\n\n";
     err_msg << "  Common configuration issues:\n";
-    err_msg << "    - Missing required fields (vectors, events, etc.)\n";
     err_msg << "    - Invalid data types (string instead of number, etc.)\n";
     err_msg << "    - Invalid enum values (check allowed values)\n";
     err_msg << "    - Out of range values (check min/max constraints)\n\n";
@@ -657,7 +663,7 @@ utils::Expected<void, utils::Error> ValidateConfig(const Config& config) {
     return utils::MakeUnexpected(
         utils::MakeError(utils::ErrorCode::kConfigInvalidValue, "events.min_support must not be negative"));
   }
-  if (config.events.decay_alpha < 0.0 || config.events.decay_alpha > 1.0) {
+  if (!events::IsValidDecayAlpha(config.events.decay_alpha)) {
     return utils::MakeUnexpected(
         utils::MakeError(utils::ErrorCode::kConfigInvalidValue, "events.decay_alpha must be between 0.0 and 1.0"));
   }

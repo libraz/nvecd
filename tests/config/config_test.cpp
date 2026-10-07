@@ -306,6 +306,61 @@ TEST(ConfigTest, OutOfRangeNumberNamesTheKeyInsteadOfReportingASyntaxError) {
 }
 
 /**
+ * @brief A quoted scalar is a string by YAML semantics, whatever it looks like
+ */
+TEST(ConfigTest, QuotedNumericAndBooleanScalarsStayStrings) {
+  std::ofstream ofs("quoted_scalar_test_config.yaml");
+  ofs << "security:\n  requirepass: \"12345\"\nlogging:\n  level: 'info'\n";
+  ofs.close();
+  auto config_result = LoadConfig("quoted_scalar_test_config.yaml");
+  ASSERT_TRUE(config_result) << config_result.error().message();
+  EXPECT_EQ(config_result->security.requirepass, "12345");
+
+  std::ofstream bool_ofs("quoted_scalar_test_config.yaml");
+  bool_ofs << "security:\n  requirepass: 'true'\n";
+  bool_ofs.close();
+  auto bool_result = LoadConfig("quoted_scalar_test_config.yaml");
+  ASSERT_TRUE(bool_result) << bool_result.error().message();
+  EXPECT_EQ(bool_result->security.requirepass, "true");
+
+  // A plain scalar is still typed: a bare number where a string is required fails.
+  std::ofstream plain_ofs("quoted_scalar_test_config.yaml");
+  plain_ofs << "security:\n  requirepass: 12345\n";
+  plain_ofs.close();
+  EXPECT_FALSE(LoadConfig("quoted_scalar_test_config.yaml"));
+  std::remove("quoted_scalar_test_config.yaml");
+}
+
+/**
+ * @brief Validation diagnostics never claim a constraint the schema lacks
+ */
+TEST(ConfigTest, ValidationErrorDoesNotClaimRequiredFields) {
+  std::ofstream ofs("invalid_type_test_config.yaml");
+  ofs << "events:\n  ctx_buffer_size: not-a-number\n";
+  ofs.close();
+  auto config_result = LoadConfig("invalid_type_test_config.yaml");
+  ASSERT_FALSE(config_result);
+  EXPECT_EQ(config_result.error().message().find("Missing required"), std::string::npos)
+      << config_result.error().message();
+  std::remove("invalid_type_test_config.yaml");
+}
+
+/**
+ * @brief decay_alpha accepts exactly the domain ApplyDecay and WAL replay accept
+ */
+TEST(ConfigTest, DecayAlphaDomainIsZeroToOneInclusive) {
+  Config config;
+  config.events.decay_alpha = 0.0;
+  EXPECT_TRUE(ValidateConfig(config)) << "0 clears the index and is documented as valid";
+  config.events.decay_alpha = 1.0;
+  EXPECT_TRUE(ValidateConfig(config));
+  for (const double invalid : {-0.01, 1.01, std::numeric_limits<double>::quiet_NaN()}) {
+    config.events.decay_alpha = invalid;
+    EXPECT_FALSE(ValidateConfig(config)) << invalid;
+  }
+}
+
+/**
  * @brief Test loading configuration with invalid YAML syntax
  */
 TEST(ConfigTest, LoadInvalidYAML) {

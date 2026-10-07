@@ -9,6 +9,7 @@
 #pragma once
 
 #include <atomic>
+#include <cmath>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
@@ -22,6 +23,17 @@
 #include "utils/expected.h"
 
 namespace nvecd::events {
+
+/**
+ * @brief Whether @p alpha is a decay factor ApplyDecay applies
+ *
+ * The one domain shared by config validation, the live decay pass and WAL
+ * replay, so no maintenance record can be logged that replay then rejects:
+ * finite and in [0, 1], where 0 clears the index.
+ */
+inline bool IsValidDecayAlpha(double alpha) {
+  return std::isfinite(alpha) && alpha >= 0.0 && alpha <= 1.0;
+}
 
 class CoOccurrenceEdgeValidator;
 
@@ -253,8 +265,9 @@ class CoOccurrenceIndex {
   /**
    * @brief Apply exponential decay to all scores
    *
-   * Multiplies all scores by alpha (0.0 < alpha <= 1.0).
-   * This favors recent co-occurrences over old ones.
+   * Multiplies all scores by alpha; 0 clears the index. An alpha outside
+   * IsValidDecayAlpha() is ignored. This favors recent co-occurrences over
+   * old ones.
    *
    * @param alpha Decay factor (typically 0.99)
    */

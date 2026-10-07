@@ -63,7 +63,7 @@ Semantic rules beyond the ranges above: `ctx_buffer_size` must be greater than z
 <!-- BEGIN GENERATED: options vectors -->
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `default_dimension` | int | 768 | Default vector dimension (number of features per vector) (1-4096) |
+| `default_dimension` | int | 768 | Dimension the ANN index is pre-sized for; the first stored vector fixes the dimension the store accepts (1-4096) |
 | `distance_metric` | string | "cosine" | Distance metric for similarity search (`cosine` `dot` `l2`) |
 <!-- END GENERATED: options vectors -->
 
@@ -94,7 +94,7 @@ Search behaviour, fusion weights and the ANN index. See [vector-search.md](./vec
 | `hnsw_m` | int | 16 | HNSW number of connections per node; the maximum is the largest value whose doubled bottom-layer link count stays inside the 32-bit counter that holds it (2-2147483647) |
 | `hnsw_ef_construction` | int | 200 | HNSW search width during construction; the maximum is the range of the type it is read into, not a tuning limit (1-4294967295) |
 | `hnsw_ef_search` | int | 50 | HNSW search width during query; the maximum is the range of the type it is read into, not a tuning limit (1-4294967295) |
-| `hnsw_max_elements` | int | 0 | HNSW pre-allocated capacity (0 = dynamic growth); the value is reserved at startup and the maximum is the largest index the snapshot loader accepts, so reserving beyond it produces an index that cannot be reloaded (0-10000000) |
+| `hnsw_max_elements` | int | 0 | HNSW pre-allocated capacity (0 = dynamic growth); the value is reserved at startup, and the maximum is a plain capacity bound (0-10000000) |
 <!-- END GENERATED: options similarity -->
 
 Cross-key rules:
@@ -106,7 +106,7 @@ Cross-key rules:
 - `ivf_enabled` is the older spelling of `index_type: ivf`. It is applied only when `index_type` is still `flat`; with `index_type` set to `hnsw` or `ivf`, the flag has no effect even though the IVF keys are still range-checked.
 - `fusion_alpha` and `fusion_beta` are independent numbers, not two halves of one budget; they are not required to sum to 1. They must not both be 0, which validation rejects because fusion would have nothing to rank by.
 
-`hnsw_max_elements` is reserved at startup, and its maximum is the largest index the snapshot loader accepts — reserving beyond it produces an index that cannot be reloaded.
+`hnsw_max_elements` is reserved at startup. Its maximum, 10,000,000, is a plain capacity bound: the index is rebuilt from the vector store on load rather than read from the snapshot, so no loader constrains it.
 
 ## `snapshot`
 
@@ -273,12 +273,12 @@ The write-ahead log. See [persistence.md](./persistence.md).
 | `max_file_size` | int | 67108864 | Maximum size per WAL file in bytes; the maximum is the largest integer the configuration reader carries, not a tuning limit (1-9223372036854775807) |
 | `sync_on_write` | bool | false | fsync after every append (high durability, lower throughput); sync_interval_ms selects the batch interval when this is false |
 | `sync_interval_ms` | int | 100 | Batch fsync interval in milliseconds when sync_on_write is false (0 = fsync on every append); the maximum is the range of the type it is read into, not a tuning limit (0-4294967295) |
-| `include_vectors` | bool | true | Persist vector bodies in VECSET WAL records; disable only when snapshots provide the required vector durability |
+| `include_vectors` | bool | true | Persist vector bodies in VECSET WAL records (metadata sent with a VECSET is logged either way); disable only when snapshots provide the required vector durability |
 <!-- END GENERATED: options wal -->
 
 `dir` must not be empty when `enabled` is true. `sync_interval_ms` has no effect while `sync_on_write` is true, which is the trade of durability against write throughput.
 
-`include_vectors` interacts directly with recovery. With it false, `VECSET` records carry no vector body and are not written at all, so a restart restores vectors only as far as the last snapshot; any `VECDEL` or `METASET` in the log that refers to a vector the snapshot does not contain is skipped, counted, and reported by `INFO` as `wal_replay_records_skipped`. Turning it off is a decision to make snapshots the durability boundary for vector data, and it keeps the server startable rather than failing recovery on the resulting gap.
+`include_vectors` interacts directly with recovery. With it false, a `VECSET` writes no record — only metadata sent with it is logged, as the equivalent `METASET` — so a restart restores vectors only as far as the last snapshot; any `VECDEL` or `METASET` in the log that refers to a vector the snapshot does not contain is skipped, counted, and reported by `INFO` as `wal_replay_records_skipped`. Turning it off is a decision to make snapshots the durability boundary for vector data, and it keeps the server startable rather than failing recovery on the resulting gap.
 
 ## A minimal configuration
 

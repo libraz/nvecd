@@ -349,7 +349,7 @@ float CoOccurrenceIndex::GetScore(const std::string& item_id_1, const std::strin
 }
 
 void CoOccurrenceIndex::ApplyDecay(double alpha) {
-  if (alpha < 0.0 || alpha > 1.0) {
+  if (!IsValidDecayAlpha(alpha)) {
     return;  // Invalid alpha, skip decay
   }
 

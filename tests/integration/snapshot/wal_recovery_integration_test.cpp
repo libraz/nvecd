@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <variant>
 
 #include "cache/similarity_cache.h"
 #include "config/config.h"
@@ -200,7 +201,7 @@ TEST(WalRecoveryIntegration, RecoversStateFromWalReplay) {
     EXPECT_TRUE(b.vector_store->HasVector("item_a"));
     EXPECT_TRUE(b.vector_store->HasVector("item_b"));
 
-    // Metadata recovered (verbatim filter_expr re-parsed).
+    // Metadata recovered (typed when logged).
     const auto* meta = b.metadata_store->Get("item_a");
     ASSERT_NE(meta, nullptr);
     EXPECT_NE(meta->find("status"), meta->end());
@@ -270,6 +271,44 @@ TEST(WalRecoveryIntegration, ReplaySkipsRecordsWhoseVectorTheConfigOmitted) {
     EXPECT_EQ(*replayed, 2U);  // the METASET and the VECDEL, both skipped
     EXPECT_FALSE(b.vector_store->HasVector("orphan"));
     EXPECT_EQ(b.metadata_store->Get("orphan"), nullptr);
+  }
+
+  fs::remove_all(root);
+}
+
+TEST(WalRecoveryIntegration, InlineVecsetMetadataSurvivesReplayWithoutVectorPayloads) {
+  const std::string root = MakeTempDir("inline_metadata");
+  const std::string wal_dir = root + "/wal";
+  fs::create_directories(wal_dir);
+
+  {
+    Instance a(root);
+    a.config->wal.include_vectors = false;
+    // The vector itself is in the snapshot; only the later write is logged.
+    ASSERT_TRUE(a.vector_store->SetVector("kept", {1.0F, 0.0F}).has_value());
+    a.OpenWal(wal_dir);
+    a.EnableWalForLiveWrites();
+
+    // The JSON surface's VECSET carries metadata inline.
+    Command vecset;
+    vecset.type = CommandType::kVecset;
+    vecset.id = "kept";
+    vecset.vector = {0.0F, 1.0F};
+    vecset.metadata = vectors::Metadata{{"tier", std::string("gold")}};
+    ASSERT_TRUE(ApplyWrite(*a.ctx, vecset).has_value());
+    a.wal.Close();
+
+    Instance b(root);
+    b.config->wal.include_vectors = false;
+    ASSERT_TRUE(b.vector_store->SetVector("kept", {1.0F, 0.0F}).has_value());
+    b.OpenWal(wal_dir);
+    auto replayed = b.TryReplay(/*from=*/0);
+    ASSERT_TRUE(replayed.has_value()) << replayed.error().message();
+    EXPECT_EQ(*replayed, 1U);
+    EXPECT_EQ(b.stats.wal_replay_records_skipped.load(), 0U);
+    const auto* meta = b.metadata_store->Get("kept");
+    ASSERT_NE(meta, nullptr);
+    EXPECT_EQ(std::get<std::string>(meta->at("tier")), "gold");
   }
 
   fs::remove_all(root);

@@ -101,7 +101,7 @@ Sequence numbers are contiguous across segments; replay treats a gap as corrupti
 
 ### Ordering
 
-**The record is appended before the in-memory mutation, not after.** A write handler validates the command, appends the record, and only then applies it to the stores. A refused append propagates as an error, so a client never receives `OK` for a write the log would not accept; the server also latches itself read-only, because a WAL that cannot accept a record can no longer describe what the server did.
+**The record is appended before the in-memory mutation, not after.** A write handler validates the command, appends the record, and only then applies it to the stores. A refused append propagates as an error, so a client never receives `OK` for a write the log would not accept; the server also latches a fail-stop state, because a WAL that cannot accept a record can no longer describe what the server did. Until a restart, `EVENT`, `VECSET`, `VECDEL` and `METASET` are refused with `ERROR READONLY Persistence failure; writes are refused until restart` on both surfaces; the latch is separate from the lock-mode snapshot flag, so a save finishing does not clear it.
 
 An event that the deduplication window rejects is applied as a no-op and writes no record.
 
@@ -123,9 +123,9 @@ Truncation is the only thing that reclaims WAL space, and it runs solely as part
 
 ### Omitting vector bodies
 
-`wal.include_vectors: false` writes no record at all for a `VECSET`. Operators choose it when snapshots are their intended durability boundary for vector data and the log only needs to carry events and metadata.
+`wal.include_vectors: false` omits the vector payload: a `VECSET` writes no record, unless it carries metadata (the HTTP `/vecset` form), in which case that metadata is logged as the equivalent `METASET` record. Operators choose it when snapshots are their intended durability boundary for vector data and the log only needs to carry events and metadata.
 
-The consequence is direct: **a vector written while that setting was off cannot be recovered from the WAL.** Only a snapshot taken after the write holds it. Replay tolerates the resulting gap narrowly — a `VECDEL` or `METASET` whose subject vector is missing is a deliberate absence rather than corruption, so it is skipped and counted. `INFO` reports the running total as `wal_replay_records_skipped`, so the size of the gap survives log rotation. Every other operation and every other failure, including a CRC mismatch, a truncation or a decode failure, stops recovery.
+The consequence is direct: **a vector written while that setting was off cannot be recovered from the WAL.** Only a snapshot taken after the write holds it. Replay tolerates the resulting gap narrowly — a `VECDEL` or `METASET` whose subject vector is missing is a deliberate absence rather than corruption, so it is skipped and counted. `INFO` reports the running total as `wal_replay_records_skipped`, so the size of the gap survives log rotation. Replay likewise skips and counts a record that validation added after it was logged now rejects: a `VECSET` whose item ID would break the line protocol (empty, or carrying whitespace or a control byte) or whose components the store refuses, and a legacy text `METASET` record whose pairs used a comparison or `in(...)`, which the `METASET` grammar now rejects instead of storing one value. Every other operation and every other failure, including a CRC mismatch, a truncation, a decode failure or a dimension mismatch, stops recovery.
 
 ## Restart recovery
 
@@ -162,7 +162,7 @@ OK DUMP_SAVE_STARTED /var/lib/nvecd/snapshots/backup.nvec
 
 In lock mode the response comes back after the whole handshake has completed, as `OK DUMP_SAVED /var/lib/nvecd/snapshots/backup.nvec`.
 
-**`DUMP LOAD <path>`** replaces the live state with a snapshot. The file is deserialized into staged stores first, so a corrupt or semantically invalid snapshot can only damage those; the live stores are swapped in under exclusive gates, the ANN index is rebuilt and the query cache is cleared. With a WAL configured, a load is treated as a deliberate rollback: the loaded snapshot becomes the newest recovery base and the pre-load WAL tail is discarded, so a later restart does not replay the mutations the operator just rolled back. Because the loaded file becomes the recovery base, its name must end in `.nvec` or `.dmp` when a WAL is configured; without a WAL any name loads. A load is refused while a background fork save is still writing, since that save would finish later and outrank the loaded snapshot. If any durability step of a load fails after publication, the server latches itself read-only and needs a restart — it will not resume serving on a state whose recovery base is uncertain.
+**`DUMP LOAD <path>`** replaces the live state with a snapshot. The file is deserialized into staged stores first, so a corrupt or semantically invalid snapshot can only damage those; the live stores are swapped in under exclusive gates, the ANN index is rebuilt and the query cache is cleared. With a WAL configured, a load is treated as a deliberate rollback: the loaded snapshot becomes the newest recovery base and the pre-load WAL tail is discarded, so a later restart does not replay the mutations the operator just rolled back. Because the loaded file becomes the recovery base, its name must end in `.nvec` or `.dmp` when a WAL is configured; without a WAL any name loads. A load is refused while a background fork save is still writing, since that save would finish later and outrank the loaded snapshot. If any durability step of a load fails after publication, the server latches the same fail-stop state, keeps refusing commands as loading, and needs a restart — it will not resume serving on a state whose recovery base is uncertain.
 
 **`DUMP VERIFY <path>`** runs the integrity check described above without loading anything.
 

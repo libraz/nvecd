@@ -7,6 +7,9 @@
 
 #include <gtest/gtest.h>
 
+#include <string>
+#include <variant>
+
 using namespace nvecd::server;
 using namespace nvecd::utils;
 
@@ -101,11 +104,11 @@ TEST(CommandParserTest, ParseVecset_MissingVector) {
 TEST(CommandParserTest, ParseVecset_RejectsNonFiniteFloat) {
   auto result = ParseCommand("VECSET item123 1.0 nan");
   ASSERT_FALSE(result.has_value());
-  EXPECT_EQ(result.error().code(), ErrorCode::kCommandInvalidArgument);
+  EXPECT_EQ(result.error().code(), ErrorCode::kCommandInvalidVector);
 
   result = ParseCommand("VECSET item123 1.0 inf");
   ASSERT_FALSE(result.has_value());
-  EXPECT_EQ(result.error().code(), ErrorCode::kCommandInvalidArgument);
+  EXPECT_EQ(result.error().code(), ErrorCode::kCommandInvalidVector);
 }
 
 TEST(CommandParserTest, ParseVecdel_ValidAndRejectsMissingId) {
@@ -125,7 +128,19 @@ TEST(CommandParserTest, ParseMetaset_Valid) {
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->type, CommandType::kMetaset);
   EXPECT_EQ(result->id, "item123");
-  EXPECT_EQ(result->filter_expr, "category:electronics,active:true");
+  ASSERT_TRUE(result->metadata.has_value());
+  EXPECT_EQ(result->metadata->size(), 2u);
+  EXPECT_EQ(std::get<std::string>(result->metadata->at("category")), "electronics");
+  EXPECT_TRUE(std::get<bool>(result->metadata->at("active")));
+}
+
+TEST(CommandParserTest, ParseMetaset_RejectsAnythingButEqualityPairs) {
+  for (const char* request : {"METASET x price>10", "METASET x price<=10", "METASET x k!=v", "METASET x k=in(a|b)",
+                              "METASET x ,", "METASET x ,,,"}) {
+    auto result = ParseCommand(request);
+    ASSERT_FALSE(result.has_value()) << request;
+    EXPECT_EQ(result.error().code(), ErrorCode::kCommandInvalidArgument) << request;
+  }
 }
 
 TEST(CommandParserTest, ParseMetaset_MissingArgs) {
@@ -462,4 +477,101 @@ TEST(CommandParserTest, ParseCaseInsensitive) {
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->type, CommandType::kEvent);
   EXPECT_EQ(result->event_type, nvecd::events::EventType::ADD);
+}
+
+// ============================================================================
+// Shared numeric validators
+// ============================================================================
+
+TEST(CommandParserTest, TimestampAcceptsOnlyUnsignedDigits) {
+  for (const char* value : {"-1", "+5", "1e3", "\t5", "18446744073709551616", ""}) {
+    auto result = ParseCommand(std::string("EVENT ctx1 ADD item1 10 timestamp=") + value);
+    ASSERT_FALSE(result.has_value()) << value;
+    EXPECT_EQ(result.error().code(), ErrorCode::kCommandInvalidArgument) << value;
+  }
+  auto del = ParseCommand("EVENT ctx1 DEL item1 timestamp=-1");
+  ASSERT_FALSE(del.has_value());
+
+  auto max = ParseCommand("EVENT ctx1 ADD item1 10 timestamp=18446744073709551615");
+  ASSERT_TRUE(max.has_value()) << max.error().message();
+  EXPECT_EQ(*max->timestamp, 18446744073709551615ULL);
+}
+
+TEST(CommandParserTest, TopKOverflowIsReportedAsTopKRangeError) {
+  for (const char* request : {"SIM item1 4294967297", "SIM item1 99999999999999999999999", "SIMV 4294967297 0.1"}) {
+    auto result = ParseCommand(request, 100);
+    ASSERT_FALSE(result.has_value()) << request;
+    EXPECT_EQ(result.error().code(), ErrorCode::kCommandInvalidTopK) << request;
+  }
+  auto unbounded = ParseCommand("SIM item1 2147483648", 0);
+  ASSERT_FALSE(unbounded.has_value());
+  EXPECT_EQ(unbounded.error().code(), ErrorCode::kCommandInvalidTopK);
+
+  auto negative = ParseCommand("SIM item1 -99999999999999999999999", 100);
+  ASSERT_FALSE(negative.has_value());
+  EXPECT_EQ(negative.error().code(), ErrorCode::kCommandInvalidTopK);
+}
+
+TEST(CommandParserTest, DenormalAndUnderflowFloatsNarrowInsteadOfFailing) {
+  auto vecset = ParseCommand("VECSET item1 1e-40 1e-50 0.5");
+  ASSERT_TRUE(vecset.has_value()) << vecset.error().message();
+  ASSERT_EQ(vecset->vector.size(), 3u);
+  EXPECT_GT(vecset->vector[0], 0.0F);
+  EXPECT_EQ(vecset->vector[1], 0.0F);
+
+  auto simv = ParseCommand("SIMV 5 min_score=1e-45 1e-40 0.5");
+  ASSERT_TRUE(simv.has_value()) << simv.error().message();
+  EXPECT_EQ(simv->vector.size(), 2u);
+}
+
+TEST(CommandParserTest, FloatTokensRejectNonDecimalSpellings) {
+  auto overflow = ParseCommand("VECSET item1 1e39 0.5");
+  ASSERT_FALSE(overflow.has_value());
+  EXPECT_EQ(overflow.error().message(), "Invalid float: 1e39");
+
+  auto nan = ParseCommand("VECSET item1 nan 0.5");
+  ASSERT_FALSE(nan.has_value());
+  EXPECT_EQ(nan.error().message(), "Invalid float: nan");
+
+  auto hex = ParseCommand("VECSET item1 0x10 0.5");
+  ASSERT_FALSE(hex.has_value());
+  EXPECT_EQ(hex.error().message(), "Invalid float: 0x10");
+
+  auto word = ParseCommand("VECSET item1 abc 0.5");
+  ASSERT_FALSE(word.has_value());
+  EXPECT_EQ(word.error().message(), "Failed to parse float: abc");
+}
+
+TEST(CommandParserTest, FilterIsParsedWithTheCommand) {
+  auto sim = ParseCommand("SIM item1 5 filter=price>10,status:active");
+  ASSERT_TRUE(sim.has_value()) << sim.error().message();
+  EXPECT_EQ(sim->filter_expr, "price>10,status:active");
+  EXPECT_EQ(sim->filter.conditions.size(), 2u);
+
+  auto bad = ParseCommand("SIMV 5 filter=novalue 0.1");
+  ASSERT_FALSE(bad.has_value());
+  EXPECT_EQ(bad.error().code(), ErrorCode::kCommandParseError);
+}
+
+// ============================================================================
+// AUTH separator handling
+// ============================================================================
+
+TEST(CommandParserTest, AuthPasswordIsEverythingAfterTheSeparator) {
+  struct Case {
+    const char* request;
+    const char* password;
+  };
+  for (const Case& c : {Case{"AUTH secret", "secret"}, Case{"AUTH\tsecret", "secret"}, Case{" AUTH s3cret", "s3cret"},
+                        Case{"\tauth pass word ", "pass word "}, Case{"AUTH  lead", " lead"}}) {
+    auto result = ParseCommand(c.request);
+    ASSERT_TRUE(result.has_value()) << c.request;
+    EXPECT_EQ(result->type, CommandType::kAuth) << c.request;
+    EXPECT_EQ(result->variable_value, c.password) << c.request;
+  }
+  for (const char* request : {"AUTH", "AUTH ", "AUTH\t"}) {
+    auto result = ParseCommand(request);
+    ASSERT_FALSE(result.has_value()) << request;
+    EXPECT_EQ(result.error().code(), ErrorCode::kCommandSyntaxError) << request;
+  }
 }

@@ -112,8 +112,8 @@
       "properties": {
         "default_dimension": {
           "type": "integer",
-          "description": "Default vector dimension (number of features per vector)",
-          "description_ja": "既定のベクトル次元数（ベクトルごとの特徴量数）",
+          "description": "Dimension the ANN index is pre-sized for; the first stored vector fixes the dimension the store accepts",
+          "description_ja": "ANN 索引を事前に確保する次元数。ストアが受け付ける次元は最初に保存されたベクトルで決まる",
           "default": 768,
           "minimum": 1,
           "maximum": 4096
@@ -282,8 +282,8 @@
         },
         "hnsw_max_elements": {
           "type": "integer",
-          "description": "HNSW pre-allocated capacity (0 = dynamic growth); the value is reserved at startup and the maximum is the largest index the snapshot loader accepts, so reserving beyond it produces an index that cannot be reloaded",
-          "description_ja": "HNSW の事前確保容量（0 = 動的に拡張）。値は起動時に確保され、上限はスナップショット読み込みが受け付ける索引の最大サイズ。これを超えて確保すると再読み込みできない索引になる",
+          "description": "HNSW pre-allocated capacity (0 = dynamic growth); the value is reserved at startup, and the maximum is a plain capacity bound",
+          "description_ja": "HNSW の事前確保容量（0 = 動的に拡張）。値は起動時に確保され、上限は単純な容量の上限",
           "default": 0,
           "minimum": 0,
           "maximum": 10000000
@@ -707,8 +707,8 @@
         },
         "include_vectors": {
           "type": "boolean",
-          "description": "Persist vector bodies in VECSET WAL records; disable only when snapshots provide the required vector durability",
-          "description_ja": "VECSET の WAL レコードにベクトル本体を永続化する。無効化してよいのは、ベクトルの耐久性をスナップショットで満たせる場合だけ",
+          "description": "Persist vector bodies in VECSET WAL records (metadata sent with a VECSET is logged either way); disable only when snapshots provide the required vector durability",
+          "description_ja": "VECSET の WAL レコードにベクトル本体を永続化する（VECSET に付けたメタデータはどちらでも記録される）。無効化してよいのは、ベクトルの耐久性をスナップショットで満たせる場合だけ",
           "default": true
         }
       }
