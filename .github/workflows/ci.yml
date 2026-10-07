@@ -19,7 +19,7 @@ jobs:
   build-and-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
@@ -27,13 +27,13 @@ jobs:
       - name: Build with coverage
         run: |
           cmake -B build -DCMAKE_BUILD_TYPE=Debug -DNVECD_PORTABLE_BUILD=ON -DCMAKE_CXX_FLAGS="--coverage" -DCMAKE_C_FLAGS="--coverage"
-          cmake --build build --parallel
+          cmake --build build --parallel 4
 
       - name: Run unit tests
         run: ctest --test-dir build --output-on-failure --label-exclude integration
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           plugins: gcov
