@@ -67,6 +67,8 @@ config.recv_buffer_size = 65536;
 
 A zero `timeout_ms` or `recv_buffer_size` means "unset" and is replaced by the default, in the C++ client and the C API alike.
 
+`timeout_ms` applies to every command, including `Save`, `Load` and `Verify`. A snapshot of a large store can take longer than the default to write or read, so raise `timeout_ms` on a handle used for them. `nvecd-cli` waits up to an hour for `DUMP SAVE`, `DUMP LOAD` and `DUMP VERIFY` on its own.
+
 Setting `unix_socket_path` switches the transport: the client connects to that socket and ignores `host` and `port`.
 
 ```cpp

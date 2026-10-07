@@ -517,9 +517,9 @@ target_link_libraries(distance_simd_test
   gtest
   gtest_main
 )
-# The ISA kernels this case asserts are behind #ifdef, so without the same
-# flags the library is built with, the assertions for them compile away and the
-# case reports success for a kernel it never called.
+# The ISA kernels this case asserts are behind #ifdef, so without the flags the
+# library's kernel translation unit is built with, the assertions for them
+# compile away and the case reports success for a kernel it never called.
 nvecd_target_simd_flags(distance_simd_test)
 gtest_discover_tests(distance_simd_test)
 

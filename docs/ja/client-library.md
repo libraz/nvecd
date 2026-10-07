@@ -67,6 +67,8 @@ config.recv_buffer_size = 65536;
 
 `timeout_ms` と `recv_buffer_size` が 0 の場合は「未設定」として扱われ、C++ クライアントでも C API でも既定値に置き換えられます。
 
+`timeout_ms` は `Save`、`Load`、`Verify` を含むすべてのコマンドに適用されます。大きなストアのスナップショットは書き込みや読み込みに既定値より長くかかることがあるため、これらに使うハンドルでは `timeout_ms` を引き上げてください。`nvecd-cli` は `DUMP SAVE`、`DUMP LOAD`、`DUMP VERIFY` については独自に最大 1 時間待ちます。
+
 `unix_socket_path` を設定すると転送方式が切り替わり、クライアントはそのソケットに接続して `host` と `port` を無視します。
 
 ```cpp
