@@ -116,7 +116,7 @@ See [persistence.md](./persistence.md).
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `dir` | string | "/var/lib/nvecd/snapshots" | Snapshot directory path |
-| `default_filename` | string | "nvecd.nvec" | Filename an argument-less DUMP SAVE writes inside the snapshot directory; validated like a client-supplied path, so an absolute or escaping name is refused (empty = fall back to a timestamped name). Must end in .nvec or .dmp, or startup will not treat the file as a recovery candidate |
+| `default_filename` | string | "nvecd.nvec" | Filename an argument-less DUMP SAVE writes inside the snapshot directory; validated like a client-supplied path, so an absolute or escaping name is refused (empty = fall back to a timestamped name). Must end in .nvec or .dmp, the extensions startup recovery scans for; any other name is rejected when the configuration loads |
 | `interval_sec` | int | 0 | Snapshot interval in seconds (0 = disabled) (0-86400) |
 | `retain` | int | 3 | Number of automatic snapshots to retain; manual snapshots are never removed (0 = keep every file) (0-100) |
 | `mode` | string | "fork" | Snapshot consistency mode: fork (COW, non-blocking) or lock (global write lock, blocking) (`fork` `lock`) |

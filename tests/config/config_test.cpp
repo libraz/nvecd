@@ -40,7 +40,7 @@ TEST(ConfigTest, LoadValidConfig) {
 
   // Snapshot config
   EXPECT_EQ(config.snapshot.dir, "/tmp/nvecd_test_snapshots");
-  EXPECT_EQ(config.snapshot.default_filename, "test.snapshot");
+  EXPECT_EQ(config.snapshot.default_filename, "test.nvec");
   EXPECT_EQ(config.snapshot.interval_sec, 600);
   EXPECT_EQ(config.snapshot.retain, 5);
   EXPECT_EQ(config.snapshot.mode, "fork");
@@ -433,6 +433,20 @@ TEST(ConfigTest, ValidateSnapshotMode) {
   auto result = ValidateConfig(config);
   EXPECT_FALSE(result);
   EXPECT_EQ(result.error().code(), nvecd::utils::ErrorCode::kConfigInvalidValue);
+}
+
+TEST(ConfigTest, ValidateSnapshotDefaultFilenameExtension) {
+  Config config;
+  for (const char* name : {"", "nvecd.nvec", "backup.dmp"}) {
+    config.snapshot.default_filename = name;
+    EXPECT_TRUE(ValidateConfig(config)) << name;
+  }
+  for (const char* name : {"nvecd.snapshot", "backup.bak", "noext"}) {
+    config.snapshot.default_filename = name;
+    auto result = ValidateConfig(config);
+    ASSERT_FALSE(result) << name;
+    EXPECT_EQ(result.error().code(), nvecd::utils::ErrorCode::kConfigInvalidValue);
+  }
 }
 
 /**

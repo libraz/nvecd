@@ -13,6 +13,7 @@
 #include <cerrno>
 #include <cmath>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <nlohmann/json-schema.hpp>
 #include <nlohmann/json.hpp>
@@ -22,6 +23,7 @@
 
 #include "config/config_schema_embedded.h"
 #include "events/co_occurrence_index.h"
+#include "storage/snapshot_format.h"
 #include "utils/error.h"
 #include "utils/structured_log.h"
 
@@ -779,6 +781,15 @@ utils::Expected<void, utils::Error> ValidateConfig(const Config& config) {
     return utils::MakeUnexpected(
         utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
                          "snapshot.mode must be 'fork' or 'lock' (got: " + config.snapshot.mode + ")"));
+  }
+  // A default name recovery would not scan could checkpoint the WAL against an unrecoverable file.
+  if (!config.snapshot.default_filename.empty() &&
+      !storage::snapshot_format::IsRecoverableExtension(
+          std::filesystem::path(config.snapshot.default_filename).extension().string())) {
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
+                                                  "snapshot.default_filename must end in " +
+                                                      storage::snapshot_format::RecoverableExtensionList() +
+                                                      " (got: " + config.snapshot.default_filename + ")"));
   }
 
   // Validate performance configuration

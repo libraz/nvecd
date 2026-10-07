@@ -304,8 +304,8 @@
         },
         "default_filename": {
           "type": "string",
-          "description": "Filename an argument-less DUMP SAVE writes inside the snapshot directory; validated like a client-supplied path, so an absolute or escaping name is refused (empty = fall back to a timestamped name). Must end in .nvec or .dmp, or startup will not treat the file as a recovery candidate",
-          "description_ja": "引数なしの DUMP SAVE がスナップショットディレクトリ内に書き込むファイル名。クライアント指定のパスと同様に検証されるため、絶対パスやディレクトリを抜け出す名前は拒否される（空 = タイムスタンプ付きの名前にフォールバック）。.nvec か .dmp で終わる必要があり、そうでないと起動時に復旧候補として扱われない",
+          "description": "Filename an argument-less DUMP SAVE writes inside the snapshot directory; validated like a client-supplied path, so an absolute or escaping name is refused (empty = fall back to a timestamped name). Must end in .nvec or .dmp, the extensions startup recovery scans for; any other name is rejected when the configuration loads",
+          "description_ja": "引数なしの DUMP SAVE がスナップショットディレクトリ内に書き込むファイル名。クライアント指定のパスと同様に検証されるため、絶対パスやディレクトリを抜け出す名前は拒否される（空 = タイムスタンプ付きの名前にフォールバック）。起動時の復旧が探す拡張子である .nvec か .dmp で終わる必要があり、それ以外の名前は設定の読み込み時に拒否される",
           "default": "nvecd.nvec"
         },
         "interval_sec": {
