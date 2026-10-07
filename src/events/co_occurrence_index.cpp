@@ -227,11 +227,15 @@ void CoOccurrenceIndex::UpdateFromEventsInternal(const std::string& ctx [[maybe_
   // Prune affected items after a bulk update. Apply min_support immediately
   // as well, otherwise a deployment with decay disabled never enforces it.
   if (config_.max_neighbors_per_item > 0 || config_.min_support > 0.0F) {
-    for (size_t i = 0; i < events.size(); ++i) {
-      auto it = co_scores_.find(events[i].item_id);
-      if (it != co_scores_.end() && it->second.size() > config_.max_neighbors_per_item) {
-        PruneItemLocked(events[i].item_id);
-      }
+    std::vector<std::string> affected_ids;
+    affected_ids.reserve(events.size());
+    for (const auto& event : events) {
+      affected_ids.push_back(event.item_id);
+    }
+    std::sort(affected_ids.begin(), affected_ids.end());
+    affected_ids.erase(std::unique(affected_ids.begin(), affected_ids.end()), affected_ids.end());
+    for (const auto& item_id : affected_ids) {
+      PruneItemLocked(item_id);
     }
   }
 }
@@ -247,6 +251,7 @@ void CoOccurrenceIndex::ApplyNegativeSignalLocked(const std::string& removed_id,
     return;
   }
 
+  std::vector<std::string> affected_ids{removed_id};
   for (const auto& event : context_events) {
     if (event.item_id == removed_id) {
       continue;
@@ -257,12 +262,28 @@ void CoOccurrenceIndex::ApplyNegativeSignalLocked(const std::string& removed_id,
 
     auto reduction = static_cast<float>(event.score * negative_weight);
 
+    // A zero reduction must not materialize an edge, as in the positive path.
+    if (reduction == 0.0F) {
+      continue;
+    }
+
     // Symmetric reduction (both directions)
     co_scores_[removed_id][event.item_id] -= reduction;
     co_scores_[event.item_id][removed_id] -= reduction;
+    affected_ids.push_back(event.item_id);
   }
 
   generation_.fetch_add(1, std::memory_order_release);
+
+  // A reduction can create an edge that did not exist, so the retention bounds
+  // apply to every ID it touched, in the same write.
+  if (config_.max_neighbors_per_item > 0 || config_.min_support > 0.0F) {
+    std::sort(affected_ids.begin(), affected_ids.end());
+    affected_ids.erase(std::unique(affected_ids.begin(), affected_ids.end()), affected_ids.end());
+    for (const auto& item_id : affected_ids) {
+      PruneItemLocked(item_id);
+    }
+  }
 }
 
 size_t CoOccurrenceIndex::GetNeighborCount(const std::string& item_id) const {
@@ -296,13 +317,17 @@ std::vector<std::pair<std::string, float>> CoOccurrenceIndex::GetSimilar(const s
     }
   }
 
-  // Sort by score descending
-  std::sort(results.begin(), results.end(), [](const auto& lhs, const auto& rhs) { return lhs.second > rhs.second; });
-
-  // Return top-k results
-  if (results.size() > static_cast<size_t>(top_k)) {
-    results.resize(static_cast<size_t>(top_k));
-  }
+  // Score descending, ties by ascending id: the selected set at the top-k
+  // boundary must not depend on hash iteration order.
+  const size_t keep = std::min(results.size(), static_cast<size_t>(top_k));
+  std::partial_sort(results.begin(), results.begin() + static_cast<ptrdiff_t>(keep), results.end(),
+                    [](const auto& lhs, const auto& rhs) {
+                      if (lhs.second != rhs.second) {
+                        return lhs.second > rhs.second;
+                      }
+                      return lhs.first < rhs.first;
+                    });
+  results.resize(keep);
 
   return results;
 }
@@ -464,10 +489,17 @@ void CoOccurrenceIndex::PruneItemLocked(const std::string& item_id) {
 
   // Trim to max_neighbors if needed
   if (config_.max_neighbors_per_item > 0 && neighbors.size() > config_.max_neighbors_per_item) {
-    // Collect into vector, sort by absolute score descending, keep top-K
+    // Collect into vector, sort by absolute score descending (ties by ascending
+    // id, so the kept set does not depend on hash order), keep top-K
     std::vector<std::pair<std::string, float>> sorted_neighbors(neighbors.begin(), neighbors.end());
-    std::sort(sorted_neighbors.begin(), sorted_neighbors.end(),
-              [](const auto& a, const auto& b) { return std::abs(a.second) > std::abs(b.second); });
+    std::sort(sorted_neighbors.begin(), sorted_neighbors.end(), [](const auto& a, const auto& b) {
+      const float score_a = std::abs(a.second);
+      const float score_b = std::abs(b.second);
+      if (score_a != score_b) {
+        return score_a > score_b;
+      }
+      return a.first < b.first;
+    });
 
     // Remove entries beyond max_neighbors
     for (size_t i = config_.max_neighbors_per_item; i < sorted_neighbors.size(); ++i) {

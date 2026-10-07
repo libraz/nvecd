@@ -22,6 +22,24 @@
 
 namespace nvecd::similarity {
 
+namespace {
+
+/// Ranks a (score, row) candidate ahead of another: higher score first, then
+/// ascending item id, the order SimilarityResult::operator< defines. Used as the
+/// heap comparator, so the heap top is the worst candidate kept.
+struct CandidateRanksBefore {
+  const std::vector<std::string>* ids;
+
+  bool operator()(const std::pair<float, size_t>& lhs, const std::pair<float, size_t>& rhs) const {
+    if (lhs.first != rhs.first) {
+      return lhs.first > rhs.first;
+    }
+    return (*ids)[lhs.second] < (*ids)[rhs.second];
+  }
+};
+
+}  // namespace
+
 SimilarityEngine::SimilarityEngine(events::EventStore* event_store, events::CoOccurrenceIndex* co_index,
                                    vectors::VectorStore* vector_store, const config::SimilarityConfig& config,
                                    const config::VectorsConfig& vectors_config, vectors::MetadataStore* metadata_store)
@@ -102,12 +120,21 @@ void SimilarityEngine::EnsureAnnDimension() {
     return;  // No vector stored yet; nothing to bind to.
   }
   if (real_dim != ann_dimension_) {
-    // Rebind the still-empty index to the real dimension. Rebuild(nullptr, 0,
-    // dim) resets the index and adopts the new dimension without inserting.
-    ann_index_->Rebuild(nullptr, 0, real_dim);
+    // Rebind the still-empty index to the real dimension: an empty replacement
+    // resets the index and adopts the new dimension without inserting.
+    ReplaceAnnContents(nullptr, 0, real_dim, nullptr);
     ann_dimension_ = real_dim;
   }
   ann_dimension_bound_ = true;
+}
+
+void SimilarityEngine::ReplaceAnnContents(const float* matrix, uint32_t count, uint32_t dimension,
+                                          const std::vector<bool>* deleted) {
+  // The one place ANN contents are replaced wholesale. The adapters hold no
+  // train-threshold or tombstone policy of their own: rows flagged in @p deleted
+  // are left out, and an IVF index comes back untrained for the background
+  // trainer to gate on ivf_train_threshold.
+  ann_index_->Rebuild(matrix, count, dimension, deleted);
 }
 
 void SimilarityEngine::RebuildAnnFromStore() {
@@ -115,32 +142,40 @@ void SimilarityEngine::RebuildAnnFromStore() {
     return;  // flat: nothing to rebuild
   }
   JoinTrainThread();
-  std::unique_lock publication_lock(ann_publication_mutex_);
-  // A rebuild drops the trained layout and both write tiers. Excluding a seal
-  // in flight keeps it from committing assignments made against the layout this
-  // call is about to replace.
-  std::lock_guard seal_lock(ivf_seal_mutex_);
-  // Hold one store snapshot for both the index build and the generation
-  // publication. A search can therefore observe either the old pair or the
-  // complete new pair, never old ANN labels mapped through a new ID layout.
-  auto snap = vector_store_->GetCompactSnapshot();
-  const auto dim = static_cast<uint32_t>(snap.dim);
-  const auto count = static_cast<uint32_t>(snap.count);
-  ann_index_->Rebuild(snap.matrix, count, dim == 0 ? ann_dimension_ : dim);
-  ann_generation_.store(snap.generation, std::memory_order_release);
-  if (dim == 0) {
-    ann_dimension_bound_ = false;
-    return;
-  }
-  ann_dimension_ = dim;
-  ann_dimension_bound_ = true;
+  {
+    std::unique_lock publication_lock(ann_publication_mutex_);
+    // A rebuild drops the trained layout and both write tiers. Excluding a seal
+    // in flight keeps it from committing assignments made against the layout this
+    // call is about to replace.
+    std::lock_guard seal_lock(ivf_seal_mutex_);
+    // Hold one store snapshot for both the index build and the generation
+    // publication. A search can therefore observe either the old pair or the
+    // complete new pair, never old ANN labels mapped through a new ID layout.
+    auto snap = vector_store_->GetCompactSnapshot();
+    const auto dim = static_cast<uint32_t>(snap.dim);
+    const auto count = static_cast<uint32_t>(snap.count);
+    ReplaceAnnContents(snap.matrix, count, dim == 0 ? ann_dimension_ : dim, snap.deleted);
+    ann_rebuild_count_.fetch_add(1, std::memory_order_relaxed);
+    ann_generation_.store(snap.generation, std::memory_order_release);
+    if (dim == 0) {
+      ann_dimension_bound_ = false;
+      return;
+    }
+    ann_dimension_ = dim;
+    ann_dimension_bound_ = true;
 
-  utils::StructuredLog()
-      .Event("ann_index_rebuilt_from_store")
-      .Field("index_type", config_.index_type)
-      .Field("count", static_cast<uint64_t>(count))
-      .Field("dimension", static_cast<uint64_t>(dim))
-      .Info();
+    utils::StructuredLog()
+        .Event("ann_index_rebuilt_from_store")
+        .Field("index_type", config_.index_type)
+        .Field("count", static_cast<uint64_t>(count))
+        .Field("dimension", static_cast<uint64_t>(dim))
+        .Info();
+  }
+
+  // The rebuild leaves an IVF index untrained with its live rows buffered.
+  // Training takes its own store snapshot, so it starts only once the locks
+  // above are released.
+  MaybeTrainIvfIndex();
 }
 
 SimilarityEngine::~SimilarityEngine() {
@@ -149,10 +184,16 @@ SimilarityEngine::~SimilarityEngine() {
 }
 
 void SimilarityEngine::JoinTrainThread() {
-  if (ivf_train_thread_ && ivf_train_thread_->joinable()) {
-    ivf_train_thread_->join();
+  // Take the handle out under the lock so concurrent callers (rebuilds from
+  // several writers, the destructor) never join the same thread twice.
+  std::unique_ptr<std::thread> thread;
+  {
+    std::lock_guard lock(ivf_train_thread_mutex_);
+    thread = std::move(ivf_train_thread_);
   }
-  ivf_train_thread_.reset();
+  if (thread && thread->joinable()) {
+    thread->join();
+  }
 }
 
 SimilarityEngine::DistanceFunc SimilarityEngine::SelectDistanceFunction(const std::string& metric) {
@@ -350,8 +391,8 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
   // Bounded min-heap: track top-k (score, index) pairs without string allocation
   int k = validated_top_k.value();
   using ScoreIdx = std::pair<float, size_t>;
-  auto cmp = [](const ScoreIdx& a, const ScoreIdx& b) { return a.first > b.first; };
-  std::priority_queue<ScoreIdx, std::vector<ScoreIdx>, decltype(cmp)> min_heap(cmp);
+  const CandidateRanksBefore cmp{snap.idx_to_id};
+  std::priority_queue<ScoreIdx, std::vector<ScoreIdx>, CandidateRanksBefore> min_heap(cmp);
 
   // Lambda to push a candidate into the min-heap
   auto push_candidate = [&](size_t idx) {
@@ -375,14 +416,16 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
     }
     if (static_cast<int>(min_heap.size()) < k) {
       min_heap.push({score, idx});
-    } else if (score > min_heap.top().first) {
+    } else if (cmp(ScoreIdx{score, idx}, min_heap.top())) {
       min_heap.pop();
       min_heap.push({score, idx});
     }
   };
 
   // Determine whether to sample; avoid allocating full index vector for full scan
-  bool use_sampling = config_.sample_size > 0 && snap.count > config_.sample_size * 2;
+  // A filter is applied per row, so sampling first would leave a sparse filter
+  // too few survivors to fill top_k; a filtered query scans every row instead.
+  bool use_sampling = !has_filter && config_.sample_size > 0 && snap.count > config_.sample_size * 2;
   if (use_sampling) {
     auto scan_indices = SampleIndices(snap.count, config_.sample_size);
     for (size_t idx : scan_indices) {
@@ -498,20 +541,25 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
         .Warn();
   }
 
-  // Normalize scores for each source
-  if (has_event_candidates) {
-    NormalizeScores(*event_results);
-  }
-  if (has_vector_candidates) {
-    NormalizeScores(*vector_results);
+  // Min-max normalization puts the two sources on one scale so they can be
+  // weighted against each other. A lone source has nothing to be weighed
+  // against and keeps its own scale, so min_score cuts the same items in fusion
+  // as in the single-source query.
+  const bool single_source = has_event_candidates != has_vector_candidates;
+  if (!single_source) {
+    if (has_event_candidates) {
+      NormalizeScores(*event_results);
+    }
+    if (has_vector_candidates) {
+      NormalizeScores(*vector_results);
+    }
   }
 
   // If one source has no candidates, its configured weight must not shrink the
-  // surviving score. Re-normalize the contributing weights to one so min_score
-  // has identical semantics in fusion and its single-source fallback.
+  // surviving score, so the lone source is taken at weight one.
   float event_weight = has_event_candidates ? beta : 0.0F;
   float vector_weight = has_vector_candidates ? alpha : 0.0F;
-  if (has_event_candidates != has_vector_candidates) {
+  if (single_source) {
     event_weight = has_event_candidates ? 1.0F : 0.0F;
     vector_weight = has_vector_candidates ? 1.0F : 0.0F;
   } else if (const float contributing_weight = event_weight + vector_weight; contributing_weight > 0.0F) {
@@ -703,8 +751,8 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
   // Bounded min-heap: track top-k (score, index) pairs without string allocation
   int k = validated_top_k.value();
   using ScoreIdx = std::pair<float, size_t>;
-  auto cmp = [](const ScoreIdx& a, const ScoreIdx& b) { return a.first > b.first; };
-  std::priority_queue<ScoreIdx, std::vector<ScoreIdx>, decltype(cmp)> min_heap(cmp);
+  const CandidateRanksBefore cmp{snap.idx_to_id};
+  std::priority_queue<ScoreIdx, std::vector<ScoreIdx>, CandidateRanksBefore> min_heap(cmp);
 
   // Lambda to push a candidate into the min-heap
   auto push_candidate = [&](size_t idx) {
@@ -725,14 +773,16 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
     }
     if (static_cast<int>(min_heap.size()) < k) {
       min_heap.push({score, idx});
-    } else if (score > min_heap.top().first) {
+    } else if (cmp(ScoreIdx{score, idx}, min_heap.top())) {
       min_heap.pop();
       min_heap.push({score, idx});
     }
   };
 
   // Determine whether to sample; avoid allocating full index vector for full scan
-  bool use_sampling = config_.sample_size > 0 && snap.count > config_.sample_size * 2;
+  // A filter is applied per row, so sampling first would leave a sparse filter
+  // too few survivors to fill top_k; a filtered query scans every row instead.
+  bool use_sampling = !has_filter && config_.sample_size > 0 && snap.count > config_.sample_size * 2;
   if (use_sampling) {
     auto scan_indices = SampleIndices(snap.count, config_.sample_size);
     for (size_t idx : scan_indices) {
@@ -894,13 +944,10 @@ void SimilarityEngine::NotifyVectorAdded(size_t compact_index, const float* vect
 
   const uint64_t published_generation = ann_generation_.load(std::memory_order_relaxed);
   if (published_generation == std::numeric_limits<uint64_t>::max() || published_generation + 1 != snap.generation) {
-    // Rebuild resets the index, so it must not overlap a seal committing
-    // assignments made against the layout being replaced.
-    std::lock_guard seal_lock(ivf_seal_mutex_);
-    ann_index_->Rebuild(snap.matrix, static_cast<uint32_t>(snap.count), static_cast<uint32_t>(snap.dim));
-    ann_dimension_ = static_cast<uint32_t>(snap.dim);
-    ann_dimension_bound_ = true;
-    ann_generation_.store(snap.generation, std::memory_order_release);
+    // The index missed a mutation, so it is rebuilt from the store.
+    snap.lock.unlock();
+    publication_lock.unlock();
+    RebuildAnnFromStore();
     return;
   }
 
@@ -917,7 +964,7 @@ void SimilarityEngine::NotifyVectorAdded(size_t compact_index, const float* vect
     case vectors::AnnIndexType::kIvf: {
       // IVF: append to write buffer (fast path)
       auto* adapter = static_cast<vectors::IvfAnnAdapter*>(ann_index_.get());
-      adapter->GetIvfIndex()->AppendToBuffer(compact_index, published_vector);
+      adapter->Add(static_cast<uint32_t>(compact_index), published_vector);
 
       start_ivf_training = !adapter->IsTrained();
       buffered_for_ivf = true;
@@ -949,7 +996,18 @@ void SimilarityEngine::NotifyVectorRemoved(size_t compact_index) {
     return;
   }
   std::unique_lock publication_lock(ann_publication_mutex_);
+  auto snap = vector_store_->GetCompactSnapshot();
+  const uint64_t published_generation = ann_generation_.load(std::memory_order_relaxed);
+  if (published_generation == std::numeric_limits<uint64_t>::max() || published_generation + 1 != snap.generation) {
+    // The index missed a mutation besides this removal, so it is rebuilt from
+    // the store, whose tombstones the rebuild leaves out.
+    snap.lock.unlock();
+    publication_lock.unlock();
+    RebuildAnnFromStore();
+    return;
+  }
   ann_index_->MarkDeleted(static_cast<uint32_t>(compact_index));
+  ann_generation_.store(snap.generation, std::memory_order_release);
 }
 
 bool SimilarityEngine::IsIvfTrained() const {
@@ -1004,9 +1062,8 @@ void SimilarityEngine::ForceIvfTrain() {
   }
   // Training rebuilds the partition and drops the inverted lists with it, so
   // everything the store holds has to be assigned against the new centroids.
-  // The incremental trainer assigns only the write buffer, which after a
-  // retrain of a populated index is empty: it would leave a trained index
-  // reporting readiness with nothing in it.
+  // The rebuild buffers every live row and then trains, so the seal that
+  // follows training publishes the whole corpus.
   RebuildAnnFromStore();
 }
 
@@ -1099,14 +1156,6 @@ void SimilarityEngine::MaybeTrainIvfIndex() {
     // snap (and its read lock) is released here, before k-means launch.
   }
 
-  // Pre-compute nlist based on TOTAL vector count (not sample size).
-  // This ensures the number of clusters scales with the full dataset.
-  if (config_.ivf_nlist == 0) {
-    auto sqrt_n = static_cast<uint32_t>(std::max(1.0, std::sqrt(static_cast<double>(valid_count))));
-    uint32_t nlist = std::min(sqrt_n, vectors::IvfIndex::kMaxAutoNlist);
-    ivf_index->SetNlist(nlist);
-  }
-
   utils::StructuredLog()
       .Event("ivf_training_start_async")
       .Field("vector_count", static_cast<int64_t>(valid_count))
@@ -1118,11 +1167,12 @@ void SimilarityEngine::MaybeTrainIvfIndex() {
 
   // Launch training in a background thread.
   // After training, seal the write buffer to move buffered entries into IVF.
-  ivf_train_thread_ = std::make_unique<std::thread>(
-      [this, ivf_index, sample_matrix, sample_indices = std::move(sample_indices), dim]() {
+  auto train_thread = std::make_unique<std::thread>(
+      [this, adapter, ivf_index, sample_matrix, sample_indices = std::move(sample_indices), dim, valid_count]() {
         // Phase 1: Train centroids on the sample (no vector assignment
-        // since all data is already in the write buffer)
-        ivf_index->Train(sample_matrix->data(), sample_indices.data(), sample_indices.size(), dim, false);
+        // since all data is already in the write buffer). An auto nlist scales
+        // with the whole corpus, not with the sample.
+        adapter->Train(sample_matrix->data(), sample_indices.data(), sample_indices.size(), dim, valid_count);
 
         // Phase 2: Seal the write buffer to assign buffered entries to
         // the newly-trained IVF clusters. Routed through the engine's single
@@ -1138,6 +1188,8 @@ void SimilarityEngine::MaybeTrainIvfIndex() {
 
         ivf_training_.store(false);
       });
+  std::lock_guard thread_lock(ivf_train_thread_mutex_);
+  ivf_train_thread_ = std::move(train_thread);
 }
 
 // ============================================================================

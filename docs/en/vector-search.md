@@ -143,8 +143,9 @@ corpus, so query cost falls roughly in proportion to `nprobe / nlist`.
 
 IVF has to be trained before it can partition anything. Training starts once the
 store holds `ivf_train_threshold` vectors (default 10000) and runs in a
-background thread over a sample of at most 50000 vectors, so ingestion is not
-blocked by it. `ivf_nlist` (default 256) sets the number of cells; 0 derives
+background thread, so ingestion is not blocked by it. Up to 50000 vectors are
+copied for the run and k-means trains on a random sample of at most 10000 of
+them. `ivf_nlist` (default 256) sets the number of cells; 0 derives
 `sqrt(n)`, capped at 1024.
 
 Until training finishes, and for every vector written after it, new vectors land
@@ -255,7 +256,10 @@ exist anywhere in the corpus, not merely among the first `top_k` unfiltered
 candidates.
 
 `min_score` runs **after** top-k selection. It is a cutoff on the returned rows,
-not a search parameter, so it can only shrink the response:
+not a search parameter, so it can only shrink the response. The default of
+`0.0` already excludes rows with a negative score, so under `cosine` or `dot`
+a query returns fewer than `top_k` rows when the corpus holds too few
+non-negative matches:
 
 ```bash
 SIM item42 10 using=vectors min_score=0.8

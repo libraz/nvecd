@@ -48,8 +48,11 @@ a new event and contributes again, so `ADD` is idempotent only within the window
 
 `SET` is the state verb — a rating, a like, a bookmark. It is deduplicated by
 last value: a repeat with a score the context already holds for that item is
-dropped, regardless of elapsed time. Re-sending the same `SET` is therefore
-always a no-op, and changing the score is always a new event.
+dropped, regardless of elapsed time. Re-sending the same `SET` is therefore a
+no-op, and changing the score is always a new event. The last values live in a
+bounded cache that a restart rebuilds from the events still in each context's
+buffer, so a `SET` whose event has already left the buffer is applied again
+after a restart.
 
 `DEL` is the removal verb — an unlike, a removed bookmark, a dismissed
 recommendation. It carries no score: the server stores it with a score of exactly

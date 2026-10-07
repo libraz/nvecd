@@ -50,7 +50,7 @@ similarity:
   sample_size: 10000
 ```
 
-`flat` scans every vector and returns the exact top-k. It is the default, it needs no build step and no training, and it is the right answer for a corpus small enough that a scan fits the latency budget. Its cost is linear in both corpus size and dimension.
+`flat` scans vectors and returns the exact top-k as long as `sample_size` is 0 or the corpus is at most twice `sample_size`; above that it scores a random sample (see `sample_size` below). It is the default, it needs no build step and no training, and it is the right answer for a corpus small enough that a scan fits the latency budget. Its cost is linear in both corpus size and dimension.
 
 `hnsw` builds a navigable graph. Recall is tuned by `hnsw_ef_search`, the search width at query time: higher means more of the graph explored, higher recall and more latency. `hnsw_m` and `hnsw_ef_construction` govern the graph itself and take effect at build time, so changing them means rebuilding. `hnsw_max_elements` reserves capacity at startup; left at 0 the graph grows on demand.
 
@@ -122,7 +122,7 @@ Four readings decide whether the cache earns its memory.
 
 ## Vector dimension
 
-`vectors.default_dimension` is fixed for the store. It multiplies three things at once: the memory each vector occupies, the work a distance computation does, and the size of an ANN index built over the vectors.
+The store's dimension is fixed by the first vector it receives; `vectors.default_dimension` only pre-sizes the ANN index. The dimension multiplies three things at once: the memory each vector occupies, the work a distance computation does, and the size of an ANN index built over the vectors.
 
 The scanning path is linear in dimension, so halving the dimension roughly halves scan cost. Only dimension 128 has measured figures, in [Benchmarks](./benchmarks.md#search-latency); other dimensions follow that scaling but have not been measured. Where the embedding model allows a choice, a smaller dimension is cheaper in every dimension of cost at once, and the quality difference is a property of the model rather than of nvecd.
 
@@ -149,7 +149,7 @@ bytes ≈ vectors × dimension × 4      (the matrix, float32)
       + vectors × (id length + index overhead)
 ```
 
-The matrix dominates as soon as the dimension is more than a few dozen: at dimension 768, a million vectors is about 3 GB of matrix, and everything else is rounding. Deleting a vector does not shrink the matrix — it sets a tombstone, and the space returns when the store defragments.
+The matrix dominates the store as soon as the dimension is more than a few dozen: at dimension 768, a million vectors is about 3 GB of matrix, and everything else in the store is rounding. An ANN index is a separate allocation on top of that. `hnsw` keeps its own copy of every vector (another `vectors × dimension × 4`) plus a norm per vector and the graph's adjacency lists, so an HNSW server needs more than twice the figure above. `ivf` holds the centroids, the inverted lists of ids, and a copy of each vector still waiting in the write buffer. None of this appears in `INFO` or in the memory metrics. Deleting a vector does not shrink the matrix — it sets a tombstone, and the space returns when the store defragments.
 
 Event memory has no comparable formula, because the co-occurrence index is a map of maps whose width depends on the data. It grows with the number of items that have neighbours, times the neighbour count each has accumulated, and both string keys are stored. `max_neighbors_per_item` is what bounds it.
 

@@ -699,6 +699,10 @@ utils::Expected<void, utils::Error> ValidateConfig(const Config& config) {
     return utils::MakeUnexpected(
         utils::MakeError(utils::ErrorCode::kConfigInvalidValue, "similarity.fusion_beta must be between 0.0 and 1.0"));
   }
+  if (config.similarity.fusion_alpha + config.similarity.fusion_beta <= 0.0) {
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
+                                                  "similarity.fusion_alpha and fusion_beta must not both be 0"));
+  }
   if (config.similarity.adaptive_min_alpha < 0.0 || config.similarity.adaptive_min_alpha > 1.0) {
     return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
                                                   "similarity.adaptive_min_alpha must be between 0.0 and 1.0"));

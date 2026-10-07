@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 
+#include "events/id_validation.h"
 #include "utils/error.h"
 #include "utils/structured_log.h"
 #include "vectors/distance.h"
@@ -19,8 +20,10 @@ VectorStore::VectorStore(config::VectorsConfig config) : config_(std::move(confi
 
 utils::Expected<void, utils::Error> VectorStore::ValidateVector(const std::string& vector_id,
                                                                 const std::vector<float>& vec) const {
-  if (vector_id.empty()) {
-    auto error = utils::MakeError(utils::ErrorCode::kInvalidArgument, "ID cannot be empty");
+  // Ids are written unescaped into line-framed responses, so every surface that
+  // stores one shares the event layer's identifier rules.
+  if (auto id_check = events::ValidateIdentifier("ID", vector_id); !id_check) {
+    auto error = utils::MakeError(utils::ErrorCode::kInvalidArgument, id_check.error().message());
     utils::LogVectorStoreError("set_vector", vector_id, static_cast<int>(vec.size()), error.message());
     return utils::MakeUnexpected(error);
   }

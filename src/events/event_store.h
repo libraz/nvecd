@@ -107,7 +107,7 @@ class EventValidator {
  */
 struct EventStoreStatistics {
   size_t active_contexts = 0;   ///< Number of contexts with events
-  uint64_t total_events = 0;    ///< Total events processed (cumulative)
+  uint64_t total_events = 0;    ///< Events processed since start (a restore counts the restored events)
   uint64_t deduped_events = 0;  ///< Total deduplicated events (ignored)
   size_t stored_events = 0;     ///< Current number of stored events
   size_t memory_bytes = 0;      ///< Estimated memory usage in bytes
@@ -210,7 +210,8 @@ class EventStore {
    * byte-for-byte: temporal-decay weights depend on the original timestamps and
    * DEL/SET semantics depend on the original types, neither of which must be
    * altered by replaying through the dedup path. The total event counter is
-   * incremented to mirror the original ingestion count.
+   * incremented once per restored event, so after a restore it counts the
+   * restored buffer contents rather than the original ingestion total.
    *
    * What is restored verbatim is the value, not an exemption from the store's
    * invariants: the event goes through EventValidator just like a wire event,
@@ -254,6 +255,10 @@ class EventStore {
 
   /**
    * @brief Get all context identifiers
+   *
+   * Ordered from least to most recently written, so restoring contexts in this
+   * order reproduces the eviction order.
+   *
    * @return Vector of all context IDs
    */
   std::vector<std::string> GetAllContexts() const;

@@ -44,6 +44,14 @@ class SimilarityCacheTestHelper {
     return cache.item_to_cache_keys_.size();
   }
 
+  /// True when the stored payload holds no capacity beyond its length.
+  static bool PayloadIsTight(SimilarityCache& cache, const CacheKey& key) {
+    std::shared_lock lock(cache.mutex_);
+    auto iter = cache.cache_map_.find(key);
+    return iter != cache.cache_map_.end() &&
+           iter->second.first.compressed_data.capacity() == iter->second.first.compressed_data.size();
+  }
+
   static bool EntryIsCompressed(SimilarityCache& cache, const CacheKey& key) {
     std::shared_lock lock(cache.mutex_);
     auto iter = cache.cache_map_.find(key);
@@ -160,6 +168,25 @@ TEST(SimilarityCacheTest, CompressionSettingChangesStoredRepresentation) {
   ASSERT_EQ(loaded->size(), 1U);
   EXPECT_EQ(loaded->front().item_id, "item");
   EXPECT_FLOAT_EQ(loaded->front().score, 0.75F);
+}
+
+// Compression exists to shrink what the cache holds, so the stored payload must
+// not keep the worst-case buffer the compressor allocated for it.
+TEST(SimilarityCacheTest, CompressedEntryHoldsOnlyItsCompressedBytes) {
+  const auto key = MakeKey("compressed", 1);
+  std::vector<similarity::SimilarityResult> results;
+  for (int row = 0; row < 100; ++row) {
+    results.emplace_back("item_" + std::to_string(row), 0.5F);
+  }
+
+  SimilarityCache compressed(1024 * 1024, 0.0, 0, true, 1);
+  SimilarityCache plain(1024 * 1024, 0.0, 0, false, 1);
+  ASSERT_TRUE(compressed.Insert(key, results, 1.0));
+  ASSERT_TRUE(plain.Insert(key, results, 1.0));
+
+  ASSERT_TRUE(SimilarityCacheTestHelper::EntryIsCompressed(compressed, key));
+  EXPECT_TRUE(SimilarityCacheTestHelper::PayloadIsTight(compressed, key));
+  EXPECT_LE(compressed.GetStatistics().current_memory_bytes * 10, plain.GetStatistics().current_memory_bytes);
 }
 
 TEST(SimilarityCacheTest, EvictionBatchSettingEvictsInConfiguredGroups) {

@@ -148,9 +148,10 @@ class SimilarityEngine {
   /**
    * @brief Notify the engine that a vector was added or updated
    *
-   * If IVF is enabled and trained, adds the vector to the IVF index.
-   * If IVF is enabled but not yet trained, checks if the training
-   * threshold has been reached and triggers training if so.
+   * Adds the vector to the ANN index, replacing the entry of an overwritten
+   * compact index. If the index has missed another mutation it is rebuilt from
+   * the store instead. If IVF is enabled but not yet trained, checks if the
+   * training threshold has been reached and triggers training if so.
    *
    * @param compact_index Index in compact storage
    * @param vector Pointer to vector data
@@ -159,6 +160,11 @@ class SimilarityEngine {
 
   /**
    * @brief Notify the engine that a vector was removed
+   *
+   * Retires the entry incrementally and advances the generation the index
+   * mirrors, unless the index missed another mutation, in which case it is
+   * rebuilt from the store.
+   *
    * @param compact_index Index that was removed
    */
   void NotifyVectorRemoved(size_t compact_index);
@@ -221,14 +227,22 @@ class SimilarityEngine {
   /**
    * @brief Rebuild the ANN index from the current VectorStore contents
    *
-   * Resets the ANN index and re-inserts every vector currently held by the
-   * VectorStore, adopting the store's actual dimension. Must be called after a
+   * Resets the ANN index and re-inserts every live vector currently held by the
+   * VectorStore, adopting the store's actual dimension. Tombstoned rows are left
+   * out. An IVF index comes back untrained with its rows buffered; training then
+   * starts in the background once the corpus reaches ivf_train_threshold. Must be called after a
    * snapshot load or DUMP LOAD: those paths repopulate the VectorStore directly
    * without going through NotifyVectorAdded, so without this the ANN index would
    * silently omit the restored corpus (and, after the first post-load VECSET,
    * misattribute stale compact indices). No-op for the flat index.
    */
   void RebuildAnnFromStore();
+
+  /// @brief VectorStore generation the ANN index currently mirrors
+  uint64_t GetAnnGeneration() const { return ann_generation_.load(std::memory_order_acquire); }
+
+  /// @brief Number of full ANN rebuilds from the store since construction
+  uint64_t GetAnnRebuildCount() const { return ann_rebuild_count_.load(std::memory_order_relaxed); }
 
   /**
    * @brief Get the configured index type
@@ -315,8 +329,23 @@ class SimilarityEngine {
   mutable std::shared_mutex ann_publication_mutex_;
   std::atomic<uint64_t> ann_generation_{0};
 
+  /// Full rebuilds from the store since construction.
+  std::atomic<uint64_t> ann_rebuild_count_{0};
+
   /// Dimension the ANN index is currently bound to (0 = flat/no index).
   uint32_t ann_dimension_ = 0;
+
+  /**
+   * @brief Replace the ANN index contents with the given live rows
+   *
+   * Callers hold ann_publication_mutex_ exclusively.
+   *
+   * @param matrix Contiguous [count x dimension] rows, or nullptr when empty
+   * @param count Number of rows
+   * @param dimension Dimension the index is bound to afterwards
+   * @param deleted Per-row tombstone flags, or nullptr when every row is live
+   */
+  void ReplaceAnnContents(const float* matrix, uint32_t count, uint32_t dimension, const std::vector<bool>* deleted);
 
   /// True once the ANN index has been bound to the real data dimension
   /// (via the first vector add or a rebuild-from-store).
@@ -324,6 +353,7 @@ class SimilarityEngine {
 
   /// Background thread for asynchronous IVF training
   std::unique_ptr<std::thread> ivf_train_thread_;
+  std::mutex ivf_train_thread_mutex_;  ///< Guards the handle above
 
   /// True while IVF training is in progress (search falls back to brute-force)
   std::atomic<bool> ivf_training_{false};

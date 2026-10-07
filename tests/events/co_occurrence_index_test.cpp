@@ -597,4 +597,21 @@ TEST(CoOccurrenceIndexTest, ApplyDecay_RemovesNearZeroEntries) {
 }
 
 }  // namespace
+// Items tied at the top-k boundary are chosen by ascending id, not by whatever
+// order the hash map yields them in.
+TEST(CoOccurrenceIndexTest, TiedScoresSelectLowestIdsAtTopKBoundary) {
+  CoOccurrenceIndex index;
+  std::vector<Event> events = {Event("a", 10, 1000)};
+  for (const char* id : {"x7", "x3", "x5", "x1", "x8", "x2", "x6", "x4"}) {
+    events.emplace_back(id, 10, 1000);
+  }
+  index.UpdateFromEvents("ctx", events);
+
+  auto similar = index.GetSimilar("a", 3);
+  ASSERT_EQ(similar.size(), 3U);
+  EXPECT_EQ(similar[0].first, "x1");
+  EXPECT_EQ(similar[1].first, "x2");
+  EXPECT_EQ(similar[2].first, "x3");
+}
+
 }  // namespace nvecd::events

@@ -33,6 +33,9 @@ constexpr size_t kPrefetchAhead = 4;
 /// Minimum norm threshold to avoid division by zero
 constexpr float kNormEpsilon = 1e-7F;
 
+/// cluster_of_ value for a compact index that is in no inverted list
+constexpr uint32_t kNoCluster = std::numeric_limits<uint32_t>::max();
+
 /// Sentinel "worse than any real score" for max-selection across all metrics
 constexpr float kWorstScore = -std::numeric_limits<float>::infinity();
 
@@ -121,7 +124,7 @@ float IvfIndex::ScoreCandidate(const float* a, float norm_a, const float* b, flo
 }
 
 void IvfIndex::Train(const float* matrix, const size_t* valid_indices, size_t num_valid, uint32_t dimension,
-                     bool assign_vectors) {
+                     bool assign_vectors, size_t corpus_size) {
   // Prevent concurrent training attempts
   bool expected = false;
   if (!training_in_progress_.compare_exchange_strong(expected, true)) {
@@ -149,7 +152,8 @@ void IvfIndex::Train(const float* matrix, const size_t* valid_indices, size_t nu
 
   // Auto-scale nlist if set to 0: use sqrt(n), capped at kMaxAutoNlist
   if (effective_nlist == 0) {
-    auto sqrt_n = static_cast<uint32_t>(std::max(1.0, std::sqrt(static_cast<double>(num_valid))));
+    const size_t scaled_count = corpus_size > 0 ? corpus_size : num_valid;
+    auto sqrt_n = static_cast<uint32_t>(std::max(1.0, std::sqrt(static_cast<double>(scaled_count))));
     effective_nlist = std::min(sqrt_n, kMaxAutoNlist);
   }
 
@@ -194,6 +198,7 @@ void IvfIndex::Train(const float* matrix, const size_t* valid_indices, size_t nu
   // Initialize inverted lists
   inverted_lists_.clear();
   inverted_lists_.resize(config_.nlist);
+  cluster_of_.clear();
 
   // Assign vectors to clusters if requested
   if (assign_vectors) {
@@ -224,7 +229,7 @@ void IvfIndex::Train(const float* matrix, const size_t* valid_indices, size_t nu
         best = idx % nlist;
       }
 
-      inverted_lists_[best].push_back(idx);
+      AppendToListLocked(best, idx);
     }
   }
 
@@ -253,7 +258,7 @@ void IvfIndex::AddVector(size_t compact_index, const float* vector) {
   }
 
   size_t cluster = FindNearestCentroid(vector);
-  inverted_lists_[cluster].push_back(compact_index);
+  AppendToListLocked(cluster, compact_index);
 }
 
 void IvfIndex::BulkAddVectors(const size_t* compact_indices, const float* vectors, size_t count, uint32_t dimension) {
@@ -288,8 +293,26 @@ void IvfIndex::BulkAddVectors(const size_t* compact_indices, const float* vector
       best = idx % nlist;
     }
 
-    inverted_lists_[best].push_back(idx);
+    AppendToListLocked(best, idx);
   }
+}
+
+void IvfIndex::AppendToListLocked(size_t cluster, size_t compact_index) {
+  EraseIndexedLocked(compact_index);
+  inverted_lists_[cluster].push_back(compact_index);
+  if (compact_index >= cluster_of_.size()) {
+    cluster_of_.resize(compact_index + 1, kNoCluster);
+  }
+  cluster_of_[compact_index] = static_cast<uint32_t>(cluster);
+}
+
+void IvfIndex::EraseIndexedLocked(size_t compact_index) {
+  if (compact_index >= cluster_of_.size() || cluster_of_[compact_index] == kNoCluster) {
+    return;
+  }
+  auto& list = inverted_lists_[cluster_of_[compact_index]];
+  list.erase(std::remove(list.begin(), list.end(), compact_index), list.end());
+  cluster_of_[compact_index] = kNoCluster;
 }
 
 void IvfIndex::RemoveVector(size_t compact_index) {
@@ -302,17 +325,16 @@ void IvfIndex::RemoveVector(size_t compact_index) {
     EraseFromTier(compact_index, dim, sealing_indices_, sealing_vectors_, sealing_slots_);
   }
 
-  // Then check IVF inverted lists
+  // Then the inverted list. Most calls are the retire step of a first insert,
+  // so the exclusive lock is taken only when the index is actually sealed.
+  {
+    std::shared_lock lock(mutex_);
+    if (compact_index >= cluster_of_.size() || cluster_of_[compact_index] == kNoCluster) {
+      return;
+    }
+  }
   std::unique_lock lock(mutex_);
-
-  if (!trained_) {
-    return;
-  }
-
-  // Search all inverted lists for the compact_index
-  for (auto& list : inverted_lists_) {
-    list.erase(std::remove(list.begin(), list.end(), compact_index), list.end());
-  }
+  EraseIndexedLocked(compact_index);
 }
 
 std::vector<std::pair<float, size_t>> IvfIndex::Search(const float* query_vec, float query_norm, const float* matrix,
@@ -477,6 +499,7 @@ void IvfIndex::Reset(uint32_t dimension) {
   centroids_.clear();
   centroid_norms_.clear();
   inverted_lists_.clear();
+  cluster_of_.clear();
   ++layout_generation_;
 
   std::unique_lock buf_lock(buffer_mutex_);
@@ -670,9 +693,10 @@ bool IvfIndex::SealBuffer() {
     std::unique_lock buf_lock(buffer_mutex_);
     for (size_t i = 0; i < seal_indices.size(); ++i) {
       // Skip anything a concurrent RemoveVector took out of the sealing tier
-      // while the assignment ran off-lock.
-      if (sealing_slots_.count(seal_indices[i]) != 0) {
-        inverted_lists_[cluster_assignments[i]].push_back(seal_indices[i]);
+      // while the assignment ran off-lock, and anything overwritten since: its
+      // newer embedding is in the write buffer and is assigned by the next seal.
+      if (sealing_slots_.count(seal_indices[i]) != 0 && buffer_slots_.count(seal_indices[i]) == 0) {
+        AppendToListLocked(cluster_assignments[i], seal_indices[i]);
       }
     }
     ClearTier(sealing_indices_, sealing_vectors_, sealing_slots_);

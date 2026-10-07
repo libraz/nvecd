@@ -126,7 +126,9 @@ OK EVENT
 VECSET <id> <f1> <f2> ... <fN>
 ```
 
-`<id>` のベクトルを登録または置換します。次元は浮動小数点トークンの個数から決まり、ストアがすでに使っている次元と一致しなければなりません。最初のベクトルが次元を確定するまでは、その値は `vectors.default_dimension` です。
+`<id>` のベクトルを登録または置換します。次元は浮動小数点トークンの個数から決まり、ストアがすでに使っている次元と一致しなければなりません。その次元は最初に保存されたベクトルが確定させ、`vectors.default_dimension` は ANN 索引の事前サイズを決めるだけです。
+
+`<id>` は `EVENT` のアイテム ID と同じ識別子の規則に従います。空白区切りのコマンドでは違反を送れないため、拒否に届くのは JSON 面からで、そこでは 400 になり、何も保存もログ記録もされません。
 
 ```text
 > VECSET item1 0.1 0.2 0.3 0.4
@@ -189,7 +191,7 @@ SIM <id> <top_k> [using=events|vectors|fusion] [adaptive=on|off] [filter=<expr>]
 | `filter=` | フィルタ式（後述） | フィルタなし |
 | `min_score=` | 有限の浮動小数点数 | `0.0` |
 
-`adaptive=` は統合検索にのみ適用されます。`min_score=` は検索後に適用されるため、結果集合を広げるのではなく削ります。
+`adaptive=` は統合検索にのみ適用されます。`min_score=` は検索後に適用されるため、結果集合を広げるのではなく削ります。既定値の `0.0` はスコアが負の行を除外します。
 
 ```text
 > SIM item1 5 using=vectors
@@ -279,7 +281,7 @@ item2 0.9940
 ERROR Invalid filter condition: 'bogus'
 ```
 
-メタデータを持たないアイテムはどの条件にも一致しないため、フィルタは `METASET` または HTTP の `/metaset` と `/vecset` を通ったアイテムに結果を絞り込みます。
+メタデータを持たないアイテムは空のメタデータマップとして評価されます。`!=` 以外のすべての条件に失敗し、`!=` は欠けたフィールドを値と異なるものとして扱います。そのためフィルタが `!=` 条件だけで構成されていない限り、結果は `METASET` または HTTP の `/metaset` と `/vecset` を通ったアイテムに絞り込まれます。
 
 ## 管理コマンド
 
@@ -589,7 +591,7 @@ cache.ttl_seconds=600 (mutable)
 | `Failed to parse timestamp: <v>` | `timestamp=` が数値でない |
 | `Context cannot be empty` ／ `ID cannot be empty` | `EVENT` のコンテキストまたはアイテム ID が空 |
 | `Context must not contain whitespace or control characters` | `EVENT` のコンテキストに `0x20` 以下または `0x7F` のバイトがある |
-| `ID must not contain whitespace or control characters` | `EVENT` のアイテム ID に対する同じ規則 |
+| `ID must not contain whitespace or control characters` | `EVENT` のアイテム ID または `VECSET` の ID に対する同じ規則 |
 | `VECSET requires at least 2 arguments: <id> <floats>` | `VECSET` の引数個数 |
 | `Invalid float: <t>` | 末尾に余分な文字が付いた浮動小数点トークン、または `nan` や `inf` などの非有限の綴り |
 | `Failed to parse float: <t>` | そもそも数値でない浮動小数点トークン |

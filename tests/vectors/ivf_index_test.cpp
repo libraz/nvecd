@@ -981,6 +981,43 @@ TEST(IvfClusterCountTest, AutoNlistRescalesAfterReset) {
   EXPECT_EQ(index.GetClusterCount(), 20U);  // sqrt(400)
 }
 
+// An auto nlist follows the corpus the trainer reports, not the sample it was
+// handed, and leaves the configured value at auto so a later run re-derives it.
+TEST_F(IvfIndexTest, AutoNlistFollowsReportedCorpusSizeOnEveryRun) {
+  IvfIndex::Config config;
+  config.nlist = 0;
+  config.max_iterations = 2;
+  IvfIndex index(kDim, config);
+
+  index.Train(matrix_.data(), valid_indices_.data(), 100, kDim, /*assign_vectors=*/false, /*corpus_size=*/400);
+  ASSERT_EQ(index.GetClusterCount(), 20U);  // sqrt(400)
+
+  index.ResetTrained();
+  index.Train(matrix_.data(), valid_indices_.data(), 100, kDim, /*assign_vectors=*/false, /*corpus_size=*/2500);
+  EXPECT_EQ(index.GetClusterCount(), 50U);  // sqrt(2500), not the first run's 20
+}
+
+// A vector is in at most one inverted list, so adding an index that is already
+// sealed moves it rather than duplicating it, and removal finds it directly.
+TEST_F(IvfIndexTest, ReaddingSealedIndexKeepsOneListEntry) {
+  IvfIndex::Config config;
+  config.nlist = 8;
+  config.max_iterations = 2;
+  IvfIndex index(kDim, config);
+  index.Train(matrix_.data(), valid_indices_.data(), valid_indices_.size(), kDim);
+  ASSERT_EQ(index.GetIndexedCount(), kNumVectors);
+
+  for (size_t round = 0; round < 5; ++round) {
+    index.AddVector(3, vectors_[100 + round].data());
+  }
+  EXPECT_EQ(index.GetIndexedCount(), kNumVectors);
+
+  index.RemoveVector(3);
+  EXPECT_EQ(index.GetIndexedCount(), kNumVectors - 1);
+  index.RemoveVector(3);
+  EXPECT_EQ(index.GetIndexedCount(), kNumVectors - 1);
+}
+
 // ============================================================================
 // Dimension rebinding
 // ============================================================================

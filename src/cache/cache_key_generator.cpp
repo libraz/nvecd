@@ -23,15 +23,26 @@ std::string AdaptiveCachePart(std::optional<bool> adaptive) {
   return *adaptive ? "on" : "off";
 }
 
+/// Append a free-form field as "<length>:<bytes>" so no id or filter text can
+/// run into the fields that follow it.
+void AppendField(std::ostringstream& oss, const std::string& text) {
+  oss << text.size() << ':' << text;
+}
+
 }  // namespace
 
 CacheKey GenerateSimCacheKey(const SimCacheKeyParams& params) {
   std::ostringstream oss;
-  oss << "SIM:" << params.id << ":" << params.top_k << ":" << params.mode << ":a" << AdaptiveCachePart(params.adaptive)
-      << ":g" << params.cooccurrence_generation << ":v" << params.vector_generation;
+  oss << "SIM:";
+  AppendField(oss, params.id);
+  oss << ":" << params.top_k << ":";
+  AppendField(oss, params.mode);
+  oss << ":a" << AdaptiveCachePart(params.adaptive) << ":g" << params.cooccurrence_generation << ":v"
+      << params.vector_generation;
   oss << ":m" << params.metadata_generation << ":d" << params.dataset_generation;
   if (!params.filter_expr.empty()) {
-    oss << ":f" << params.filter_expr;
+    oss << ":f";
+    AppendField(oss, params.filter_expr);
   }
   return CacheKeyGenerator::Generate(oss.str());
 }
@@ -41,7 +52,8 @@ CacheKey GenerateSimvCacheKey(const SimvCacheKeyParams& params) {
   oss << "SIMV:" << HashVector(params.vector) << ":" << params.top_k << ":v" << params.vector_generation;
   oss << ":m" << params.metadata_generation << ":d" << params.dataset_generation;
   if (!params.filter_expr.empty()) {
-    oss << ":f" << params.filter_expr;
+    oss << ":f";
+    AppendField(oss, params.filter_expr);
   }
   return CacheKeyGenerator::Generate(oss.str());
 }

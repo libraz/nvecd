@@ -119,9 +119,9 @@ utils::Expected<std::vector<uint8_t>, utils::Error> ResultCompressor::CompressSi
     return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCacheCompressionFailed, "LZ4 compression failed"));
   }
 
-  // Resize to actual compressed size
-  compressed.resize(static_cast<size_t>(compressed_size));
-  return compressed;
+  // Copy out the compressed bytes: resize() alone keeps the worst-case capacity,
+  // which is what the cache would then hold and account for.
+  return std::vector<uint8_t>(compressed.begin(), compressed.begin() + compressed_size);
 }
 
 utils::Expected<std::vector<similarity::SimilarityResult>, utils::Error> ResultCompressor::DecompressSimilarityResults(

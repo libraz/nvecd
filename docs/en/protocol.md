@@ -126,7 +126,9 @@ Both identifiers are validated: neither may be empty, and neither may carry a by
 VECSET <id> <f1> <f2> ... <fN>
 ```
 
-Registers or replaces the vector for `<id>`. The dimension is taken from the number of float tokens and must match the dimension the store is already using, which is `vectors.default_dimension` until the first vector fixes it.
+Registers or replaces the vector for `<id>`. The dimension is taken from the number of float tokens and must match the dimension the store is already using. The first stored vector fixes that dimension; `vectors.default_dimension` only pre-sizes the ANN index.
+
+`<id>` follows the same identifier rule as an `EVENT` item ID. A space-delimited command cannot violate it, so a rejection is reached through the JSON surface, where it is a 400 and nothing is stored or logged.
 
 ```text
 > VECSET item1 0.1 0.2 0.3 0.4
@@ -189,7 +191,7 @@ Searches for items similar to `<id>`. `top_k` is a positive integer and must not
 | `filter=` | a filter expression (see below) | no filter |
 | `min_score=` | any finite float | `0.0` |
 
-`adaptive=` applies to fusion mode only. `min_score=` is applied after the search, so it trims the result set rather than widening it.
+`adaptive=` applies to fusion mode only. `min_score=` is applied after the search, so it trims the result set rather than widening it. The default `0.0` excludes rows with a negative score.
 
 ```text
 > SIM item1 5 using=vectors
@@ -279,7 +281,7 @@ item2 0.9940
 ERROR Invalid filter condition: 'bogus'
 ```
 
-An item with no metadata matches no condition, so a filter narrows results to items that have been through `METASET` or the HTTP `/metaset` and `/vecset` routes.
+An item with no metadata is evaluated as an empty metadata map: it fails every condition except `!=`, which treats an absent field as different from the value. Unless the filter is made only of `!=` conditions, it therefore narrows results to items that have been through `METASET` or the HTTP `/metaset` and `/vecset` routes.
 
 ## Administrative commands
 
@@ -589,7 +591,7 @@ Every failure is a single `ERROR <message>` line. A rejected command still count
 | `Failed to parse timestamp: <v>` | non-numeric `timestamp=` |
 | `Context cannot be empty` / `ID cannot be empty` | empty `EVENT` context or item ID |
 | `Context must not contain whitespace or control characters` | `EVENT` context carrying a byte at or below `0x20`, or `0x7F` |
-| `ID must not contain whitespace or control characters` | the same rule for an `EVENT` item ID |
+| `ID must not contain whitespace or control characters` | the same rule for an `EVENT` item ID or a `VECSET` ID |
 | `VECSET requires at least 2 arguments: <id> <floats>` | `VECSET` arity |
 | `Invalid float: <t>` | float token with trailing characters, or a non-finite spelling such as `nan` or `inf` |
 | `Failed to parse float: <t>` | float token that is not a number at all |

@@ -7,6 +7,17 @@
 
 namespace nvecd::vectors {
 
+namespace {
+
+/// What an item with no stored entry is evaluated as, so that matching depends
+/// on the metadata fields alone and not on whether an entry was ever written.
+const Metadata& NoMetadata() {
+  static const Metadata kEmpty;
+  return kEmpty;
+}
+
+}  // namespace
+
 void MetadataStore::Set(const std::string& id, Metadata meta) {
   std::unique_lock lock(mutex_);
   // Presence is determined solely by map membership. An explicitly set but
@@ -52,7 +63,7 @@ std::vector<std::string> MetadataStore::Filter(const MetadataFilter& filter,
     result.reserve(candidates.size());
     for (const auto& id : candidates) {
       auto it = metadata_.find(id);
-      if (it != metadata_.end() && filter.Match(it->second)) {
+      if (filter.Match(it != metadata_.end() ? it->second : NoMetadata())) {
         result.push_back(id);
       }
     }
@@ -75,10 +86,7 @@ bool MetadataStore::Matches(const std::string& id, const MetadataFilter& filter)
     return true;
   }
   auto it = metadata_.find(id);
-  if (it == metadata_.end()) {
-    return false;
-  }
-  return filter.Match(it->second);
+  return filter.Match(it != metadata_.end() ? it->second : NoMetadata());
 }
 
 uint32_t MetadataStore::Size() const {

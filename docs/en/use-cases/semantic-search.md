@@ -80,7 +80,7 @@ doc_billing 0.2613
 
 `SIMV` scores are raw metric values. Nothing normalises them, so under `cosine` they land in `[-1, 1]` and mean the same thing in every query the corpus ever serves. That is what makes an absolute threshold usable here, where the same threshold on a fusion query would not be — fusion rescales each result set to its own range.
 
-`top_k` alone always returns `top_k` documents, however irrelevant. A search box wants an empty result for a query that matches nothing, which is what `min_score` gives:
+`top_k` alone returns up to `top_k` documents, however irrelevant; the default `min_score` of `0.0` drops only the rows whose score is negative. A search box wants an empty result for a query that matches nothing, which is what `min_score` gives:
 
 ```bash
 nvecd-cli -p 11017 SIMV 3 min_score=0.8 0.90 0.25 0.12 0.05

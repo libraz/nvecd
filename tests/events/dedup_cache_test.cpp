@@ -179,21 +179,25 @@ TEST_F(DedupCacheTest, ZeroWindowDisabled) {
   EXPECT_FALSE(cache.IsDuplicate(key, 1000));
 }
 
-TEST_F(DedupCacheTest, FutureTimestampDoesNotAllowRepeatedOlderRetries) {
+// Whether a record is a duplicate depends on event time alone, so a timestamp
+// that jumps backwards beyond the window is a new event however soon it
+// arrives, and it becomes the baseline its own retries are judged against.
+TEST_F(DedupCacheTest, BackwardsTimestampBeyondWindowEstablishesNewBaseline) {
   DedupCache cache(100, 60);
   EventKey key("ctx1", "id1", 100);
 
   EXPECT_FALSE(cache.CheckAndInsert(key, 1'000'000));
+  EXPECT_FALSE(cache.CheckAndInsert(key, 1'000));
   EXPECT_TRUE(cache.CheckAndInsert(key, 1'000));
-  EXPECT_TRUE(cache.CheckAndInsert(key, 1'000));
-  EXPECT_EQ(cache.GetStatistics().total_hits, 2U);
+  EXPECT_EQ(cache.GetStatistics().total_hits, 1U);
 }
 
 TEST_F(DedupCacheTest, TimestampDistanceUsesOverflowSafeSubtraction) {
   DedupCache cache(100, 60);
   EventKey key("ctx1", "id1", 100);
   cache.Insert(key, std::numeric_limits<uint64_t>::max());
-  EXPECT_TRUE(cache.IsDuplicate(key, 0));
+  EXPECT_TRUE(cache.IsDuplicate(key, std::numeric_limits<uint64_t>::max() - 10));
+  EXPECT_FALSE(cache.IsDuplicate(key, 0));
 }
 
 TEST_F(DedupCacheTest, ThreadSafety) {

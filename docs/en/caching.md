@@ -140,10 +140,12 @@ any of them erases the entries referencing it immediately, rather than leaving
 them to age out. `EVENT`, `VECSET` and `VECDEL` all invalidate this way, on the
 mutated ID only.
 
-Selective invalidation is what makes the cache usable under a live event stream.
-A recommendation workload writes events continuously; if every event cleared the
-cache, nothing would ever survive to be hit. Erasing only the entries that
-mention the touched item leaves the rest of the working set intact.
+Selective invalidation reclaims memory; it does not keep the cache warm under a
+live event stream. Every `SIM` key carries the co-occurrence generation, so any
+event that changes a score makes every cached `SIM` entry unreachable, whatever
+its mode. A vector write does the same to `SIM` and `SIMV` entries through the
+vector generation. What a workload that writes continuously can still hit is
+limited to repeats of a query issued between two such writes.
 
 Two writes are broader. `METASET`, and a `VECSET` that carries metadata, clear
 the cache outright: a metadata change alters which items *any* filtered query

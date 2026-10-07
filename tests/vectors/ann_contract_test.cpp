@@ -119,7 +119,7 @@ class AnnContractTest : public ::testing::Test {
   void RebuildFromStore() {
     auto snap = store_.GetCompactSnapshot();
     index_->Rebuild(snap.matrix, static_cast<uint32_t>(snap.count),
-                    static_cast<uint32_t>(snap.dim == 0 ? kDim : snap.dim));
+                    static_cast<uint32_t>(snap.dim == 0 ? kDim : snap.dim), snap.deleted);
   }
 
   /// Unit vector pointing along @p axis.
@@ -169,7 +169,7 @@ TYPED_TEST(AnnContractTest, EmptyRebuildAdoptsRequestedDimensionBeforeFirstInser
   ASSERT_EQ(this->index_->Dimension(), kOtherDim);
 
   const uint32_t first = this->InsertStoreOnly("a", TestFixture::AxisVector(0));
-  this->index_->Rebuild(nullptr, 0, static_cast<uint32_t>(this->store_.GetDimension()));
+  this->index_->Rebuild(nullptr, 0, static_cast<uint32_t>(this->store_.GetDimension()), nullptr);
   ASSERT_EQ(this->index_->Dimension(), TestFixture::kDim);
 
   this->Publish(first);
@@ -205,7 +205,7 @@ TYPED_TEST(AnnContractTest, RebuildReplacesPreviousContents) {
   this->Insert("a", TestFixture::AxisVector(0));
   this->Insert("b", TestFixture::AxisVector(1));
 
-  this->index_->Rebuild(nullptr, 0, TestFixture::kDim);
+  this->index_->Rebuild(nullptr, 0, TestFixture::kDim, nullptr);
 
   EXPECT_EQ(this->index_->Size(), 0U);
   auto query = TestFixture::AxisVector(0);
@@ -290,6 +290,43 @@ TYPED_TEST(AnnContractTest, DeletedIndexBecomesVisibleAgainAfterRebuild) {
   auto query = TestFixture::AxisVector(0);
   auto results = this->index_->Search(query.data(), 2);
   EXPECT_TRUE(TestFixture::Contains(results, first));
+}
+
+// A rebuild from a store that holds tombstones indexes the live rows only.
+TYPED_TEST(AnnContractTest, RebuildLeavesTombstonedRowsOut) {
+  constexpr uint32_t kCount = 8;
+  std::vector<uint32_t> indices;
+  for (uint32_t i = 0; i < kCount; ++i) {
+    indices.push_back(this->InsertStoreOnly("item" + std::to_string(i), TestFixture::AxisVector(i)));
+  }
+  ASSERT_TRUE(this->store_.DeleteVector("item2"));
+
+  this->RebuildFromStore();
+
+  EXPECT_EQ(this->index_->Size(), kCount - 1);
+  auto query = TestFixture::AxisVector(2);
+  auto results = this->index_->Search(query.data(), kCount);
+  EXPECT_EQ(results.size(), kCount - 1);
+  EXPECT_FALSE(TestFixture::Contains(results, indices[2]));
+}
+
+// Adding an index that is already live replaces its entry, so repeated
+// overwrites neither grow the index nor return the item twice.
+TYPED_TEST(AnnContractTest, AddOnLiveIndexReplacesItsEntry) {
+  const uint32_t first = this->Insert("a", TestFixture::AxisVector(0));
+  this->Insert("b", TestFixture::AxisVector(1));
+
+  for (uint32_t round = 0; round < 5; ++round) {
+    ASSERT_TRUE(this->store_.SetVector("a", TestFixture::AxisVector(2 + round)).has_value());
+    this->Publish(first);
+  }
+
+  EXPECT_EQ(this->index_->Size(), 2U);
+  auto query = TestFixture::AxisVector(6);
+  auto results = this->index_->Search(query.data(), 4);
+  ASSERT_EQ(results.size(), 2U);
+  EXPECT_EQ(results[0].first, first);
+  EXPECT_NEAR(results[0].second, 1.0F, 0.01F);
 }
 
 // ============================================================================
@@ -407,6 +444,35 @@ TYPED_TEST(AnnContractTest, SearchStaysConsistentDuringConcurrentMutation) {
     reader.join();
   }
   EXPECT_TRUE(readers_running) << "readers never searched; the window was not concurrent";
+}
+
+// ============================================================================
+// IVF adapter: dimension binding
+// ============================================================================
+
+// A query validated against the index's bound dimension must never be read at
+// the store's different current dimension, and no result is correct when the
+// two disagree. The query is exactly the bound width, so a read at the store's
+// width would run past it.
+TEST(IvfAnnAdapterTest, SearchReturnsEmptyWhenStoreDimensionDiffersFromBoundDimension) {
+  constexpr uint32_t kStoreDim = 16;
+  constexpr uint32_t kBoundDim = 8;
+  config::VectorsConfig vectors_config;
+  VectorStore store(vectors_config);
+  ASSERT_TRUE(store.SetVector("a", std::vector<float>(kStoreDim, 1.0F)).has_value());
+
+  AnnIndexOptions options;
+  options.dimension = kBoundDim;
+  options.distance_metric = "cosine";
+  options.ivf.nlist = 4;
+  options.ivf.nprobe = 4;
+  options.vector_store = &store;
+  auto index = MakeAnnIndex(AnnIndexType::kIvf, options);
+  ASSERT_NE(index, nullptr);
+  ASSERT_EQ(index->Dimension(), kBoundDim);
+
+  const std::vector<float> query(kBoundDim, 1.0F);
+  EXPECT_TRUE(index->Search(query.data(), 4).empty());
 }
 
 }  // namespace

@@ -47,6 +47,9 @@ class IvfAnnAdapter : public AnnIndex {
   }
 
   void Add(uint32_t compact_index, const float* vector) override {
+    // An overwrite keeps its compact index, so the previous embedding is
+    // retired from every tier before the new one is buffered.
+    ivf_->RemoveVector(static_cast<size_t>(compact_index));
     ivf_->AppendToBuffer(static_cast<size_t>(compact_index), vector);
   }
 
@@ -66,8 +69,11 @@ class IvfAnnAdapter : public AnnIndex {
     // dimension, while a concurrent Clear/SetVector can move the store's. When
     // the two disagree the index is not bound to this corpus, so there is no
     // correct result and neither buffer may be strided.
-    const auto dimension = static_cast<uint32_t>(snap.dim);
-    float query_norm = simd::GetOptimalImpl().l2_norm(query, snap.dim);
+    const uint32_t dimension = ivf_->GetDimension();
+    if (dimension == 0 || static_cast<size_t>(dimension) != snap.dim) {
+      return {};
+    }
+    float query_norm = simd::GetOptimalImpl().l2_norm(query, dimension);
 
     auto ivf_results =
         ivf_->Search(query, query_norm, snap.matrix, snap.norms, snap.count, dimension, static_cast<size_t>(top_k));
@@ -80,7 +86,8 @@ class IvfAnnAdapter : public AnnIndex {
     return results;
   }
 
-  void Rebuild(const float* all_vectors, uint32_t count, uint32_t dimension) override {
+  void Rebuild(const float* all_vectors, uint32_t count, uint32_t dimension,
+               const std::vector<bool>* deleted) override {
     // Adopt the caller's dimension so Search (query_norm / stride) matches the
     // real data dimension even when the index was provisionally constructed for
     // a different configured default_dimension. This has to happen before the
@@ -89,15 +96,33 @@ class IvfAnnAdapter : public AnnIndex {
     // in place there makes AppendToBuffer read past the caller's vector.
     ivf_->Reset(dimension);
     if (count == 0 || all_vectors == nullptr) {
-      return;  // Dimension-only rebind: nothing to train yet.
+      return;  // Dimension-only rebind: nothing to buffer yet.
     }
-    // Build valid indices
-    std::vector<size_t> valid_indices;
-    valid_indices.reserve(count);
+    // Live rows go to the write buffer, where they are searchable at once.
+    // Training is left to the engine's trainer, which applies the train
+    // threshold off the request path.
     for (uint32_t i = 0; i < count; ++i) {
-      valid_indices.push_back(i);
+      if (deleted != nullptr && i < deleted->size() && (*deleted)[i]) {
+        continue;
+      }
+      ivf_->AppendToBuffer(static_cast<size_t>(i), all_vectors + static_cast<size_t>(i) * dimension);
     }
-    ivf_->Train(all_vectors, valid_indices.data(), count, dimension);
+  }
+
+  /**
+   * @brief Train the centroids on a sample of the live rows
+   *
+   * Rows already in the write buffer are not assigned; SealBuffer publishes
+   * them against the new centroids.
+   *
+   * @param matrix Contiguous [n x dimension] sample matrix
+   * @param indices Row indices of @p matrix to train on
+   * @param count Number of indices
+   * @param dimension Vector dimension
+   * @param corpus_size Live vector count the auto-scaled nlist derives from
+   */
+  void Train(const float* matrix, const size_t* indices, size_t count, uint32_t dimension, size_t corpus_size) {
+    ivf_->Train(matrix, indices, count, dimension, /*assign_vectors=*/false, corpus_size);
   }
 
   uint32_t Size() const override { return static_cast<uint32_t>(ivf_->GetIndexedCount() + ivf_->GetBufferSize()); }

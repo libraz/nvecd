@@ -105,4 +105,35 @@ TEST(CoOccurrenceNegativeTest, OnlyAffectsDeletedItem) {
   EXPECT_FLOAT_EQ(score_bc_before, score_bc_after);
 }
 
+// A prior event scored zero (a DEL, or an ADD of 0) reduces nothing, so it must
+// not leave a stored zero-score edge behind.
+TEST(CoOccurrenceNegativeTest, ZeroScoredPriorEventCreatesNoEdge) {
+  CoOccurrenceIndex index;
+  std::vector<Event> context = {Event("b", 0, 1000), Event("c", 10, 1000)};
+
+  {
+    auto lock = index.AcquireWriteLock();
+    index.ApplyNegativeSignalLocked("a", context, 0.5);
+  }
+
+  EXPECT_EQ(index.GetNeighborCount("b"), 0U);
+  EXPECT_EQ(index.GetNeighborCount("a"), 1U);
+}
+
+// Edges a negative pass creates are subject to the retention bounds of the
+// write that created them.
+TEST(CoOccurrenceNegativeTest, NegativeEdgesRespectNeighborCap) {
+  CoOccurrenceIndex::Config config;
+  config.max_neighbors_per_item = 2;
+  CoOccurrenceIndex index(config);
+  std::vector<Event> context = {Event("b", 10, 1000), Event("c", 20, 1000), Event("d", 30, 1000), Event("e", 40, 1000)};
+
+  {
+    auto lock = index.AcquireWriteLock();
+    index.ApplyNegativeSignalLocked("a", context, 0.5);
+  }
+
+  EXPECT_LE(index.GetNeighborCount("a"), 2U);
+}
+
 }  // namespace nvecd::events

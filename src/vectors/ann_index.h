@@ -65,7 +65,9 @@ enum class AnnIndexType : uint8_t {
  * - Search with top_k == 0 returns an empty result set and performs no
  *   operation on an empty container.
  * - Search never returns a compact_index that was passed to MarkDeleted and not
- *   re-Added since.
+ *   re-Added since, or one flagged as deleted in the last Rebuild.
+ * - Add on a compact_index that is already live replaces its entry: the index
+ *   holds one entry per live compact_index, carrying the latest vector.
  * - Size() equals the number of live compact indices; MarkDeleted on an unknown
  *   or already-deleted index leaves it unchanged and never wraps.
  * - A zero-norm candidate scores 0.0 under cosine and takes part in ranking, as
@@ -106,11 +108,17 @@ class AnnIndex {
    * previous dimension in place there makes the next insert read past the
    * caller's vector buffer.
    *
+   * Rows flagged in @p deleted are tombstones of the source matrix: they are
+   * not part of the rebuilt index, so Size() equals the live row count and no
+   * search returns them.
+   *
    * @param all_vectors Pointer to contiguous [count x dimension] float matrix
    * @param count Number of vectors
    * @param dimension Vector dimension
+   * @param deleted Per-row tombstone flags, or nullptr when every row is live
    */
-  virtual void Rebuild(const float* all_vectors, uint32_t count, uint32_t dimension) = 0;
+  virtual void Rebuild(const float* all_vectors, uint32_t count, uint32_t dimension,
+                       const std::vector<bool>* deleted) = 0;
 
   /**
    * @brief Get the vector dimension the index is currently bound to

@@ -15,7 +15,6 @@
 #pragma once
 
 #include <atomic>
-#include <chrono>
 #include <cstdint>
 #include <list>
 #include <shared_mutex>
@@ -151,11 +150,10 @@ class DedupCache {
   // Cache entry: timestamp + iterator to LRU list
   struct CacheEntry {
     uint64_t timestamp{0};
-    std::chrono::steady_clock::time_point last_seen_at{};
     LRUIterator lru_iter;
   };
 
-  bool IsWithinWindow(const CacheEntry& entry, uint64_t timestamp, std::chrono::steady_clock::time_point now) const;
+  bool IsWithinWindow(const CacheEntry& entry, uint64_t timestamp) const;
 
   size_t max_size_;      ///< Maximum cache size
   uint32_t window_sec_;  ///< Time window in seconds

@@ -14,6 +14,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -22,6 +23,8 @@
 #include <shared_mutex>
 #include <string>
 #include <thread>
+#include <unordered_set>
+#include <vector>
 
 #include "cache/cache_key.h"
 #include "cache/similarity_cache.h"
@@ -30,12 +33,14 @@
 #include "config/runtime_variable_manager.h"
 #include "events/co_occurrence_index.h"
 #include "events/event_store.h"
+#include "server/command_parser.h"
 #include "server/handlers/admin_handler.h"
 #include "server/handlers/cache_handler.h"
 #include "server/handlers/debug_handler.h"
 #include "server/handlers/dump_handler.h"
 #include "server/handlers/info_handler.h"
 #include "server/handlers/variable_handler.h"
+#include "server/request_dispatcher.h"
 #include "server/server_types.h"
 #include "similarity/similarity_engine.h"
 #include "storage/snapshot_format_v1.h"
@@ -77,6 +82,7 @@ class HandlerTest : public ::testing::Test {
     metadata_store_ = std::make_unique<nvecd::vectors::MetadataStore>();
 
     nvecd::config::SimilarityConfig sim_cfg;
+    ConfigureSimilarity(sim_cfg);
     similarity_engine_ = std::make_unique<nvecd::similarity::SimilarityEngine>(
         event_store_.get(), co_index_.get(), vector_store_.get(), sim_cfg, vectors_cfg);
 
@@ -117,6 +123,9 @@ class HandlerTest : public ::testing::Test {
     std::filesystem::remove_all(dump_dir_);
   }
 
+  /// Hook for fixtures that run the engine with a non-default index.
+  virtual void ConfigureSimilarity(nvecd::config::SimilarityConfig& /*similarity_config*/) {}
+
   ServerStats stats_;
   std::atomic<bool> loading_{false};
   std::atomic<bool> read_only_{false};
@@ -137,6 +146,132 @@ class HandlerTest : public ::testing::Test {
   alignas(HandlerContext) char ctx_storage_[sizeof(HandlerContext)]{};  // NOLINT(modernize-avoid-c-arrays)
   HandlerContext* ctx_ = nullptr;
 };
+
+// ============================================================================
+// ANN index synchronisation through the production load and write paths
+// ============================================================================
+
+class HandlerAnnTest : public HandlerTest, public ::testing::WithParamInterface<std::string> {
+ protected:
+  void ConfigureSimilarity(nvecd::config::SimilarityConfig& similarity_config) override {
+    similarity_config.index_type = GetParam();
+    similarity_config.ivf_nlist = 2;
+    similarity_config.ivf_nprobe = 2;
+    similarity_config.ivf_train_threshold = 4;
+    similarity_config.ivf_seal_threshold = 100000;
+  }
+
+  /// Wait until the index answers queries and an IVF write buffer is published.
+  bool WaitUntilReady() {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (std::chrono::steady_clock::now() < deadline) {
+      if (similarity_engine_->IsAnnIndexReady() && similarity_engine_->GetIvfUnsealedCount() == 0) {
+        return true;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return false;
+  }
+
+  static std::vector<float> Row(size_t index) {
+    const auto angle = static_cast<float>(index) * 0.4F;
+    return {std::cos(angle), std::sin(angle), 0.5F};
+  }
+
+  Command VecsetCommand(const std::string& id, std::vector<float> vector) {
+    Command command;
+    command.type = CommandType::kVecset;
+    command.id = id;
+    command.dimension = static_cast<int>(vector.size());
+    command.vector = std::move(vector);
+    return command;
+  }
+
+  Command VecdelCommand(const std::string& id) {
+    Command command;
+    command.type = CommandType::kVecdel;
+    command.id = id;
+    return command;
+  }
+
+  std::unordered_set<std::string> SearchIds(int top_k) {
+    auto results = similarity_engine_->SearchByVector({1.0F, 0.0F, 0.5F}, top_k);
+    EXPECT_TRUE(results.has_value());
+    std::unordered_set<std::string> ids;
+    if (results.has_value()) {
+      for (const auto& result : *results) {
+        ids.insert(result.item_id);
+      }
+    }
+    return ids;
+  }
+};
+
+INSTANTIATE_TEST_SUITE_P(Indexes, HandlerAnnTest, ::testing::Values("hnsw", "ivf"));
+
+TEST_P(HandlerAnnTest, DumpLoadRebuildsAnnIndexFromRestoredStore) {
+  constexpr size_t kCount = 8;
+  for (size_t i = 0; i < kCount; ++i) {
+    ASSERT_TRUE(vector_store_->SetVector("item" + std::to_string(i), Row(i)).has_value());
+  }
+  config_->snapshot.mode = "lock";
+  config_->snapshot.dir = dump_dir_.string();
+  const std::string dump_path = (dump_dir_ / "ann_roundtrip.dmp").string();
+  ASSERT_TRUE(HandleDumpSave(*ctx_, dump_path).has_value());
+  vector_store_->Clear();
+
+  auto load_result = HandleDumpLoad(*ctx_, dump_path);
+  ASSERT_TRUE(load_result.has_value()) << load_result.error().message();
+
+  ASSERT_TRUE(WaitUntilReady());
+  EXPECT_EQ(similarity_engine_->GetAnnGeneration(), vector_store_->GetGeneration());
+  EXPECT_EQ(SearchIds(static_cast<int>(kCount)).size(), kCount);
+}
+
+TEST_P(HandlerAnnTest, VecsetOverwriteAndVecdelKeepAnnInSync) {
+  constexpr size_t kCount = 8;
+  for (size_t i = 0; i < kCount; ++i) {
+    ASSERT_TRUE(ApplyWrite(*ctx_, VecsetCommand("item" + std::to_string(i), Row(i))).has_value());
+  }
+  ASSERT_TRUE(WaitUntilReady());
+
+  ASSERT_TRUE(ApplyWrite(*ctx_, VecsetCommand("item3", Row(30))).has_value());
+  const uint64_t rebuilds = similarity_engine_->GetAnnRebuildCount();
+  ASSERT_TRUE(ApplyWrite(*ctx_, VecdelCommand("item5")).has_value());
+
+  ASSERT_TRUE(WaitUntilReady());
+  EXPECT_EQ(similarity_engine_->GetAnnRebuildCount(), rebuilds);
+  EXPECT_EQ(similarity_engine_->GetAnnGeneration(), vector_store_->GetGeneration());
+  const auto ids = SearchIds(static_cast<int>(kCount));
+  EXPECT_EQ(ids.size(), kCount - 1);
+  EXPECT_EQ(ids.count("item5"), 0U);
+}
+
+// An id that would break line framing is refused before any state change: the
+// store stays empty and the server does not fall into fail-stop.
+TEST_P(HandlerAnnTest, VecsetWithFramingBreakingIdIsRejectedWithoutSideEffects) {
+  for (const std::string bad : {std::string("a b"), std::string("a\r\nb"), std::string("a\x7f")}) {
+    auto outcome = ApplyWrite(*ctx_, VecsetCommand(bad, Row(1)));
+    ASSERT_FALSE(outcome.has_value());
+    EXPECT_EQ(outcome.error().code(), nvecd::utils::ErrorCode::kInvalidArgument);
+  }
+  EXPECT_EQ(vector_store_->GetVectorCount(), 0U);
+  EXPECT_FALSE(read_only_.load());
+}
+
+// Fusion with both weights at zero has nothing to rank by, so configuration
+// validation refuses it instead of letting fusion queries come back empty.
+TEST(FusionWeightValidationTest, RejectsZeroSumOfWeights) {
+  nvecd::config::Config config;
+  config.similarity.fusion_alpha = 0.0;
+  config.similarity.fusion_beta = 0.0;
+  auto zero = nvecd::config::ValidateConfig(config);
+  ASSERT_FALSE(zero.has_value());
+  EXPECT_EQ(zero.error().code(), nvecd::utils::ErrorCode::kConfigInvalidValue);
+
+  config.similarity.fusion_beta = 0.1;
+  EXPECT_TRUE(nvecd::config::ValidateConfig(config).has_value());
+}
 
 // ============================================================================
 // Null-pointer test fixture for error path coverage

@@ -206,6 +206,40 @@ TEST_F(MetadataStoreTest, MatchesSingle) {
   EXPECT_TRUE(store_.Matches("missing", empty));  // Empty filter always matches
 }
 
+// An item with no entry is evaluated as an empty metadata map: it passes a
+// filter made only of != conditions and fails every other condition, exactly
+// like an item whose entry is empty or lacks the field.
+TEST_F(MetadataStoreTest, NotEqualFilterTreatsMissingEntryAsEmptyMetadata) {
+  store_.Set("empty_entry", {});
+  store_.Set("other_field", {{"owner", std::string("alice")}});
+  store_.Set("equal", {{"status", std::string("draft")}});
+
+  MetadataFilter ne_filter;
+  FilterCondition ne;
+  ne.field = "status";
+  ne.op = FilterOp::kNe;
+  ne.value = std::string("draft");
+  ne_filter.conditions.push_back(ne);
+
+  EXPECT_TRUE(store_.Matches("never_set", ne_filter));
+  EXPECT_TRUE(store_.Matches("empty_entry", ne_filter));
+  EXPECT_TRUE(store_.Matches("other_field", ne_filter));
+  EXPECT_FALSE(store_.Matches("equal", ne_filter));
+
+  const std::vector<std::string> candidates = {"never_set", "empty_entry", "other_field", "equal"};
+  auto filtered = store_.Filter(ne_filter, candidates);
+  std::sort(filtered.begin(), filtered.end());
+  EXPECT_EQ(filtered, (std::vector<std::string>{"empty_entry", "never_set", "other_field"}));
+
+  MetadataFilter eq_filter;
+  FilterCondition eq;
+  eq.field = "status";
+  eq.op = FilterOp::kEq;
+  eq.value = std::string("draft");
+  eq_filter.conditions.push_back(eq);
+  EXPECT_FALSE(store_.Matches("never_set", eq_filter));
+}
+
 TEST_F(MetadataStoreTest, MultipleIds) {
   store_.Set("alpha", {{"a", std::string("x")}});
   store_.Set("beta", {{"b", std::string("y")}});

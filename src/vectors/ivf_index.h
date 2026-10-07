@@ -134,9 +134,11 @@ class IvfIndex {
    * @param dimension Vector dimension
    * @param assign_vectors If true, assign all valid vectors to clusters after training.
    *        Set to false when caller will use AddVector() to assign separately.
+   * @param corpus_size Live vector count an auto-scaled nlist is derived from, for
+   *        a caller that trains on a sample of the corpus. 0 means @p num_valid.
    */
   void Train(const float* matrix, const size_t* valid_indices, size_t num_valid, uint32_t dimension,
-             bool assign_vectors = true);
+             bool assign_vectors = true, size_t corpus_size = 0);
 
   /**
    * @brief Add a single vector directly to the IVF inverted lists
@@ -161,7 +163,7 @@ class IvfIndex {
   /**
    * @brief Remove a vector from the index
    *
-   * Searches both the IVF inverted lists and the write buffer.
+   * Removes it from the write buffer, the sealing tier and its inverted list.
    *
    * @param compact_index Index to remove
    */
@@ -241,8 +243,8 @@ class IvfIndex {
   void SetNprobe(uint32_t nprobe);
 
   /**
-   * @brief Set the number of clusters before training
-   * @param nlist Number of Voronoi cells (overrides auto-scaling)
+   * @brief Set the operator-configured number of clusters
+   * @param nlist Number of Voronoi cells (0 restores auto-scaling)
    */
   void SetNlist(uint32_t nlist);
 
@@ -328,6 +330,17 @@ class IvfIndex {
   void KMeansTrain(const float* matrix, const size_t* sample_indices, size_t sample_size, uint32_t dim);
 
   /**
+   * @brief Append a compact index to an inverted list
+   *
+   * Retires any entry the index already holds in another list, so an index is
+   * never in two lists. Requires mutex_ held exclusively.
+   */
+  void AppendToListLocked(size_t cluster, size_t compact_index);
+
+  /// Remove a compact index from its inverted list. Requires mutex_ held exclusively.
+  void EraseIndexedLocked(size_t compact_index);
+
+  /**
    * @brief Find the nearest centroid for a vector
    * @param vec Pointer to vector data
    * @return Index of nearest centroid
@@ -392,6 +405,11 @@ class IvfIndex {
 
   /// Inverted lists: cluster_id -> list of compact indices
   std::vector<std::vector<size_t>> inverted_lists_;
+
+  /// compact_index -> cluster whose list holds it (kNoCluster when unsealed).
+  /// Lets an overwrite or removal retire the sealed entry without scanning every
+  /// list.
+  std::vector<uint32_t> cluster_of_;
 
   /// Bumped whenever the trained IVF layout changes. SealBuffer uses this to
   /// discard an off-lock assignment if training/reset changed the centroids

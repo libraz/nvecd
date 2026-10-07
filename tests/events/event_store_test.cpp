@@ -244,6 +244,42 @@ TEST(EventStoreTest, GetEventsNonexistentContext) {
   EXPECT_TRUE(events.empty());
 }
 
+TEST(EventStoreTest, GetAllContextsIsOrderedLeastRecentlyWrittenFirst) {
+  auto config = MakeConfig();
+  EventStore store(config);
+
+  ASSERT_TRUE(store.AddEvent("user1", "item1", 10).has_value());
+  ASSERT_TRUE(store.AddEvent("user2", "item2", 20).has_value());
+  ASSERT_TRUE(store.AddEvent("user3", "item3", 30).has_value());
+  ASSERT_TRUE(store.AddEvent("user1", "item4", 40).has_value());
+
+  EXPECT_EQ(store.GetAllContexts(), (std::vector<std::string>{"user2", "user3", "user1"}));
+}
+
+// A snapshot writes contexts in GetAllContexts() order, so restoring them in
+// that order has to keep the same context next in line for eviction.
+TEST(EventStoreTest, RestoringContextsInSerializedOrderKeepsEvictionOrder) {
+  auto config = MakeConfig();
+  config.max_contexts = 3;
+  EventStore original(config);
+  ASSERT_TRUE(original.AddEvent("a", "item1", 10).has_value());
+  ASSERT_TRUE(original.AddEvent("b", "item2", 20).has_value());
+  ASSERT_TRUE(original.AddEvent("c", "item3", 30).has_value());
+  ASSERT_TRUE(original.AddEvent("a", "item4", 40).has_value());  // "b" is now the oldest
+
+  EventStore restored(config);
+  for (const auto& ctx : original.GetAllContexts()) {
+    for (const auto& event : original.GetEvents(ctx)) {
+      ASSERT_TRUE(restored.RestoreEvent(ctx, event).has_value());
+    }
+  }
+  ASSERT_TRUE(restored.AddEvent("d", "item5", 50).has_value());
+
+  EXPECT_TRUE(restored.GetEvents("b").empty());
+  EXPECT_FALSE(restored.GetEvents("a").empty());
+  EXPECT_FALSE(restored.GetEvents("c").empty());
+}
+
 TEST(EventStoreTest, GetAllContexts) {
   auto config = MakeConfig();
   EventStore store(config);

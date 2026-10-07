@@ -184,6 +184,24 @@ TEST(VectorStoreTest, EmptyId) {
   EXPECT_NE(result.error().message().find("ID"), std::string::npos);
 }
 
+// Ids are written unescaped into line-framed responses, so an id that carries
+// whitespace or a control byte is refused before it can be stored.
+TEST(VectorStoreTest, RejectsIdsThatBreakLineFraming) {
+  VectorStore store(MakeConfig());
+  const std::vector<float> vec = {0.1f, 0.2f, 0.3f};
+
+  for (const std::string bad :
+       {std::string("a b"), std::string("a\r\nb"), std::string("a\tb"), std::string("a\x7f"), std::string("a\0b", 3)}) {
+    auto result = store.SetVector(bad, vec);
+    ASSERT_FALSE(result.has_value()) << "accepted id of " << bad.size() << " bytes";
+    EXPECT_EQ(result.error().code(), utils::ErrorCode::kInvalidArgument);
+    EXPECT_FALSE(store.ValidateVector(bad, vec).has_value());
+  }
+  EXPECT_EQ(store.GetVectorCount(), 0U);
+
+  EXPECT_TRUE(store.SetVector("item:1/\xe3\x81\x82", vec).has_value());
+}
+
 TEST(VectorStoreTest, EmptyVector) {
   auto config = MakeConfig();
   VectorStore store(config);

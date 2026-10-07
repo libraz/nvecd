@@ -47,12 +47,25 @@ TEST(GenerateSimCacheKeyTest, AllModes) {
   EXPECT_NE(events, fusion);
 }
 
+// Ids and filters are free-form text that may contain the field separator, so
+// shifting a boundary between them must still produce a different key.
+TEST(GenerateSimCacheKeyTest, FreeFormFieldsCannotCollideAcrossBoundaries) {
+  SimCacheKeyParams with_filter{"p", 10, "fusion", std::nullopt, 0, 0, "c=1:10:fusion"};
+  SimCacheKeyParams colon_id{"p:10:fusion", 10, "fusion", std::nullopt, 0, 0, "c=1"};
+  EXPECT_NE(GenerateSimCacheKey(with_filter), GenerateSimCacheKey(colon_id));
+
+  SimCacheKeyParams id_a{"a:b", 10, "vectors", std::nullopt, 0, 0, ""};
+  SimCacheKeyParams id_b{"a", 10, "b:vectors", std::nullopt, 0, 0, ""};
+  EXPECT_NE(GenerateSimCacheKey(id_a), GenerateSimCacheKey(id_b));
+}
+
 TEST(GenerateSimCacheKeyTest, CanonicalKeyIncludesAllCrossSurfaceInvalidationFields) {
   SimCacheKeyParams base{"item", 10, "fusion", true, 7, 11, "status:active"};
 
-  // TCP and HTTP provide the same values to the shared builder, so they must
-  // resolve to the identical entry.
-  EXPECT_EQ(GenerateSimCacheKey(base), GenerateSimCacheKey(base));
+  // TCP and HTTP provide the same values to the shared builder, so equal values
+  // built independently must resolve to the identical entry.
+  const SimCacheKeyParams same{"item", 10, "fusion", true, 7, 11, "status:active"};
+  EXPECT_EQ(GenerateSimCacheKey(base), GenerateSimCacheKey(same));
 
   auto changed_vector_generation = base;
   ++changed_vector_generation.vector_generation;

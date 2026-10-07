@@ -360,6 +360,162 @@ TEST(SimilarityEngineAnnDeleteTest, StaleAnnGenerationFallsBackWithoutWrongIdSco
 }
 
 // ============================================================================
+// ANN index synchronisation
+// ============================================================================
+
+/// Drives an engine the way the dispatcher does: store write, then notification.
+class SimilarityEngineAnnSyncTest : public ::testing::Test {
+ protected:
+  void BuildEngine(const std::string& index_type) {
+    vectors_config_ = MakeVectorsConfig();
+    auto similarity_config = MakeSimilarityConfig();
+    similarity_config.index_type = index_type;
+    similarity_config.hnsw_m = 8;
+    similarity_config.hnsw_ef_construction = 32;
+    similarity_config.hnsw_ef_search = 16;
+    event_store_ = std::make_unique<events::EventStore>(MakeEventsConfig());
+    co_index_ = std::make_unique<events::CoOccurrenceIndex>();
+    vector_store_ = std::make_unique<vectors::VectorStore>(vectors_config_);
+    engine_ = std::make_unique<SimilarityEngine>(event_store_.get(), co_index_.get(), vector_store_.get(),
+                                                 similarity_config, vectors_config_);
+  }
+
+  void Put(const std::string& id, const std::vector<float>& vec) {
+    ASSERT_TRUE(vector_store_->SetVector(id, vec).has_value());
+    const auto compact_index = vector_store_->GetCompactIndex(id);
+    ASSERT_TRUE(compact_index.has_value());
+    engine_->NotifyVectorAdded(*compact_index, vec.data());
+  }
+
+  void Remove(const std::string& id) {
+    const auto compact_index = vector_store_->GetCompactIndex(id);
+    ASSERT_TRUE(compact_index.has_value());
+    ASSERT_TRUE(vector_store_->DeleteVector(id));
+    engine_->NotifyVectorRemoved(*compact_index);
+  }
+
+  static std::vector<float> Row(size_t index) {
+    const auto angle = static_cast<float>(index) * 0.37F;
+    return {std::cos(angle), std::sin(angle), 0.25F + 0.01F * static_cast<float>(index % 7)};
+  }
+
+  std::unordered_set<std::string> SearchIds(int top_k) {
+    auto results = engine_->SearchByVector({1.0F, 0.0F, 0.0F}, top_k);
+    EXPECT_TRUE(results.has_value());
+    std::unordered_set<std::string> ids;
+    if (results.has_value()) {
+      for (const auto& result : *results) {
+        ids.insert(result.item_id);
+      }
+    }
+    return ids;
+  }
+
+  config::VectorsConfig vectors_config_;
+  std::unique_ptr<events::EventStore> event_store_;
+  std::unique_ptr<events::CoOccurrenceIndex> co_index_;
+  std::unique_ptr<vectors::VectorStore> vector_store_;
+  std::unique_ptr<SimilarityEngine> engine_;
+};
+
+// A delete that leaves a tombstone in place moves no other row, so retiring the
+// one entry is enough: the index keeps mirroring the store and the next write
+// is incremental too.
+TEST_F(SimilarityEngineAnnSyncTest, TombstoneDeleteKeepsAnnCurrentWithoutRebuild) {
+  BuildEngine("hnsw");
+  constexpr size_t kCount = 70;
+  for (size_t i = 0; i < kCount; ++i) {
+    Put("v" + std::to_string(i), Row(i));
+  }
+  const uint64_t rebuilds = engine_->GetAnnRebuildCount();
+  ASSERT_EQ(engine_->GetAnnGeneration(), vector_store_->GetGeneration());
+
+  Remove("v10");
+  EXPECT_EQ(engine_->GetAnnGeneration(), vector_store_->GetGeneration());
+  EXPECT_EQ(engine_->GetAnnRebuildCount(), rebuilds);
+
+  const auto ids = SearchIds(static_cast<int>(kCount));
+  EXPECT_EQ(ids.size(), kCount - 1);
+  EXPECT_EQ(ids.count("v10"), 0U);
+
+  Put("extra", Row(kCount));
+  EXPECT_EQ(engine_->GetAnnGeneration(), vector_store_->GetGeneration());
+  EXPECT_EQ(engine_->GetAnnRebuildCount(), rebuilds);
+  EXPECT_EQ(SearchIds(static_cast<int>(kCount) + 1).size(), kCount);
+}
+
+// A rebuild from a store that holds tombstones must not bring the deleted rows
+// back as live entries, or they displace live results from an unfiltered query.
+TEST_F(SimilarityEngineAnnSyncTest, RebuildLeavesTombstonedRowsOut) {
+  BuildEngine("hnsw");
+  constexpr size_t kCount = 12;
+  for (size_t i = 0; i < kCount; ++i) {
+    ASSERT_TRUE(vector_store_->SetVector("v" + std::to_string(i), Row(i)).has_value());
+  }
+  ASSERT_TRUE(vector_store_->DeleteVector("v0"));
+  ASSERT_EQ(vector_store_->GetCompactCount(), kCount);  // tombstone, not compacted
+
+  engine_->RebuildAnnFromStore();
+  EXPECT_EQ(engine_->GetAnnGeneration(), vector_store_->GetGeneration());
+
+  const auto ids = SearchIds(static_cast<int>(kCount));
+  EXPECT_EQ(ids.size(), kCount - 1);
+  EXPECT_EQ(ids.count("v0"), 0U);
+}
+
+// An IVF index trains only through the background trainer, and only once the
+// corpus reaches ivf_train_threshold; below it every query stays exact.
+TEST_F(SimilarityEngineAnnSyncTest, IvfRebuildBelowTrainThresholdStaysUntrained) {
+  BuildEngine("ivf");
+  for (size_t i = 0; i < 20; ++i) {
+    ASSERT_TRUE(vector_store_->SetVector("v" + std::to_string(i), Row(i)).has_value());
+  }
+  engine_->RebuildAnnFromStore();
+
+  EXPECT_FALSE(engine_->IsIvfTrained());
+  EXPECT_EQ(engine_->GetIvfIndexedCount(), 0U);
+  EXPECT_EQ(SearchIds(20).size(), 20U);
+}
+
+// Overwriting a sealed row replaces its inverted-list entry rather than adding
+// a second one beside it.
+TEST_F(SimilarityEngineAnnSyncTest, IvfOverwriteOfSealedVectorKeepsOneEntry) {
+  vectors_config_ = MakeVectorsConfig();
+  auto similarity_config = MakeSimilarityConfig();
+  similarity_config.index_type = "ivf";
+  similarity_config.ivf_nlist = 2;
+  similarity_config.ivf_nprobe = 2;
+  similarity_config.ivf_train_threshold = 8;
+  similarity_config.ivf_seal_threshold = 100000;
+  event_store_ = std::make_unique<events::EventStore>(MakeEventsConfig());
+  co_index_ = std::make_unique<events::CoOccurrenceIndex>();
+  vector_store_ = std::make_unique<vectors::VectorStore>(vectors_config_);
+  engine_ = std::make_unique<SimilarityEngine>(event_store_.get(), co_index_.get(), vector_store_.get(),
+                                               similarity_config, vectors_config_);
+
+  constexpr size_t kCount = 16;
+  for (size_t i = 0; i < kCount; ++i) {
+    Put("v" + std::to_string(i), Row(i));
+  }
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  while ((!engine_->IsIvfTrained() || engine_->GetIvfUnsealedCount() > 0) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  ASSERT_TRUE(engine_->IsIvfTrained());
+  ASSERT_EQ(engine_->GetIvfIndexedCount(), kCount);
+
+  for (int round = 0; round < 5; ++round) {
+    Put("v3", Row(100 + static_cast<size_t>(round)));
+  }
+  while (engine_->GetIvfUnsealedCount() > 0 && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  EXPECT_EQ(engine_->GetIvfIndexedCount(), kCount);
+  EXPECT_EQ(SearchIds(static_cast<int>(kCount)).size(), kCount);
+}
+
+// ============================================================================
 // Index Type Selection
 // ============================================================================
 
@@ -422,16 +578,16 @@ TEST_F(SimilarityEngineIndexSelectionTest, HnswBuildsReadyIndex) {
   ExpectSearchCoversStore();
 }
 
-TEST_F(SimilarityEngineIndexSelectionTest, IvfBuildsTrainedIndex) {
+TEST_F(SimilarityEngineIndexSelectionTest, IvfStaysUntrainedBelowTrainThreshold) {
   auto similarity_config = MakeSimilarityConfig();
   similarity_config.index_type = "ivf";
   BuildEngine(similarity_config);
 
   EXPECT_EQ(engine_->GetIndexType(), "ivf");
-  // A rebuild from the store clusters what it finds, so IVF is trained by the
-  // time the rebuild returns.
-  EXPECT_TRUE(engine_->IsIvfTrained());
-  EXPECT_TRUE(engine_->IsAnnIndexReady());
+  // Two vectors are below the default train threshold, so the rebuild leaves
+  // the index untrained and queries take the exact path.
+  EXPECT_FALSE(engine_->IsIvfTrained());
+  EXPECT_FALSE(engine_->IsAnnIndexReady());
   ExpectSearchCoversStore();
 }
 
@@ -443,7 +599,6 @@ TEST_F(SimilarityEngineIndexSelectionTest, LegacyIvfEnabledPromotesFlatToIvf) {
   BuildEngine(similarity_config);
 
   EXPECT_EQ(engine_->GetIndexType(), "ivf");
-  EXPECT_TRUE(engine_->IsIvfTrained());
   ExpectSearchCoversStore();
 }
 
@@ -743,7 +898,8 @@ TEST_F(SimilarityEngineTest, EventOnlyFallbackUsesUnitWeightWhenConfiguredEventW
   auto results = engine.SearchByIdFusion("query", 10);
   ASSERT_TRUE(results.has_value()) << results.error().message();
   ASSERT_EQ(results->size(), 1U);
-  EXPECT_FLOAT_EQ(results->front().score, 1.0F);
+  // The lone source is taken at weight one and keeps its own score scale.
+  EXPECT_FLOAT_EQ(results->front().score, 42.0F);
 }
 
 TEST_F(SimilarityEngineTest, FusionParameters_BetaOnly) {
@@ -1081,6 +1237,68 @@ TEST_F(MetadataDesyncTest, SlotReuseDoesNotLeakDeletedMetadata) {
     ASSERT_TRUE(results.has_value());
     ASSERT_EQ(results->size(), 1U);
     EXPECT_EQ((*results)[0].item_id, "bob_item");
+  }
+}
+
+// A filter is applied per row, so a sampled scan would leave a sparse filter
+// with too few survivors. A filtered query covers the whole corpus instead.
+TEST_F(MetadataDesyncTest, SparseFilterFillsTopKWhenCorpusExceedsSampleSize) {
+  similarity_config_.sample_size = 5;
+  engine_ = std::make_unique<SimilarityEngine>(event_store_.get(), co_index_.get(), vector_store_.get(),
+                                               similarity_config_, vectors_config_, metadata_store_.get());
+
+  constexpr size_t kCorpus = 60;
+  constexpr size_t kMatching = 6;
+  for (size_t i = 0; i < kCorpus; ++i) {
+    const std::string id = "item" + std::to_string(i);
+    const auto angle = static_cast<float>(i) * 0.1F;
+    ASSERT_TRUE(vector_store_->SetVector(id, {std::cos(angle), std::sin(angle), 0.5F}).has_value());
+    if (i % (kCorpus / kMatching) == 0) {
+      metadata_store_->Set(id, {{"owner", std::string("alice")}});
+    }
+  }
+
+  auto by_vector = engine_->SearchByVector({1.0F, 0.0F, 0.5F}, static_cast<int>(kMatching), OwnerFilter("alice"));
+  ASSERT_TRUE(by_vector.has_value());
+  EXPECT_EQ(by_vector->size(), kMatching);
+
+  auto by_id = engine_->SearchByIdVectors("item1", static_cast<int>(kMatching), OwnerFilter("alice"));
+  ASSERT_TRUE(by_id.has_value());
+  EXPECT_EQ(by_id->size(), kMatching);
+}
+
+// Equal scores are ordered by ascending item id, and so is the set kept at the
+// top-k boundary, whatever order the rows were stored in.
+TEST_F(SimilarityEngineTest, TiedScoresSelectLowestIdsAtTopKBoundary) {
+  const std::vector<std::string> ids = {"d", "h", "b", "f", "a", "g", "c", "e"};
+  for (const auto& id : ids) {
+    ASSERT_TRUE(vector_store_->SetVector(id, {0.6F, 0.8F, 0.0F}).has_value());
+  }
+
+  auto results = engine_->SearchByVector({0.6F, 0.8F, 0.0F}, 3);
+  ASSERT_TRUE(results.has_value());
+  ASSERT_EQ(results->size(), 3U);
+  EXPECT_EQ((*results)[0].item_id, "a");
+  EXPECT_EQ((*results)[1].item_id, "b");
+  EXPECT_EQ((*results)[2].item_id, "c");
+}
+
+// With no event neighbours the vector source is alone, and fusion reports its
+// scores unchanged, so a min_score cutoff keeps the same items in both modes.
+TEST_F(SimilarityEngineTest, FusionWithoutEventsKeepsVectorScoreScale) {
+  ASSERT_TRUE(vector_store_->SetVector("q", {1.0F, 0.0F, 0.0F}).has_value());
+  ASSERT_TRUE(vector_store_->SetVector("near", {0.9F, 0.4F, 0.0F}).has_value());
+  ASSERT_TRUE(vector_store_->SetVector("mid", {0.6F, 0.8F, 0.0F}).has_value());
+  ASSERT_TRUE(vector_store_->SetVector("far", {0.2F, 0.9F, 0.3F}).has_value());
+
+  auto vectors_only = engine_->SearchByIdVectors("q", 10);
+  auto fusion = engine_->SearchByIdFusion("q", 10);
+  ASSERT_TRUE(vectors_only.has_value());
+  ASSERT_TRUE(fusion.has_value());
+  ASSERT_EQ(fusion->size(), vectors_only->size());
+  for (size_t i = 0; i < fusion->size(); ++i) {
+    EXPECT_EQ((*fusion)[i].item_id, (*vectors_only)[i].item_id);
+    EXPECT_FLOAT_EQ((*fusion)[i].score, (*vectors_only)[i].score);
   }
 }
 

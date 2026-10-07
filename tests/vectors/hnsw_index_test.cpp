@@ -431,7 +431,7 @@ TEST_F(HnswIndexTest, RebuildFromMatrix) {
     v = std::uniform_real_distribution<float>(-1.0F, 1.0F)(rng);
   }
 
-  index_->Rebuild(matrix.data(), kCount, kDim);
+  index_->Rebuild(matrix.data(), kCount, kDim, nullptr);
   EXPECT_EQ(index_->Size(), kCount);
 
   // Search should work

@@ -222,14 +222,7 @@ size_t EventStore::GetContextCount() const {
 std::vector<std::string> EventStore::GetAllContexts() const {
   std::shared_lock lock(mutex_);
 
-  std::vector<std::string> contexts;
-  contexts.reserve(ctx_events_.size());
-
-  for (const auto& [ctx, _] : ctx_events_) {
-    contexts.push_back(ctx);
-  }
-
-  return contexts;
+  return std::vector<std::string>(ctx_lru_.begin(), ctx_lru_.end());
 }
 
 void EventStore::Clear() {

@@ -84,6 +84,44 @@ TEST(CoOccurrencePruningTest, MaxNeighborsZeroMeansUnlimited) {
   EXPECT_EQ(index.GetNeighborCount("item0"), 4U);
 }
 
+// min_support is part of every write, so a bulk update under a roomy neighbour
+// cap still removes the weak edges it just created.
+TEST(CoOccurrencePruningTest, BulkUpdateAppliesMinSupportBelowNeighborCap) {
+  CoOccurrenceIndex::Config cfg;
+  cfg.max_neighbors_per_item = 100;
+  cfg.min_support = 50.0F;
+  CoOccurrenceIndex index(cfg);
+
+  auto events = MakeEvents({
+      {"weak1", 1, 1000},
+      {"weak2", 1, 1001},
+      {"strong1", 10, 1002},
+      {"strong2", 10, 1003},
+  });
+  index.UpdateFromEvents("ctx1", events);
+
+  EXPECT_EQ(index.GetNeighborCount("weak1"), 0U);
+  EXPECT_EQ(index.GetNeighborCount("strong1"), 1U);
+  EXPECT_GT(index.GetScore("strong1", "strong2"), 0.0F);
+}
+
+// Edges tied at the cap boundary are kept by ascending id, whatever order the
+// hash map held them in.
+TEST(CoOccurrencePruningTest, TiedEdgesAtNeighborCapKeepLowestIds) {
+  CoOccurrenceIndex::Config cfg;
+  cfg.max_neighbors_per_item = 2;
+  CoOccurrenceIndex index(cfg);
+
+  auto events = MakeEvents({{"hub", 10, 1000}, {"x4", 10, 1001}, {"x2", 10, 1002}, {"x3", 10, 1003}, {"x1", 10, 1004}});
+  index.UpdateFromEvents("ctx1", events);
+
+  EXPECT_EQ(index.GetNeighborCount("hub"), 2U);
+  EXPECT_GT(index.GetScore("hub", "x1"), 0.0F);
+  EXPECT_GT(index.GetScore("hub", "x2"), 0.0F);
+  EXPECT_FLOAT_EQ(index.GetScore("hub", "x3"), 0.0F);
+  EXPECT_FLOAT_EQ(index.GetScore("hub", "x4"), 0.0F);
+}
+
 TEST(CoOccurrencePruningTest, MaxNeighborsExactLimit) {
   CoOccurrenceIndex::Config cfg;
   cfg.max_neighbors_per_item = 3;

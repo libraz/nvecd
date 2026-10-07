@@ -17,6 +17,7 @@
 #include <atomic>
 #include <random>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -59,6 +60,23 @@ std::vector<float> MakeVector(std::mt19937& rng, uint32_t dim) {
     component = dist(rng);
   }
   return vec;
+}
+
+/// True for an id the workload could have written: results must never name a row
+/// the store was never given, whatever stale mapping a search resolved through.
+bool IsKnownId(const std::string& id) {
+  constexpr std::string_view kPrefix = "item";
+  if (id.compare(0, kPrefix.size(), kPrefix) != 0 || id.size() == kPrefix.size()) {
+    return false;
+  }
+  size_t number = 0;
+  for (size_t i = kPrefix.size(); i < id.size(); ++i) {
+    if (id[i] < '0' || id[i] > '9') {
+      return false;
+    }
+    number = number * 10 + static_cast<size_t>(id[i] - '0');
+  }
+  return number < kIdSpace;
 }
 
 /// Writes per writer thread for the index types whose publish path is cheap.
@@ -106,7 +124,21 @@ void RunStress(const std::string& index_type, bool exercise_dispatcher_path, int
         size_t id_num = id_dist(rng);
         std::string id = "item" + std::to_string(id_num);
         if ((iter & 3) == 0) {
-          vector_store.DeleteVector(id);
+          if (exercise_dispatcher_path) {
+            // The production delete sequence: a compaction re-keys every row and
+            // rebuilds the index, a tombstone retires the one entry.
+            const auto compact_index = vector_store.GetCompactIndex(id);
+            const size_t rows_before = vector_store.GetCompactCount();
+            if (compact_index.has_value() && vector_store.DeleteVector(id)) {
+              if (vector_store.GetCompactCount() < rows_before) {
+                engine.RebuildAnnFromStore();
+              } else {
+                engine.NotifyVectorRemoved(*compact_index);
+              }
+            }
+          } else {
+            vector_store.DeleteVector(id);
+          }
         } else {
           auto vec = MakeVector(rng, kDim);
           if (vector_store.SetVector(id, vec).has_value() && exercise_dispatcher_path) {
@@ -134,13 +166,23 @@ void RunStress(const std::string& index_type, bool exercise_dispatcher_path, int
           for (size_t i = 1; i < by_vec->size(); ++i) {
             EXPECT_GE((*by_vec)[i - 1].score, (*by_vec)[i].score);
           }
+          for (const auto& result : *by_vec) {
+            EXPECT_TRUE(IsKnownId(result.item_id)) << result.item_id;
+          }
         }
 
         // SearchByIdVectors (query by existing ID; may not exist transiently)
         std::string id = "item" + std::to_string(id_dist(rng));
         auto by_id = engine.SearchByIdVectors(id, 10, {});
-        // Either found-with-results or a clean not-found error; never a crash.
-        (void)by_id;
+        // Either found-with-results or a clean not-found error.
+        if (by_id.has_value()) {
+          for (const auto& result : *by_id) {
+            EXPECT_TRUE(IsKnownId(result.item_id)) << result.item_id;
+            EXPECT_NE(result.item_id, id);
+          }
+        } else {
+          EXPECT_EQ(by_id.error().code(), utils::ErrorCode::kVectorNotFound) << by_id.error().message();
+        }
 
         read_ops.fetch_add(1, std::memory_order_relaxed);
       }
@@ -164,11 +206,11 @@ TEST(VectorStoreConcurrencyStress, FlatBruteForce) {
 }
 
 TEST(VectorStoreConcurrencyStress, HnswIncrementalInsert) {
-  // A delete advances the store generation without publishing to the index, so
-  // the next add finds a generation gap and rebuilds the whole graph. With
-  // ef_construction neighbour selection over the shared ID space that costs
-  // orders of magnitude more per write than the flat or IVF publish, hence the
-  // shorter write run; the interleaving being exercised is the same.
+  // A compacting delete or an interleaved write leaves the index a generation
+  // behind, which rebuilds the whole graph. With ef_construction neighbour
+  // selection over the shared ID space that costs orders of magnitude more per
+  // write than the flat or IVF publish, hence the shorter write run; the
+  // interleaving being exercised is the same.
   RunStress("hnsw", /*exercise_dispatcher_path=*/true, /*iterations=*/24);
 }
 

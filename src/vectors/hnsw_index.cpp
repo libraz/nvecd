@@ -533,7 +533,8 @@ std::vector<std::pair<uint32_t, float>> HnswIndex::Search(const float* query, ui
   return results;
 }
 
-void HnswIndex::Rebuild(const float* all_vectors, uint32_t count, uint32_t dimension) {
+void HnswIndex::Rebuild(const float* all_vectors, uint32_t count, uint32_t dimension,
+                        const std::vector<bool>* deleted) {
   std::unique_lock lock(mutex_);
 
   // Clear existing state
@@ -563,6 +564,9 @@ void HnswIndex::Rebuild(const float* all_vectors, uint32_t count, uint32_t dimen
   // observe the old graph before Rebuild starts or the complete replacement;
   // they never search an empty/partially rebuilt graph.
   for (uint32_t i = 0; i < count; ++i) {
+    if (deleted != nullptr && i < deleted->size() && (*deleted)[i]) {
+      continue;
+    }
     AddLocked(i, all_vectors + static_cast<size_t>(i) * dimension);
   }
 }
