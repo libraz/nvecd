@@ -14,10 +14,9 @@
 
 // The ISA-specific kernels are deliberately NOT included here. Selecting one is
 // a compile-time decision that depends on -mavx2, which CMake applies only to
-// the nvecd_vectors target; a header that branched on __AVX2__ would compile a
-// different body in every other target. The selection therefore lives in
-// distance_simd.cpp, which is part of that target, and this header only
-// declares the result.
+// the kernel translation unit; a header that branched on __AVX2__ would compile
+// a different body in every other target. The selection therefore lives in
+// distance_simd.cpp, and this header only declares the result.
 
 namespace nvecd::vectors::simd {
 
