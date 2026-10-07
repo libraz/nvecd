@@ -19,7 +19,7 @@ nvecd -t -c /etc/nvecd/config.yaml
 | `-h`, `--help` | print usage and exit |
 | `-v`, `--version` | print the version and exit |
 
-The path may also be given as a positional argument; giving two config files is an error. Started with no file at all, the server runs entirely on the built-in defaults shown in the tables below, and `--config-test` without a file is an error.
+The path may also be given as a positional argument; giving two config files is an error. Started with no file at all, the server runs on the built-in defaults shown in the tables below with one exception: `network.allow_cidrs` becomes `["127.0.0.1/32"]` instead of the empty deny-all list, so a server started without a file accepts local clients only. `--config-test` without a file is an error.
 
 `examples/config.yaml` is rendered from the same schema and carries every key at its default.
 
@@ -67,7 +67,7 @@ Semantic rules beyond the ranges above: `ctx_buffer_size` must be greater than z
 | `distance_metric` | string | "cosine" | Distance metric for similarity search (`cosine` `dot` `l2`) |
 <!-- END GENERATED: options vectors -->
 
-`default_dimension` must be greater than zero. It fixes the accepted dimension: a `VECSET` whose vector has a different length is rejected with a dimension mismatch. Changing it after data exists means the existing snapshot no longer matches the configuration, so it is a rebuild rather than a tuning change. See [vector-search.md](./vector-search.md).
+`default_dimension` must be greater than zero. It only pre-sizes the ANN index. The first stored vector fixes the dimension the store accepts, and a later `VECSET` whose vector has a different length is rejected with a dimension mismatch. Changing it after data exists means the existing snapshot no longer matches the configuration, so it is a rebuild rather than a tuning change. See [vector-search.md](./vector-search.md).
 
 ## `similarity`
 
@@ -104,7 +104,7 @@ Cross-key rules:
 - The IVF keys are validated only when the index is IVF, that is when `index_type: ivf` or `ivf_enabled: true`. `ivf_nprobe` and `ivf_train_threshold` must be greater than zero, and `ivf_nprobe` must not exceed `ivf_nlist` unless `ivf_nlist` is `0`.
 - The HNSW keys are validated only when `index_type: hnsw`. `hnsw_m` must be at least 2, and both `ef` values greater than zero.
 - `ivf_enabled` is the older spelling of `index_type: ivf`. It is applied only when `index_type` is still `flat`; with `index_type` set to `hnsw` or `ivf`, the flag has no effect even though the IVF keys are still range-checked.
-- `fusion_alpha` and `fusion_beta` are independent numbers, not two halves of one budget; they are not required to sum to 1.
+- `fusion_alpha` and `fusion_beta` are independent numbers, not two halves of one budget; they are not required to sum to 1. They must not both be 0, which validation rejects because fusion would have nothing to rank by.
 
 `hnsw_max_elements` is reserved at startup, and its maximum is the largest index the snapshot loader accepts — reserving beyond it produces an index that cannot be reloaded.
 
@@ -146,7 +146,7 @@ See [persistence.md](./persistence.md).
 
 `thread_pool_size` must not be negative, and `max_connections` and `connection_timeout_sec` must be greater than zero.
 
-These keys are not TCP-only. The HTTP server derives its own limits from them: `thread_pool_size` becomes its worker count, `max_connections` and `max_connections_per_ip` its admission limits, `max_query_length` its maximum request body, and its listen queue is `max_connections − thread_pool_size`, with a floor of one. A request body above `max_query_length` is refused on both surfaces.
+These keys are not TCP-only. The HTTP server derives its own limits from them: `thread_pool_size` becomes its worker count (resolved the same way as for TCP, so `0` means one worker per detected hardware thread on both), `max_connections` and `max_connections_per_ip` its admission limits, `max_query_length` its maximum request body, and its listen queue is `max_connections` minus that resolved worker count, with a floor of one. A request body above `max_query_length` is refused on both surfaces.
 
 ## `api`
 
@@ -226,7 +226,7 @@ network:
 | `file` | string | "" | Log file path (empty string = stdout, path = file output) |
 <!-- END GENERATED: options logging -->
 
-`level` and `json` are both changeable at runtime; `file` is not, because reopening the handle is a restart-level change.
+`level` and `json` are both changeable at runtime; `file` is not, because reopening the handle is a restart-level change. The file is opened for appending, so a restart keeps the previous run's log. A `file` that cannot be opened is a startup error reported on standard output, and the server exits with status 1.
 
 ## `cache`
 
@@ -385,7 +385,7 @@ logging:
   file: "/var/log/nvecd/nvecd.log"
 ```
 
-Check it before restarting:
+Check it before restarting. `--config-test` reads and validates the file only; it does not open `logging.file`, so checking a configuration beside a running server leaves that server's log untouched:
 
 ```bash
 $ nvecd -t -c /etc/nvecd/config.yaml

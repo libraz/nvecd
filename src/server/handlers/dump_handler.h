@@ -17,6 +17,22 @@
 namespace nvecd::server::handlers {
 
 /**
+ * @brief Start a background fork snapshot of the live stores
+ *
+ * The one routine every fork capture goes through: DUMP SAVE in fork mode, the
+ * auto-snapshot scheduler and WAL-off decay maintenance. It holds the snapshot
+ * gate shared and the write serialization gate across the WAL sequence capture
+ * and fork(), so no write sits between its WAL append and its store apply, and
+ * it refuses while a DUMP LOAD is in flight. The captured sequence therefore
+ * equals exactly what the forked image contains.
+ *
+ * @param ctx Handler context (stores, config, fork writer, gates)
+ * @param resolved_path Validated snapshot path
+ * @return Success once the child exists, or an error
+ */
+utils::Expected<void, utils::Error> StartForkSnapshot(HandlerContext& ctx, const std::string& resolved_path);
+
+/**
  * @brief Handle DUMP SAVE
  *
  * With no @p filepath the snapshot goes to `snapshot.default_filename` inside

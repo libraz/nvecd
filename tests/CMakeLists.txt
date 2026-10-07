@@ -228,6 +228,31 @@ gtest_discover_tests(snapshot_scheduler_test
   PROPERTIES TIMEOUT 30
 )
 
+add_executable(main_logging_test
+  server/main_logging_test.cpp
+)
+target_link_libraries(main_logging_test
+  gtest
+  gtest_main
+)
+target_compile_definitions(main_logging_test PRIVATE NVECD_BINARY="$<TARGET_FILE:nvecd>")
+add_dependencies(main_logging_test nvecd)
+gtest_discover_tests(main_logging_test
+  PROPERTIES TIMEOUT 60
+)
+
+add_executable(tcp_rate_limit_test
+  server/tcp_rate_limit_test.cpp
+)
+target_link_libraries(tcp_rate_limit_test
+  nvecd_server
+  gtest
+  gtest_main
+)
+gtest_discover_tests(tcp_rate_limit_test
+  PROPERTIES TIMEOUT 30
+)
+
 add_executable(rate_limiter_test
   server/rate_limiter_test.cpp
 )

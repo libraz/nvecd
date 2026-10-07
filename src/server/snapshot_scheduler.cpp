@@ -23,7 +23,9 @@
 #include <string>
 #include <system_error>
 
-#include "utils/flag_guard.h"
+#include "server/handlers/dump_handler.h"
+#include "storage/snapshot_fork.h"
+#include "storage/wal_checkpoint.h"
 #include "utils/structured_log.h"
 
 namespace nvecd::server {
@@ -71,25 +73,8 @@ bool IsAbandonedTemporary(const std::string& filename) {
 }
 }  // namespace
 
-SnapshotScheduler::SnapshotScheduler(config::SnapshotConfig config, storage::ForkSnapshotWriter* fork_writer,
-                                     const config::Config* full_config, events::EventStore* event_store,
-                                     events::CoOccurrenceIndex* co_index, vectors::VectorStore* vector_store,
-                                     vectors::MetadataStore* metadata_store, std::atomic<bool>& read_only)
-    : config_(std::move(config)),
-      fork_writer_(fork_writer),
-      full_config_(full_config),
-      event_store_(event_store),
-      co_index_(co_index),
-      vector_store_(vector_store),
-      metadata_store_(metadata_store),
-      read_only_(read_only) {}
-
-SnapshotScheduler::SnapshotScheduler(config::SnapshotConfig config, storage::ForkSnapshotWriter* fork_writer,
-                                     const config::Config* full_config, events::EventStore* event_store,
-                                     events::CoOccurrenceIndex* co_index, vectors::VectorStore* vector_store,
-                                     std::atomic<bool>& read_only)
-    : SnapshotScheduler(std::move(config), fork_writer, full_config, event_store, co_index, vector_store, nullptr,
-                        read_only) {}
+SnapshotScheduler::SnapshotScheduler(config::SnapshotConfig config, HandlerContext& ctx)
+    : config_(std::move(config)), ctx_(ctx) {}
 
 SnapshotScheduler::~SnapshotScheduler() {
   Stop();
@@ -151,14 +136,14 @@ void SnapshotScheduler::SchedulerLoop() {
     // on this call; CheckChild() only picks up the finished outcome and clears
     // the session. Without it the writer stays kInProgress forever, so a single
     // fork would be the only snapshot the process ever takes.
-    if (fork_writer_ != nullptr) {
-      const bool was_in_progress = fork_writer_->IsInProgress();
-      fork_writer_->CheckChild();
+    if (ctx_.fork_snapshot_writer != nullptr) {
+      const bool was_in_progress = ctx_.fork_snapshot_writer->IsInProgress();
+      ctx_.fork_snapshot_writer->CheckChild();
       // A forked child creates its output asynchronously. Retention cleanup
       // must run only after that child is reaped; otherwise the newly started
       // snapshot can appear after CleanupOldSnapshots() has counted files and
       // leave retain + 1 files behind.
-      if (was_in_progress && !fork_writer_->IsInProgress()) {
+      if (was_in_progress && !ctx_.fork_snapshot_writer->IsInProgress()) {
         CleanupOldSnapshots();
       }
     }
@@ -179,10 +164,10 @@ void SnapshotScheduler::SchedulerLoop() {
 
   // Drain a final CheckChild on shutdown so a snapshot that completed just
   // before Stop() still records its checkpoint and truncates the WAL.
-  if (fork_writer_ != nullptr) {
-    const bool was_in_progress = fork_writer_->IsInProgress();
-    fork_writer_->CheckChild();
-    if (was_in_progress && !fork_writer_->IsInProgress()) {
+  if (ctx_.fork_snapshot_writer != nullptr) {
+    const bool was_in_progress = ctx_.fork_snapshot_writer->IsInProgress();
+    ctx_.fork_snapshot_writer->CheckChild();
+    if (was_in_progress && !ctx_.fork_snapshot_writer->IsInProgress()) {
       CleanupOldSnapshots();
     }
   }
@@ -192,21 +177,6 @@ void SnapshotScheduler::SchedulerLoop() {
 
 void SnapshotScheduler::TakeSnapshot() {
   try {
-    // Atomically try to acquire the read_only flag
-    // This prevents TOCTOU race between checking and setting the flag
-    bool expected = false;
-    if (!read_only_.compare_exchange_strong(expected, true)) {
-      // Another dump operation (manual or auto) is already in progress
-      utils::StructuredLog()
-          .Event("auto_snapshot_skipped")
-          .Field("reason", "another DUMP operation is in progress")
-          .Info();
-      return;
-    }
-
-    // Flag successfully acquired, use RAII guard to ensure it's reset on exit
-    utils::FlagResetGuard read_only_guard(read_only_);
-
     // Generate timestamp-based filename
     auto timestamp = std::time(nullptr);
     std::tm tm_buf{};
@@ -218,9 +188,8 @@ void SnapshotScheduler::TakeSnapshot() {
 
     utils::StructuredLog().Event("snapshot_taking").Field("path", snapshot_path.string()).Info();
 
-    // Start background fork-based snapshot
-    auto result = fork_writer_->StartBackgroundSave(snapshot_path.string(), *full_config_, *event_store_, *co_index_,
-                                                    *vector_store_, metadata_store_);
+    // A running save or load makes this tick fail; the next tick retries.
+    auto result = handlers::StartForkSnapshot(ctx_, snapshot_path.string());
 
     if (result) {
       utils::StructuredLog().Event("snapshot_started").Field("path", snapshot_path.string()).Info();
@@ -301,7 +270,21 @@ void SnapshotScheduler::CleanupOldSnapshots() {
     const auto retain_count = static_cast<size_t>(config_.retain);
     for (size_t i = retain_count; i < snapshot_files.size(); ++i) {
       utils::StructuredLog().Event("snapshot_removing_old").Field("path", snapshot_files[i].first.string()).Info();
-      std::filesystem::remove(snapshot_files[i].first);
+      // The checkpoint sidecar goes first: a crash between the two removals
+      // then leaves a snapshot without a sidecar, never an orphan sidecar.
+      std::error_code remove_error;
+      std::filesystem::remove(snapshot_files[i].first.string() + storage::kWalCheckpointSuffix, remove_error);
+      if (!remove_error) {
+        std::filesystem::remove(snapshot_files[i].first, remove_error);
+      }
+      if (remove_error) {
+        utils::StructuredLog()
+            .Event("server_error")
+            .Field("operation", "snapshot_cleanup")
+            .Field("path", snapshot_files[i].first.string())
+            .Field("error", remove_error.message())
+            .Error();
+      }
     }
 
   } catch (const std::exception& e) {

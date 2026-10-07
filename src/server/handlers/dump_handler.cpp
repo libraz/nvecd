@@ -37,6 +37,33 @@ namespace {
 constexpr int kFilepathBufferSize = 256;
 }  // namespace
 
+utils::Expected<void, utils::Error> StartForkSnapshot(HandlerContext& ctx, const std::string& resolved_path) {
+  if (ctx.fork_snapshot_writer == nullptr || ctx.config == nullptr || ctx.event_store == nullptr ||
+      ctx.co_index == nullptr || ctx.vector_store == nullptr) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kInternalError, "Fork snapshot writer not initialized"));
+  }
+
+  // Serialize the pre-fork store barrier and WAL sequence capture with both
+  // regular mutations and DUMP LOAD. The guard only covers fork(), not the
+  // child write, so serving resumes immediately after the COW image exists.
+  std::shared_lock<std::shared_mutex> snapshot_write_guard;
+  if (ctx.snapshot_write_gate != nullptr) {
+    snapshot_write_guard = std::shared_lock(*ctx.snapshot_write_gate);
+  }
+  if (ctx.loading.load(std::memory_order_acquire)) {
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kSnapshotAlreadyInProgress,
+                                                  "Cannot save snapshot while a snapshot load is in progress"));
+  }
+  std::unique_lock<std::mutex> write_serialization_guard;
+  if (ctx.write_serialization_gate != nullptr) {
+    write_serialization_guard = std::unique_lock(*ctx.write_serialization_gate);
+  }
+
+  return ctx.fork_snapshot_writer->StartBackgroundSave(resolved_path, *ctx.config, *ctx.event_store, *ctx.co_index,
+                                                       *ctx.vector_store, ctx.metadata_store);
+}
+
 utils::Expected<std::string, utils::Error> HandleDumpSave(HandlerContext& ctx, const std::string& filepath) {
   // Check if config is available. Resolving the destination needs it, because
   // an argument-less DUMP SAVE uses the operator's configured filename.
@@ -61,7 +88,7 @@ utils::Expected<std::string, utils::Error> HandleDumpSave(HandlerContext& ctx, c
   const std::string requested_path = filepath.empty() ? ctx.config->snapshot.default_filename : filepath;
 
   if (!requested_path.empty()) {
-    auto validated = utils::ValidateDumpPath(requested_path, ctx.dump_dir);
+    auto validated = utils::ValidateDumpPath(requested_path, ctx.dump_dir, utils::DumpPathUse::kRecoveryBase);
     if (!validated) {
       return utils::MakeUnexpected(validated.error());
     }
@@ -87,33 +114,7 @@ utils::Expected<std::string, utils::Error> HandleDumpSave(HandlerContext& ctx, c
   // Branch on snapshot mode
   if (ctx.config->snapshot.mode == "fork") {
     // Fork mode: non-blocking background save
-    if (ctx.fork_snapshot_writer == nullptr) {
-      return utils::MakeUnexpected(
-          utils::MakeError(utils::ErrorCode::kInternalError, "Fork snapshot writer not initialized"));
-    }
-
-    // Serialize the pre-fork store barrier and WAL sequence capture with both
-    // regular mutations and DUMP LOAD. The guard only covers fork(), not the
-    // child write, so serving resumes immediately after the COW image exists.
-    std::shared_lock<std::shared_mutex> snapshot_write_guard;
-    if (ctx.snapshot_write_gate != nullptr) {
-      snapshot_write_guard = std::shared_lock(*ctx.snapshot_write_gate);
-    }
-    if (ctx.loading.load(std::memory_order_acquire)) {
-      return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kSnapshotAlreadyInProgress,
-                                                    "Cannot save snapshot while a snapshot load is in progress"));
-    }
-    std::unique_lock<std::mutex> write_serialization_guard;
-    if (ctx.write_serialization_gate != nullptr) {
-      write_serialization_guard = std::unique_lock(*ctx.write_serialization_gate);
-    }
-
-    // Reap any finished child first
-    ctx.fork_snapshot_writer->CheckChild();
-
-    auto result = ctx.fork_snapshot_writer->StartBackgroundSave(resolved_path, *ctx.config, *ctx.event_store,
-                                                                *ctx.co_index, *ctx.vector_store, ctx.metadata_store);
-
+    auto result = StartForkSnapshot(ctx, resolved_path);
     if (!result) {
       utils::LogStorageError("dump_save", resolved_path, result.error().message());
       return utils::MakeUnexpected(result.error());
@@ -165,7 +166,10 @@ utils::Expected<std::string, utils::Error> HandleDumpLoad(HandlerContext& ctx, c
     return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kInvalidArgument, "DUMP LOAD requires a filepath"));
   }
 
-  auto validated = utils::ValidateDumpPath(filepath, ctx.dump_dir);
+  // With a WAL the loaded file becomes the recovery base the WAL is truncated
+  // against, so it must carry a name startup recovery scans for.
+  auto validated = utils::ValidateDumpPath(
+      filepath, ctx.dump_dir, ctx.wal != nullptr ? utils::DumpPathUse::kRecoveryBase : utils::DumpPathUse::kInspect);
   if (!validated) {
     return utils::MakeUnexpected(validated.error());
   }
@@ -229,6 +233,17 @@ utils::Expected<std::string, utils::Error> HandleDumpLoad(HandlerContext& ctx, c
   std::unique_lock<std::mutex> write_serialization_guard;
   if (ctx.write_serialization_gate != nullptr) {
     write_serialization_guard = std::unique_lock(*ctx.write_serialization_gate);
+  }
+
+  // A fork child still writing a pre-load image would finish after the load
+  // and become a newer recovery base than the loaded file. With loading set
+  // and the gate held, no new child can start, so this check is final.
+  if (ctx.fork_snapshot_writer != nullptr) {
+    ctx.fork_snapshot_writer->CheckChild();
+    if (ctx.fork_snapshot_writer->IsInProgress()) {
+      return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kSnapshotAlreadyInProgress,
+                                                    "Cannot load snapshot while a background save is in progress"));
+    }
   }
 
   ctx.event_store->SwapState(staged_event_store);

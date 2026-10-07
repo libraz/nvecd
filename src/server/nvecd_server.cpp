@@ -24,6 +24,7 @@
 
 #include "cache/similarity_cache.h"
 #include "server/connection_io_handler.h"
+#include "server/handlers/dump_handler.h"
 #include "server/http_server.h"
 #include "server/reactor_connection.h"
 #include "server/request_dispatcher.h"
@@ -36,8 +37,10 @@
 namespace nvecd::server {
 
 namespace {
-constexpr int kShutdownCheckIntervalMs = 100;
+constexpr int kShutdownCheckIntervalMs = 10;
 constexpr size_t kBytesPerMegabyte = 1024 * 1024;  // Bytes in a megabyte
+/// Snapshot WAL-off decay maintenance writes inside snapshot.dir.
+constexpr const char* kMaintenanceSnapshotFilename = "maintenance.nvec";
 
 /**
  * @brief Find completed snapshots in @p dir, newest first.
@@ -115,6 +118,8 @@ NvecdServer::NvecdServer(config::Config config) : config_(std::move(config)) {}
 NvecdServer::~NvecdServer() {
   if (running_.load()) {
     Stop();
+  } else {
+    AbortStart();
   }
 }
 
@@ -128,14 +133,16 @@ utils::Expected<void, utils::Error> NvecdServer::Start() {
   // Initialize components
   auto init_result = InitializeComponents();
   if (!init_result) {
+    AbortStart();
     return init_result;
   }
 
-  // Create thread pool
+  // Resolve the worker count once; TCP and HTTP both size from it.
   int worker_threads = config_.perf.thread_pool_size;
   if (worker_threads <= 0) {
     worker_threads = static_cast<int>(std::thread::hardware_concurrency());
   }
+  worker_threads = std::max(1, worker_threads);
   thread_pool_ = std::make_unique<ThreadPool>(static_cast<size_t>(worker_threads));
 
   spdlog::info("Thread pool created with {} workers", worker_threads);
@@ -143,26 +150,7 @@ utils::Expected<void, utils::Error> NvecdServer::Start() {
   // Start() can fail after worker/reactor construction (for example, an
   // unsupported poller or a bind failure). NvecdServer is not marked running
   // until the listener is live, so Stop() would intentionally be a no-op in
-  // this path; clean up the partially-started network stack explicitly.
-  const auto abort_network_start = [this] {
-    if (unix_acceptor_) {
-      unix_acceptor_->Stop();
-      unix_acceptor_.reset();
-    }
-    if (acceptor_) {
-      acceptor_->Stop();
-      acceptor_.reset();
-    }
-    if (reactor_) {
-      reactor_->Stop();
-      reactor_.reset();
-    }
-    if (thread_pool_) {
-      thread_pool_->Shutdown(static_cast<uint32_t>(config_.perf.shutdown_timeout_ms));
-      thread_pool_.reset();
-    }
-  };
-
+  // this path; AbortStart() tears down what was started instead.
   // Idle sockets are kept in the reactor, not on worker threads. Workers run
   // only the request callbacks extracted from readable connections.
   ReactorConfig reactor_config;
@@ -181,7 +169,7 @@ utils::Expected<void, utils::Error> NvecdServer::Start() {
   });
   auto reactor_result = reactor_->Start();
   if (!reactor_result) {
-    abort_network_start();
+    AbortStart();
     return reactor_result;
   }
 
@@ -238,7 +226,7 @@ utils::Expected<void, utils::Error> NvecdServer::Start() {
   auto start_result = acceptor_->Start();
   if (!start_result) {
     spdlog::error("Failed to start connection acceptor: {}", start_result.error().message());
-    abort_network_start();
+    AbortStart();
     return start_result;
   }
 
@@ -280,10 +268,10 @@ utils::Expected<void, utils::Error> NvecdServer::Start() {
     http_config.cors_allow_origin = config_.api.http.cors_allow_origin;
     http_config.allow_cidrs = config_.network.allow_cidrs;
     http_config.requirepass = config_.security.requirepass;
-    http_config.worker_threads = static_cast<size_t>(std::max(1, config_.perf.thread_pool_size));
+    http_config.worker_threads = static_cast<size_t>(worker_threads);
     http_config.max_connections = static_cast<size_t>(std::max(0, config_.perf.max_connections));
     http_config.max_connections_per_ip = static_cast<size_t>(std::max(0, config_.perf.max_connections_per_ip));
-    const int queued_connections = std::max(1, config_.perf.max_connections - config_.perf.thread_pool_size);
+    const int queued_connections = std::max(1, config_.perf.max_connections - worker_threads);
     http_config.max_queued_connections = static_cast<size_t>(queued_connections);
     // Apply the same per-request query-length budget to HTTP and TCP.
     if (config_.perf.max_query_length > 0) {
@@ -317,23 +305,7 @@ void NvecdServer::Stop() {
   running_.store(false);
   shutdown_.store(true);
 
-  // Stop snapshot scheduler before waiting for fork child
-  if (snapshot_scheduler_) {
-    snapshot_scheduler_->Stop();
-  }
-
-  // Stop co-occurrence decay scheduler
-  if (decay_scheduler_) {
-    decay_scheduler_->Stop();
-  }
-
-  // Wait for any in-progress fork snapshot. The grace period is the operator's
-  // configured shutdown budget rather than the writer's own default, so a
-  // snapshot child cannot hold shutdown open past what the deployment allows.
-  // The cast is safe because the schema constrains this key to 100..60000.
-  if (fork_writer_) {
-    fork_writer_->WaitForChild(static_cast<uint32_t>(config_.perf.shutdown_timeout_ms));
-  }
+  StopBackgroundWork();
 
   // Stop HTTP server
   if (http_server_) {
@@ -350,22 +322,26 @@ void NvecdServer::Stop() {
     acceptor_->Stop();
   }
 
-  // The acceptors have stopped admitting sockets. Now unregister all reactor
-  // clients before worker shutdown so close callbacks and queued responses
-  // still see valid server state.
+  // The acceptors have stopped admitting sockets. Requests already read from
+  // live connections finish and their responses flush while the event loop is
+  // still running; only then are the connections unregistered.
   if (reactor_) {
-    reactor_->Stop();
-  }
-
-  // Wait for existing connections to finish (with timeout)
-  auto start_time = std::chrono::steady_clock::now();
-  while (stats_.active_connections.load() > 0) {
-    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start_time);
-    if (elapsed.count() > config_.perf.shutdown_timeout_ms) {
-      spdlog::warn("Shutdown timeout reached with {} active connections", stats_.active_connections.load());
-      break;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(config_.perf.shutdown_timeout_ms);
+    const auto drained = [this] {
+      return in_flight_requests_.load() == 0 && (!thread_pool_ || thread_pool_->GetQueueSize() == 0) &&
+             reactor_->MemoryBudget()->UsedBytes() == 0;
+    };
+    while (!drained()) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        spdlog::warn("Shutdown timeout reached with {} request(s) in flight", in_flight_requests_.load());
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(kShutdownCheckIntervalMs));
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(kShutdownCheckIntervalMs));
+    // Unregister all reactor clients before worker shutdown so close callbacks
+    // and queued responses still see valid server state.
+    reactor_->Stop();
   }
 
   // Stop thread pool. Queued tasks hold raw pointers to the reactor and to the
@@ -393,6 +369,50 @@ void NvecdServer::Stop() {
   spdlog::info("nvecd server stopped");
   spdlog::info("Total commands processed: {}", stats_.total_commands.load());
   spdlog::info("Total connections: {}", stats_.total_connections.load());
+}
+
+void NvecdServer::StopBackgroundWork() {
+  // Stop snapshot scheduler before waiting for fork child
+  if (snapshot_scheduler_) {
+    snapshot_scheduler_->Stop();
+  }
+
+  // Stop co-occurrence decay scheduler
+  if (decay_scheduler_) {
+    decay_scheduler_->Stop();
+  }
+
+  // Wait for any in-progress fork snapshot. The grace period is the operator's
+  // configured shutdown budget rather than the writer's own default, so a
+  // snapshot child cannot hold shutdown open past what the deployment allows.
+  // The cast is safe because the schema constrains this key to 100..60000.
+  if (fork_writer_) {
+    fork_writer_->WaitForChild(static_cast<uint32_t>(config_.perf.shutdown_timeout_ms));
+  }
+}
+
+void NvecdServer::AbortStart() {
+  if (unix_acceptor_) {
+    unix_acceptor_->Stop();
+    unix_acceptor_.reset();
+  }
+  if (acceptor_) {
+    acceptor_->Stop();
+    acceptor_.reset();
+  }
+  if (reactor_) {
+    reactor_->Stop();
+    reactor_.reset();
+  }
+  if (thread_pool_) {
+    thread_pool_->Shutdown(static_cast<uint32_t>(config_.perf.shutdown_timeout_ms));
+    thread_pool_.reset();
+  }
+  // The schedulers reference the WAL, so they are joined before it closes.
+  StopBackgroundWork();
+  if (wal_.IsOpen()) {
+    wal_.Close();
+  }
 }
 
 utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
@@ -494,9 +514,10 @@ utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
   //      restores all state up to the snapshot's WAL checkpoint sequence; the
   //      WAL was truncated against that snapshot, so its records alone would not
   //      reconstruct the pre-snapshot state.
-  //   2. Open() recovers CurrentSequence from existing WAL files.
+  //   2. Open() recovers CurrentSequence from existing WAL files, floored at
+  //      the loaded checkpoint.
   //   3. Replay() re-applies records strictly after the snapshot's checkpoint
-  //      (floor = ReadWalCheckpoint + 1, or 0 when no snapshot was loaded), so
+  //      (from = ReadWalCheckpoint + 1, or 1 when no snapshot was loaded), so
   //      no event the snapshot already absorbed is double-counted.
   //   4. Only after replay is handler_ctx_.wal published, so live writes append
   //      sequences strictly greater than the recovered maximum.
@@ -584,7 +605,10 @@ utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
     wal_config.sync_interval_ms = config_.wal.sync_interval_ms;
     wal_config.include_vectors = config_.wal.include_vectors;
 
-    auto wal_open = wal_.Open(wal_config);
+    // The checkpoint floors the sequence so a WAL emptied by truncation never
+    // reissues numbers the snapshot already covers.
+    const uint64_t checkpoint = loaded_snapshot->checkpoint;
+    auto wal_open = wal_.Open(wal_config, checkpoint);
     if (!wal_open) {
       // Durability was requested but the WAL is unavailable: fail startup rather
       // than silently degrading to non-durable operation.
@@ -592,9 +616,10 @@ utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
       return utils::MakeUnexpected(wal_open.error());
     }
 
-    // 3. Replay only records beyond the loaded snapshot's checkpoint.
-    const uint64_t checkpoint = loaded_snapshot->checkpoint;
-    const uint64_t from = (checkpoint == 0) ? 0 : checkpoint + 1;
+    // 3. Replay only records beyond the loaded snapshot's checkpoint. Without a
+    // snapshot the floor is sequence 1, so a log whose prefix was truncated
+    // against a snapshot that is now missing fails instead of replaying a tail.
+    const uint64_t from = checkpoint + 1;
 
     // Replay BEFORE publishing handler_ctx_.wal so replayed records are not
     // re-appended.
@@ -632,9 +657,7 @@ utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
 
   // Create and start SnapshotScheduler (if auto-snapshot is enabled)
   if (config_.snapshot.interval_sec > 0) {
-    snapshot_scheduler_ =
-        std::make_unique<SnapshotScheduler>(config_.snapshot, fork_writer_.get(), &config_, event_store_.get(),
-                                            co_index_.get(), vector_store_.get(), metadata_store_.get(), read_only_);
+    snapshot_scheduler_ = std::make_unique<SnapshotScheduler>(config_.snapshot, handler_ctx_);
     snapshot_scheduler_->Start();
   }
 
@@ -642,42 +665,44 @@ utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
   decay_scheduler_ = std::make_unique<DecayScheduler>(
       co_index_.get(), static_cast<int>(config_.events.decay_interval_sec), config_.events.decay_alpha,
       [this](double alpha, bool prune) -> utils::Expected<void, utils::Error> {
-        std::shared_lock snapshot_guard(snapshot_write_gate_);
-        std::lock_guard write_guard(write_serialization_gate_);
-        if (read_only_.load(std::memory_order_acquire)) {
-          return utils::MakeUnexpected(
-              utils::MakeError(utils::ErrorCode::kEventDecayFailed, "Server is read-only; decay maintenance skipped"));
-        }
+        {
+          std::shared_lock snapshot_guard(snapshot_write_gate_);
+          std::lock_guard write_guard(write_serialization_gate_);
+          if (read_only_.load(std::memory_order_acquire)) {
+            return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kEventDecayFailed,
+                                                          "Server is read-only; decay maintenance skipped"));
+          }
 
-        if (handler_ctx_.wal != nullptr) {
-          std::vector<uint8_t> payload(sizeof(alpha) + sizeof(uint8_t));
-          std::memcpy(payload.data(), &alpha, sizeof(alpha));
-          payload[sizeof(alpha)] = prune ? 1 : 0;
-          auto appended =
-              handler_ctx_.wal->Append(storage::WalOpType::kCoOccurrenceMaintenance, payload.data(), payload.size());
-          if (!appended) {
-            read_only_.store(true, std::memory_order_release);
-            return utils::MakeUnexpected(appended.error());
+          if (handler_ctx_.wal != nullptr) {
+            std::vector<uint8_t> payload(sizeof(alpha) + sizeof(uint8_t));
+            std::memcpy(payload.data(), &alpha, sizeof(alpha));
+            payload[sizeof(alpha)] = prune ? 1 : 0;
+            auto appended =
+                handler_ctx_.wal->Append(storage::WalOpType::kCoOccurrenceMaintenance, payload.data(), payload.size());
+            if (!appended) {
+              read_only_.store(true, std::memory_order_release);
+              return utils::MakeUnexpected(appended.error());
+            }
+          }
+
+          co_index_->ApplyDecay(alpha);
+          if (prune) {
+            co_index_->Prune();
           }
         }
 
-        co_index_->ApplyDecay(alpha);
-        if (prune) {
-          co_index_->Prune();
+        // Without a WAL, persist the post-maintenance state through a fork
+        // snapshot taken outside the write gates, so restart does not bring
+        // decayed or pruned pairs back. A pass that changed nothing is skipped.
+        if (handler_ctx_.wal != nullptr || (alpha >= 1.0 && !prune)) {
+          return {};
         }
-
-        // Without a WAL, publish the post-maintenance state as a completed
-        // snapshot before admitting another write. Startup will select it by
-        // normal snapshot ordering, so decay/prune does not resurrect.
-        if (handler_ctx_.wal == nullptr) {
-          const auto maintenance_path = (std::filesystem::path(config_.snapshot.dir) / "maintenance.nvec").string();
-          auto persisted =
-              storage::snapshot_v1::WriteSnapshotV1(maintenance_path, config_, *event_store_, *co_index_,
-                                                    *vector_store_, nullptr, nullptr, metadata_store_.get());
-          if (!persisted) {
-            read_only_.store(true, std::memory_order_release);
-            return utils::MakeUnexpected(persisted.error());
-          }
+        const auto maintenance_path =
+            (std::filesystem::path(config_.snapshot.dir) / kMaintenanceSnapshotFilename).string();
+        auto started = handlers::StartForkSnapshot(handler_ctx_, maintenance_path);
+        if (!started) {
+          // Scores are already decayed in memory; the next pass persists them.
+          spdlog::warn("Maintenance snapshot not started: {}", started.error().message());
         }
         return {};
       });
@@ -764,7 +789,10 @@ std::string NvecdServer::ProcessRequest(const std::string& request, ConnectionCo
     }
   }
 
-  return dispatcher_->Dispatch(request, conn_ctx);
+  in_flight_requests_.fetch_add(1);
+  std::string response = dispatcher_->Dispatch(request, conn_ctx);
+  in_flight_requests_.fetch_sub(1);
+  return response;
 }
 
 }  // namespace nvecd::server

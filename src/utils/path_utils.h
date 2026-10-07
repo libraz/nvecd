@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <cerrno>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <string>
@@ -18,6 +19,7 @@
 #include <unistd.h>
 #endif
 
+#include "storage/snapshot_format.h"
 #include "utils/error.h"
 #include "utils/expected.h"
 
@@ -365,18 +367,28 @@ class PrivateStorageTarget {
 
 #endif
 
+/// What a validated dump path will be used for.
+enum class DumpPathUse : uint8_t {
+  kInspect,       ///< Read or inspect an existing file under any name
+  kRecoveryBase,  ///< Written or checkpointed as a startup recovery base
+};
+
 /**
  * @brief Validate and canonicalize a dump file path
  *
  * If the filepath is not absolute, it is prepended with dump_dir.
  * The resulting path is canonicalized and checked for path traversal
- * (i.e., the canonical path must reside within the dump directory).
+ * (i.e., the canonical path must reside within the dump directory). A path
+ * that becomes a recovery base must also carry an extension startup recovery
+ * scans for; otherwise its WAL checkpoint would name a file recovery skips.
  *
  * @param filepath The raw file path (absolute or relative)
  * @param dump_dir The allowed dump directory
+ * @param use What the caller will do with the path
  * @return The validated canonical path, or an error on failure
  */
-inline Expected<std::string, Error> ValidateDumpPath(const std::string& filepath, const std::string& dump_dir) {
+inline Expected<std::string, Error> ValidateDumpPath(const std::string& filepath, const std::string& dump_dir,
+                                                     DumpPathUse use = DumpPathUse::kInspect) {
   // An empty filepath names no file and must be refused on that ground alone.
   // Left to the checks below it would never be joined to dump_dir, and
   // weakly_canonical() resolves an empty path to the process working
@@ -391,6 +403,13 @@ inline Expected<std::string, Error> ValidateDumpPath(const std::string& filepath
   // Defense-in-depth: reject paths containing ".." segments before canonicalization
   if (filepath.find("..") != std::string::npos) {
     return MakeUnexpected(MakeError(ErrorCode::kInvalidArgument, "Invalid filepath: path traversal detected"));
+  }
+
+  if (use == DumpPathUse::kRecoveryBase &&
+      !storage::snapshot_format::IsRecoverableExtension(std::filesystem::path(filepath).extension().string())) {
+    return MakeUnexpected(MakeError(
+        ErrorCode::kInvalidArgument,
+        "Invalid filepath: snapshot name must end in " + storage::snapshot_format::RecoverableExtensionList()));
   }
 
   std::string resolved = filepath;

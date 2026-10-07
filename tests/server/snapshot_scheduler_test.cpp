@@ -8,10 +8,19 @@
 #include <gtest/gtest.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <string>
 #include <thread>
+#include <vector>
+
+#include "events/co_occurrence_index.h"
+#include "events/event_store.h"
+#include "storage/snapshot_fork.h"
+#include "storage/wal_checkpoint.h"
+#include "vectors/vector_store.h"
 
 namespace nvecd::server {
 namespace {
@@ -29,12 +38,6 @@ config::SnapshotConfig MakeTestConfig(int interval_sec, int retain, const std::s
 /// Test fixture that provides common test infrastructure
 class SnapshotSchedulerTest : public ::testing::Test {
  protected:
-  void SetUp() override {
-    // Create a unique temp directory for each test
-    temp_dir_ = std::filesystem::temp_directory_path() / ("nvecd_sched_test_" + std::to_string(GetCurrentTimestamp()));
-    std::filesystem::create_directories(temp_dir_);
-  }
-
   void TearDown() override {
     std::error_code ec;
     std::filesystem::remove_all(temp_dir_, ec);
@@ -46,9 +49,9 @@ class SnapshotSchedulerTest : public ::testing::Test {
 
   std::filesystem::path temp_dir_;
   std::atomic<bool> read_only_{false};
+  std::atomic<bool> loading_{false};
+  ServerStats stats_;
 
-  // Minimal stores for constructor (scheduler won't actually use them
-  // in disabled/start-stop tests)
   config::EventsConfig events_cfg_;
   config::VectorsConfig vectors_cfg_;
   events::EventStore event_store_{events_cfg_};
@@ -56,13 +59,20 @@ class SnapshotSchedulerTest : public ::testing::Test {
   vectors::VectorStore vector_store_{vectors_cfg_};
   storage::ForkSnapshotWriter fork_writer_;
   config::Config full_config_;
+  HandlerContext ctx_{&event_store_, &co_index_,    &vector_store_, nullptr,    nullptr, nullptr, nullptr,
+                      stats_,        &full_config_, loading_,       read_only_, "",      ""};
+
+  void SetUp() override {
+    temp_dir_ = std::filesystem::temp_directory_path() / ("nvecd_sched_test_" + std::to_string(GetCurrentTimestamp()));
+    std::filesystem::create_directories(temp_dir_);
+    ctx_.fork_snapshot_writer = &fork_writer_;
+  }
 };
 
 TEST_F(SnapshotSchedulerTest, DisabledWhenIntervalZero) {
   auto snap_config = MakeTestConfig(0, 3, temp_dir_.string());
 
-  SnapshotScheduler scheduler(snap_config, &fork_writer_, &full_config_, &event_store_, &co_index_, &vector_store_,
-                              read_only_);
+  SnapshotScheduler scheduler(snap_config, ctx_);
 
   scheduler.Start();
   EXPECT_FALSE(scheduler.IsRunning());
@@ -71,8 +81,7 @@ TEST_F(SnapshotSchedulerTest, DisabledWhenIntervalZero) {
 TEST_F(SnapshotSchedulerTest, DisabledWhenIntervalNegative) {
   auto snap_config = MakeTestConfig(-1, 3, temp_dir_.string());
 
-  SnapshotScheduler scheduler(snap_config, &fork_writer_, &full_config_, &event_store_, &co_index_, &vector_store_,
-                              read_only_);
+  SnapshotScheduler scheduler(snap_config, ctx_);
 
   scheduler.Start();
   EXPECT_FALSE(scheduler.IsRunning());
@@ -81,8 +90,7 @@ TEST_F(SnapshotSchedulerTest, DisabledWhenIntervalNegative) {
 TEST_F(SnapshotSchedulerTest, StartsAndStops) {
   auto snap_config = MakeTestConfig(5, 3, temp_dir_.string());
 
-  SnapshotScheduler scheduler(snap_config, &fork_writer_, &full_config_, &event_store_, &co_index_, &vector_store_,
-                              read_only_);
+  SnapshotScheduler scheduler(snap_config, ctx_);
 
   scheduler.Start();
   EXPECT_TRUE(scheduler.IsRunning());
@@ -94,8 +102,7 @@ TEST_F(SnapshotSchedulerTest, StartsAndStops) {
 TEST_F(SnapshotSchedulerTest, StopIsIdempotent) {
   auto snap_config = MakeTestConfig(5, 3, temp_dir_.string());
 
-  SnapshotScheduler scheduler(snap_config, &fork_writer_, &full_config_, &event_store_, &co_index_, &vector_store_,
-                              read_only_);
+  SnapshotScheduler scheduler(snap_config, ctx_);
 
   scheduler.Start();
   EXPECT_TRUE(scheduler.IsRunning());
@@ -112,8 +119,7 @@ TEST_F(SnapshotSchedulerTest, DestructorStopsScheduler) {
   auto snap_config = MakeTestConfig(5, 3, temp_dir_.string());
 
   {
-    SnapshotScheduler scheduler(snap_config, &fork_writer_, &full_config_, &event_store_, &co_index_, &vector_store_,
-                                read_only_);
+    SnapshotScheduler scheduler(snap_config, ctx_);
     scheduler.Start();
     EXPECT_TRUE(scheduler.IsRunning());
     // Destructor should call Stop() and join the thread
@@ -121,87 +127,62 @@ TEST_F(SnapshotSchedulerTest, DestructorStopsScheduler) {
   // If we get here without hanging, the destructor properly stopped the thread
 }
 
-TEST_F(SnapshotSchedulerTest, CleanupRetainsCorrectCount) {
-  // Create 5 auto_*.nvec files in the temp directory with staggered modification times
+TEST_F(SnapshotSchedulerTest, CleanupKeepsExactlyTheNewestAutoSnapshotsAndTheirSidecars) {
+  namespace fs = std::filesystem;
+  const auto now = fs::file_time_type::clock::now();
+  std::vector<fs::path> fakes;
   for (int i = 0; i < 5; ++i) {
-    std::string filename = "auto_20260101_00000" + std::to_string(i) + ".nvec";
-    std::filesystem::path filepath = temp_dir_ / filename;
-    std::ofstream ofs(filepath);
-    ofs << "test data " << i;
-    ofs.close();
-
-    // Stagger modification times so sorting is deterministic
-    // Use resize to touch the file at slightly different times
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const fs::path path = temp_dir_ / ("auto_20260101_00000" + std::to_string(i) + ".nvec");
+    std::ofstream(path) << "test data " << i;
+    std::ofstream(path.string() + storage::kWalCheckpointSuffix) << "sidecar " << i;
+    // Older index means older snapshot; every fake predates the real one.
+    fs::last_write_time(path, now - std::chrono::minutes(10 - i));
+    fakes.push_back(path);
   }
+  std::ofstream(temp_dir_ / "manual_snapshot.nvec") << "manual data";
 
-  // Also create a non-auto file that should NOT be cleaned up
-  {
-    std::filesystem::path manual_file = temp_dir_ / "manual_snapshot.nvec";
-    std::ofstream ofs(manual_file);
-    ofs << "manual data";
-  }
-
-  // Verify we have 5 auto files + 1 manual file
-  int auto_count = 0;
-  int total_count = 0;
-  for (const auto& entry : std::filesystem::directory_iterator(temp_dir_)) {
-    if (entry.is_regular_file() && entry.path().extension() == ".nvec") {
-      ++total_count;
-      if (entry.path().filename().string().rfind("auto_", 0) == 0) {
-        ++auto_count;
+  const auto auto_snapshots = [this] {
+    std::vector<std::string> names;
+    for (const auto& entry : fs::directory_iterator(temp_dir_)) {
+      const std::string name = entry.path().filename().string();
+      if (entry.path().extension() == ".nvec" && name.rfind("auto_", 0) == 0) {
+        names.push_back(name);
       }
     }
+    std::sort(names.begin(), names.end());
+    return names;
+  };
+
+  SnapshotScheduler scheduler(MakeTestConfig(1, 3, temp_dir_.string()), ctx_);
+  scheduler.Start();
+  ASSERT_TRUE(scheduler.IsRunning());
+
+  // The first tick forks a real snapshot (six files). Once it is published,
+  // a load-in-progress flag makes every later tick refuse to fork, so
+  // retention runs exactly once, after that child is reaped.
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  while (auto_snapshots().size() != 6 && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
-  ASSERT_EQ(auto_count, 5);
-  ASSERT_EQ(total_count, 6);
-
-  // Create scheduler with retain=3 and a very long interval (won't actually trigger)
-  auto snap_config = MakeTestConfig(99999, 3, temp_dir_.string());
-
-  SnapshotScheduler scheduler(snap_config, &fork_writer_, &full_config_, &event_store_, &co_index_, &vector_store_,
-                              read_only_);
-
-  // Start and immediately stop -- the first snapshot won't fire for 99999 seconds,
-  // but we want the scheduler infrastructure for the test.
-  // Instead, we'll use a short interval and wait for one cycle.
-  // Actually, we can test cleanup indirectly by using a very short interval.
-
-  // Better approach: use interval=1 so the scheduler fires quickly
-  auto short_config = MakeTestConfig(1, 3, temp_dir_.string());
-
-  SnapshotScheduler short_scheduler(short_config, &fork_writer_, &full_config_, &event_store_, &co_index_,
-                                    &vector_store_, read_only_);
-
-  short_scheduler.Start();
-  ASSERT_TRUE(short_scheduler.IsRunning());
-
-  // Wait for the scheduler to fire at least once (1s interval + some margin)
-  std::this_thread::sleep_for(std::chrono::milliseconds(2500));
-
-  short_scheduler.Stop();
-
-  // Count remaining auto_*.nvec files
-  auto_count = 0;
-  int manual_count = 0;
-  for (const auto& entry : std::filesystem::directory_iterator(temp_dir_)) {
-    if (entry.is_regular_file() && entry.path().extension() == ".nvec") {
-      if (entry.path().filename().string().rfind("auto_", 0) == 0) {
-        ++auto_count;
-      } else {
-        ++manual_count;
-      }
-    }
+  loading_.store(true);
+  while (auto_snapshots().size() != 3 && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
+  scheduler.Stop();
 
-  // Should retain at most 3 auto files (the 3 newest).
-  // The scheduler may have created additional auto files via TakeSnapshot(),
-  // but cleanup should keep only 3.
-  EXPECT_LE(auto_count, 3);
+  const auto remaining = auto_snapshots();
+  ASSERT_EQ(remaining.size(), 3U);
+  // Survivors are the real snapshot plus the two newest fakes.
+  EXPECT_EQ(remaining[0], fakes[3].filename().string());
+  EXPECT_EQ(remaining[1], fakes[4].filename().string());
+  EXPECT_EQ(remaining[2].rfind("auto_2", 0), 0U);
 
-  // Manual file should be untouched
-  EXPECT_EQ(manual_count, 1);
-  EXPECT_TRUE(std::filesystem::exists(temp_dir_ / "manual_snapshot.nvec"));
+  for (int i = 0; i < 5; ++i) {
+    const bool kept = i >= 3;
+    EXPECT_EQ(fs::exists(fakes[i]), kept) << fakes[i];
+    EXPECT_EQ(fs::exists(fakes[i].string() + storage::kWalCheckpointSuffix), kept) << fakes[i];
+  }
+  EXPECT_TRUE(fs::exists(temp_dir_ / "manual_snapshot.nvec"));
 }
 
 TEST_F(SnapshotSchedulerTest, CleanupReclaimsTemporariesOfDeadWritersOnly) {
@@ -220,8 +201,7 @@ TEST_F(SnapshotSchedulerTest, CleanupReclaimsTemporariesOfDeadWritersOnly) {
   ASSERT_TRUE(std::filesystem::exists(live));
 
   auto snap_config = MakeTestConfig(1, 3, temp_dir_.string());
-  SnapshotScheduler scheduler(snap_config, &fork_writer_, &full_config_, &event_store_, &co_index_, &vector_store_,
-                              read_only_);
+  SnapshotScheduler scheduler(snap_config, ctx_);
   scheduler.Start();
   ASSERT_TRUE(scheduler.IsRunning());
   std::this_thread::sleep_for(std::chrono::milliseconds(2500));

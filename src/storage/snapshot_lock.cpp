@@ -8,6 +8,7 @@
 #include <shared_mutex>
 
 #include "storage/snapshot_format_v1.h"
+#include "storage/snapshot_session.h"
 #include "storage/wal.h"
 #include "utils/structured_log.h"
 
@@ -20,6 +21,12 @@ utils::Expected<void, utils::Error> WriteSnapshotWithLock(
     WriteAheadLog* wal, uint64_t* captured_sequence) {
   if (captured_sequence != nullptr) {
     *captured_sequence = 0;
+  }
+  if (wal != nullptr) {
+    auto preserved = PreserveRecoveryBase(filepath);
+    if (!preserved) {
+      return utils::MakeUnexpected(preserved.error());
+    }
   }
   utils::LogStorageInfo("snapshot_lock", "Acquiring write locks as barrier for consistent snapshot");
 

@@ -14,11 +14,7 @@
 #include <thread>
 
 #include "config/config.h"
-#include "events/co_occurrence_index.h"
-#include "events/event_store.h"
-#include "storage/snapshot_fork.h"
-#include "vectors/metadata_store.h"
-#include "vectors/vector_store.h"
+#include "server/server_types.h"
 
 namespace nvecd::server {
 
@@ -44,7 +40,7 @@ void ReclaimAbandonedTemporaries(const std::string& dir);
  * Key responsibilities:
  * - Periodic snapshot creation via ForkSnapshotWriter
  * - Cleanup of old auto-snapshot files
- * - Mutual exclusion with manual DUMP SAVE operations
+ * - Mutual exclusion with manual DUMP SAVE and DUMP LOAD through the shared gates
  *
  * Thread Safety:
  * - Start/Stop are not thread-safe (call from main thread only)
@@ -54,23 +50,11 @@ class SnapshotScheduler {
  public:
   /**
    * @brief Construct a SnapshotScheduler
-   * @param config Snapshot configuration (interval, retain, dir, mode)
-   * @param fork_writer Fork-based snapshot writer (non-owning)
-   * @param full_config Full configuration for snapshot metadata (non-owning)
-   * @param event_store Event store for snapshot data (non-owning)
-   * @param co_index Co-occurrence index for snapshot data (non-owning)
-   * @param vector_store Vector store for snapshot data (non-owning)
-   * @param read_only Reference to read_only flag for mutual exclusion with manual DUMP SAVE
+   * @param config Snapshot configuration (interval, retain, dir)
+   * @param ctx Handler context whose stores, fork writer and write gates every
+   *            snapshot is taken through (non-owning, must outlive the scheduler)
    */
-  SnapshotScheduler(config::SnapshotConfig config, storage::ForkSnapshotWriter* fork_writer,
-                    const config::Config* full_config, events::EventStore* event_store,
-                    events::CoOccurrenceIndex* co_index, vectors::VectorStore* vector_store,
-                    vectors::MetadataStore* metadata_store, std::atomic<bool>& read_only);
-
-  SnapshotScheduler(config::SnapshotConfig config, storage::ForkSnapshotWriter* fork_writer,
-                    const config::Config* full_config, events::EventStore* event_store,
-                    events::CoOccurrenceIndex* co_index, vectors::VectorStore* vector_store,
-                    std::atomic<bool>& read_only);
+  SnapshotScheduler(config::SnapshotConfig config, HandlerContext& ctx);
 
   // Non-copyable and non-movable
   SnapshotScheduler(const SnapshotScheduler&) = delete;
@@ -113,8 +97,8 @@ class SnapshotScheduler {
   /**
    * @brief Take a snapshot using ForkSnapshotWriter
    *
-   * Acquires exclusive access via compare_exchange_strong on read_only_,
-   * generates a timestamped filename, and starts a background fork save.
+   * Generates a timestamped filename and starts a background fork save through
+   * the same gated capture routine as DUMP SAVE.
    */
   void TakeSnapshot();
 
@@ -128,13 +112,7 @@ class SnapshotScheduler {
   void CleanupOldSnapshots();
 
   config::SnapshotConfig config_;
-  storage::ForkSnapshotWriter* fork_writer_;
-  const config::Config* full_config_;
-  events::EventStore* event_store_;
-  events::CoOccurrenceIndex* co_index_;
-  vectors::VectorStore* vector_store_;
-  vectors::MetadataStore* metadata_store_;
-  std::atomic<bool>& read_only_;
+  HandlerContext& ctx_;
 
   std::atomic<bool> running_{false};
   std::unique_ptr<std::thread> scheduler_thread_;

@@ -136,6 +136,17 @@ utils::Expected<void, utils::Error> ForkSnapshotWriter::StartBackgroundSave(
     current_result_.wal_sequence = 0;
   }
 
+  if (wal_ != nullptr) {
+    auto preserved = PreserveRecoveryBase(filepath);
+    if (!preserved) {
+      std::lock_guard lock(status_mutex_);
+      current_result_.status = SnapshotStatus::kFailed;
+      current_result_.error_message = preserved.error().message();
+      current_result_.end_time = static_cast<uint64_t>(std::time(nullptr));
+      return utils::MakeUnexpected(preserved.error());
+    }
+  }
+
   utils::LogStorageInfo("snapshot_fork", "Acquiring store locks for pre-fork barrier");
 
   // Install the fork barrier that flushes spdlog before fork (see
@@ -153,11 +164,13 @@ utils::Expected<void, utils::Error> ForkSnapshotWriter::StartBackgroundSave(
   auto lock_vs = vector_store.AcquireReadLock();
   auto lock_ms = metadata_store != nullptr ? metadata_store->AcquireReadLock() : std::shared_lock<std::shared_mutex>();
 
-  // Capture the WAL sequence WHILE the store-lock barrier is held. Writes are
-  // serialized behind these locks, so the captured value is exactly the maximum
-  // op reflected in the about-to-be-frozen (COW) snapshot. It is recorded in the
-  // checkpoint sidecar and used to truncate the WAL only after the child
-  // succeeds, so the WAL never drops a record the snapshot does not contain.
+  // Capture the WAL sequence WHILE the store-lock barrier is held. The caller
+  // holds the write serialization gate (server::handlers::StartForkSnapshot),
+  // so no write sits between its WAL append and its apply, and the captured
+  // value is exactly the maximum op reflected in the about-to-be-frozen (COW)
+  // snapshot. It is recorded in the checkpoint sidecar and used to truncate the
+  // WAL only after the child succeeds, so the WAL never drops a record the
+  // snapshot does not contain.
   const uint64_t captured_wal_sequence = (wal_ != nullptr) ? wal_->CurrentSequence() : 0;
 
   // Ensure SIGCHLD is not SIG_IGN (macOS auto-reaps children when ignored)

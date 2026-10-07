@@ -82,3 +82,56 @@ gtest_discover_tests(wal_crash_recovery_test
     TIMEOUT 120
     LABELS "integration;crash"
 )
+
+add_executable(snapshot_recovery_base_test
+  snapshot_recovery_base_test.cpp
+)
+target_link_libraries(snapshot_recovery_base_test
+  nvecd_server
+  nvecd_storage
+  gtest_main
+)
+target_include_directories(snapshot_recovery_base_test PRIVATE ${CMAKE_SOURCE_DIR}/tests/integration)
+gtest_discover_tests(snapshot_recovery_base_test
+  DISCOVERY_MODE POST_BUILD
+  DISCOVERY_TIMEOUT 30
+  PROPERTIES
+    RESOURCE_LOCK server_port_and_storage_io
+    TIMEOUT 120
+    LABELS integration
+)
+
+add_executable(decay_maintenance_recovery_test
+  decay_maintenance_recovery_test.cpp
+)
+target_link_libraries(decay_maintenance_recovery_test
+  nvecd_server
+  nvecd_storage
+  gtest_main
+)
+target_include_directories(decay_maintenance_recovery_test PRIVATE ${CMAKE_SOURCE_DIR}/tests/integration)
+gtest_discover_tests(decay_maintenance_recovery_test
+  DISCOVERY_MODE POST_BUILD
+  DISCOVERY_TIMEOUT 30
+  PROPERTIES
+    RESOURCE_LOCK server_port_and_storage_io
+    TIMEOUT 120
+    LABELS integration
+)
+
+add_executable(server_lifecycle_test
+  server_lifecycle_test.cpp
+)
+target_link_libraries(server_lifecycle_test
+  nvecd_server
+  gtest_main
+)
+target_include_directories(server_lifecycle_test PRIVATE ${CMAKE_SOURCE_DIR}/tests/integration)
+gtest_discover_tests(server_lifecycle_test
+  DISCOVERY_MODE POST_BUILD
+  DISCOVERY_TIMEOUT 30
+  PROPERTIES
+    RESOURCE_LOCK server_port_and_storage_io
+    TIMEOUT 60
+    LABELS integration
+)

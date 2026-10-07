@@ -134,6 +134,20 @@ class NvecdServer {
   utils::Expected<void, utils::Error> InitializeComponents();
 
   /**
+   * @brief Join the snapshot and decay schedulers and reap any snapshot child
+   */
+  void StopBackgroundWork();
+
+  /**
+   * @brief Tear down whatever a failed Start() brought up
+   *
+   * Runs on every Start() failure and from the destructor of a server that is
+   * not running: network components first, then the background work, and the
+   * WAL last, so no thread outlives a component it references.
+   */
+  void AbortStart();
+
+  /**
    * @brief Handle client connection
    * @param client_fd Client socket file descriptor
    */
@@ -154,7 +168,8 @@ class NvecdServer {
   std::atomic<bool> running_{false};
   std::atomic<bool> shutdown_{false};  // Set to true when shutting down
   std::atomic<bool> loading_{false};
-  std::atomic<bool> read_only_{false};  // Set to true during snapshot save
+  std::atomic<bool> read_only_{false};         // Set to true during snapshot save
+  std::atomic<size_t> in_flight_requests_{0};  // TCP requests inside ProcessRequest
   std::shared_mutex snapshot_write_gate_;
   std::mutex write_serialization_gate_;
 
@@ -200,9 +215,9 @@ class NvecdServer {
   std::unique_ptr<DecayScheduler> decay_scheduler_;           ///< Background co-occurrence decay scheduler
 
   /// Write-Ahead Log for durability (owned). Opened after stores are populated
-  /// when config.wal.enabled; closed in Stop()/destructor (flushes pending
-  /// writes and joins its background sync thread). Declared last so it is
-  /// destroyed first, after the schedulers that may reference it are stopped.
+  /// when config.wal.enabled; closed by Stop() or AbortStart() only after the
+  /// schedulers that reference it are joined (flushes pending writes and joins
+  /// its background sync thread).
   storage::WriteAheadLog wal_;
 };
 

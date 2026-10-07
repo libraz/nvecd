@@ -5,8 +5,10 @@
 
 #include "storage/snapshot_session.h"
 
+#include <fcntl.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <unistd.h>
 
 #include <cerrno>
 #include <chrono>
@@ -25,7 +27,57 @@ namespace {
 /// Grace period between SIGTERM and SIGKILL when a child overruns its deadline.
 constexpr uint32_t kChildSigtermGraceMs = 500;
 
+/// Hidden name with a recoverable extension that keeps the previous generation.
+std::filesystem::path PreservedBasePath(const std::filesystem::path& snapshot_path) {
+  return snapshot_path.parent_path() /
+         ("." + snapshot_path.filename().string() + ".prev" + snapshot_path.extension().string());
+}
+
+bool FsyncDirectory(const std::filesystem::path& directory) {
+  const int fd = ::open(directory.empty() ? "." : directory.c_str(), O_RDONLY | O_DIRECTORY);
+  if (fd < 0) {
+    return false;
+  }
+  const bool synced = ::fsync(fd) == 0;
+  const bool closed = ::close(fd) == 0;
+  return synced && closed;
+}
+
 }  // namespace
+
+utils::Expected<void, utils::Error> PreserveRecoveryBase(const std::string& snapshot_path) {
+  const std::filesystem::path path(snapshot_path);
+  const std::string sidecar = snapshot_path + kWalCheckpointSuffix;
+  std::error_code error;
+  if (!std::filesystem::is_regular_file(path, error) || !std::filesystem::exists(sidecar, error)) {
+    return {};
+  }
+  error.clear();
+
+  const auto preserved = PreservedBasePath(path);
+  const std::string preserved_sidecar = preserved.string() + kWalCheckpointSuffix;
+  // A pair left by an interrupted save stays the base unless the path has
+  // validated since; only then is it replaced, sidecar first.
+  if (std::filesystem::exists(preserved, error) && !ReadWalCheckpoint(snapshot_path)) {
+    return {};
+  }
+  std::filesystem::remove(preserved_sidecar, error);
+  if (!error) {
+    std::filesystem::remove(preserved, error);
+  }
+  if (error) {
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kStorageWriteError,
+                                                  "Failed to replace preserved snapshot: " + error.message(),
+                                                  preserved.string()));
+  }
+  if (::link(snapshot_path.c_str(), preserved.c_str()) != 0 ||
+      ::link(sidecar.c_str(), preserved_sidecar.c_str()) != 0 || !FsyncDirectory(path.parent_path())) {
+    return utils::MakeUnexpected(utils::MakeError(
+        utils::ErrorCode::kStorageWriteError,
+        "Failed to preserve snapshot recovery base: " + std::string(std::strerror(errno)), preserved.string()));
+  }
+  return {};
+}
 
 SnapshotSession::SnapshotSession(std::string filepath, pid_t child_pid, uint64_t wal_sequence, WriteAheadLog* wal)
     : filepath_(std::move(filepath)), child_pid_(child_pid), wal_sequence_(wal_sequence), wal_(wal) {
@@ -152,6 +204,9 @@ void SnapshotSession::ReapAndComplete() {
 
 void SnapshotSession::Complete(const utils::Expected<void, utils::Error>& write_result) {
   auto outcome = RunDurabilityHandshake(write_result);
+  if (wal_ != nullptr) {
+    ReleasePreservedBase();
+  }
 
   std::lock_guard<std::mutex> lock(mutex_);
   finished_ = true;
@@ -201,6 +256,26 @@ utils::Expected<SnapshotOutcome, utils::Error> SnapshotSession::RunDurabilityHan
 
   utils::LogStorageInfo("snapshot_session", "Snapshot completed and WAL truncated: " + filepath_);
   return outcome;
+}
+
+void SnapshotSession::ReleasePreservedBase() const {
+  const auto preserved = PreservedBasePath(filepath_);
+  std::error_code error;
+  if (!std::filesystem::exists(preserved, error)) {
+    return;
+  }
+  // While the path itself does not validate, the preserved pair is the base.
+  if (!ReadWalCheckpoint(filepath_)) {
+    return;
+  }
+  std::filesystem::remove(preserved.string() + kWalCheckpointSuffix, error);
+  if (!error) {
+    std::filesystem::remove(preserved, error);
+  }
+  if (error) {
+    utils::LogStorageWarning("snapshot_session",
+                             "Failed to remove preserved snapshot '" + preserved.string() + "': " + error.message());
+  }
 }
 
 void SnapshotSession::ReclaimChildTemporaries() const {

@@ -12,13 +12,18 @@
 #include <gtest/gtest.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <zlib.h>
 
+#include <algorithm>
+#include <array>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <sstream>
 #include <string>
 #include <variant>
+#include <vector>
 
 #include "config/config.h"
 #include "events/co_occurrence_index.h"
@@ -895,6 +900,87 @@ TEST_F(SnapshotFormatV1Test, RequiredWholeFileCrcCannotBeZero) {
   auto verified = VerifySnapshotIntegrity(path, integrity_error);
   EXPECT_FALSE(verified.has_value());
   EXPECT_EQ(integrity_error.type, snapshot_format::CRCErrorType::FileCRC);
+}
+
+TEST_F(SnapshotFormatV1Test, SnapshotWhoseWholeFileCrcIsZeroLoads) {
+  PopulateStores();
+  const std::string path = TestFilePath("crc_zero.dmp");
+  ASSERT_TRUE(WriteSnapshotV1(path, config_, *event_store_, *co_index_, *vector_store_).has_value());
+
+  std::vector<uint8_t> bytes;
+  {
+    std::ifstream input(path, std::ios::binary);
+    bytes.assign(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+  }
+  // The CRC is computed with its own field zeroed; snapshot_timestamp (header
+  // offset 8) is free to change, so four of its bytes are solved to force 0.
+  const size_t crc_offset = snapshot_format::kFixedHeaderSize + 24;
+  const size_t patch_offset = snapshot_format::kFixedHeaderSize + 8;
+  std::fill_n(bytes.begin() + static_cast<std::ptrdiff_t>(crc_offset), 4, 0);
+  const auto crc_of = [&bytes] { return static_cast<uint32_t>(crc32(0L, bytes.data(), bytes.size())); };
+
+  // CRC32 is affine in the message bits, so flipping patch bit j XORs a fixed
+  // column into the result; solve the 32x32 system over GF(2) for the CRC.
+  const uint32_t base = crc_of();
+  std::array<uint32_t, 32> columns{};
+  for (size_t bit = 0; bit < 32; ++bit) {
+    bytes[patch_offset + bit / 8] ^= static_cast<uint8_t>(1U << (bit % 8));
+    columns[bit] = crc_of() ^ base;
+    bytes[patch_offset + bit / 8] ^= static_cast<uint8_t>(1U << (bit % 8));
+  }
+  // Row r holds the coefficient bits of CRC bit r, with the target in bit 32.
+  std::array<uint64_t, 32> augmented{};
+  for (size_t row = 0; row < 32; ++row) {
+    uint64_t value = 0;
+    for (size_t bit = 0; bit < 32; ++bit) {
+      value |= static_cast<uint64_t>((columns[bit] >> row) & 1U) << bit;
+    }
+    augmented[row] = value | (static_cast<uint64_t>((base >> row) & 1U) << 32);
+  }
+  size_t pivot_row = 0;
+  std::array<int, 32> pivot_of_column{};
+  pivot_of_column.fill(-1);
+  for (size_t column = 0; column < 32 && pivot_row < 32; ++column) {
+    size_t found = pivot_row;
+    while (found < 32 && ((augmented[found] >> column) & 1U) == 0) {
+      ++found;
+    }
+    if (found == 32) {
+      continue;
+    }
+    std::swap(augmented[pivot_row], augmented[found]);
+    for (size_t other = 0; other < 32; ++other) {
+      if (other != pivot_row && ((augmented[other] >> column) & 1U) != 0) {
+        augmented[other] ^= augmented[pivot_row];
+      }
+    }
+    pivot_of_column[column] = static_cast<int>(pivot_row);
+    ++pivot_row;
+  }
+  for (size_t column = 0; column < 32; ++column) {
+    if (pivot_of_column[column] >= 0 && ((augmented[static_cast<size_t>(pivot_of_column[column])] >> 32) & 1U) != 0) {
+      bytes[patch_offset + column / 8] ^= static_cast<uint8_t>(1U << (column % 8));
+    }
+  }
+  ASSERT_EQ(crc_of(), 0U);
+  {
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    output.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+  }
+
+  snapshot_format::IntegrityError integrity_error;
+  auto verified = VerifySnapshotIntegrity(path, integrity_error);
+  EXPECT_TRUE(verified.has_value()) << integrity_error.message;
+
+  config::Config loaded_config;
+  config::EventsConfig events_cfg;
+  config::VectorsConfig vectors_cfg;
+  events::EventStore loaded_events(events_cfg);
+  events::CoOccurrenceIndex loaded_co;
+  vectors::VectorStore loaded_vectors(vectors_cfg);
+  auto loaded = ReadSnapshotV1(path, loaded_config, loaded_events, loaded_co, loaded_vectors);
+  EXPECT_TRUE(loaded.has_value()) << loaded.error().message();
+  EXPECT_EQ(loaded_vectors.GetVectorCount(), vector_store_->GetVectorCount());
 }
 
 TEST_F(SnapshotFormatV1Test, DeclaredFileAboveTotalCapIsRejected) {

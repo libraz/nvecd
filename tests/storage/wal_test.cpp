@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <string>
@@ -751,6 +752,107 @@ TEST_F(WalTest, SequenceContinuityAcrossReopen) {
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(*result, 3U);
   }
+}
+
+TEST_F(WalTest, SequenceFloorSurvivesATruncatedAndEmptiedLog) {
+  const std::string payload = "record";
+  {
+    WriteAheadLog wal;
+    ASSERT_TRUE(wal.Open(MakeConfig()));
+    for (int index = 0; index < 5; ++index) {
+      ASSERT_TRUE(wal.Append(WalOpType::kVecSet, payload.data(), static_cast<uint32_t>(payload.size())));
+    }
+  }
+  {
+    // An idle restart rotates to an empty segment; a checkpoint at 5 then
+    // deletes the only segment holding records.
+    WriteAheadLog wal;
+    ASSERT_TRUE(wal.Open(MakeConfig(), 5));
+    ASSERT_TRUE(wal.Truncate(5));
+  }
+
+  WriteAheadLog wal;
+  ASSERT_TRUE(wal.Open(MakeConfig(), 5));
+  EXPECT_EQ(wal.CurrentSequence(), 5U);
+  auto appended = wal.Append(WalOpType::kVecSet, payload.data(), static_cast<uint32_t>(payload.size()));
+  ASSERT_TRUE(appended.has_value());
+  EXPECT_EQ(*appended, 6U);
+
+  std::vector<uint64_t> replayed;
+  auto result = wal.Replay(6, [&](const WalRecord& record) { replayed.push_back(record.sequence); });
+  ASSERT_TRUE(result.has_value()) << result.error().to_string();
+  EXPECT_EQ(replayed, std::vector<uint64_t>{6U});
+}
+
+TEST_F(WalTest, LogEndingBelowTheSequenceFloorIsRejected) {
+  {
+    WriteAheadLog wal;
+    ASSERT_TRUE(wal.Open(MakeConfig()));
+    const std::string payload = "record";
+    ASSERT_TRUE(wal.Append(WalOpType::kVecSet, payload.data(), static_cast<uint32_t>(payload.size())));
+  }
+
+  WriteAheadLog wal;
+  auto opened = wal.Open(MakeConfig(), 10);
+  ASSERT_FALSE(opened.has_value());
+  EXPECT_EQ(opened.error().code(), utils::ErrorCode::kWalCorrupted);
+}
+
+TEST_F(WalTest, TornHeaderInLatestSegmentIsDiscarded) {
+  const auto config = MakeConfig(96);
+  {
+    WriteAheadLog wal;
+    ASSERT_TRUE(wal.Open(config));
+    for (int index = 0; index < 4; ++index) {
+      const std::string payload = "rotated_record_" + std::to_string(index);
+      ASSERT_TRUE(wal.Append(WalOpType::kVecSet, payload.data(), static_cast<uint32_t>(payload.size())));
+    }
+  }
+  std::vector<std::string> segments;
+  for (const auto& entry : fs::directory_iterator(test_dir_)) {
+    segments.push_back(entry.path().filename().string());
+  }
+  std::sort(segments.begin(), segments.end());
+  ASSERT_FALSE(segments.empty());
+
+  // A crash between creating the next segment and writing its header.
+  char torn_name[32];
+  std::snprintf(torn_name, sizeof(torn_name), "wal-%06d.log", std::stoi(segments.back().substr(4, 6)) + 1);
+  const std::string torn = test_dir_ + "/" + torn_name;
+  {
+    const int fd = ::open(torn.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+    ASSERT_GE(fd, 0);
+    const uint32_t magic = kWalMagic;
+    ASSERT_EQ(::write(fd, &magic, 3), 3);
+    ::close(fd);
+  }
+
+  WriteAheadLog wal;
+  auto opened = wal.Open(config);
+  ASSERT_TRUE(opened.has_value()) << opened.error().to_string();
+  EXPECT_FALSE(fs::exists(torn));
+  EXPECT_EQ(wal.CurrentSequence(), 4U);
+  uint64_t count = 0;
+  ASSERT_TRUE(wal.Replay(1, [&](const WalRecord&) { ++count; }));
+  EXPECT_EQ(count, 4U);
+}
+
+TEST_F(WalTest, TornHeaderInNonLatestSegmentIsRejected) {
+  const auto config = MakeConfig();
+  {
+    WriteAheadLog wal;
+    ASSERT_TRUE(wal.Open(config));
+    const std::string payload = "record";
+    ASSERT_TRUE(wal.Append(WalOpType::kVecSet, payload.data(), static_cast<uint32_t>(payload.size())));
+  }
+  {
+    const int fd = ::open((test_dir_ + "/wal-000000.log").c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+    ASSERT_GE(fd, 0);
+    ::close(fd);
+  }
+
+  WriteAheadLog wal;
+  EXPECT_FALSE(wal.Open(config).has_value());
 }
 
 // --- Batch Fsync ---

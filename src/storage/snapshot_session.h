@@ -32,6 +32,21 @@ constexpr int kSnapshotChildExitSuccess = 0;
 /// Exit code with which a snapshot child reports a failed write.
 constexpr int kSnapshotChildExitFailure = 1;
 
+/**
+ * @brief Keep a checkpointed snapshot recoverable while a save replaces it
+ *
+ * Publishing a save renames the new image over @p snapshot_path, which leaves
+ * the old sidecar describing bytes that are gone until the new sidecar lands.
+ * When @p snapshot_path has a sidecar, both files are hard-linked under a
+ * hidden recoverable name first, so a crash in that window still finds the
+ * old generation as a valid recovery base. The session that completes the
+ * save removes the preserved pair once the path validates on its own again.
+ *
+ * @param snapshot_path Snapshot path a save is about to write
+ * @return Success (including when there was nothing to preserve), or an error
+ */
+utils::Expected<void, utils::Error> PreserveRecoveryBase(const std::string& snapshot_path);
+
 /// Side effects produced by a snapshot session that ran to completion.
 struct SnapshotOutcome {
   std::string filepath;                 ///< Snapshot that was published
@@ -140,6 +155,9 @@ class SnapshotSession {
 
   /// Remove temporary files the fork child left behind when it did not publish.
   void ReclaimChildTemporaries() const;
+
+  /// Drop the generation PreserveRecoveryBase kept once the path validates again.
+  void ReleasePreservedBase() const;
 
   const std::string filepath_;
   const pid_t child_pid_;

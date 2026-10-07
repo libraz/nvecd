@@ -402,9 +402,6 @@ Expected<void, Error> VerifyFileLevelIntegrity(std::istream& input_stream, const
   if ((header.flags & snapshot_format::flags_v1::kWithCRC) == 0) {
     return fail_file_integrity("Snapshot does not declare required CRC32 protection");
   }
-  if (header.file_crc32 == 0) {
-    return fail_file_integrity("Snapshot file CRC32 is missing");
-  }
   auto computed_crc = CalculateFileCRC32Streaming(input_stream, actual_file_size);
   if (!computed_crc) {
     return MakeUnexpected(computed_crc.error());

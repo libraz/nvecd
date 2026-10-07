@@ -12,10 +12,14 @@
 
 #include <csignal>
 #include <iostream>
+#include <memory>
+#include <string>
 #include <thread>
 
 #include "config/config.h"
 #include "server/nvecd_server.h"
+#include "utils/error.h"
+#include "utils/expected.h"
 #include "utils/structured_log.h"
 #include "vectors/distance_simd.h"
 #include "version.h"
@@ -44,8 +48,14 @@ void SignalHandler(int signal) {
  * Sets spdlog level, structured log format, and optional file output
  * based on the loaded configuration. This mirrors the mappings used by
  * RuntimeVariableManager::ApplyLoggingLevel() and ApplyLoggingFormat().
+ *
+ * @param config Loaded configuration
+ * @param open_file_sink Whether to attach logging.file; a config check must
+ *                       not touch the file a running server writes to
+ * @return Success, or a configuration error when logging.file cannot be opened
  */
-void ApplyLoggingConfig(const nvecd::config::Config& config) {
+nvecd::utils::Expected<void, nvecd::utils::Error> ApplyLoggingConfig(const nvecd::config::Config& config,
+                                                                     bool open_file_sink) {
   // Map config level string to spdlog level
   spdlog::level::level_enum level = spdlog::level::info;
   if (config.logging.level == "trace") {
@@ -64,14 +74,23 @@ void ApplyLoggingConfig(const nvecd::config::Config& config) {
                                                              : nvecd::utils::LogFormat::TEXT);
 
   // Configure file sink if specified
-  if (!config.logging.file.empty()) {
-    auto file_sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(config.logging.file, true);
+  if (open_file_sink && !config.logging.file.empty()) {
+    std::shared_ptr<spdlog::sinks::basic_file_sink_mt> file_sink;
+    try {
+      // Append, so a restart keeps the log of the previous run.
+      file_sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(config.logging.file, /*truncate=*/false);
+    } catch (const spdlog::spdlog_ex& error) {
+      return nvecd::utils::MakeUnexpected(nvecd::utils::MakeError(
+          nvecd::utils::ErrorCode::kConfigInvalidValue,
+          "Cannot open logging.file '" + config.logging.file + "': " + std::string(error.what())));
+    }
     auto console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
     auto logger = std::make_shared<spdlog::logger>("", spdlog::sinks_init_list{console_sink, file_sink});
     logger->set_level(level);
     logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
     spdlog::set_default_logger(logger);
   }
+  return {};
 }
 
 }  // namespace
@@ -166,7 +185,11 @@ int main(int argc, char* argv[]) {
       return 1;
     }
     config = *config_result;
-    ApplyLoggingConfig(config);
+    auto logging = ApplyLoggingConfig(config, /*open_file_sink=*/!config_test_mode);
+    if (!logging) {
+      spdlog::error("Failed to apply logging config: {}", logging.error().message());
+      return 1;
+    }
     spdlog::info("Configuration loaded successfully");
 
     // Config test mode: validate and exit
@@ -199,7 +222,8 @@ int main(int argc, char* argv[]) {
     // Config struct is default-initialized from config.h defaults.
     // Only override: restrict network access to localhost when no config file is specified.
     config.network.allow_cidrs = {"127.0.0.1/32"};
-    ApplyLoggingConfig(config);
+    // Defaults carry no logging.file, so this cannot fail.
+    static_cast<void>(ApplyLoggingConfig(config, /*open_file_sink=*/true));
   }
 
   // Create and start server

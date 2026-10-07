@@ -19,7 +19,7 @@ nvecd -t -c /etc/nvecd/config.yaml
 | `-h`、`--help` | 使い方を表示して終了する |
 | `-v`、`--version` | バージョンを表示して終了する |
 
-パスは位置引数としても渡せます。設定ファイルを 2 つ与えるとエラーになります。ファイルをまったく指定せずに起動した場合、サーバーは以下の表に示す組み込みの既定値だけで動作します。ファイルなしの `--config-test` はエラーです。
+パスは位置引数としても渡せます。設定ファイルを 2 つ与えるとエラーになります。ファイルをまったく指定せずに起動した場合、サーバーは以下の表に示す組み込みの既定値で動作しますが、例外が 1 つあります。`network.allow_cidrs` は空の全拒否リストではなく `["127.0.0.1/32"]` になるため、ファイルなしで起動したサーバーはローカルのクライアントだけを受け付けます。ファイルなしの `--config-test` はエラーです。
 
 `examples/config.yaml` は同じスキーマから描画されており、すべてのキーを既定値のまま載せています。
 
@@ -67,7 +67,7 @@ nvecd -t -c /etc/nvecd/config.yaml
 | `distance_metric` | string | "cosine" | 類似検索に用いる距離メトリック (`cosine` `dot` `l2`) |
 <!-- END GENERATED: options vectors -->
 
-`default_dimension` は 0 より大きい必要があります。この値が受け付ける次元を決めます。長さの異なるベクトルを渡した `VECSET` は次元不一致で拒否されます。データが存在する状態でこの値を変えると既存のスナップショットが設定と一致しなくなるため、チューニングではなく作り直しになります。[vector-search.md](./vector-search.md) を参照してください。
+`default_dimension` は 0 より大きい必要があります。この値は ANN 索引の事前サイズを決めるだけです。ストアが受け付ける次元は最初に保存されたベクトルが確定させ、以降に長さの異なるベクトルを渡した `VECSET` は次元不一致で拒否されます。データが存在する状態でこの値を変えると既存のスナップショットが設定と一致しなくなるため、チューニングではなく作り直しになります。[vector-search.md](./vector-search.md) を参照してください。
 
 ## `similarity`
 
@@ -104,7 +104,7 @@ nvecd -t -c /etc/nvecd/config.yaml
 - IVF 系のキーは索引が IVF のとき、つまり `index_type: ivf` または `ivf_enabled: true` のときにだけ検証されます。`ivf_nprobe` と `ivf_train_threshold` は 0 より大きく、`ivf_nlist` が `0` でない限り `ivf_nprobe` は `ivf_nlist` 以下である必要があります。
 - HNSW 系のキーは `index_type: hnsw` のときにだけ検証されます。`hnsw_m` は 2 以上、2 つの `ef` はどちらも 0 より大きい必要があります。
 - `ivf_enabled` は `index_type: ivf` の古い綴りです。`index_type` がまだ `flat` のときにだけ適用され、`index_type` に `hnsw` や `ivf` を設定した場合、IVF 系のキーは範囲検査されるもののこのフラグ自体は効きません。
-- `fusion_alpha` と `fusion_beta` は独立した 2 つの数値であり、ひとつの配分を分け合う関係ではありません。合計が 1 になる必要はありません。
+- `fusion_alpha` と `fusion_beta` は独立した 2 つの数値であり、ひとつの配分を分け合う関係ではありません。合計が 1 になる必要はありません。両方を 0 にすることはできません。統合検索に順位付けの根拠がなくなるため、検証で拒否されます。
 
 `hnsw_max_elements` は起動時に確保され、その上限はスナップショットローダーが受け付ける最大の索引です。上限を超えて確保すると、読み直せない索引ができます。
 
@@ -146,7 +146,7 @@ nvecd -t -c /etc/nvecd/config.yaml
 
 `thread_pool_size` は負であってはならず、`max_connections` と `connection_timeout_sec` は 0 より大きい必要があります。
 
-これらのキーは TCP 専用ではありません。HTTP サーバーも自身の上限をここから導きます。`thread_pool_size` がワーカー数、`max_connections` と `max_connections_per_ip` が受け入れ上限、`max_query_length` がリクエストボディの上限になり、待ち行列は `max_connections − thread_pool_size`（最低 1）です。`max_query_length` を超えるリクエストボディは両方の面で拒否されます。
+これらのキーは TCP 専用ではありません。HTTP サーバーも自身の上限をここから導きます。`thread_pool_size` がワーカー数（TCP と同じ方法で解決されるため、`0` はどちらでも検出したハードウェアスレッドごとに 1 ワーカーを意味します）、`max_connections` と `max_connections_per_ip` が受け入れ上限、`max_query_length` がリクエストボディの上限になり、待ち行列は `max_connections` からその解決後のワーカー数を引いた値（最低 1）です。`max_query_length` を超えるリクエストボディは両方の面で拒否されます。
 
 ## `api`
 
@@ -226,7 +226,7 @@ network:
 | `file` | string | "" | ログファイルのパス（空文字列 = 標準出力、パス指定 = ファイル出力） |
 <!-- END GENERATED: options logging -->
 
-`level` と `json` はどちらも実行時に変更できます。`file` はできません。ハンドルの開き直しは再起動相当の変更だからです。
+`level` と `json` はどちらも実行時に変更できます。`file` はできません。ハンドルの開き直しは再起動相当の変更だからです。ファイルは追記モードで開くため、再起動しても前回のログは残ります。開けない `file` は起動エラーとして標準出力に報告され、サーバーは終了ステータス 1 で終了します。
 
 ## `cache`
 
@@ -385,7 +385,7 @@ logging:
   file: "/var/log/nvecd/nvecd.log"
 ```
 
-再起動する前に検証します。
+再起動する前に検証します。`--config-test` はファイルを読んで検証するだけで `logging.file` は開かないため、稼働中のサーバーの横で設定を検査してもそのサーバーのログには触れません。
 
 ```bash
 $ nvecd -t -c /etc/nvecd/config.yaml

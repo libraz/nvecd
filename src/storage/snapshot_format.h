@@ -70,6 +70,20 @@ inline bool IsRecoverableExtension(std::string_view extension) {
 }
 
 /**
+ * @brief The recoverable extensions joined as "a or b", for error messages
+ */
+inline std::string RecoverableExtensionList() {
+  std::string list;
+  for (size_t index = 0; index < kRecoverableExtensions.size(); ++index) {
+    if (index > 0) {
+      list += index + 1 == kRecoverableExtensions.size() ? " or " : ", ";
+    }
+    list += kRecoverableExtensions[index];
+  }
+  return list;
+}
+
+/**
  * @brief Format version enum for type safety
  */
 // NOLINTNEXTLINE(performance-enum-size) - Must match file format uint32_t

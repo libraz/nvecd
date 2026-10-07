@@ -107,7 +107,14 @@ TEST(WalCrashRecoveryTest, AcknowledgedWritesSurviveSigkillAtAllWalBoundaries) {
     if (boundaries[index] == CrashBoundary::kFirstSegment) {
       EXPECT_NE(results.find("first-segment"), std::string::npos);
     } else if (boundaries[index] == CrashBoundary::kRotation) {
-      EXPECT_NE(results.find("rotation-11"), std::string::npos);
+      for (int written = 0; written < 12; ++written) {
+        const std::string id = "rotation-" + std::to_string(written);
+        EXPECT_NE(results.find(id + " "), std::string::npos) << id << " missing: " << results;
+      }
+      const std::string info = client.SendCommand("INFO");
+      const auto pos = info.find("vector_count: ");
+      ASSERT_NE(pos, std::string::npos) << info;
+      EXPECT_EQ(std::stoul(info.substr(pos + 14)), 12U);
     } else {
       EXPECT_NE(results.find("checkpoint-before"), std::string::npos);
       EXPECT_NE(results.find("checkpoint-after"), std::string::npos);

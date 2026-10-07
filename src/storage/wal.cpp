@@ -135,7 +135,7 @@ WriteAheadLog::~WriteAheadLog() {
   Close();
 }
 
-Expected<void, Error> WriteAheadLog::Open(const Config& config) {
+Expected<void, Error> WriteAheadLog::Open(const Config& config, uint64_t sequence_floor) {
   // Close owns mutex_ while releasing the active fd. Calling it after taking
   // mutex_ here deadlocks when Open is used to rotate to a new configuration.
   // Lifecycle calls are serialized by the server; close first, then acquire
@@ -203,6 +203,16 @@ Expected<void, Error> WriteAheadLog::Open(const Config& config) {
         utils::ErrorCode::kWalTruncateFailed,
         "Failed to fsync WAL directory after removing empty segments: " + std::string(std::strerror(errno))));
   }
+
+  // Truncation removes only segments wholly at or below a checkpoint and never
+  // the current one, so a surviving log ends at or above the checkpoint.
+  if (current_sequence_ != 0 && current_sequence_ < sequence_floor) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kWalCorrupted, "WAL ends at sequence " + std::to_string(current_sequence_) +
+                                                              ", below the loaded snapshot checkpoint " +
+                                                              std::to_string(sequence_floor)));
+  }
+  current_sequence_ = std::max(current_sequence_, sequence_floor);
 
   // Open or create the current file
   auto rotate_result = RotateFile();
@@ -737,12 +747,6 @@ Expected<void, Error> WriteAheadLog::ScanExistingFiles() {
           utils::MakeError(utils::ErrorCode::kWalReadError, "Failed to open WAL segment: " + path));
     }
 
-    auto header_result = ValidateFileHeader(fd, path);
-    if (!header_result) {
-      ::close(fd);
-      return utils::MakeUnexpected(header_result.error());
-    }
-
     struct stat initial_info {};
     if (::fstat(fd, &initial_info) != 0) {
       ::close(fd);
@@ -753,6 +757,22 @@ Expected<void, Error> WriteAheadLog::ScanExistingFiles() {
     WalFile wf;
     wf.path = path;
     wf.file_number = num;
+
+    // A crash during rotation can leave the newest segment with a partial file
+    // header. It holds no record, so it is reported empty and Open removes it.
+    if (latest_segment && static_cast<uint64_t>(initial_info.st_size) < kWalFileHeaderSize) {
+      ::close(fd);
+      wf.file_size = static_cast<uint64_t>(initial_info.st_size);
+      current_file_number_ = std::max(current_file_number_, num);
+      files_.push_back(std::move(wf));
+      continue;
+    }
+
+    auto header_result = ValidateFileHeader(fd, path);
+    if (!header_result) {
+      ::close(fd);
+      return utils::MakeUnexpected(header_result.error());
+    }
     wf.min_sequence = UINT64_MAX;
     wf.max_sequence = 0;
     off_t last_valid_offset = kWalFileHeaderSize;

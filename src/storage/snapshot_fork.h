@@ -103,6 +103,8 @@ class ForkSnapshotWriter {
    *
    * Pre-fork barrier: Acquires shared locks on all stores simultaneously to
    * drain and exclude writers. After fork, parent releases locks immediately.
+   * The server calls this only through server::handlers::StartForkSnapshot,
+   * which holds the write gates so the captured WAL sequence matches the image.
    *
    * Child process (post-fork path is async-signal-safe with respect to
    * application locks; it never re-enters spdlog, whose registry/sink mutex a

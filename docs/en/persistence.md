@@ -13,20 +13,21 @@ nvecd keeps its data in memory. Two mechanisms put that data on disk: a snapshot
 
 Fork is the default because the parent excludes writers only across the sequence capture and the `fork()` call, not across the serialization. Lock mode has no copy-on-write memory cost, but a client that sends `EVENT`, `VECSET`, `VECDEL` or `METASET` during a lock-mode save receives `ERROR READONLY Snapshot in progress`.
 
-`snapshot.mode` governs `DUMP SAVE`. Automated snapshots always use the fork writer regardless of the setting.
+`snapshot.mode` governs `DUMP SAVE`. Automated snapshots — the scheduler's and the decay maintenance snapshot written without a WAL — always use the fork writer regardless of the setting.
 
 ## The fork sequence
 
 ![A shared read lock across all four stores, a WAL sequence captured under it, fork, then the child serializes while the parent resumes](../images/snapshot-fork.svg)
 
-A fork-mode save runs in this order.
+A fork-mode save runs in this order. `DUMP SAVE`, the snapshot scheduler and decay maintenance all start their snapshots through the same routine, so the order is identical for each.
 
-1. The writer publishes `in_progress` before touching any lock, so a second save is refused rather than racing.
-2. A shared read lock is acquired on all four stores at once — event store, co-occurrence index, vector store, metadata store. Writers are serialized behind these locks, so holding all four drains the in-flight ones and excludes new ones.
-3. **The WAL sequence is read while that barrier is held.** Because no write can be in progress, the captured value is exactly the highest operation the about-to-be-frozen image contains. Everything downstream depends on this: the sidecar records it and the truncation uses it, so the log can never drop a record the snapshot does not carry.
-4. The logger is quiesced **in the parent**, by a `pthread_atfork` prepare handler and a flush immediately before the call, and the process forks. The child never touches the logger at all — a sibling thread may have held its registry mutex at fork time, and that mutex would be permanently locked in the child.
-5. The child re-initializes the four inherited locks, closes every descriptor above standard error, resets `SIGCHLD`, `SIGPIPE` and `SIGTERM` to their defaults, and serializes the stores with logging suppressed. It exits `0` on a complete write and `1` otherwise, reporting failure through an async-signal-safe `write(2)`, which is its only diagnostic.
-6. The parent releases the four locks and resumes serving. It hands the child to a session object and returns.
+1. The capture takes the snapshot gate shared and the write serialization mutex — the mutex every write holds across appending its WAL record and applying it to the stores — and is refused while a `DUMP LOAD` is in flight. No write can then sit between its append and its apply.
+2. The writer publishes `in_progress`, so a second save is refused rather than racing. With a WAL configured, a checkpointed snapshot already at the target path is preserved first, as described under the durability handshake.
+3. A shared read lock is acquired on all four stores at once — event store, co-occurrence index, vector store, metadata store — so no store is mid-mutation when the image is frozen.
+4. **The WAL sequence is read while the gate and the locks are held.** Because no write can be in progress, the captured value is exactly the highest operation the about-to-be-frozen image contains. Everything downstream depends on this: the sidecar records it and the truncation uses it, so the log can never drop a record the snapshot does not carry.
+5. The logger is quiesced **in the parent**, by a `pthread_atfork` prepare handler and a flush immediately before the call, and the process forks. The child never touches the logger at all — a sibling thread may have held its registry mutex at fork time, and that mutex would be permanently locked in the child.
+6. The child re-initializes the four inherited locks, closes every descriptor above standard error, resets `SIGCHLD`, `SIGPIPE` and `SIGTERM` to their defaults, and serializes the stores with logging suppressed. It exits `0` on a complete write and `1` otherwise, reporting failure through an async-signal-safe `write(2)`, which is its only diagnostic.
+7. The parent releases the locks and the gate and resumes serving. It hands the child to a session object and returns.
 
 The session owns the child from that point. The parent's request threads never reap it: a completion thread inside the session performs the single `waitpid()` for that pid and then runs the durability handshake — the sidecar write and the WAL truncate — on that same thread, without waiting for a client request, a scheduler tick or shutdown.
 
@@ -44,6 +45,8 @@ When the writer succeeded and a WAL is configured, the session does two things i
 The sidecar comes first so that a crash between the two steps leaves a WAL that is longer than necessary rather than one cut back to a snapshot no reader will accept as a recovery base. Reading the sidecar re-reads the snapshot's size and CRC32 and rejects the sidecar if either disagrees, so a sidecar left beside a replaced or truncated snapshot is not usable.
 
 A failure in either step is a failed snapshot, reported as such, not a warning attached to a success.
+
+Saving over a path that already holds a checkpointed snapshot replaces the file before its new sidecar exists, so for a moment the old sidecar describes bytes that are gone. Before such a save writes anything, the existing snapshot and its sidecar are hard-linked under a hidden name, `.<name>.prev<extension>` (for `nvecd.nvec`, `.nvecd.nvec.prev.nvec`), which recovery treats as an ordinary candidate. A crash in that window therefore recovers from the previous generation. The session removes the preserved pair as soon as the path validates on its own again; a save that fails and leaves the path without a valid sidecar keeps the pair as the recovery base until a later save succeeds.
 
 ## Snapshot file format
 
@@ -114,6 +117,8 @@ A short or failed write closes the current segment and refuses further appends t
 
 A new segment is started when the current one would exceed `wal.max_file_size` (64 MiB by default). Segment numbers are six digits wide; the reader matches that fixed width only.
 
+A crash between creating a new segment and writing its 8-byte header leaves the newest segment with a partial header. It holds no record, so opening the log removes it. A short header in any other segment, or a complete header with the wrong magic or version, stops startup.
+
 Truncation is the only thing that reclaims WAL space, and it runs solely as part of the snapshot durability handshake. A deployment that enables the WAL and never takes a snapshot accumulates segments without bound.
 
 ### Omitting vector bodies
@@ -129,8 +134,8 @@ The consequence is direct: **a vector written while that setting was off cannot 
 With the WAL enabled, startup runs this sequence, and the order is load-bearing.
 
 1. **Select a snapshot.** The server lists regular files in `snapshot.dir` whose extension is `.nvec` or `.dmp` and which have a `.walseq` sidecar beside them, newest modification time first. For each candidate it validates the sidecar, then deserializes the snapshot into a staged set of stores and publishes them only on success. The first candidate that survives both wins.
-2. **Open the WAL.** Opening scans the segment directory, discards header-only segments left by a previous run that appended nothing, recovers the current sequence, and starts a fresh segment.
-3. **Replay.** Records strictly after the checkpointed sequence are re-applied — the floor is the sidecar's sequence plus one, or zero when no snapshot was loaded. Each record goes through the same write path live traffic uses, so recovery reconstructs exactly the state the original command produced.
+2. **Open the WAL.** Opening scans the segment directory, discards header-only segments left by a previous run that appended nothing, recovers the current sequence, and starts a fresh segment. The recovered sequence is never lower than the loaded snapshot's checkpoint, so a log that truncation and idle restarts emptied does not hand out sequence numbers the snapshot already covers. A log whose last record lies below the checkpoint contradicts the snapshot, and startup fails.
+3. **Replay.** Records strictly after the checkpointed sequence are re-applied — the floor is the sidecar's sequence plus one, or one when no snapshot was loaded. When the log holds records past the floor but not the floor itself, as it does after truncation against a snapshot that is no longer there, startup fails rather than replaying a partial tail. Each record goes through the same write path live traffic uses, so recovery reconstructs exactly the state the original command produced.
 4. **Publish the WAL.** Only now do the write handlers and the fork writer receive the WAL pointer. Until this moment it is null, which is what keeps replay from appending every replayed record a second time.
 
 The ANN index is rebuilt from the restored vector store afterwards. Both the snapshot load and the replay repopulate the store directly rather than through the incremental add path, so the index would otherwise be empty or hold only the replayed tail.
@@ -145,7 +150,7 @@ What a reader should conclude about the durability window: with the WAL enabled 
 
 [Protocol](./protocol.md) carries the exhaustive argument syntax. What each subcommand is for:
 
-**`DUMP SAVE [path]`** writes a snapshot. With no argument it uses `snapshot.default_filename`, which goes through the same path validation as a client-supplied name. In fork mode the response comes back as soon as the child exists:
+**`DUMP SAVE [path]`** writes a snapshot. With no argument it uses `snapshot.default_filename`, which goes through the same path validation as a client-supplied name. The name must end in `.nvec` or `.dmp`, the extensions startup recovery scans for; any other name is refused before a file is written, so no save can checkpoint the WAL against a file recovery would skip. In fork mode the response comes back as soon as the child exists:
 
 ```bash
 nvecd-cli DUMP SAVE backup.nvec
@@ -157,7 +162,7 @@ OK DUMP_SAVE_STARTED /var/lib/nvecd/snapshots/backup.nvec
 
 In lock mode the response comes back after the whole handshake has completed, as `OK DUMP_SAVED /var/lib/nvecd/snapshots/backup.nvec`.
 
-**`DUMP LOAD <path>`** replaces the live state with a snapshot. The file is deserialized into staged stores first, so a corrupt or semantically invalid snapshot can only damage those; the live stores are swapped in under exclusive gates, the ANN index is rebuilt and the query cache is cleared. With a WAL configured, a load is treated as a deliberate rollback: the loaded snapshot becomes the newest recovery base and the pre-load WAL tail is discarded, so a later restart does not replay the mutations the operator just rolled back. If any durability step of a load fails after publication, the server latches itself read-only and needs a restart — it will not resume serving on a state whose recovery base is uncertain.
+**`DUMP LOAD <path>`** replaces the live state with a snapshot. The file is deserialized into staged stores first, so a corrupt or semantically invalid snapshot can only damage those; the live stores are swapped in under exclusive gates, the ANN index is rebuilt and the query cache is cleared. With a WAL configured, a load is treated as a deliberate rollback: the loaded snapshot becomes the newest recovery base and the pre-load WAL tail is discarded, so a later restart does not replay the mutations the operator just rolled back. Because the loaded file becomes the recovery base, its name must end in `.nvec` or `.dmp` when a WAL is configured; without a WAL any name loads. A load is refused while a background fork save is still writing, since that save would finish later and outrank the loaded snapshot. If any durability step of a load fails after publication, the server latches itself read-only and needs a restart — it will not resume serving on a state whose recovery base is uncertain.
 
 **`DUMP VERIFY <path>`** runs the integrity check described above without loading anything.
 
@@ -203,7 +208,7 @@ END
 ```yaml
 snapshot:
   dir: "/var/lib/nvecd/snapshots"
-  default_filename: "nvecd.snapshot"
+  default_filename: "nvecd.nvec"
   interval_sec: 3600
   retain: 3
   mode: "fork"
@@ -211,9 +216,13 @@ snapshot:
 
 `interval_sec` is `0` by default, which disables the scheduler entirely. When it is positive, a background thread starts a fork snapshot every interval, named `auto_YYYYMMDD_HHMMSS.nvec`.
 
-`retain` bounds the number of automatic snapshots kept. Retention matches `auto_*.nvec` only and sorts by modification time, so a snapshot written by `DUMP SAVE` under any other name is never deleted. Cleanup runs after a fork child has been reaped, not while one is in flight, so a newly started snapshot cannot appear after the file count was taken and leave `retain + 1` files behind.
+`retain` bounds the number of automatic snapshots kept. Retention matches `auto_*.nvec` only and sorts by modification time, so a snapshot written by `DUMP SAVE` under any other name is never deleted. A pruned snapshot's `.walseq` sidecar is removed with it, sidecar first, so no orphaned sidecar accumulates. Cleanup runs after a fork child has been reaped, not while one is in flight, so a newly started snapshot cannot appear after the file count was taken and leave `retain + 1` files behind.
 
 Each scheduler tick also publishes the outcome of a finished background snapshot, which is what moves the writer out of `in_progress` so the next snapshot can start. The durability handshake itself does not wait for that tick — the session's own thread has already run it. On a server with the scheduler disabled, the next `DUMP SAVE` or `DUMP STATUS` publishes the outcome instead.
+
+### Decay maintenance without a WAL
+
+With the WAL disabled, every co-occurrence decay pass (`events.decay_interval_sec`, hourly by default) that changes anything is followed by a fork snapshot to `maintenance.nvec` in `snapshot.dir`, whether or not the scheduler is enabled. Writes are excluded only across its capture and `fork()`, as for any fork snapshot. When it is the newest snapshot, restart selects it by the ordinary rules, so decayed or pruned pairs do not come back. If the snapshot cannot start because another save is running, or its child fails, the failure is logged and the server stays writable; the decayed scores already in memory reach disk with the next snapshot. With the WAL enabled, a decay pass is a WAL record instead and no maintenance snapshot is written.
 
 Temporary files left by a writer whose process no longer exists are reclaimed at startup and on every retention pass. A temporary is named `.<snapshot name>.tmp.<pid>.<n>` and can only be published by the process that created it, so one whose owner is gone can never complete.
 
@@ -223,7 +232,7 @@ Snapshot temporary files, WAL segments and checkpoint sidecars are created mode 
 
 Before writing, the parent directory must be owned by the server's effective user and must not be writable by group or others, and no ancestor directory may be group- or world-writable without the sticky bit. Once validated, the directory is held open as a descriptor and every later operation — creating the temporary, renaming it into place, fsyncing — is performed relative to that descriptor, so replacing a directory in the path after validation cannot redirect the write.
 
-A path supplied to any `DUMP` subcommand is rejected outright if it contains `..` anywhere, and after canonicalization it must resolve inside `snapshot.dir`. The same validation applies to `snapshot.default_filename`, because that value comes from a configuration file rather than from the code: a configured name that escapes the snapshot directory is refused rather than resolved against it.
+A path supplied to any `DUMP` subcommand is rejected outright if it contains `..` anywhere, and after canonicalization it must resolve inside `snapshot.dir`. The same validation applies to `snapshot.default_filename`, because that value comes from a configuration file rather than from the code: a configured name that escapes the snapshot directory is refused rather than resolved against it. A name that will become a recovery base — every `DUMP SAVE`, and `DUMP LOAD` with a WAL configured — must also end in `.nvec` or `.dmp`.
 
 ## Backups and copying state between machines
 

@@ -100,10 +100,18 @@ class WriteAheadLog {
 
   /**
    * @brief Open WAL directory, recover state from existing files
+   *
+   * The sequence floor is the checkpoint of the snapshot recovery loaded. Every
+   * sequence Append assigns afterwards is strictly greater than it, even when
+   * truncation and empty-segment cleanup left no record on disk. A surviving
+   * record that ends below the floor means the log and the snapshot disagree,
+   * and Open fails rather than reissue sequences the checkpoint already covers.
+   *
    * @param config WAL configuration
+   * @param sequence_floor Highest sequence already absorbed by the loaded snapshot
    * @return Success or error
    */
-  Expected<void, Error> Open(const Config& config);
+  Expected<void, Error> Open(const Config& config, uint64_t sequence_floor = 0);
 
   /**
    * @brief Close WAL, flush pending writes, stop sync thread
