@@ -16,9 +16,9 @@ class Version {
  public:
   /**
    * @brief Get version string
-   * @return Version string (e.g., "0.2.0")
+   * @return Version string (e.g., "0.2.1")
    */
-  static std::string String() { return "0.2.0"; }
+  static std::string String() { return "0.2.1"; }
 
   /**
    * @brief Get major version
@@ -33,7 +33,7 @@ class Version {
   /**
    * @brief Get patch version
    */
-  static int Patch() { return 0; }
+  static int Patch() { return 1; }
 };
 
 }  // namespace nvecd

@@ -199,7 +199,7 @@ target_link_libraries(nvecdclient PRIVATE
 target_compile_definitions(nvecdclient PRIVATE $<$<BOOL:${BUILD_TESTS}>:NVECD_ENABLE_TEST_HOOKS>)
 set_target_properties(nvecdclient PROPERTIES
   EXPORT_NAME client
-  VERSION 0.2.0
+  VERSION 0.2.1
   SOVERSION 0
   PUBLIC_HEADER "client/nvecdclient.h;client/nvecdclient_c.h"
 )
