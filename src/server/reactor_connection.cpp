@@ -97,14 +97,14 @@ bool ReactorConnection::OnReadable() {
         } else {
           accumulated_.append(chunk.data(), static_cast<size_t>(read));
           while (true) {
-            size_t end = accumulated_.find("\r\n");
-            size_t delimiter = 2;
-            if (end == std::string::npos) {
-              end = accumulated_.find('\n');
-              delimiter = 1;
-            }
-            if (end == std::string::npos)
+            // A request ends at the first LF; a CR directly before it belongs
+            // to the terminator, so mixed endings frame one request per line.
+            const size_t newline = accumulated_.find('\n');
+            if (newline == std::string::npos)
               break;
+            const bool has_cr = newline > 0 && accumulated_[newline - 1] == '\r';
+            const size_t end = has_cr ? newline - 1 : newline;
+            const size_t delimiter = has_cr ? 2 : 1;
             if (end > config_.max_query_length || requests_.size() >= kMaxPendingFrames ||
                 request_bytes_ + end > config_.max_accumulated_bytes) {
               overflow = true;
@@ -211,9 +211,10 @@ bool ReactorConnection::ScheduleDrain() {
     return true;
   if (thread_pool_ == nullptr || !thread_pool_->Submit([self = shared_from_this()] { self->DrainRequests(); })) {
     drain_scheduled_.store(false, std::memory_order_release);
-    (void)EnqueueResponse("ERROR Server busy");
+    // Stay registered so the reply is flushed before the close, as on overflow.
+    if (!EnqueueResponse("ERROR Server busy"))
+      return false;
     CloseAfterFlush();
-    return false;
   }
   return true;
 }
@@ -240,7 +241,10 @@ void ReactorConnection::DrainRequests() {
     }
     if (resume_read)
       reactor_->SetReadEnabled(Fd(), true);
-    if (!EnqueueResponse(processor_(request, context_))) {
+    const bool enqueued = EnqueueResponse(processor_(request, context_));
+    // Idle time starts when a request completes, not when it was read.
+    last_active_.store(std::chrono::steady_clock::now(), std::memory_order_relaxed);
+    if (!enqueued) {
       CloseAfterFlush();
       break;
     }
@@ -271,6 +275,10 @@ bool ReactorConnection::EnqueueResponse(const std::string& response) {
 bool ReactorConnection::HasPendingOutput() const {
   std::lock_guard<std::mutex> lock(write_mutex_);
   return !responses_.empty();
+}
+
+bool ReactorConnection::HasWorkInFlight() const {
+  return drain_scheduled_.load(std::memory_order_acquire) || HasPendingRequests() || HasPendingOutput();
 }
 
 bool ReactorConnection::HasPendingRequests() const {

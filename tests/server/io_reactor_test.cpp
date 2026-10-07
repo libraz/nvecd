@@ -12,7 +12,9 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "server/reactor_connection.h"
@@ -129,6 +131,78 @@ TEST(IoReactorTest, InitialReadDeadlineClosesSlowlorisPartialRequest) {
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
   }
   EXPECT_EQ(reactor.ConnectionCount(), 0U);
+
+  reactor.Stop();
+  pool.Shutdown();
+  ::close(sockets[1]);
+}
+
+TEST(IoReactorTest, MixedLineEndingsFrameOneRequestPerLine) {
+  ThreadPool pool(1);
+  IoReactor reactor({10, 0});
+  ASSERT_TRUE(reactor.Start());
+
+  int sockets[2];
+  ASSERT_EQ(MakeSocketPair(sockets), 0);
+  std::atomic<bool> saw_terminator{false};
+  ASSERT_TRUE(reactor.Register(sockets[0], &pool, TestIoConfig(),
+                               [&saw_terminator](const std::string& request, ConnectionContext&) {
+                                 if (request.find_first_of("\r\n") != std::string::npos)
+                                   saw_terminator = true;
+                                 return "OK " + request;
+                               }));
+
+  ASSERT_EQ(::write(sockets[1], "PING\nINFO\r\nLAST\n", 16), 16);
+  std::string received;
+  for (int attempt = 0; attempt < 3 && received.size() < 30; ++attempt) {
+    received += ReadAvailable(sockets[1]);
+  }
+  EXPECT_EQ(received, "OK PING\r\nOK INFO\r\nOK LAST\r\n");
+  EXPECT_FALSE(saw_terminator.load());
+
+  reactor.Stop();
+  pool.Shutdown();
+  ::close(sockets[1]);
+}
+
+TEST(IoReactorTest, ServerBusyReplyIsFlushedBeforeTheClose) {
+  ThreadPool pool(1);
+  pool.Shutdown();  // Every Submit now fails, as with a saturated pool.
+  IoReactor reactor({10, 0});
+  ASSERT_TRUE(reactor.Start());
+
+  int sockets[2];
+  ASSERT_EQ(MakeSocketPair(sockets), 0);
+  ASSERT_TRUE(
+      reactor.Register(sockets[0], &pool, TestIoConfig(), [](const std::string&, ConnectionContext&) { return "OK"; }));
+
+  ASSERT_EQ(::write(sockets[1], "INFO\n", 5), 5);
+  EXPECT_EQ(ReadAvailable(sockets[1]), "ERROR Server busy\r\n");
+  EXPECT_EQ(ReadAvailable(sockets[1]), "");  // then end of stream
+
+  reactor.Stop();
+  ::close(sockets[1]);
+}
+
+TEST(IoReactorTest, ExecutingRequestIsNotReapedAsIdle) {
+  ThreadPool pool(1);
+  ReactorConfig config;
+  config.poll_timeout_ms = 10;
+  config.idle_timeout_sec = 1;
+  config.reaper_interval_sec = 1;
+  IoReactor reactor(config);
+  ASSERT_TRUE(reactor.Start());
+
+  int sockets[2];
+  ASSERT_EQ(MakeSocketPair(sockets), 0);
+  ASSERT_TRUE(reactor.Register(sockets[0], &pool, TestIoConfig(), [](const std::string&, ConnectionContext&) {
+    // Runs well past the idle timeout with no socket activity.
+    std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+    return std::string("OK");
+  }));
+
+  ASSERT_EQ(::write(sockets[1], "SLOW\n", 5), 5);
+  EXPECT_EQ(ReadAvailable(sockets[1], 5000), "OK\r\n");
 
   reactor.Stop();
   pool.Shutdown();

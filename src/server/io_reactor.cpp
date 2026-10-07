@@ -260,8 +260,11 @@ void IoReactor::ReapIdleConnections() {
       }
     }
   }
-  for (const auto& [fd, connection] : stale)
+  for (const auto& [fd, connection] : stale) {
+    if (connection->HasWorkInFlight())
+      continue;
     Unregister(fd, connection.get());
+  }
 }
 
 }  // namespace nvecd::server
