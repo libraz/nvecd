@@ -312,17 +312,28 @@ class EventStore {
   size_t MemoryUsageLocked() const;
 
   /**
-   * @brief Append a validated event, optionally capturing the prior buffer
+   * @brief Apply a validated ingestion while mutex_ is held exclusively
    *
-   * The only path that writes into a context ring buffer. Taking a
-   * ValidatedEvent means no caller can reach the buffers with a raw value that
-   * has not been through EventValidator.
+   * Dedup decisions, counters, the append, and optional prior-buffer capture
+   * form one EventStore transaction. A null result skips both result creation
+   * and the potentially expensive prior-buffer copy used by incremental
+   * co-occurrence updates.
+   *
+   * @param validated Event to ingest
+   * @param result Receives the outcome and prior buffer when non-null
+   * @pre mutex_ is held exclusively
+   */
+  void IngestValidatedLocked(const ValidatedEvent& validated, IngestResult* result);
+
+  /**
+   * @brief Append a validated event while mutex_ is held exclusively
    *
    * @param validated Event to append
    * @param prior_events When non-null, receives the buffer contents captured
-   *        under the same lock immediately before the append
+   *        immediately before the append
+   * @pre mutex_ is held exclusively
    */
-  void AppendValidated(const ValidatedEvent& validated, std::vector<Event>* prior_events);
+  void AppendValidatedLocked(const ValidatedEvent& validated, std::vector<Event>* prior_events);
 
   /**
    * @brief Make room for a new context according to the configured LRU cap.
@@ -350,7 +361,9 @@ class EventStore {
   std::atomic<uint64_t> total_events_{0};    ///< Total events processed
   std::atomic<uint64_t> deduped_events_{0};  ///< Total deduplicated events
 
-  // Deduplication caches
+  // All access from EventStore takes mutex_ before these caches' internal
+  // mutexes. Clear follows the same order; SwapState swaps cache ownership
+  // while both EventStore mutexes are held.
   std::unique_ptr<DedupCache> dedup_cache_;  ///< For ADD type (time-window)
   std::unique_ptr<StateCache> state_cache_;  ///< For SET/DEL type (last-value)
 };

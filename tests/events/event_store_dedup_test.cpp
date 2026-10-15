@@ -216,4 +216,59 @@ TEST_F(EventStoreDeduplicationTest, ConcurrentDuplicateAddsAreStoredExactlyOnce)
   EXPECT_EQ(stats.stored_events, 1U);
 }
 
+TEST_F(EventStoreDeduplicationTest, ConcurrentSetsLeaveCacheMatchingTheFinalBufferedEvent) {
+  constexpr size_t kWarmupEvents = 2048;
+  constexpr size_t kWarmupIdSize = 1024;
+  config_.ctx_buffer_size = static_cast<uint32_t>(kWarmupEvents + 8);
+  EventStore store(config_);
+
+  // A large prior buffer widens any window between the cache update and the append.
+  const std::string padding(kWarmupIdSize, 'x');
+  for (size_t i = 0; i < kWarmupEvents; ++i) {
+    const std::string id = "warmup" + std::to_string(i) + padding;
+    ASSERT_TRUE(store.RestoreEvent("ctx", Event(id, 1, static_cast<uint64_t>(i + 1), EventType::ADD)));
+  }
+
+  std::atomic<int> ready{0};
+  std::atomic<bool> start{false};
+  std::atomic<int> failures{0};
+  std::vector<std::thread> workers;
+  workers.reserve(8);
+  for (int i = 0; i < 8; ++i) {
+    workers.emplace_back([&, i]() {
+      ready.fetch_add(1, std::memory_order_release);
+      while (!start.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+      for (int round = 0; round < 8; ++round) {
+        const int score = 1 + ((i * 17 + round * 31) % 100);
+        auto result = store.AddEventAndGetPrior("ctx", "shared-state", score, EventType::SET,
+                                                100000 + static_cast<uint64_t>(i * 8 + round));
+        if (!result) {
+          failures.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
+    });
+  }
+  while (ready.load(std::memory_order_acquire) != 8) {
+    std::this_thread::yield();
+  }
+  start.store(true, std::memory_order_release);
+  for (auto& worker : workers) {
+    worker.join();
+  }
+  ASSERT_EQ(failures.load(), 0);
+
+  const auto events = store.GetEvents("ctx");
+  ASSERT_GT(events.size(), kWarmupEvents);
+  ASSERT_EQ(events.back().item_id, "shared-state");
+  const auto final_score = events.back().score;
+  const auto size_before_replay = events.size();
+
+  auto replay = store.AddEventAndGetPrior("ctx", "shared-state", final_score, EventType::SET, 200000);
+  ASSERT_TRUE(replay);
+  EXPECT_TRUE(replay->deduped);
+  EXPECT_EQ(store.GetEvents("ctx").size(), size_before_replay);
+}
+
 }  // namespace nvecd::events

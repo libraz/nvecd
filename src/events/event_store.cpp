@@ -42,6 +42,13 @@ uint64_t ResolveTimestamp(uint64_t timestamp) {
   return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count());
 }
 
+/// @brief Resolve and validate a live request; DEL carries no weight and is stored with score 0.
+utils::Expected<ValidatedEvent, utils::Error> ValidateLiveEvent(const std::string& ctx, const std::string& id,
+                                                                int score, EventType type, uint64_t timestamp) {
+  const int stored_score = (type == EventType::DEL) ? 0 : score;
+  return EventValidator::Validate(ctx, Event(id, stored_score, ResolveTimestamp(timestamp), type));
+}
+
 }  // namespace
 
 utils::Expected<ValidatedEvent, utils::Error> EventValidator::Validate(const std::string& ctx, const Event& event) {
@@ -52,6 +59,17 @@ utils::Expected<ValidatedEvent, utils::Error> EventValidator::Validate(const std
   auto id_valid = ValidateIdentifier("ID", event.item_id);
   if (!id_valid) {
     return utils::MakeUnexpected(id_valid.error());
+  }
+
+  switch (event.type) {
+    case EventType::ADD:
+    case EventType::SET:
+    case EventType::DEL:
+      break;
+    default:
+      return utils::MakeUnexpected(
+          utils::MakeError(utils::ErrorCode::kEventStoreError,
+                           "Invalid event type: " + std::to_string(static_cast<unsigned int>(event.type))));
   }
 
   // Score range. DEL carries no weight, so it is stored as exactly 0; ADD and
@@ -72,10 +90,14 @@ utils::Expected<ValidatedEvent, utils::Error> EventValidator::Validate(const std
 
 utils::Expected<void, utils::Error> EventStore::AddEvent(const std::string& ctx, const std::string& id, int score,
                                                          EventType type, uint64_t timestamp) {
-  auto result = AddEventAndGetPrior(ctx, id, score, type, timestamp);
-  if (!result) {
-    return utils::MakeUnexpected(result.error());
+  auto validated = ValidateLiveEvent(ctx, id, score, type, timestamp);
+  if (!validated) {
+    utils::LogEventStoreError("add_event", ctx, validated.error().message());
+    return utils::MakeUnexpected(validated.error());
   }
+
+  std::unique_lock lock(mutex_);
+  IngestValidatedLocked(*validated, nullptr);
   return {};
 }
 
@@ -83,15 +105,13 @@ utils::Expected<EventStore::PreparedEvent, utils::Error> EventStore::PrepareEven
                                                                                   const std::string& id, int score,
                                                                                   EventType type,
                                                                                   uint64_t timestamp) const {
-  const uint64_t resolved_timestamp = ResolveTimestamp(timestamp);
-  // DEL carries no weight: it is stored with score 0 whatever the request asked
-  // for, so the score is normalized before validation rather than after it.
-  const int stored_score = (type == EventType::DEL) ? 0 : score;
-  auto validated = EventValidator::Validate(ctx, Event(id, stored_score, resolved_timestamp, type));
+  auto validated = ValidateLiveEvent(ctx, id, score, type, timestamp);
   if (!validated) {
     return utils::MakeUnexpected(validated.error());
   }
+  const uint64_t resolved_timestamp = validated->Get().event.timestamp;
 
+  std::shared_lock lock(mutex_);
   PreparedEvent prepared;
   switch (type) {
     case EventType::ADD:
@@ -113,64 +133,15 @@ utils::Expected<EventStore::IngestResult, utils::Error> EventStore::AddEventAndG
                                                                                         const std::string& id,
                                                                                         int score, EventType type,
                                                                                         uint64_t timestamp) {
-  // Use provided timestamp or current time
-  const uint64_t ts = ResolveTimestamp(timestamp);
-  // DEL events carry no weight and are stored with score 0.
-  const int stored_score = (type == EventType::DEL) ? 0 : score;
-
-  auto validated = EventValidator::Validate(ctx, Event(id, stored_score, ts, type));
+  auto validated = ValidateLiveEvent(ctx, id, score, type, timestamp);
   if (!validated) {
     utils::LogEventStoreError("add_event", ctx, validated.error().message());
     return utils::MakeUnexpected(validated.error());
   }
 
-  // Increment total event count (includes duplicates)
-  total_events_.fetch_add(1, std::memory_order_relaxed);
-
+  std::unique_lock lock(mutex_);
   IngestResult result;
-
-  // Deduplication based on event type
-  switch (type) {
-    case EventType::ADD:
-      // Time-window based deduplication
-      if (dedup_cache_) {
-        EventKey key(ctx, id, score);
-        if (dedup_cache_->CheckAndInsert(key, ts)) {
-          deduped_events_.fetch_add(1, std::memory_order_relaxed);
-          result.deduped = true;
-          return result;  // Duplicate within time window
-        }
-      }
-      break;
-
-    case EventType::SET:
-      // Last-value based deduplication
-      if (state_cache_) {
-        StateKey key(ctx, id);
-        if (state_cache_->CheckAndUpdateSet(key, score)) {
-          deduped_events_.fetch_add(1, std::memory_order_relaxed);
-          result.deduped = true;
-          return result;  // Same value, idempotent skip
-        }
-      }
-      break;
-
-    case EventType::DEL:
-      // Deletion flag based deduplication
-      if (state_cache_) {
-        StateKey key(ctx, id);
-        if (state_cache_->CheckAndMarkDeleted(key)) {
-          deduped_events_.fetch_add(1, std::memory_order_relaxed);
-          result.deduped = true;
-          return result;  // Already deleted
-        }
-      }
-      break;
-  }
-
-  result.stored_event = validated->Get().event;
-  AppendValidated(*validated, &result.prior_events);
-
+  IngestValidatedLocked(*validated, &result);
   return result;
 }
 
@@ -184,8 +155,9 @@ utils::Expected<void, utils::Error> EventStore::RestoreEvent(const std::string& 
     return utils::MakeUnexpected(validated.error());
   }
 
+  std::unique_lock lock(mutex_);
   total_events_.fetch_add(1, std::memory_order_relaxed);
-  AppendValidated(*validated, nullptr);
+  AppendValidatedLocked(*validated, nullptr);
 
   // Restore the last-value state cache in the same insertion order as the
   // ring buffer. Snapshot/WAL recovery bypasses AddEventAndGetPrior(), so
@@ -314,15 +286,45 @@ size_t EventStore::MemoryUsageLocked() const {
   return total;
 }
 
-void EventStore::AppendValidated(const ValidatedEvent& validated, std::vector<Event>* prior_events) {
+void EventStore::IngestValidatedLocked(const ValidatedEvent& validated, IngestResult* result) {
+  const ContextEvent& pair = *validated;
+  const Event& event = pair.event;
+
+  total_events_.fetch_add(1, std::memory_order_relaxed);
+
+  bool deduped = false;
+  switch (event.type) {
+    case EventType::ADD:
+      deduped = dedup_cache_ != nullptr &&
+                dedup_cache_->CheckAndInsert(EventKey(pair.ctx, event.item_id, event.score), event.timestamp);
+      break;
+    case EventType::SET:
+      deduped =
+          state_cache_ != nullptr && state_cache_->CheckAndUpdateSet(StateKey(pair.ctx, event.item_id), event.score);
+      break;
+    case EventType::DEL:
+      deduped = state_cache_ != nullptr && state_cache_->CheckAndMarkDeleted(StateKey(pair.ctx, event.item_id));
+      break;
+  }
+
+  if (deduped) {
+    deduped_events_.fetch_add(1, std::memory_order_relaxed);
+    if (result != nullptr) {
+      result->deduped = true;
+    }
+    return;
+  }
+
+  if (result != nullptr) {
+    result->stored_event = event;
+  }
+  AppendValidatedLocked(validated, result != nullptr ? &result->prior_events : nullptr);
+}
+
+void EventStore::AppendValidatedLocked(const ValidatedEvent& validated, std::vector<Event>* prior_events) {
   const ContextEvent& pair = *validated;
 
-  // Capturing prior_events under the same lock that performs the push
-  // guarantees that concurrent same-context ingests each observe a distinct,
-  // consistent prior view (no lost or duplicated co-occurrence pairs).
-  std::unique_lock lock(mutex_);
-
-  // Create ring buffer for context if it doesn't exist
+  // Create ring buffer for context if it doesn't exist.
   auto it = ctx_events_.find(pair.ctx);
   if (it == ctx_events_.end()) {
     EvictLeastRecentlyUsedContextLocked();
@@ -332,7 +334,7 @@ void EventStore::AppendValidated(const ValidatedEvent& validated, std::vector<Ev
   TouchContextLocked(pair.ctx);
 
   if (prior_events != nullptr) {
-    // Snapshot the buffer contents that existed before this event.
+    // Capture immediately before append while the caller holds mutex_.
     *prior_events = it->second.GetAll();
   }
 

@@ -586,6 +586,32 @@ TEST(EventStoreTest, PrepareEventAgreesWithTheStoredForm) {
   }
 }
 
+TEST(EventStoreTest, InvalidEventTypesAreRejectedByEveryIngestionPath) {
+  auto config = MakeConfig();
+  config.dedup_window_sec = 60;
+  config.dedup_cache_size = 100;
+  EventStore store(config);
+  for (const auto raw_type : {3U, 255U}) {
+    const auto invalid_type = static_cast<EventType>(raw_type);
+    const Event invalid_event("item", 42, 1000, invalid_type);
+
+    EXPECT_FALSE(EventValidator::Validate("ctx", invalid_event)) << raw_type;
+    EXPECT_FALSE(store.PrepareEvent("ctx", "item", 42, invalid_type, 1000)) << raw_type;
+    EXPECT_FALSE(store.AddEvent("ctx", "item", 42, invalid_type, 1000)) << raw_type;
+    EXPECT_FALSE(store.AddEventAndGetPrior("ctx", "item", 42, invalid_type, 1000)) << raw_type;
+    EXPECT_FALSE(store.RestoreEvent("ctx", invalid_event)) << raw_type;
+  }
+
+  EXPECT_TRUE(store.GetEvents("ctx").empty());
+  EXPECT_EQ(store.GetStatistics().total_events, 0U);
+  EXPECT_EQ(store.GetStatistics().deduped_events, 0U);
+
+  // A rejected enum must not seed any state that changes a later valid write.
+  auto valid = store.AddEventAndGetPrior("ctx", "item", 42, EventType::SET, 1001);
+  ASSERT_TRUE(valid);
+  EXPECT_FALSE(valid->deduped);
+}
+
 // ============================================================================
 // LRU Bookkeeping (incremental vs full-scan reference)
 // ============================================================================
