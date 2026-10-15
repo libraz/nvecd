@@ -15,36 +15,25 @@ RateLimiter::RateLimiter(int capacity, int refill_rate, int max_clients)
 bool RateLimiter::Allow(const std::string& client_key) {
   std::lock_guard<std::mutex> lock(mutex_);
 
-  auto it = buckets_.find(client_key);
-  if (it == buckets_.end()) {
+  auto it = clients_.find(client_key);
+  if (it == clients_.end()) {
     // New client - create bucket with full tokens
-    if (static_cast<int>(buckets_.size()) >= max_clients_) {
+    if (static_cast<int>(clients_.size()) >= max_clients_) {
       EvictOldest();
     }
 
-    Bucket bucket;
-    bucket.tokens = static_cast<double>(capacity_) - 1.0;  // Consume 1 for this request
-    bucket.last_refill = std::chrono::steady_clock::now();
-    buckets_[client_key] = bucket;
-
     lru_list_.push_front(client_key);
-    lru_map_[client_key] = lru_list_.begin();
+    Bucket bucket{static_cast<double>(capacity_) - 1.0, std::chrono::steady_clock::now()};
+    clients_.emplace(client_key, Client{bucket, lru_list_.begin()});
     return true;
   }
 
   // Existing client - refill and check
-  Refill(it->second);
+  Refill(it->second.bucket);
+  lru_list_.splice(lru_list_.begin(), lru_list_, it->second.lru_position);
 
-  // Update LRU
-  auto lru_it = lru_map_.find(client_key);
-  if (lru_it != lru_map_.end()) {
-    lru_list_.erase(lru_it->second);
-    lru_list_.push_front(client_key);
-    lru_map_[client_key] = lru_list_.begin();
-  }
-
-  if (it->second.tokens >= 1.0) {
-    it->second.tokens -= 1.0;
+  if (it->second.bucket.tokens >= 1.0) {
+    it->second.bucket.tokens -= 1.0;
     return true;
   }
 
@@ -62,9 +51,7 @@ void RateLimiter::EvictOldest() {
   if (lru_list_.empty()) {
     return;
   }
-  const auto& oldest = lru_list_.back();
-  buckets_.erase(oldest);
-  lru_map_.erase(oldest);
+  clients_.erase(lru_list_.back());
   lru_list_.pop_back();
 }
 

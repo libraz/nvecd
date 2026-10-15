@@ -41,6 +41,11 @@ class RateLimiter {
     std::chrono::steady_clock::time_point last_refill;
   };
 
+  struct Client {
+    Bucket bucket;
+    std::list<std::string>::iterator lru_position;
+  };
+
   void Refill(Bucket& bucket);
   void EvictOldest();
 
@@ -49,9 +54,8 @@ class RateLimiter {
   const int max_clients_;
 
   std::mutex mutex_;
-  std::unordered_map<std::string, Bucket> buckets_;
+  std::unordered_map<std::string, Client> clients_;
   std::list<std::string> lru_list_;  ///< Front = most recent
-  std::unordered_map<std::string, std::list<std::string>::iterator> lru_map_;
 };
 
 }  // namespace nvecd::server
