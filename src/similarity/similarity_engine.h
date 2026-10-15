@@ -287,6 +287,29 @@ class SimilarityEngine {
    */
   static std::vector<SimilarityResult> MergeAndSelectTopK(std::vector<SimilarityResult> results, int top_k);
 
+  /// Query handed to SearchByQuery. @p data must outlive the call.
+  struct QueryVector {
+    const float* data;               ///< Query components
+    size_t dim;                      ///< Number of components
+    float norm;                      ///< L2 norm of the query
+    const std::string* excluded_id;  ///< Item left out of the results; non-null for a by-ID query
+  };
+
+  /**
+   * @brief Top-k nearest vectors for a query, via ANN when ready, else a flat scan
+   *
+   * Must be called with no VectorStore snapshot held. For a by-ID query
+   * (@p query.excluded_id set) the flat path re-resolves the query row by ID in
+   * the snapshot it scans and fails with kVectorNotFound if it is gone.
+   *
+   * @param query Query vector
+   * @param top_k Validated result count
+   * @param filter Metadata filter (may be empty)
+   * @return Results sorted by score descending, or an error
+   */
+  utils::Expected<std::vector<SimilarityResult>, utils::Error> SearchByQuery(const QueryVector& query, int top_k,
+                                                                             const vectors::MetadataFilter& filter);
+
   /// @brief Sample unique indices uniformly from [0, total).
   std::vector<size_t> SampleIndices(size_t total, size_t sample_size) const;
 

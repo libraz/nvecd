@@ -19,11 +19,12 @@
 namespace nvecd::cache {
 
 // Helper struct for serialization (POD type for LZ4 compression)
-// id: 256-byte fixed buffer, score: 4-byte float = 260 bytes per result
 struct SerializedSimilarityResult {
   char id[256];  // Fixed-size ID buffer
   float score;
 };
+static_assert(sizeof(SerializedSimilarityResult) == ResultCompressor::kSerializedResultSize,
+              "kSerializedResultSize must match the serialized layout");
 
 utils::Expected<std::vector<uint8_t>, utils::Error> ResultCompressor::SerializeSimilarityResults(
     const std::vector<similarity::SimilarityResult>& results) {

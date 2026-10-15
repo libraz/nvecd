@@ -41,47 +41,12 @@ void MetadataStore::Delete(const std::string& id) {
   metadata_.erase(id);
 }
 
-std::vector<std::string> MetadataStore::Filter(const MetadataFilter& filter,
-                                               const std::vector<std::string>& candidates) const {
-  std::shared_lock lock(mutex_);
-  std::vector<std::string> result;
-
-  if (filter.Empty()) {
-    // No filter: return all candidates or all items with metadata.
-    if (!candidates.empty()) {
-      return candidates;
-    }
-    result.reserve(metadata_.size());
-    for (const auto& entry : metadata_) {
-      result.push_back(entry.first);
-    }
-    return result;
-  }
-
-  if (!candidates.empty()) {
-    // Filter only the given candidates.
-    result.reserve(candidates.size());
-    for (const auto& id : candidates) {
-      auto it = metadata_.find(id);
-      if (filter.Match(it != metadata_.end() ? it->second : NoMetadata())) {
-        result.push_back(id);
-      }
-    }
-  } else {
-    // Linear scan all items.
-    result.reserve(metadata_.size() / 4);  // Heuristic
-    for (const auto& [id, meta] : metadata_) {
-      if (filter.Match(meta)) {
-        result.push_back(id);
-      }
-    }
-  }
-
-  return result;
-}
-
 bool MetadataStore::Matches(const std::string& id, const MetadataFilter& filter) const {
   std::shared_lock lock(mutex_);
+  return MatchesLocked(id, filter);
+}
+
+bool MetadataStore::MatchesLocked(const std::string& id, const MetadataFilter& filter) const {
   if (filter.Empty()) {
     return true;
   }

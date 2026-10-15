@@ -7,11 +7,10 @@
  * correctly associated with its item across defragmentation and tombstone-slot
  * reuse, which both change the compact_index of an item without notice.
  *
- * Provides linear-scan filtering (Phase 1) with planned inverted index
- * support (Phase 2).
+ * Filtering is a per-item check (Matches); callers scan their own candidates.
  *
  * Thread-safety:
- * - Multiple concurrent reads (Get, Filter) via shared_mutex
+ * - Multiple concurrent reads (Get, Matches) via shared_mutex
  * - Exclusive writes (Set, Delete)
  */
 
@@ -63,20 +62,20 @@ class MetadataStore {
   void Delete(const std::string& id);
 
   /**
-   * @brief Filter items by metadata conditions (linear scan)
-   * @param filter AND-combined filter conditions
-   * @param candidates If non-empty, only check these item IDs
-   * @return Item IDs that match all conditions
-   */
-  std::vector<std::string> Filter(const MetadataFilter& filter, const std::vector<std::string>& candidates = {}) const;
-
-  /**
    * @brief Check if a single item matches the filter
    * @param id Item to check
    * @param filter Filter conditions
    * @return True if matches (or filter is empty)
    */
   bool Matches(const std::string& id, const MetadataFilter& filter) const;
+
+  /**
+   * @brief Matches() for a caller that already holds AcquireReadLock()
+   * @param id Item to check
+   * @param filter Filter conditions
+   * @return True if matches (or filter is empty)
+   */
+  bool MatchesLocked(const std::string& id, const MetadataFilter& filter) const;
 
   /**
    * @brief Get number of items with metadata

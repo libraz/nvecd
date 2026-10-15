@@ -77,7 +77,6 @@ utils::Expected<void, utils::Error> VectorStore::SetVector(const std::string& ve
     return utils::MakeUnexpected(validation.error());
   }
 
-  constexpr float kNormEpsilon = 1e-7F;
   const float input_norm = validation.value();
   std::vector<float> normalized_data;
   const std::vector<float>* data_ptr = &vec;
@@ -355,21 +354,8 @@ const float* VectorStore::GetMatrixRow(size_t idx) const {
   return matrix_.data() + idx * dim;
 }
 
-const float* VectorStore::GetMatrixData() const {
-  return matrix_.empty() ? nullptr : matrix_.data();
-}
-
-size_t VectorStore::GetMatrixCount() const {
-  size_t dim = dimension_.load(std::memory_order_relaxed);
-  return dim > 0 ? matrix_.size() / dim : 0;
-}
-
 float VectorStore::GetNorm(size_t idx) const {
   return norms_[idx];
-}
-
-const std::string& VectorStore::GetIdByIndex(size_t idx) const {
-  return idx_to_id_[idx];
 }
 
 std::shared_lock<std::shared_mutex> VectorStore::AcquireReadLock() const {
@@ -410,10 +396,6 @@ std::optional<size_t> VectorStore::GetCompactIndex(const std::string& id) const 
     return std::nullopt;
   }
   return it->second;
-}
-
-bool VectorStore::IsDeleted(size_t idx) const {
-  return idx < deleted_.size() && deleted_[idx];
 }
 
 void VectorStore::Defragment() {

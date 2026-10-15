@@ -22,6 +22,9 @@
 
 namespace nvecd::vectors {
 
+/// Norms below this are treated as zero (cosine and normalization are undefined).
+inline constexpr float kNormEpsilon = 1e-7F;
+
 // ============================================================================
 // Raw-pointer distance functions (for AnnIndex / DistanceFunc)
 // ============================================================================
@@ -37,8 +40,7 @@ inline float CosineDistanceRaw(const float* a, const float* b, uint32_t dim) {
   float dot = impl.dot_product(a, b, dim);
   float norm_a = impl.l2_norm(a, dim);
   float norm_b = impl.l2_norm(b, dim);
-  constexpr float kEps = 1e-7F;
-  if (norm_a < kEps || norm_b < kEps) {
+  if (norm_a < kNormEpsilon || norm_b < kNormEpsilon) {
     return 0.0F;
   }
   return dot / (norm_a * norm_b);
@@ -137,7 +139,6 @@ inline float CosineSimilarity(const std::vector<float>& lhs, const std::vector<f
   float norm_lhs = impl.l2_norm(lhs.data(), lhs.size());
   float norm_rhs = impl.l2_norm(rhs.data(), rhs.size());
 
-  constexpr float kNormEpsilon = 1e-7F;
   if (norm_lhs < kNormEpsilon || norm_rhs < kNormEpsilon) {
     return 0.0F;  // Undefined for zero/near-zero vectors
   }
@@ -159,7 +160,6 @@ inline float CosineSimilarity(const std::vector<float>& lhs, const std::vector<f
  * @return Cosine similarity, or 0.0 if either norm is near-zero
  */
 inline float CosineSimilarityPreNorm(const float* lhs, const float* rhs, size_t dim, float norm_lhs, float norm_rhs) {
-  constexpr float kNormEpsilon = 1e-7F;
   if (norm_lhs < kNormEpsilon || norm_rhs < kNormEpsilon) {
     return 0.0F;
   }
@@ -196,7 +196,6 @@ inline float L2Distance(const std::vector<float>& lhs, const std::vector<float>&
  */
 inline bool Normalize(std::vector<float>& vec) {
   float norm = L2Norm(vec);
-  constexpr float kNormEpsilon = 1e-7F;
   if (norm < kNormEpsilon) {
     return false;  // Cannot normalize zero/near-zero vector
   }

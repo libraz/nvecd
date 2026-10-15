@@ -240,17 +240,6 @@ class SimilarityCache {
   bool Erase(const CacheKey& key);
 
   /**
-   * @brief Register which item IDs appear in a cache entry's results
-   *
-   * Builds reverse index for selective invalidation. Only tracks
-   * up to kMaxTrackedItemsPerEntry items per entry to bound memory.
-   *
-   * @param key Cache key
-   * @param item_ids Item IDs that appear in the query and results
-   */
-  void RegisterResultItems(const CacheKey& key, const std::vector<std::string>& item_ids);
-
-  /**
    * @brief Invalidate all cache entries that reference a given item ID
    *
    * Uses reverse index for O(k) invalidation where k is the number
@@ -265,12 +254,6 @@ class SimilarityCache {
    * @brief Clear all cache entries
    */
   void Clear();
-
-  /**
-   * @brief Clear cache entries matching a predicate
-   * @param predicate Function returning true for keys to erase
-   */
-  void ClearIf(std::function<bool(const CacheKey&)> predicate);
 
   /**
    * @brief Purge all TTL-expired entries
@@ -530,6 +513,18 @@ class SimilarityCache {
                      double query_cost_ms, int effective_ttl_seconds,
                      const std::vector<std::string>* item_ids = nullptr);
 
+  /**
+   * @brief Effective TTL for a search type, or nullopt when its policy disables caching
+   *
+   * Reads the policy without mutating shared state. A positive per-type TTL
+   * overrides the global one.
+   */
+  std::optional<int> ResolveEffectiveTtl(SearchType search_type) const;
+
+  /// Add the time elapsed since @p start_time to the miss-latency total.
+  void RecordMissLatency(std::chrono::high_resolution_clock::time_point start_time);
+
+  /// Track up to kMaxTrackedItemsPerEntry of @p item_ids for @p key. Caller holds mutex_ exclusively.
   void RegisterResultItemsLocked(const CacheKey& key, CachedEntry& entry, const std::vector<std::string>& item_ids);
 
   /**

@@ -19,42 +19,42 @@ TEST(StateCacheTest, ConstructEmpty) {
   EXPECT_EQ(cache.Size(), 0);
 }
 
-TEST(StateCacheTest, IsDuplicateSetNewKey) {
+TEST(StateCacheTest, WouldDeduplicateSetNewKey) {
   StateCache cache(100);
   StateKey key("ctx1", "item1");
 
-  EXPECT_FALSE(cache.IsDuplicateSet(key, 100));
+  EXPECT_FALSE(cache.WouldDeduplicateSet(key, 100));
 }
 
-TEST(StateCacheTest, IsDuplicateSetSameScore) {
-  StateCache cache(100);
-  StateKey key("ctx1", "item1");
-
-  cache.UpdateScore(key, 100);
-  EXPECT_TRUE(cache.IsDuplicateSet(key, 100));
-}
-
-TEST(StateCacheTest, IsDuplicateSetDifferentScore) {
+TEST(StateCacheTest, WouldDeduplicateSetSameScore) {
   StateCache cache(100);
   StateKey key("ctx1", "item1");
 
   cache.UpdateScore(key, 100);
-  EXPECT_FALSE(cache.IsDuplicateSet(key, 200));
+  EXPECT_TRUE(cache.WouldDeduplicateSet(key, 100));
 }
 
-TEST(StateCacheTest, IsDuplicateDelNotTracked) {
+TEST(StateCacheTest, WouldDeduplicateSetDifferentScore) {
   StateCache cache(100);
   StateKey key("ctx1", "item1");
 
-  EXPECT_FALSE(cache.IsDuplicateDel(key));
+  cache.UpdateScore(key, 100);
+  EXPECT_FALSE(cache.WouldDeduplicateSet(key, 200));
 }
 
-TEST(StateCacheTest, IsDuplicateDelAlreadyDeleted) {
+TEST(StateCacheTest, WouldDeduplicateDelNotTracked) {
+  StateCache cache(100);
+  StateKey key("ctx1", "item1");
+
+  EXPECT_FALSE(cache.WouldDeduplicateDel(key));
+}
+
+TEST(StateCacheTest, WouldDeduplicateDelAlreadyDeleted) {
   StateCache cache(100);
   StateKey key("ctx1", "item1");
 
   cache.MarkDeleted(key);
-  EXPECT_TRUE(cache.IsDuplicateDel(key));
+  EXPECT_TRUE(cache.WouldDeduplicateDel(key));
 }
 
 TEST(StateCacheTest, ClearResetsAll) {
@@ -66,7 +66,7 @@ TEST(StateCacheTest, ClearResetsAll) {
 
   cache.Clear();
   EXPECT_EQ(cache.Size(), 0);
-  EXPECT_FALSE(cache.IsDuplicateSet(key, 100));
+  EXPECT_FALSE(cache.WouldDeduplicateSet(key, 100));
 }
 
 // ============================================================================
@@ -93,12 +93,12 @@ TEST(StateCacheTest, LRUEviction_RemovesOldest) {
   EXPECT_EQ(cache.Size(), 3);
 
   // key1 should be evicted (LRU)
-  EXPECT_FALSE(cache.IsDuplicateSet(key1, 100));
+  EXPECT_FALSE(cache.WouldDeduplicateSet(key1, 100));
 
   // key2, key3, key4 should still exist
-  EXPECT_TRUE(cache.IsDuplicateSet(key2, 200));
-  EXPECT_TRUE(cache.IsDuplicateSet(key3, 300));
-  EXPECT_TRUE(cache.IsDuplicateSet(key4, 400));
+  EXPECT_TRUE(cache.WouldDeduplicateSet(key2, 200));
+  EXPECT_TRUE(cache.WouldDeduplicateSet(key3, 300));
+  EXPECT_TRUE(cache.WouldDeduplicateSet(key4, 400));
 }
 
 TEST(StateCacheTest, LRUEviction_AccessRefreshesOrder) {
@@ -122,12 +122,12 @@ TEST(StateCacheTest, LRUEviction_AccessRefreshesOrder) {
   EXPECT_EQ(cache.Size(), 3);
 
   // key2 should be evicted (LRU after key1 was refreshed)
-  EXPECT_FALSE(cache.IsDuplicateSet(key2, 200));
+  EXPECT_FALSE(cache.WouldDeduplicateSet(key2, 200));
 
   // key1, key3, key4 should still exist
-  EXPECT_TRUE(cache.IsDuplicateSet(key1, 100));
-  EXPECT_TRUE(cache.IsDuplicateSet(key3, 300));
-  EXPECT_TRUE(cache.IsDuplicateSet(key4, 400));
+  EXPECT_TRUE(cache.WouldDeduplicateSet(key1, 100));
+  EXPECT_TRUE(cache.WouldDeduplicateSet(key3, 300));
+  EXPECT_TRUE(cache.WouldDeduplicateSet(key4, 400));
 }
 
 TEST(StateCacheTest, DuplicateSetMovesTheEntryToMostRecent) {
@@ -168,10 +168,10 @@ TEST(StateCacheTest, LRUEviction_MarkDeletedRefreshesOrder) {
   // Adding key4 should evict key2 (now LRU)
   cache.UpdateScore(key4, 400);
 
-  EXPECT_FALSE(cache.IsDuplicateSet(key2, 200));
-  EXPECT_TRUE(cache.IsDuplicateDel(key1));
-  EXPECT_TRUE(cache.IsDuplicateSet(key3, 300));
-  EXPECT_TRUE(cache.IsDuplicateSet(key4, 400));
+  EXPECT_FALSE(cache.WouldDeduplicateSet(key2, 200));
+  EXPECT_TRUE(cache.WouldDeduplicateDel(key1));
+  EXPECT_TRUE(cache.WouldDeduplicateSet(key3, 300));
+  EXPECT_TRUE(cache.WouldDeduplicateSet(key4, 400));
 }
 
 TEST(StateCacheTest, Statistics) {
@@ -181,15 +181,29 @@ TEST(StateCacheTest, Statistics) {
   cache.UpdateScore(key, 100);
 
   // Duplicate hit
-  EXPECT_TRUE(cache.IsDuplicateSet(key, 100));
+  EXPECT_TRUE(cache.CheckAndUpdateSet(key, 100));
   // Miss (different score)
-  EXPECT_FALSE(cache.IsDuplicateSet(key, 200));
+  EXPECT_FALSE(cache.CheckAndUpdateSet(key, 200));
 
   auto stats = cache.GetStatistics();
   EXPECT_EQ(stats.size, 1);
   EXPECT_EQ(stats.max_size, 100);
   EXPECT_EQ(stats.total_hits, 1);
   EXPECT_EQ(stats.total_misses, 1);
+}
+
+TEST(StateCacheTest, CheckAndMarkDeletedRecordsThenDeduplicates) {
+  StateCache cache(100);
+  StateKey key("ctx1", "item1");
+
+  EXPECT_FALSE(cache.CheckAndMarkDeleted(key));
+  EXPECT_TRUE(cache.CheckAndMarkDeleted(key));
+  EXPECT_TRUE(cache.WouldDeduplicateDel(key));
+
+  // A SET after the delete is a state transition, not a duplicate.
+  EXPECT_FALSE(cache.CheckAndUpdateSet(key, 5));
+  EXPECT_FALSE(cache.WouldDeduplicateDel(key));
+  EXPECT_EQ(cache.Size(), 1);
 }
 
 }  // namespace

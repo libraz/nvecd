@@ -207,18 +207,6 @@ class VectorStore {
   const float* GetMatrixRow(size_t idx) const;
 
   /**
-   * @brief Get raw pointer to contiguous matrix data (caller must hold read lock)
-   * @return Pointer to matrix data, or nullptr if empty
-   */
-  const float* GetMatrixData() const;
-
-  /**
-   * @brief Get number of rows in the matrix (caller must hold read lock)
-   * @return Row count (includes tombstones)
-   */
-  size_t GetMatrixCount() const;
-
-  /**
    * @brief Get pre-computed L2 norm for vector at given index
    *
    * Caller MUST hold read lock via AcquireReadLock().
@@ -227,16 +215,6 @@ class VectorStore {
    * @return L2 norm of the vector
    */
   float GetNorm(size_t idx) const;
-
-  /**
-   * @brief Get ID for vector at given index in compact storage
-   *
-   * Caller MUST hold read lock via AcquireReadLock().
-   *
-   * @param idx Row index in compact matrix
-   * @return Reference to the vector ID string
-   */
-  const std::string& GetIdByIndex(size_t idx) const;
 
   /**
    * @brief Acquire read lock for external batch operations
@@ -266,7 +244,7 @@ class VectorStore {
    * @warning A thread holding a snapshot must NOT call any method that takes
    *          the write lock (SetVector/DeleteVector/Defragment/Clear) on the
    *          same store, or it will self-deadlock. Read-only accessors that
-   *          take a shared lock (IsDeleted/GetCompactIndex/...) are safe with
+   *          take a shared lock (GetCompactIndex/HasVector/...) are safe with
    *          C++17 std::shared_mutex recursive shared acquisition only if the
    *          implementation permits it; prefer reading the snapshot members or
    *          the *Locked variants below instead.
@@ -315,13 +293,6 @@ class VectorStore {
    * @return Index in compact matrix, or nullopt if not found
    */
   std::optional<size_t> GetCompactIndex(const std::string& id) const;
-
-  /**
-   * @brief Check if slot at given index is deleted (tombstone)
-   * @param idx Row index in compact matrix
-   * @return True if the slot is deleted
-   */
-  bool IsDeleted(size_t idx) const;
 
   /**
    * @brief Remove tombstones when fragmentation exceeds threshold

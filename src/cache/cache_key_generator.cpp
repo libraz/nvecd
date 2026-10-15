@@ -60,12 +60,12 @@ CacheKey GenerateSimvCacheKey(const SimvCacheKeyParams& params) {
 
 std::string HashVector(const std::vector<float>& vector) {
   if (vector.empty()) {
-    return std::string(32, '0');  // Return zero hash for empty vector
+    return std::string(MD5::kHexDigestSize, '0');  // Return zero hash for empty vector
   }
 
   // Guard against integer overflow
   if (vector.size() > SIZE_MAX / sizeof(float)) {
-    return std::string(32, '0');  // Return zero hash on overflow
+    return std::string(MD5::kHexDigestSize, '0');  // Return zero hash on overflow
   }
 
   // Hash raw bytes of vector using MD5
@@ -73,7 +73,7 @@ std::string HashVector(const std::vector<float>& vector) {
       reinterpret_cast<const uint8_t*>(vector.data());  // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
   size_t size_bytes = vector.size() * sizeof(float);
 
-  uint8_t digest[16];
+  uint8_t digest[MD5::kDigestSize];
   MD5 md5;
   md5.Update(data, size_bytes);
   md5.Finalize(digest);
@@ -81,7 +81,7 @@ std::string HashVector(const std::vector<float>& vector) {
   // Convert digest to hex string
   std::ostringstream oss;
   oss << std::hex << std::setfill('0');
-  for (int i = 0; i < 16; ++i) {
+  for (size_t i = 0; i < MD5::kDigestSize; ++i) {
     oss << std::setw(2) << static_cast<unsigned int>(digest[i]);
   }
   return oss.str();

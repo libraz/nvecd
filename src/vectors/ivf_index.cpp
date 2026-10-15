@@ -31,9 +31,6 @@ namespace {
 /// Prefetch ahead distance for search loop
 constexpr size_t kPrefetchAhead = 4;
 
-/// Minimum norm threshold to avoid division by zero
-constexpr float kNormEpsilon = 1e-7F;
-
 /// cluster_of_ value for a compact index that is in no inverted list
 constexpr uint32_t kNoCluster = std::numeric_limits<uint32_t>::max();
 
@@ -43,24 +40,27 @@ constexpr float kWorstScore = -std::numeric_limits<float>::infinity();
 // ---------------------------------------------------------------------------
 // Transient tier maintenance
 //
-// The write buffer and the sealing tier are each a pair of parallel arrays plus
-// a compact_index -> slot map. The three helpers below are the only places that
-// mutate a tier, so the map cannot fall out of step with the arrays it indexes.
+// The write buffer and the sealing tier are each a trio of parallel arrays
+// (indices, vectors, norms) plus a compact_index -> slot map. A norm is only
+// meaningful for cosine; other metrics store 0. The three helpers below are the
+// only places that mutate a tier, so the map cannot fall out of step with the
+// arrays it indexes.
 // Every one of them requires buffer_mutex_ held exclusively.
 // ---------------------------------------------------------------------------
 
 /// Append an entry and record its slot. The caller has already established that
 /// @p compact_index is absent from this tier.
-void PushToTier(size_t compact_index, const float* vector, uint32_t dim, std::vector<size_t>& indices,
-                std::vector<float>& vectors, std::unordered_map<size_t, size_t>& slots) {
+void PushToTier(size_t compact_index, const float* vector, float norm, uint32_t dim, std::vector<size_t>& indices,
+                std::vector<float>& vectors, std::vector<float>& norms, std::unordered_map<size_t, size_t>& slots) {
   slots.emplace(compact_index, indices.size());
   indices.push_back(compact_index);
   vectors.insert(vectors.end(), vector, vector + dim);
+  norms.push_back(norm);
 }
 
 /// Remove an entry by moving the last one into its slot. No-op when absent.
 void EraseFromTier(size_t compact_index, uint32_t dim, std::vector<size_t>& indices, std::vector<float>& vectors,
-                   std::unordered_map<size_t, size_t>& slots) {
+                   std::vector<float>& norms, std::unordered_map<size_t, size_t>& slots) {
   auto it = slots.find(compact_index);
   if (it == slots.end()) {
     return;
@@ -69,19 +69,23 @@ void EraseFromTier(size_t compact_index, uint32_t dim, std::vector<size_t>& indi
   const size_t last = indices.size() - 1;
   if (slot != last) {
     indices[slot] = indices[last];
+    norms[slot] = norms[last];
     std::copy(vectors.data() + last * dim, vectors.data() + (last + 1) * dim, vectors.data() + slot * dim);
     // The moved entry lives somewhere else now; its slot has to follow it.
     slots[indices[slot]] = slot;
   }
   slots.erase(compact_index);
   indices.pop_back();
+  norms.pop_back();
   vectors.resize(indices.size() * dim);
 }
 
 /// Empty a tier and its slot map together.
-void ClearTier(std::vector<size_t>& indices, std::vector<float>& vectors, std::unordered_map<size_t, size_t>& slots) {
+void ClearTier(std::vector<size_t>& indices, std::vector<float>& vectors, std::vector<float>& norms,
+               std::unordered_map<size_t, size_t>& slots) {
   indices.clear();
   vectors.clear();
+  norms.clear();
   slots.clear();
 }
 
@@ -102,21 +106,48 @@ IvfIndex::IvfIndex(uint32_t dimension) : config_(), configured_nlist_(config_.nl
 IvfIndex::IvfIndex(uint32_t dimension, const Config& config)
     : config_(config), configured_nlist_(config.nlist), dimension_(dimension) {}
 
-float IvfIndex::Similarity(const float* a, float norm_a, const float* b, float norm_b, uint32_t dim) const {
-  const auto& simd_impl = simd::GetOptimalImpl();
-  switch (config_.metric) {
+float IvfIndex::SimilarityFor(IvfMetric metric, const float* a, float norm_a, const float* b, float norm_b,
+                              uint32_t dim) {
+  switch (metric) {
     case IvfMetric::kDot:
-      return simd_impl.dot_product(a, b, dim);
+      return DotProductRaw(a, b, dim);
     case IvfMetric::kL2:
       // Monotonic decreasing in distance, so larger score == nearer.
-      return 1.0F / (1.0F + simd_impl.l2_distance(a, b, dim));
+      return L2SimilarityRaw(a, b, dim);
     case IvfMetric::kCosine:
     default:
       if (norm_a < kNormEpsilon || norm_b < kNormEpsilon) {
         return kWorstScore;  // Cosine undefined for zero-norm vectors
       }
-      return simd_impl.dot_product(a, b, dim) / (norm_a * norm_b);
+      return DotProductRaw(a, b, dim) / (norm_a * norm_b);
   }
+}
+
+float IvfIndex::Similarity(const float* a, float norm_a, const float* b, float norm_b, uint32_t dim) const {
+  return SimilarityFor(config_.metric, a, norm_a, b, norm_b, dim);
+}
+
+size_t IvfIndex::AssignCluster(IvfMetric metric, const float* centroids, const float* centroid_norms, uint32_t nlist,
+                               const float* vec, float vec_norm, size_t compact_index, uint32_t dim) {
+  size_t best = 0;
+  float best_sim = kWorstScore;
+
+  for (uint32_t c = 0; c < nlist; ++c) {
+    const float sim =
+        SimilarityFor(metric, vec, vec_norm, centroids + static_cast<size_t>(c) * dim, centroid_norms[c], dim);
+    if (sim > best_sim) {
+      best_sim = sim;
+      best = c;
+    }
+  }
+
+  // Zero-norm vectors have no meaningful nearest centroid under cosine
+  // (every cluster scores -inf). Spread them deterministically instead of
+  // dumping them all into cluster 0, which would skew recall.
+  if (best_sim == kWorstScore) {
+    best = compact_index % nlist;
+  }
+  return best;
 }
 
 float IvfIndex::ScoreCandidate(const float* a, float norm_a, const float* b, float norm_b, uint32_t dim) const {
@@ -206,27 +237,9 @@ void IvfIndex::Train(const float* matrix, const size_t* valid_indices, size_t nu
       size_t idx = valid_indices[i];
       const float* vec = matrix + idx * dimension;
       float vec_norm = simd_impl.l2_norm(vec, dimension);
-
-      size_t best = 0;
-      float best_sim = kWorstScore;
-
-      for (uint32_t c = 0; c < nlist; ++c) {
-        float sim = Similarity(vec, vec_norm, centroids_.data() + static_cast<size_t>(c) * dimension,
-                               centroid_norms_[c], dimension);
-        if (sim > best_sim) {
-          best_sim = sim;
-          best = c;
-        }
-      }
-
-      // Zero-norm vectors have no meaningful nearest centroid under cosine
-      // (Similarity returns -inf for every cluster). Spread them deterministically
-      // instead of dumping them all into cluster 0, which would skew recall.
-      if (best_sim == kWorstScore) {
-        best = idx % nlist;
-      }
-
-      AppendToListLocked(best, idx);
+      AppendToListLocked(AssignCluster(config_.metric, centroids_.data(), centroid_norms_.data(), nlist, vec, vec_norm,
+                                       idx, dimension),
+                         idx);
     }
   }
 
@@ -272,25 +285,9 @@ void IvfIndex::BulkAddVectors(const size_t* compact_indices, const float* vector
     size_t idx = compact_indices[i];
     const float* vec = vectors + i * dimension;  // Row i of the contiguous array
     float vec_norm = simd_impl.l2_norm(vec, dimension);
-
-    size_t best = 0;
-    float best_sim = kWorstScore;
-
-    for (uint32_t c = 0; c < nlist; ++c) {
-      float sim = Similarity(vec, vec_norm, centroids_.data() + static_cast<size_t>(c) * dimension, centroid_norms_[c],
-                             dimension);
-      if (sim > best_sim) {
-        best_sim = sim;
-        best = c;
-      }
-    }
-
-    // Spread zero-norm (cosine-undefined) vectors deterministically.
-    if (best_sim == kWorstScore) {
-      best = idx % nlist;
-    }
-
-    AppendToListLocked(best, idx);
+    AppendToListLocked(
+        AssignCluster(config_.metric, centroids_.data(), centroid_norms_.data(), nlist, vec, vec_norm, idx, dimension),
+        idx);
   }
 }
 
@@ -318,8 +315,8 @@ void IvfIndex::RemoveVector(size_t compact_index) {
   {
     std::unique_lock buf_lock(buffer_mutex_);
     const uint32_t dim = dimension_.load(std::memory_order_relaxed);
-    EraseFromTier(compact_index, dim, buffer_indices_, buffer_vectors_, buffer_slots_);
-    EraseFromTier(compact_index, dim, sealing_indices_, sealing_vectors_, sealing_slots_);
+    EraseFromTier(compact_index, dim, buffer_indices_, buffer_vectors_, buffer_norms_, buffer_slots_);
+    EraseFromTier(compact_index, dim, sealing_indices_, sealing_vectors_, sealing_norms_, sealing_slots_);
   }
 
   // Then the inverted list. Most calls are the retire step of a first insert,
@@ -409,20 +406,7 @@ std::vector<std::pair<float, size_t>> IvfIndex::Search(const float* query_vec, f
   if (buffer_results.empty()) {
     std::sort(ivf_results.begin(), ivf_results.end(),
               [](const std::pair<float, size_t>& a, const std::pair<float, size_t>& b) { return a.first > b.first; });
-    // Deduplicate by compact_index (keep the highest score). A vector whose
-    // embedding was overwritten after a seal can appear in two inverted lists
-    // (old cluster + new cluster) with no buffer entry to trigger the merge
-    // dedup below, so without this the same id would be returned twice.
-    std::unordered_set<size_t> seen_single;
-    seen_single.reserve(ivf_results.size());
-    std::vector<std::pair<float, size_t>> deduped;
-    deduped.reserve(ivf_results.size());
-    for (const auto& entry : ivf_results) {
-      if (seen_single.insert(entry.second).second) {
-        deduped.push_back(entry);
-      }
-    }
-    return deduped;
+    return ivf_results;
   }
   if (ivf_results.empty()) {
     // buffer_results is already sorted descending from SearchBuffer
@@ -500,8 +484,8 @@ void IvfIndex::Reset(uint32_t dimension) {
   ++layout_generation_;
 
   std::unique_lock buf_lock(buffer_mutex_);
-  ClearTier(buffer_indices_, buffer_vectors_, buffer_slots_);
-  ClearTier(sealing_indices_, sealing_vectors_, sealing_slots_);
+  ClearTier(buffer_indices_, buffer_vectors_, buffer_norms_, buffer_slots_);
+  ClearTier(sealing_indices_, sealing_vectors_, sealing_norms_, sealing_slots_);
 }
 
 uint32_t IvfIndex::GetDimension() const {
@@ -555,13 +539,27 @@ void IvfIndex::AppendToBuffer(size_t compact_index, const float* vector) {
   // of the same id before the buffer was sealed), overwrite its vector in place
   // instead of appending a duplicate. Two live entries for one id would return
   // the item twice from Search and keep ranking it by the stale embedding.
+  const float norm = config_.metric == IvfMetric::kCosine ? simd::GetOptimalImpl().l2_norm(vector, dim) : 0.0F;
   auto existing = buffer_slots_.find(compact_index);
   if (existing != buffer_slots_.end()) {
     std::copy(vector, vector + dim, buffer_vectors_.begin() + static_cast<ptrdiff_t>(existing->second * dim));
+    buffer_norms_[existing->second] = norm;
     return;
   }
 
-  PushToTier(compact_index, vector, dim, buffer_indices_, buffer_vectors_, buffer_slots_);
+  PushToTier(compact_index, vector, norm, dim, buffer_indices_, buffer_vectors_, buffer_norms_, buffer_slots_);
+}
+
+void IvfIndex::RestoreSealingToBufferLocked() {
+  const uint32_t dim = dimension_.load(std::memory_order_relaxed);
+  for (size_t i = 0; i < sealing_indices_.size(); ++i) {
+    if (buffer_slots_.count(sealing_indices_[i]) != 0) {
+      continue;  // A newer buffered embedding wins.
+    }
+    PushToTier(sealing_indices_[i], sealing_vectors_.data() + i * dim, sealing_norms_[i], dim, buffer_indices_,
+               buffer_vectors_, buffer_norms_, buffer_slots_);
+  }
+  ClearTier(sealing_indices_, sealing_vectors_, sealing_norms_, sealing_slots_);
 }
 
 size_t IvfIndex::GetBufferSize() const {
@@ -583,6 +581,7 @@ bool IvfIndex::SealBuffer() {
   // Phase 1: Move buffer contents into a distinct searchable sealing tier.
   std::vector<size_t> seal_indices;
   std::vector<float> seal_vectors;
+  std::vector<float> seal_norms;
   {
     std::unique_lock buf_lock(buffer_mutex_);
     if (!sealing_indices_.empty()) {
@@ -593,9 +592,11 @@ bool IvfIndex::SealBuffer() {
     }
     sealing_indices_.swap(buffer_indices_);
     sealing_vectors_.swap(buffer_vectors_);
+    sealing_norms_.swap(buffer_norms_);
     sealing_slots_.swap(buffer_slots_);
     seal_indices = sealing_indices_;
     seal_vectors = sealing_vectors_;
+    seal_norms = sealing_norms_;
   }
   // Buffer lock released: AppendToBuffer can proceed immediately
 
@@ -612,14 +613,7 @@ bool IvfIndex::SealBuffer() {
     std::shared_lock ivf_lock(mutex_);
     if (!trained_) {
       std::unique_lock buf_lock(buffer_mutex_);
-      for (size_t i = 0; i < sealing_indices_.size(); ++i) {
-        if (buffer_slots_.count(sealing_indices_[i]) != 0) {
-          continue;  // A newer buffered embedding wins.
-        }
-        PushToTier(sealing_indices_[i], sealing_vectors_.data() + i * dim, dim, buffer_indices_, buffer_vectors_,
-                   buffer_slots_);
-      }
-      ClearTier(sealing_indices_, sealing_vectors_, sealing_slots_);
+      RestoreSealingToBufferLocked();
       return false;
     }
     nlist = config_.nlist;
@@ -630,44 +624,12 @@ bool IvfIndex::SealBuffer() {
   }
 
   std::vector<size_t> cluster_assignments(seal_indices.size());
-  const auto& simd_impl = simd::GetOptimalImpl();
-  const auto similarity = [metric, &simd_impl](const float* a, float norm_a, const float* b, float norm_b,
-                                               uint32_t vector_dim) {
-    switch (metric) {
-      case IvfMetric::kDot:
-        return simd_impl.dot_product(a, b, vector_dim);
-      case IvfMetric::kL2:
-        return 1.0F / (1.0F + simd_impl.l2_distance(a, b, vector_dim));
-      case IvfMetric::kCosine:
-      default:
-        if (norm_a < kNormEpsilon || norm_b < kNormEpsilon) {
-          return kWorstScore;
-        }
-        return simd_impl.dot_product(a, b, vector_dim) / (norm_a * norm_b);
-    }
-  };
-
   for (size_t i = 0; i < seal_indices.size(); ++i) {
     const float* vec = seal_vectors.data() + i * dim;
-    float vec_norm = simd_impl.l2_norm(vec, dim);
-
-    size_t best = 0;
-    float best_sim = kWorstScore;
-
-    for (uint32_t c = 0; c < nlist; ++c) {
-      float sim = similarity(vec, vec_norm, centroids.data() + static_cast<size_t>(c) * dim, centroid_norms[c], dim);
-      if (sim > best_sim) {
-        best_sim = sim;
-        best = c;
-      }
-    }
-
-    // Spread zero-norm (cosine-undefined) vectors deterministically.
-    if (best_sim == kWorstScore) {
-      best = seal_indices[i] % nlist;
-    }
-
-    cluster_assignments[i] = best;
+    // Tier norms are only maintained for cosine; other metrics ignore the norm.
+    const float vec_norm = metric == IvfMetric::kCosine ? seal_norms[i] : 0.0F;
+    cluster_assignments[i] =
+        AssignCluster(metric, centroids.data(), centroid_norms.data(), nlist, vec, vec_norm, seal_indices[i], dim);
   }
 
   // Phase 3: Commit only if the layout we assigned against is still current.
@@ -677,14 +639,7 @@ bool IvfIndex::SealBuffer() {
     std::unique_lock ivf_lock(mutex_);
     if (!trained_ || layout_generation_ != layout_generation) {
       std::unique_lock buf_lock(buffer_mutex_);
-      for (size_t i = 0; i < sealing_indices_.size(); ++i) {
-        if (buffer_slots_.count(sealing_indices_[i]) != 0) {
-          continue;
-        }
-        PushToTier(sealing_indices_[i], sealing_vectors_.data() + i * dim, dim, buffer_indices_, buffer_vectors_,
-                   buffer_slots_);
-      }
-      ClearTier(sealing_indices_, sealing_vectors_, sealing_slots_);
+      RestoreSealingToBufferLocked();
       return false;
     }
     std::unique_lock buf_lock(buffer_mutex_);
@@ -696,7 +651,7 @@ bool IvfIndex::SealBuffer() {
         AppendToListLocked(cluster_assignments[i], seal_indices[i]);
       }
     }
-    ClearTier(sealing_indices_, sealing_vectors_, sealing_slots_);
+    ClearTier(sealing_indices_, sealing_vectors_, sealing_norms_, sealing_slots_);
   }
 
   utils::StructuredLog()
@@ -717,18 +672,16 @@ std::vector<std::pair<float, size_t>> IvfIndex::SearchBuffer(const float* query_
     return {};
   }
 
-  const auto& simd_impl = simd::GetOptimalImpl();
-
   // Score both transient tiers and deduplicate by compact index. A newer
   // buffered embedding may coexist with the older sealing copy.
   using ScoreIdx = std::pair<float, size_t>;
   std::unordered_map<size_t, float> best_scores;
   best_scores.reserve(buffer_indices_.size() + sealing_indices_.size());
   const auto score_tier = [&](const std::vector<size_t>& indices, const std::vector<float>& vectors,
-                              bool overwrite_existing) {
+                              const std::vector<float>& norms, bool overwrite_existing) {
     for (size_t i = 0; i < indices.size(); ++i) {
       const float* vec = vectors.data() + i * dimension;
-      const float vec_norm = simd_impl.l2_norm(vec, dimension);
+      const float vec_norm = norms[i];
       const float score = ScoreCandidate(query_vec, query_norm, vec, vec_norm, dimension);
       auto [it, inserted] = best_scores.emplace(indices[i], score);
       if (!inserted && (overwrite_existing || score > it->second)) {
@@ -736,8 +689,8 @@ std::vector<std::pair<float, size_t>> IvfIndex::SearchBuffer(const float* query_
       }
     }
   };
-  score_tier(sealing_indices_, sealing_vectors_, false);
-  score_tier(buffer_indices_, buffer_vectors_, true);  // Newer writes win.
+  score_tier(sealing_indices_, sealing_vectors_, sealing_norms_, false);
+  score_tier(buffer_indices_, buffer_vectors_, buffer_norms_, true);  // Newer writes win.
 
   // Bounded min-heap for top-k selection.
   auto cmp = [](const ScoreIdx& a, const ScoreIdx& b) { return a.first > b.first; };

@@ -24,18 +24,17 @@ TEST_F(DedupCacheTest, BasicDuplicateDetection) {
   EventKey key("ctx1", "id1", 100);
 
   // First insertion - not a duplicate
-  EXPECT_FALSE(cache.IsDuplicate(key, 1000));
-  cache.Insert(key, 1000);
+  EXPECT_FALSE(cache.CheckAndInsert(key, 1000));
 
   // Same event within window - duplicate
-  EXPECT_TRUE(cache.IsDuplicate(key, 1010));
-  EXPECT_TRUE(cache.IsDuplicate(key, 1059));
+  EXPECT_TRUE(cache.WouldDeduplicate(key, 1010));
+  EXPECT_TRUE(cache.WouldDeduplicate(key, 1059));
 
   // Same event at window boundary - duplicate
-  EXPECT_TRUE(cache.IsDuplicate(key, 1060));
+  EXPECT_TRUE(cache.WouldDeduplicate(key, 1060));
 
   // Same event outside window - not a duplicate
-  EXPECT_FALSE(cache.IsDuplicate(key, 1061));
+  EXPECT_FALSE(cache.WouldDeduplicate(key, 1061));
 }
 
 TEST_F(DedupCacheTest, DifferentKeysNotDuplicate) {
@@ -46,12 +45,12 @@ TEST_F(DedupCacheTest, DifferentKeysNotDuplicate) {
   EventKey key3("ctx2", "id1", 100);  // Different context
   EventKey key4("ctx1", "id1", 200);  // Different score
 
-  cache.Insert(key1, 1000);
+  cache.CheckAndInsert(key1, 1000);
 
   // Different keys are not duplicates
-  EXPECT_FALSE(cache.IsDuplicate(key2, 1000));
-  EXPECT_FALSE(cache.IsDuplicate(key3, 1000));
-  EXPECT_FALSE(cache.IsDuplicate(key4, 1000));
+  EXPECT_FALSE(cache.WouldDeduplicate(key2, 1000));
+  EXPECT_FALSE(cache.WouldDeduplicate(key3, 1000));
+  EXPECT_FALSE(cache.WouldDeduplicate(key4, 1000));
 }
 
 TEST_F(DedupCacheTest, LRUEviction) {
@@ -63,27 +62,27 @@ TEST_F(DedupCacheTest, LRUEviction) {
   EventKey key4("ctx1", "id4", 100);
 
   // Fill cache to capacity
-  cache.Insert(key1, 1000);
-  cache.Insert(key2, 1000);
-  cache.Insert(key3, 1000);
+  cache.CheckAndInsert(key1, 1000);
+  cache.CheckAndInsert(key2, 1000);
+  cache.CheckAndInsert(key3, 1000);
   EXPECT_EQ(cache.Size(), 3);
 
   // All three should be in cache
-  EXPECT_TRUE(cache.IsDuplicate(key1, 1010));
-  EXPECT_TRUE(cache.IsDuplicate(key2, 1010));
-  EXPECT_TRUE(cache.IsDuplicate(key3, 1010));
+  EXPECT_TRUE(cache.WouldDeduplicate(key1, 1010));
+  EXPECT_TRUE(cache.WouldDeduplicate(key2, 1010));
+  EXPECT_TRUE(cache.WouldDeduplicate(key3, 1010));
 
   // Insert 4th entry - should evict key1 (least recently used)
-  cache.Insert(key4, 1000);
+  cache.CheckAndInsert(key4, 1000);
   EXPECT_EQ(cache.Size(), 3);
 
   // key1 should be evicted
-  EXPECT_FALSE(cache.IsDuplicate(key1, 1010));
+  EXPECT_FALSE(cache.WouldDeduplicate(key1, 1010));
 
   // Others should still be in cache
-  EXPECT_TRUE(cache.IsDuplicate(key2, 1010));
-  EXPECT_TRUE(cache.IsDuplicate(key3, 1010));
-  EXPECT_TRUE(cache.IsDuplicate(key4, 1010));
+  EXPECT_TRUE(cache.WouldDeduplicate(key2, 1010));
+  EXPECT_TRUE(cache.WouldDeduplicate(key3, 1010));
+  EXPECT_TRUE(cache.WouldDeduplicate(key4, 1010));
 }
 
 TEST_F(DedupCacheTest, UpdateMovesToFront) {
@@ -95,21 +94,21 @@ TEST_F(DedupCacheTest, UpdateMovesToFront) {
   EventKey key4("ctx1", "id4", 100);
 
   // Fill cache
-  cache.Insert(key1, 1000);
-  cache.Insert(key2, 1000);
-  cache.Insert(key3, 1000);
+  cache.CheckAndInsert(key1, 1000);
+  cache.CheckAndInsert(key2, 1000);
+  cache.CheckAndInsert(key3, 1000);
 
   // Access key1 (moves to front)
-  cache.Insert(key1, 1100);
+  cache.CheckAndInsert(key1, 1100);
 
   // Insert key4 - should evict key2 (now least recently used)
-  cache.Insert(key4, 1000);
+  cache.CheckAndInsert(key4, 1000);
 
   // key2 should be evicted
-  EXPECT_FALSE(cache.IsDuplicate(key2, 1010));
+  EXPECT_FALSE(cache.WouldDeduplicate(key2, 1010));
 
   // key1 should still be in cache (was moved to front)
-  EXPECT_TRUE(cache.IsDuplicate(key1, 1110));
+  EXPECT_TRUE(cache.WouldDeduplicate(key1, 1110));
 }
 
 TEST_F(DedupCacheTest, Clear) {
@@ -118,16 +117,16 @@ TEST_F(DedupCacheTest, Clear) {
   EventKey key1("ctx1", "id1", 100);
   EventKey key2("ctx1", "id2", 100);
 
-  cache.Insert(key1, 1000);
-  cache.Insert(key2, 1000);
+  cache.CheckAndInsert(key1, 1000);
+  cache.CheckAndInsert(key2, 1000);
   EXPECT_EQ(cache.Size(), 2);
 
   cache.Clear();
   EXPECT_EQ(cache.Size(), 0);
 
   // Nothing should be in cache after clear
-  EXPECT_FALSE(cache.IsDuplicate(key1, 1010));
-  EXPECT_FALSE(cache.IsDuplicate(key2, 1010));
+  EXPECT_FALSE(cache.WouldDeduplicate(key1, 1010));
+  EXPECT_FALSE(cache.WouldDeduplicate(key2, 1010));
 }
 
 TEST_F(DedupCacheTest, Statistics) {
@@ -143,27 +142,27 @@ TEST_F(DedupCacheTest, Statistics) {
   EXPECT_EQ(stats.total_hits, 0);
   EXPECT_EQ(stats.total_misses, 0);
 
-  // First check - miss
-  EXPECT_FALSE(cache.IsDuplicate(key1, 1000));
-  stats = cache.GetStatistics();
-  EXPECT_EQ(stats.total_misses, 1);
-
-  // Insert
-  cache.Insert(key1, 1000);
+  // First sighting - miss, and recorded
+  EXPECT_FALSE(cache.CheckAndInsert(key1, 1000));
   stats = cache.GetStatistics();
   EXPECT_EQ(stats.size, 1);
+  EXPECT_EQ(stats.total_misses, 1);
 
-  // Duplicate check - hit
-  EXPECT_TRUE(cache.IsDuplicate(key1, 1010));
+  // Duplicate within window - hit
+  EXPECT_TRUE(cache.CheckAndInsert(key1, 1010));
   stats = cache.GetStatistics();
   EXPECT_EQ(stats.total_hits, 1);
   EXPECT_EQ(stats.total_misses, 1);
 
   // Different key - miss
-  EXPECT_FALSE(cache.IsDuplicate(key2, 1010));
+  EXPECT_FALSE(cache.CheckAndInsert(key2, 1010));
   stats = cache.GetStatistics();
   EXPECT_EQ(stats.total_hits, 1);
   EXPECT_EQ(stats.total_misses, 2);
+
+  // The read-only probe leaves the counters alone.
+  EXPECT_TRUE(cache.WouldDeduplicate(key1, 1010));
+  EXPECT_EQ(cache.GetStatistics().total_hits, 1);
 }
 
 TEST_F(DedupCacheTest, ZeroWindowDisabled) {
@@ -171,12 +170,10 @@ TEST_F(DedupCacheTest, ZeroWindowDisabled) {
 
   EventKey key("ctx1", "id1", 100);
 
-  // First insertion
-  EXPECT_FALSE(cache.IsDuplicate(key, 1000));
-  cache.Insert(key, 1000);
-
-  // Even immediate duplicate should not be detected (window = 0)
-  EXPECT_FALSE(cache.IsDuplicate(key, 1000));
+  // Even an immediate repeat is not detected (window = 0)
+  EXPECT_FALSE(cache.CheckAndInsert(key, 1000));
+  EXPECT_FALSE(cache.CheckAndInsert(key, 1000));
+  EXPECT_FALSE(cache.WouldDeduplicate(key, 1000));
 }
 
 // Whether a record is a duplicate depends on event time alone, so a timestamp
@@ -195,9 +192,9 @@ TEST_F(DedupCacheTest, BackwardsTimestampBeyondWindowEstablishesNewBaseline) {
 TEST_F(DedupCacheTest, TimestampDistanceUsesOverflowSafeSubtraction) {
   DedupCache cache(100, 60);
   EventKey key("ctx1", "id1", 100);
-  cache.Insert(key, std::numeric_limits<uint64_t>::max());
-  EXPECT_TRUE(cache.IsDuplicate(key, std::numeric_limits<uint64_t>::max() - 10));
-  EXPECT_FALSE(cache.IsDuplicate(key, 0));
+  cache.CheckAndInsert(key, std::numeric_limits<uint64_t>::max());
+  EXPECT_TRUE(cache.WouldDeduplicate(key, std::numeric_limits<uint64_t>::max() - 10));
+  EXPECT_FALSE(cache.WouldDeduplicate(key, 0));
 }
 
 TEST_F(DedupCacheTest, ThreadSafety) {
@@ -214,8 +211,8 @@ TEST_F(DedupCacheTest, ThreadSafety) {
         uint64_t ts = 1000 + (i / 10);
 
         // Mix of reads and writes
-        cache.IsDuplicate(key, ts);
-        cache.Insert(key, ts);
+        cache.WouldDeduplicate(key, ts);
+        cache.CheckAndInsert(key, ts);
       }
     });
   }

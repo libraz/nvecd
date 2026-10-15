@@ -11,25 +11,6 @@ namespace nvecd::events {
 
 StateCache::StateCache(size_t max_size) : max_size_(max_size) {}
 
-bool StateCache::IsDuplicateSet(const StateKey& key, int score) {
-  std::shared_lock lock(mutex_);
-
-  auto it = states_.find(key);
-  if (it == states_.end()) {
-    total_misses_.fetch_add(1, std::memory_order_relaxed);
-    return false;  // New key
-  }
-
-  // Check if last score equals new score
-  if (it->second.first == score) {
-    total_hits_.fetch_add(1, std::memory_order_relaxed);
-    return true;  // Duplicate SET
-  }
-
-  total_misses_.fetch_add(1, std::memory_order_relaxed);
-  return false;  // State transition
-}
-
 bool StateCache::WouldDeduplicateSet(const StateKey& key, int score) const {
   std::shared_lock lock(mutex_);
   const auto it = states_.find(key);
@@ -41,39 +22,13 @@ bool StateCache::CheckAndUpdateSet(const StateKey& key, int score) {
   auto it = states_.find(key);
   if (it != states_.end() && it->second.first == score) {
     total_hits_.fetch_add(1, std::memory_order_relaxed);
-    TouchLocked(key);
+    TouchLocked(it);
     return true;
   }
 
   total_misses_.fetch_add(1, std::memory_order_relaxed);
-  if (it != states_.end()) {
-    it->second.first = score;
-    TouchLocked(key);
-  } else {
-    EvictIfFull();
-    lru_list_.push_front(key);
-    states_.emplace(key, std::make_pair(score, lru_list_.begin()));
-  }
+  UpsertLocked(it, key, score);
   return false;
-}
-
-bool StateCache::IsDuplicateDel(const StateKey& key) {
-  std::shared_lock lock(mutex_);
-
-  auto it = states_.find(key);
-  if (it == states_.end()) {
-    total_misses_.fetch_add(1, std::memory_order_relaxed);
-    return false;  // Not yet tracked
-  }
-
-  // Check if already deleted
-  if (it->second.first == kDeletedScore) {
-    total_hits_.fetch_add(1, std::memory_order_relaxed);
-    return true;  // Already deleted
-  }
-
-  total_misses_.fetch_add(1, std::memory_order_relaxed);
-  return false;  // Not deleted yet
 }
 
 bool StateCache::WouldDeduplicateDel(const StateKey& key) const {
@@ -87,52 +42,23 @@ bool StateCache::CheckAndMarkDeleted(const StateKey& key) {
   auto it = states_.find(key);
   if (it != states_.end() && it->second.first == kDeletedScore) {
     total_hits_.fetch_add(1, std::memory_order_relaxed);
-    TouchLocked(key);
+    TouchLocked(it);
     return true;
   }
 
   total_misses_.fetch_add(1, std::memory_order_relaxed);
-  if (it != states_.end()) {
-    it->second.first = kDeletedScore;
-    TouchLocked(key);
-  } else {
-    EvictIfFull();
-    lru_list_.push_front(key);
-    states_.emplace(key, std::make_pair(kDeletedScore, lru_list_.begin()));
-  }
+  UpsertLocked(it, key, kDeletedScore);
   return false;
 }
 
 void StateCache::UpdateScore(const StateKey& key, int score) {
   std::unique_lock lock(mutex_);
-
-  auto it = states_.find(key);
-  if (it != states_.end()) {
-    // Update existing entry and move to front
-    it->second.first = score;
-    TouchLocked(key);
-  } else {
-    EvictIfFull();
-    // Insert new entry at front of LRU
-    lru_list_.push_front(key);
-    states_.emplace(key, std::make_pair(score, lru_list_.begin()));
-  }
+  UpsertLocked(states_.find(key), key, score);
 }
 
 void StateCache::MarkDeleted(const StateKey& key) {
   std::unique_lock lock(mutex_);
-
-  auto it = states_.find(key);
-  if (it != states_.end()) {
-    // Update existing entry and move to front
-    it->second.first = kDeletedScore;
-    TouchLocked(key);
-  } else {
-    EvictIfFull();
-    // Insert new entry at front of LRU
-    lru_list_.push_front(key);
-    states_.emplace(key, std::make_pair(kDeletedScore, lru_list_.begin()));
-  }
+  UpsertLocked(states_.find(key), key, kDeletedScore);
 }
 
 void StateCache::Clear() {
@@ -167,11 +93,19 @@ void StateCache::EvictIfFull() {
   }
 }
 
-void StateCache::TouchLocked(const StateKey& key) {
-  auto it = states_.find(key);
+void StateCache::TouchLocked(StateMap::iterator it) {
+  lru_list_.splice(lru_list_.begin(), lru_list_, it->second.second);
+}
+
+void StateCache::UpsertLocked(StateMap::iterator it, const StateKey& key, int score) {
   if (it != states_.end()) {
-    lru_list_.splice(lru_list_.begin(), lru_list_, it->second.second);
+    it->second.first = score;
+    TouchLocked(it);
+    return;
   }
+  EvictIfFull();
+  lru_list_.push_front(key);
+  states_.emplace(key, std::make_pair(score, lru_list_.begin()));
 }
 
 }  // namespace nvecd::events

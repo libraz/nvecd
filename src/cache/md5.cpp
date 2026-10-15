@@ -116,7 +116,7 @@ void MD5::Update(const uint8_t* data, size_t len) {
   }
 }
 
-void MD5::Finalize(uint8_t digest[16]) {
+void MD5::Finalize(uint8_t digest[kDigestSize]) {
   static const uint8_t padding[64] = {0x80};
 
   // Save number of bits
@@ -134,7 +134,7 @@ void MD5::Finalize(uint8_t digest[16]) {
   Update(bits, 8);
 
   // Store state in digest
-  for (int i = 0; i < 16; i++) {
+  for (size_t i = 0; i < kDigestSize; i++) {
     digest[i] = static_cast<uint8_t>((state_[i >> 2] >> ((i & 0x3) << 3)) & 0xff);
   }
 }
@@ -229,7 +229,7 @@ void MD5::Transform(const uint8_t block[64]) {
   state_[3] += d;
 }
 
-void MD5::Hash(const std::string& input, uint8_t digest[16]) {
+void MD5::Hash(const std::string& input, uint8_t digest[kDigestSize]) {
   MD5 md5;
   md5.Update(input);
   md5.Finalize(digest);

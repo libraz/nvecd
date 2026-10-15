@@ -30,6 +30,9 @@ namespace nvecd::cache {
  */
 class ResultCompressor {
  public:
+  /// Bytes one result occupies in the serialized representation (fixed-width id + score).
+  static constexpr size_t kSerializedResultSize = 256 + sizeof(float);
+
   /** Serialize results into the fixed-width cache wire representation. */
   static utils::Expected<std::vector<uint8_t>, utils::Error> SerializeSimilarityResults(
       const std::vector<similarity::SimilarityResult>& results);

@@ -766,7 +766,6 @@ size_t ReferenceMemoryUsage(const EventStore& store, uint32_t ctx_buffer_size) {
   for (const auto& ctx : store.GetAllContexts()) {
     total += sizeof(std::string) + ctx.capacity();
     for (const auto& event : store.GetEvents(ctx)) {
-      total += sizeof(Event);
       total += event.item_id.capacity();
     }
     total += sizeof(RingBuffer<Event>);
@@ -801,6 +800,26 @@ TEST(EventStoreTest, MemoryUsageMatchesFullCopyReference) {
 
   store.Clear();
   EXPECT_EQ(store.MemoryUsage(), ReferenceMemoryUsage(store, kBufferSize)) << "after clear";
+}
+
+// The ring buffer's slots are accounted once through its capacity, so storing
+// an event adds only the heap behind its item_id.
+TEST(EventStoreTest, MemoryUsageCountsEventSlotsOnce) {
+  constexpr uint32_t kBufferSize = 4;
+  EventStore store(MakeConfig(kBufferSize));
+
+  ASSERT_TRUE(store.AddEvent("ctx", "first", 7).has_value());
+  const size_t one_event = store.MemoryUsage();
+
+  const std::string second_id = "second-item-with-a-heap-allocated-identifier";
+  ASSERT_TRUE(store.AddEvent("ctx", second_id, 7).has_value());
+  const auto events = store.GetEvents("ctx");
+  ASSERT_EQ(events.size(), 2U);
+
+  const auto second =
+      std::find_if(events.begin(), events.end(), [&](const Event& e) { return e.item_id == second_id; });
+  ASSERT_NE(second, events.end());
+  EXPECT_EQ(store.MemoryUsage() - one_event, second->item_id.capacity());
 }
 
 }  // namespace

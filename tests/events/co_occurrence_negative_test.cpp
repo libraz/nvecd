@@ -155,4 +155,26 @@ TEST(CoOccurrenceNegativeTest, NegativeEdgesRespectNeighborCap) {
   EXPECT_LE(index.GetNeighborCount("a"), 2U);
 }
 
+// GetSimilar returns only positive edges, so the neighbor count that sizes it
+// (and fusion maturity) must not count negative ones.
+TEST(CoOccurrenceNegativeTest, PositiveNeighborCountIgnoresNegativeEdges) {
+  CoOccurrenceIndex index;
+  std::vector<Event> context = {Event("b", 10, 1000), Event("c", 10, 1000)};
+
+  {
+    auto lock = index.AcquireWriteLock();
+    index.ApplyNegativeSignalLocked("a", context, 0.5);
+  }
+
+  EXPECT_EQ(index.GetNeighborCount("a"), 2U);
+  EXPECT_EQ(index.GetPositiveNeighborCount("a"), 0U);
+  EXPECT_TRUE(index.GetSimilar("a", 10).empty());
+  EXPECT_EQ(index.GetPositiveNeighborCount("missing"), 0U);
+
+  // A positive edge on top of the negative ones is the only one counted.
+  ASSERT_TRUE(index.SetScore("a", "d", 2.0F).has_value());
+  EXPECT_EQ(index.GetNeighborCount("a"), 3U);
+  EXPECT_EQ(index.GetPositiveNeighborCount("a"), 1U);
+}
+
 }  // namespace nvecd::events

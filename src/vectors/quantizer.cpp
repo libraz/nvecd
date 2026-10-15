@@ -9,6 +9,7 @@
 #include <cmath>
 #include <limits>
 
+#include "vectors/distance.h"
 #include "vectors/distance_simd.h"
 
 namespace nvecd::vectors {
@@ -90,8 +91,7 @@ float ScalarQuantizer::AsymmetricCosine(const float* query, const uint8_t* quant
   norm_q = std::sqrt(norm_q);
   norm_c = std::sqrt(norm_c);
 
-  constexpr float kEps = 1e-7F;
-  if (norm_q < kEps || norm_c < kEps) {
+  if (norm_q < kNormEpsilon || norm_c < kNormEpsilon) {
     return 0.0F;
   }
   return dot / (norm_q * norm_c);

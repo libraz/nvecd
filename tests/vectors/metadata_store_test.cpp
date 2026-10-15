@@ -54,12 +54,8 @@ TEST_F(MetadataStoreTest, DeleteNonExistent) {
   ASSERT_NE(present, nullptr);
   EXPECT_EQ(std::get<std::string>(present->at("status")), "active");
 
-  // A no-op delete must not make the ID visible to the no-condition filter
-  // either, which would leak a phantom item into unfiltered searches.
-  MetadataFilter empty_filter;
-  auto all = store_.Filter(empty_filter);
-  ASSERT_EQ(all.size(), 1U);
-  EXPECT_EQ(all[0], "present");
+  // A no-op delete must not leave a phantom entry behind.
+  EXPECT_EQ(store_.GetAll().count("missing"), 0U);
 }
 
 TEST_F(MetadataStoreTest, Update) {
@@ -96,11 +92,9 @@ TEST_F(MetadataStoreTest, EmptyEntryParticipatesInEmptyFilter) {
   store_.Set("empty", {});
   store_.Set("full", {{"status", std::string("active")}});
 
-  // An empty (no-condition) filter returns all present items, including the
-  // explicitly empty one.
+  // The explicitly empty entry is present alongside the populated one.
+  EXPECT_EQ(store_.GetAll().size(), 2U);
   MetadataFilter empty_filter;
-  auto all = store_.Filter(empty_filter);
-  EXPECT_EQ(all.size(), 2U);
 
   // A non-empty filter never matches an empty metadata map.
   MetadataFilter filter;
@@ -110,9 +104,6 @@ TEST_F(MetadataStoreTest, EmptyEntryParticipatesInEmptyFilter) {
   cond.value = std::string("active");
   filter.conditions.push_back(cond);
 
-  auto matched = store_.Filter(filter);
-  ASSERT_EQ(matched.size(), 1U);
-  EXPECT_EQ(matched[0], "full");
   EXPECT_FALSE(store_.Matches("empty", filter));
   EXPECT_TRUE(store_.Matches("full", filter));
 
@@ -139,16 +130,7 @@ TEST_F(MetadataStoreTest, Clear) {
   EXPECT_EQ(store_.Get("a"), nullptr);
 }
 
-TEST_F(MetadataStoreTest, FilterEmpty) {
-  store_.Set("a", {{"status", std::string("active")}});
-  store_.Set("b", {{"status", std::string("deleted")}});
-
-  MetadataFilter filter;  // Empty filter
-  auto result = store_.Filter(filter);
-  EXPECT_EQ(result.size(), 2U);
-}
-
-TEST_F(MetadataStoreTest, FilterSingleCondition) {
+TEST_F(MetadataStoreTest, MatchesSingleCondition) {
   store_.Set("a", {{"status", std::string("active")}});
   store_.Set("b", {{"status", std::string("deleted")}});
   store_.Set("c", {{"status", std::string("active")}});
@@ -160,17 +142,13 @@ TEST_F(MetadataStoreTest, FilterSingleCondition) {
   cond.value = std::string("active");
   filter.conditions.push_back(cond);
 
-  auto result = store_.Filter(filter);
-  ASSERT_EQ(result.size(), 2U);
-  std::sort(result.begin(), result.end());
-  EXPECT_EQ(result[0], "a");
-  EXPECT_EQ(result[1], "c");
+  EXPECT_TRUE(store_.Matches("a", filter));
+  EXPECT_FALSE(store_.Matches("b", filter));
+  EXPECT_TRUE(store_.Matches("c", filter));
 }
 
-TEST_F(MetadataStoreTest, FilterWithCandidates) {
+TEST_F(MetadataStoreTest, MatchesLockedAgreesWithMatches) {
   store_.Set("a", {{"status", std::string("active")}});
-  store_.Set("b", {{"status", std::string("active")}});
-  store_.Set("c", {{"status", std::string("active")}});
 
   MetadataFilter filter;
   FilterCondition cond;
@@ -179,13 +157,10 @@ TEST_F(MetadataStoreTest, FilterWithCandidates) {
   cond.value = std::string("active");
   filter.conditions.push_back(cond);
 
-  // Only check candidates {a, c}
-  std::vector<std::string> candidates = {"a", "c"};
-  auto result = store_.Filter(filter, candidates);
-  ASSERT_EQ(result.size(), 2U);
-  std::sort(result.begin(), result.end());
-  EXPECT_EQ(result[0], "a");
-  EXPECT_EQ(result[1], "c");
+  auto lock = store_.AcquireReadLock();
+  EXPECT_TRUE(store_.MatchesLocked("a", filter));
+  EXPECT_FALSE(store_.MatchesLocked("missing", filter));
+  EXPECT_TRUE(store_.MatchesLocked("missing", MetadataFilter{}));
 }
 
 TEST_F(MetadataStoreTest, MatchesSingle) {
@@ -225,11 +200,6 @@ TEST_F(MetadataStoreTest, NotEqualFilterTreatsMissingEntryAsEmptyMetadata) {
   EXPECT_TRUE(store_.Matches("empty_entry", ne_filter));
   EXPECT_TRUE(store_.Matches("other_field", ne_filter));
   EXPECT_FALSE(store_.Matches("equal", ne_filter));
-
-  const std::vector<std::string> candidates = {"never_set", "empty_entry", "other_field", "equal"};
-  auto filtered = store_.Filter(ne_filter, candidates);
-  std::sort(filtered.begin(), filtered.end());
-  EXPECT_EQ(filtered, (std::vector<std::string>{"empty_entry", "never_set", "other_field"}));
 
   MetadataFilter eq_filter;
   FilterCondition eq;

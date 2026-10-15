@@ -341,6 +341,37 @@ class IvfIndex {
   void EraseIndexedLocked(size_t compact_index);
 
   /**
+   * @brief Move the sealing tier back into the write buffer
+   *
+   * Entries superseded by a newer buffered embedding are dropped. Requires
+   * buffer_mutex_ held exclusively.
+   */
+  void RestoreSealingToBufferLocked();
+
+  /**
+   * @brief Pick the inverted list a vector belongs to
+   *
+   * Nearest centroid under @p metric; a vector with no meaningful nearest
+   * centroid (zero norm under cosine) is spread by @p compact_index % nlist.
+   *
+   * @param metric Similarity metric
+   * @param centroids nlist x dim contiguous centroid matrix
+   * @param centroid_norms Norm of each centroid
+   * @param nlist Number of centroids (> 0)
+   * @param vec Vector to assign
+   * @param vec_norm L2 norm of @p vec (cosine only)
+   * @param compact_index Compact index of @p vec
+   * @param dim Vector dimension
+   * @return Cluster id
+   */
+  static size_t AssignCluster(IvfMetric metric, const float* centroids, const float* centroid_norms, uint32_t nlist,
+                              const float* vec, float vec_norm, size_t compact_index, uint32_t dim);
+
+  /// Similarity under an explicit metric; see Similarity() for the contract.
+  static float SimilarityFor(IvfMetric metric, const float* a, float norm_a, const float* b, float norm_b,
+                             uint32_t dim);
+
+  /**
    * @brief Find the nearest centroid for a vector
    * @param vec Pointer to vector data
    * @return Index of nearest centroid
@@ -431,6 +462,10 @@ class IvfIndex {
 
   /// Contiguous vector data for buffer entries [n x dimension_]
   std::vector<float> buffer_vectors_;
+
+  /// L2 norm of each tier entry; maintained for cosine only (0 otherwise).
+  std::vector<float> buffer_norms_;
+  std::vector<float> sealing_norms_;
 
   /// Entries currently being assigned to clusters. They remain searchable
   /// until the IVF commit publishes them, so sealing never creates a gap.

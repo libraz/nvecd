@@ -15,13 +15,6 @@
 
 namespace nvecd::cache {
 
-// Forward declaration from result_compressor.cpp
-// Must match SerializedSimilarityResult size for compression/decompression
-namespace {
-// Must match SerializedSimilarityResult layout: char id[256] + float score
-constexpr size_t kSerializedResultSize = 256 + sizeof(float);
-}  // namespace
-
 SimilarityCache::SimilarityCache(size_t max_memory_bytes, double min_query_cost_ms, int ttl_seconds,
                                  bool compression_enabled, size_t eviction_batch_size)
     : max_memory_bytes_(max_memory_bytes),
@@ -33,6 +26,27 @@ SimilarityCache::SimilarityCache(size_t max_memory_bytes, double min_query_cost_
   policies_[static_cast<size_t>(SearchType::kItemSearch)] = {true, 0};
   policies_[static_cast<size_t>(SearchType::kVectorSearch)] = {false, 0};
   policies_[static_cast<size_t>(SearchType::kFilteredSearch)] = {true, 60};
+}
+
+std::optional<int> SimilarityCache::ResolveEffectiveTtl(SearchType search_type) const {
+  // A positive per-type override wins, otherwise the global TTL applies.
+  int effective_ttl = ttl_seconds_.load(std::memory_order_relaxed);
+  std::lock_guard<std::mutex> lock(policy_mutex_);
+  const auto& policy = policies_[static_cast<size_t>(search_type)];
+  if (!policy.enabled) {
+    return std::nullopt;
+  }
+  if (policy.ttl_seconds > 0) {
+    effective_ttl = policy.ttl_seconds;
+  }
+  return effective_ttl;
+}
+
+void SimilarityCache::RecordMissLatency(std::chrono::high_resolution_clock::time_point start_time) {
+  const double miss_time_ms =
+      std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - start_time).count();
+  std::lock_guard<std::mutex> timing_lock(stats_.timing_mutex_);
+  stats_.total_cache_miss_time_ms += miss_time_ms;
 }
 
 std::chrono::steady_clock::time_point SimilarityCache::ComputeExpiry(int effective_ttl_seconds) {
@@ -65,13 +79,7 @@ std::optional<std::vector<similarity::SimilarityResult>> SimilarityCache::Lookup
     stats_.cache_misses++;
     stats_.cache_misses_not_found++;
 
-    // Record miss latency
-    auto end_time = std::chrono::high_resolution_clock::now();
-    double miss_time_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
-    {
-      std::lock_guard<std::mutex> timing_lock(stats_.timing_mutex_);
-      stats_.total_cache_miss_time_ms += miss_time_ms;
-    }
+    RecordMissLatency(start_time);
 
     return std::nullopt;
   }
@@ -81,13 +89,7 @@ std::optional<std::vector<similarity::SimilarityResult>> SimilarityCache::Lookup
     stats_.cache_misses++;
     stats_.cache_misses_invalidated++;
 
-    // Record miss latency
-    auto end_time = std::chrono::high_resolution_clock::now();
-    double miss_time_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
-    {
-      std::lock_guard<std::mutex> timing_lock(stats_.timing_mutex_);
-      stats_.total_cache_miss_time_ms += miss_time_ms;
-    }
+    RecordMissLatency(start_time);
 
     return std::nullopt;
   }
@@ -124,13 +126,7 @@ std::optional<std::vector<similarity::SimilarityResult>> SimilarityCache::Lookup
         }
       }
 
-      // Record miss latency
-      auto end_time = std::chrono::high_resolution_clock::now();
-      double miss_time_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
-      {
-        std::lock_guard<std::mutex> timing_lock(stats_.timing_mutex_);
-        stats_.total_cache_miss_time_ms += miss_time_ms;
-      }
+      RecordMissLatency(start_time);
 
       return std::nullopt;
     }
@@ -158,13 +154,7 @@ std::optional<std::vector<similarity::SimilarityResult>> SimilarityCache::Lookup
       }
     }
 
-    // Record miss latency
-    auto end_time = std::chrono::high_resolution_clock::now();
-    double miss_time_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
-    {
-      std::lock_guard<std::mutex> timing_lock(stats_.timing_mutex_);
-      stats_.total_cache_miss_time_ms += miss_time_ms;
-    }
+    RecordMissLatency(start_time);
 
     return std::nullopt;
   }
@@ -225,10 +215,10 @@ bool SimilarityCache::InsertWithTtl(const CacheKey& key, const std::vector<simil
   // Calculate original size in bytes (for decompression)
   // Must use serialized size, not sizeof(SimilarityResult) which includes std::string overhead
   // Guard against integer overflow in size calculation
-  if (results.size() > SIZE_MAX / kSerializedResultSize) {
+  if (results.size() > SIZE_MAX / ResultCompressor::kSerializedResultSize) {
     return false;
   }
-  const size_t original_size = results.size() * kSerializedResultSize;
+  const size_t original_size = results.size() * ResultCompressor::kSerializedResultSize;
 
   // Calculate entry memory usage
   // Entry overhead + compressed data + key size
@@ -242,9 +232,12 @@ bool SimilarityCache::InsertWithTtl(const CacheKey& key, const std::vector<simil
   // Exclusive lock for write
   std::unique_lock lock(mutex_);
 
-  // Check if already exists
-  if (cache_map_.find(key) != cache_map_.end()) {
-    return false;
+  // A live entry keeps its slot; an invalidated one is replaced.
+  if (auto existing = cache_map_.find(key); existing != cache_map_.end()) {
+    if (!existing->second.first.invalidated.load()) {
+      return false;
+    }
+    EraseLocked(key);
   }
 
   // Evict entries if needed
@@ -289,19 +282,6 @@ bool SimilarityCache::InsertWithTtl(const CacheKey& key, const std::vector<simil
   }
 
   return true;
-}
-
-void SimilarityCache::RegisterResultItems(const CacheKey& key, const std::vector<std::string>& item_ids) {
-  std::unique_lock lock(mutex_);
-
-  auto it = cache_map_.find(key);
-  if (it == cache_map_.end()) {
-    return;  // Entry was evicted before registration
-  }
-
-  RegisterResultItemsLocked(key, it->second.first, item_ids);
-  RefreshMemoryLocked();
-  EvictForSpace(0);
 }
 
 void SimilarityCache::RegisterResultItemsLocked(const CacheKey& key, CachedEntry& entry,
@@ -455,23 +435,6 @@ void SimilarityCache::Clear() {
   stats_.current_memory_bytes = 0;
 }
 
-void SimilarityCache::ClearIf(std::function<bool(const CacheKey&)> predicate) {
-  std::unique_lock lock(mutex_);
-
-  // Find all entries matching predicate
-  std::vector<CacheKey> to_erase;
-  for (const auto& [key, entry_pair] : cache_map_) {
-    if (predicate(key)) {
-      to_erase.push_back(key);
-    }
-  }
-
-  // Erase entries
-  for (const auto& key : to_erase) {
-    EraseLocked(key);
-  }
-}
-
 size_t SimilarityCache::PurgeExpired() {
   // The global TTL covers entries inserted with no per-type override. Per-type
   // entries carry their own absolute expiry, so the scan runs even when the
@@ -533,22 +496,14 @@ std::optional<std::vector<similarity::SimilarityResult>> SimilarityCache::Lookup
                                                                                  SearchType search_type) {
   auto idx = static_cast<size_t>(search_type);
 
-  // Check per-type policy and compute the effective TTL without mutating shared
-  // state. A positive per-type override wins, otherwise use the global TTL.
-  int effective_ttl = ttl_seconds_.load(std::memory_order_relaxed);
-  {
-    std::lock_guard<std::mutex> lock(policy_mutex_);
-    if (!policies_[idx].enabled) {
-      return std::nullopt;
-    }
-    if (policies_[idx].ttl_seconds > 0) {
-      effective_ttl = policies_[idx].ttl_seconds;
-    }
+  const auto effective_ttl = ResolveEffectiveTtl(search_type);
+  if (!effective_ttl) {
+    return std::nullopt;
   }
 
   stats_.per_type_queries[idx]++;
 
-  auto result = LookupWithTtl(key, effective_ttl);
+  auto result = LookupWithTtl(key, *effective_ttl);
 
   if (result.has_value()) {
     stats_.per_type_hits[idx]++;
@@ -559,39 +514,21 @@ std::optional<std::vector<similarity::SimilarityResult>> SimilarityCache::Lookup
 
 bool SimilarityCache::Insert(const CacheKey& key, const std::vector<similarity::SimilarityResult>& results,
                              double query_cost_ms, SearchType search_type) {
-  auto idx = static_cast<size_t>(search_type);
-
-  // Check per-type policy and compute the effective TTL without mutating shared
-  // state. A positive per-type override wins, otherwise use the global TTL.
-  int effective_ttl = ttl_seconds_.load(std::memory_order_relaxed);
-  {
-    std::lock_guard<std::mutex> lock(policy_mutex_);
-    if (!policies_[idx].enabled) {
-      return false;
-    }
-    if (policies_[idx].ttl_seconds > 0) {
-      effective_ttl = policies_[idx].ttl_seconds;
-    }
+  const auto effective_ttl = ResolveEffectiveTtl(search_type);
+  if (!effective_ttl) {
+    return false;
   }
-
-  return InsertWithTtl(key, results, query_cost_ms, effective_ttl);
+  return InsertWithTtl(key, results, query_cost_ms, *effective_ttl);
 }
 
 bool SimilarityCache::InsertAndRegister(const CacheKey& key, const std::vector<similarity::SimilarityResult>& results,
                                         const std::vector<std::string>& item_ids, double query_cost_ms,
                                         SearchType search_type) {
-  const auto index = static_cast<size_t>(search_type);
-  int effective_ttl = ttl_seconds_.load(std::memory_order_relaxed);
-  {
-    std::lock_guard<std::mutex> lock(policy_mutex_);
-    if (!policies_[index].enabled) {
-      return false;
-    }
-    if (policies_[index].ttl_seconds > 0) {
-      effective_ttl = policies_[index].ttl_seconds;
-    }
+  const auto effective_ttl = ResolveEffectiveTtl(search_type);
+  if (!effective_ttl) {
+    return false;
   }
-  return InsertWithTtl(key, results, query_cost_ms, effective_ttl, &item_ids);
+  return InsertWithTtl(key, results, query_cost_ms, *effective_ttl, &item_ids);
 }
 
 void SimilarityCache::SetSearchTypePolicy(SearchType search_type, const CachePolicy& policy) {

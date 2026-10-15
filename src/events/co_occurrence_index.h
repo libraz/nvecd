@@ -236,6 +236,13 @@ class CoOccurrenceIndex {
   size_t GetNeighborCount(const std::string& item_id) const;
 
   /**
+   * @brief Get the number of neighbors GetSimilar can return (score > 0)
+   * @param item_id Item ID
+   * @return Number of positively scored neighbors (0 if item not found)
+   */
+  size_t GetPositiveNeighborCount(const std::string& item_id) const;
+
+  /**
    * @brief Get the generation counter (advanced when co-occurrence state changes)
    * @return Current generation value
    */
@@ -375,6 +382,11 @@ class CoOccurrenceIndex {
 
   /// @brief Write a validated edge in both directions (acquires write lock)
   void SetValidatedScore(const ValidatedEdge& edge);
+
+  /// @brief Prune every listed item's neighbor list when a retention bound is configured
+  /// (caller must hold write lock; duplicates in the list are ignored)
+  /// @return true if the index changed
+  bool PruneAffectedLocked(std::vector<std::string> affected_ids);
 
   /// @brief Prune a single item's neighbor list (caller must hold write lock)
   /// @return true if the index changed

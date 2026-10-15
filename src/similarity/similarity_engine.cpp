@@ -37,6 +37,12 @@ struct CandidateRanksBefore {
   }
 };
 
+/// Candidates fetched per requested result when a metadata filter may discard most of them.
+constexpr int64_t kOversamplingFactor = 3;
+
+/// Rows prefetched ahead of the flat scan cursor.
+constexpr size_t kPrefetchAhead = 4;
+
 }  // namespace
 
 SimilarityEngine::SimilarityEngine(events::EventStore* event_store, events::CoOccurrenceIndex* co_index,
@@ -208,7 +214,7 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
 
   std::vector<SimilarityResult> results;
   const bool filtering = !filter.Empty() && metadata_store_ != nullptr;
-  const size_t neighbor_count = co_index_->GetNeighborCount(item_id);
+  const size_t neighbor_count = co_index_->GetPositiveNeighborCount(item_id);
   int fetch_k = validated_top_k.value();
   while (true) {
     auto co_results = co_index_->GetSimilar(item_id, fetch_k);
@@ -261,177 +267,12 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
   const float* query_ptr = snap.matrix + query_idx * snap.dim;
   float query_norm = snap.norms[query_idx];
 
-  // Oversampling factor for post-filter: fetch more candidates then filter.
-  // The product is computed in int64_t and clamped to max_top_k so the
-  // oversampling cannot overflow int even if a large top_k slips through.
-  bool has_filter = !filter.Empty() && metadata_store_ != nullptr;
-  constexpr int64_t kOversamplingFactor = 3;
-  int64_t oversampled =
-      has_filter ? static_cast<int64_t>(validated_top_k.value()) * kOversamplingFactor : validated_top_k.value();
-  int fetch_k = static_cast<int>(std::min<int64_t>(oversampled, config_.max_top_k));
-
   // Never acquire the ANN publication lock while holding a VectorStore
-  // snapshot: writers publish in the opposite (ANN → store) order.
+  // snapshot: writers publish in the opposite (ANN -> store) order.
   std::vector<float> query_copy(query_ptr, query_ptr + snap.dim);
-  const size_t total_count = snap.count;
   snap.lock.unlock();
 
-  // ANN accelerated path (HNSW or IVF). Keep the ANN generation stable while
-  // searching, then compare it with the store snapshot used for label→ID
-  // mapping. Direct VectorStore mutations can still advance the store while
-  // this shared lock is held; a mismatch falls back to a fresh flat snapshot.
-  bool ann_mapping_stale = false;
-  std::shared_lock publication_lock(ann_publication_mutex_);
-  // query_copy was captured from a store snapshot that has already been
-  // released, so its width can disagree with the dimension the ANN kernels
-  // stride at. Fall back to the flat path in that case; it re-resolves the
-  // query inside the snapshot it scans, which is self-consistent by
-  // construction.
-  if (ann_index_ && IsAnnIndexReady() && query_copy.size() == ann_dimension_) {
-    // When a metadata filter is active the post-filter can discard most ANN
-    // candidates, so a single fetch_k under-fetches relative to a flat scan.
-    // Grow fetch_k until top_k filtered results are gathered or the index is
-    // exhausted (ANN returned fewer candidates than requested, or fetch_k
-    // already covers every stored vector). Without a filter we keep the single
-    // fetch: re-fetching would only multiply ANN cost on the hot path without
-    // changing the (already filter-free) result count.
-    //
-    // IMPORTANT: ann_index_->Search() acquires its own CompactSnapshot
-    // internally, so it must run with NO snapshot held here, otherwise the
-    // second shared_lock deadlocks against a waiting writer (e.g. IVF training).
-    // We therefore call Search without a lock, then take a short-lived snapshot
-    // purely to map result indices to IDs, releasing it before the next Search.
-    std::vector<SimilarityResult> results;
-    uint32_t current_fetch = static_cast<uint32_t>(fetch_k) + 1;
-    while (true) {
-      auto ann_results = ann_index_->Search(query_copy.data(), current_fetch);
-
-      bool grow = false;
-      {
-        auto map_snap = vector_store_->GetCompactSnapshot();
-        if (map_snap.Empty()) {
-          return std::vector<SimilarityResult>{};
-        }
-        if (map_snap.generation != ann_generation_.load(std::memory_order_acquire)) {
-          ann_mapping_stale = true;
-          break;
-        }
-        results.clear();
-        results.reserve(ann_results.size());
-        for (const auto& [compact_idx, score] : ann_results) {
-          if (compact_idx >= map_snap.count || map_snap.IsDeleted(compact_idx)) {
-            continue;
-          }
-          const std::string& cand_id = (*map_snap.idx_to_id)[compact_idx];
-          // The compact index captured for the query can become stale after a
-          // concurrent compaction. Identity is stable, so exclude self by ID
-          // rather than comparing indices from two different snapshots.
-          if (cand_id == item_id) {
-            continue;
-          }
-          if (has_filter && !metadata_store_->Matches(cand_id, filter)) {
-            continue;
-          }
-          results.emplace_back(cand_id, score);
-          if (static_cast<int>(results.size()) >= validated_top_k.value()) {
-            break;
-          }
-        }
-        grow = has_filter && static_cast<int>(results.size()) < validated_top_k.value() &&
-               current_fetch < static_cast<uint32_t>(total_count) && ann_results.size() >= current_fetch;
-      }
-      if (!grow) {
-        break;
-      }
-      current_fetch *= 2;
-    }
-    if (!ann_mapping_stale) {
-      std::sort(results.begin(), results.end());
-      return results;
-    }
-  }
-  publication_lock.unlock();
-
-  // ANN may be unavailable or stale. Re-resolve the query in one fresh flat
-  // snapshot because the original snapshot was released before publication.
-  snap = vector_store_->GetCompactSnapshot();
-  if (snap.Empty()) {
-    return utils::MakeUnexpected(
-        utils::MakeError(utils::ErrorCode::kVectorNotFound, "Query vector not found: " + item_id));
-  }
-  query_it = snap.id_to_idx->find(item_id);
-  if (query_it == snap.id_to_idx->end()) {
-    return utils::MakeUnexpected(
-        utils::MakeError(utils::ErrorCode::kVectorNotFound, "Query vector not found: " + item_id));
-  }
-  query_idx = query_it->second;
-  query_ptr = snap.matrix + query_idx * snap.dim;
-  query_norm = snap.norms[query_idx];
-
-  // Bounded min-heap: track top-k (score, index) pairs without string allocation
-  int k = validated_top_k.value();
-  using ScoreIdx = std::pair<float, size_t>;
-  const CandidateRanksBefore cmp{snap.idx_to_id};
-  std::priority_queue<ScoreIdx, std::vector<ScoreIdx>, CandidateRanksBefore> min_heap(cmp);
-
-  // Lambda to push a candidate into the min-heap
-  auto push_candidate = [&](size_t idx) {
-    if (idx == query_idx) {
-      return;
-    }
-    if (snap.IsDeleted(idx)) {
-      return;
-    }
-    if (has_filter && !metadata_store_->Matches((*snap.idx_to_id)[idx], filter)) {
-      return;
-    }
-    float score;
-    if (use_prenorm_) {
-      score = vectors::CosineSimilarityPreNorm(query_ptr, snap.matrix + idx * snap.dim, snap.dim, query_norm,
-                                               snap.norms[idx]);
-    } else {
-      const float* cand_ptr = snap.matrix + idx * snap.dim;
-      score = distance_func_(query_ptr, cand_ptr, static_cast<uint32_t>(snap.dim));
-    }
-    if (static_cast<int>(min_heap.size()) < k) {
-      min_heap.push({score, idx});
-    } else if (cmp(ScoreIdx{score, idx}, min_heap.top())) {
-      min_heap.pop();
-      min_heap.push({score, idx});
-    }
-  };
-
-  // Determine whether to sample; avoid allocating full index vector for full scan
-  // A filter is applied per row, so sampling first would leave a sparse filter
-  // too few survivors to fill top_k; a filtered query scans every row instead.
-  bool use_sampling = !has_filter && config_.sample_size > 0 && snap.count > config_.sample_size * 2;
-  if (use_sampling) {
-    auto scan_indices = SampleIndices(snap.count, config_.sample_size);
-    for (size_t idx : scan_indices) {
-      push_candidate(idx);
-    }
-  } else {
-    // Full scan with prefetching to hide memory latency
-    constexpr size_t kPrefetchAhead = 4;
-    for (size_t idx = 0; idx < snap.count; ++idx) {
-      // Prefetch upcoming vector data into L1 cache
-      if (idx + kPrefetchAhead < snap.count) {
-        __builtin_prefetch(snap.matrix + (idx + kPrefetchAhead) * snap.dim, 0, 0);
-      }
-      push_candidate(idx);
-    }
-  }
-
-  // Convert heap to sorted results (only top-k strings allocated)
-  std::vector<SimilarityResult> results;
-  results.reserve(min_heap.size());
-  while (!min_heap.empty()) {
-    auto [s, i] = min_heap.top();
-    min_heap.pop();
-    results.emplace_back((*snap.idx_to_id)[i], s);
-  }
-  std::sort(results.begin(), results.end());  // SimilarityResult sorts by score desc
-  return results;
+  return SearchByQuery({query_copy.data(), query_copy.size(), query_norm, &item_id}, validated_top_k.value(), filter);
 }
 
 // ============================================================================
@@ -448,8 +289,8 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
   // Get results from both sources (request more to ensure good coverage).
   // The oversampling product is computed in int64_t and clamped to max_top_k so
   // it cannot overflow int even if a large top_k slips through.
-  int fetch_k =
-      static_cast<int>(std::min<int64_t>(static_cast<int64_t>(validated_top_k.value()) * 3, config_.max_top_k));
+  int fetch_k = static_cast<int>(
+      std::min<int64_t>(static_cast<int64_t>(validated_top_k.value()) * kOversamplingFactor, config_.max_top_k));
 
   auto event_results = SearchByIdEvents(item_id, fetch_k, filter);
 
@@ -461,7 +302,7 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
   float alpha;
   float beta;
   if (use_adaptive) {
-    size_t neighbor_count = co_index_->GetNeighborCount(item_id);
+    size_t neighbor_count = co_index_->GetPositiveNeighborCount(item_id);
     std::tie(alpha, beta) = ComputeAdaptiveWeights(neighbor_count);
   } else {
     alpha = static_cast<float>(config_.fusion_alpha);
@@ -563,16 +404,10 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
     }
   }
 
-  const bool has_filter = !filter.Empty() && metadata_store_ != nullptr;
-
-  // Convert to result vector
+  // Both sources already applied the filter, so every fused id satisfies it.
   std::vector<SimilarityResult> results;
   results.reserve(fusion_scores.size());
-
   for (const auto& [fused_id, score] : fusion_scores) {
-    if (has_filter && !metadata_store_->Matches(fused_id, filter)) {
-      continue;
-    }
     results.emplace_back(fused_id, score);
   }
 
@@ -634,30 +469,34 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
         utils::MakeError(utils::ErrorCode::kInvalidArgument, "Query vector norm must be finite and non-zero"));
   }
 
+  return SearchByQuery({query_vector.data(), query_vector.size(), query_norm, nullptr}, validated_top_k.value(),
+                       filter);
+}
+
+utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::SearchByQuery(
+    const QueryVector& query, int top_k, const vectors::MetadataFilter& filter) {
   // The oversampling product is computed in int64_t and clamped to max_top_k so
   // it cannot overflow int even if a large top_k slips through.
-  bool has_filter = !filter.Empty() && metadata_store_ != nullptr;
-  constexpr int64_t kOversamplingFactor = 3;
-  int64_t oversampled =
-      has_filter ? static_cast<int64_t>(validated_top_k.value()) * kOversamplingFactor : validated_top_k.value();
-  int fetch_k = static_cast<int>(std::min<int64_t>(oversampled, config_.max_top_k));
+  const bool has_filter = !filter.Empty() && metadata_store_ != nullptr;
+  const int64_t oversampled = has_filter ? static_cast<int64_t>(top_k) * kOversamplingFactor : top_k;
+  const int fetch_k = static_cast<int>(std::min<int64_t>(oversampled, config_.max_top_k));
 
-  // ANN accelerated path (HNSW or IVF). The query vector is caller-owned, so
-  // no snapshot is needed for the search itself; the IVF adapter takes its own
-  // snapshot internally. Take a snapshot only to map result indices to IDs.
+  // ANN accelerated path (HNSW or IVF). Keep the ANN generation stable while
+  // searching, then compare it with the store snapshot used for label->ID
+  // mapping. Direct VectorStore mutations can still advance the store while
+  // this shared lock is held; a mismatch falls back to a fresh flat snapshot.
   bool ann_mapping_stale = false;
   std::shared_lock publication_lock(ann_publication_mutex_);
-  // ann_dimension_ is the width the ANN kernels read the query at, and it is
-  // published under this same lock, so comparing against it here holds for the
-  // whole Search below. A disagreeing query never reaches an ANN kernel; it
-  // falls through to the brute-force path, which decides against the corpus it
-  // scans (the ANN index may simply be stale relative to the store).
-  if (ann_index_ && IsAnnIndexReady() && query_vector.size() == ann_dimension_) {
-    // With an active metadata filter, the post-filter can discard most ANN
-    // candidates. Grow fetch_k until top_k filtered results are gathered or the
-    // index is exhausted, so ANN matches the flat scan's result count. Without a
-    // filter we keep the single fetch to avoid multiplying ANN cost on the hot
-    // path (re-fetching cannot raise the filter-free result count).
+  // query.dim is the width the ANN kernels would read the query at, and
+  // ann_dimension_ is published under this same lock, so the comparison holds
+  // for the whole Search below. A disagreeing query falls through to the flat
+  // path, which decides against the corpus it scans (the ANN index may simply
+  // be stale relative to the store).
+  if (ann_index_ && IsAnnIndexReady() && query.dim == ann_dimension_) {
+    // With an active metadata filter the post-filter can discard most ANN
+    // candidates, so grow fetch_k until top_k filtered results are gathered or
+    // the index is exhausted. Without a filter a single fetch suffices and
+    // re-fetching would only multiply ANN cost.
     //
     // IMPORTANT: ann_index_->Search() acquires its own CompactSnapshot
     // internally, so it must run with NO snapshot held here, otherwise the
@@ -665,9 +504,10 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
     // We therefore call Search without a lock, then take a short-lived snapshot
     // purely to map result indices to IDs, releasing it before the next Search.
     std::vector<SimilarityResult> results;
-    uint32_t current_fetch = static_cast<uint32_t>(fetch_k);
+    // An excluded item can occupy one of the fetched slots.
+    uint32_t current_fetch = static_cast<uint32_t>(fetch_k) + (query.excluded_id != nullptr ? 1U : 0U);
     while (true) {
-      auto ann_results = ann_index_->Search(query_vector.data(), current_fetch);
+      auto ann_results = ann_index_->Search(query.data, current_fetch);
 
       bool grow = false;
       {
@@ -679,7 +519,6 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
           ann_mapping_stale = true;
           break;
         }
-        const auto total_count = static_cast<uint32_t>(map_snap.count);
         results.clear();
         results.reserve(ann_results.size());
         for (const auto& [compact_idx, score] : ann_results) {
@@ -687,16 +526,21 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
             continue;
           }
           const std::string& cand_id = (*map_snap.idx_to_id)[compact_idx];
+          // A compact index captured before a concurrent compaction can be stale.
+          // Identity is stable, so exclude by ID rather than by index.
+          if (query.excluded_id != nullptr && cand_id == *query.excluded_id) {
+            continue;
+          }
           if (has_filter && !metadata_store_->Matches(cand_id, filter)) {
             continue;
           }
           results.emplace_back(cand_id, score);
-          if (static_cast<int>(results.size()) >= validated_top_k.value()) {
+          if (static_cast<int>(results.size()) >= top_k) {
             break;
           }
         }
-        grow = has_filter && static_cast<int>(results.size()) < validated_top_k.value() &&
-               current_fetch < total_count && ann_results.size() >= current_fetch;
+        grow = has_filter && static_cast<int>(results.size()) < top_k && current_fetch < map_snap.count &&
+               ann_results.size() >= current_fetch;
       }
       if (!grow) {
         break;
@@ -710,46 +554,68 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
   }
   publication_lock.unlock();
 
-  // Brute-force path: hold a snapshot (read lock) for the full scan.
+  // Flat scan: hold one snapshot (read lock) for the whole scan.
   auto snap = vector_store_->GetCompactSnapshot();
-  if (snap.Empty()) {
-    return std::vector<SimilarityResult>{};
-  }
-
-  // The scan strides the matrix at snap.dim and reads the query at the same
-  // width, so agreement is established here, from the snapshot being scanned
-  // and under the read lock it holds. A concurrent Clear/SetVector cannot move
-  // the dimension between this check and the dereferences below.
-  if (query_vector.size() != snap.dim) {
-    return utils::MakeUnexpected(
-        utils::MakeError(utils::ErrorCode::kVectorDimensionMismatch, "Query vector dimension mismatch: expected " +
-                                                                         std::to_string(snap.dim) + ", got " +
-                                                                         std::to_string(query_vector.size())));
+  const float* query_ptr = query.data;
+  float query_norm = query.norm;
+  size_t excluded_idx = std::numeric_limits<size_t>::max();
+  if (query.excluded_id != nullptr) {
+    // The caller's snapshot was released before publication, so re-resolve the
+    // query by ID inside the snapshot being scanned.
+    const auto not_found =
+        utils::MakeError(utils::ErrorCode::kVectorNotFound, "Query vector not found: " + *query.excluded_id);
+    if (snap.Empty()) {
+      return utils::MakeUnexpected(not_found);
+    }
+    const auto query_it = snap.id_to_idx->find(*query.excluded_id);
+    if (query_it == snap.id_to_idx->end()) {
+      return utils::MakeUnexpected(not_found);
+    }
+    excluded_idx = query_it->second;
+    query_ptr = snap.matrix + excluded_idx * snap.dim;
+    query_norm = snap.norms[excluded_idx];
+  } else {
+    if (snap.Empty()) {
+      return std::vector<SimilarityResult>{};
+    }
+    // The scan strides the matrix at snap.dim and reads the query at the same
+    // width, so agreement is established here, from the snapshot being scanned
+    // and under the read lock it holds. A concurrent Clear/SetVector cannot move
+    // the dimension between this check and the dereferences below.
+    if (query.dim != snap.dim) {
+      return utils::MakeUnexpected(
+          utils::MakeError(utils::ErrorCode::kVectorDimensionMismatch, "Query vector dimension mismatch: expected " +
+                                                                           std::to_string(snap.dim) + ", got " +
+                                                                           std::to_string(query.dim)));
+    }
   }
 
   // Bounded min-heap: track top-k (score, index) pairs without string allocation
-  int k = validated_top_k.value();
   using ScoreIdx = std::pair<float, size_t>;
   const CandidateRanksBefore cmp{snap.idx_to_id};
   std::priority_queue<ScoreIdx, std::vector<ScoreIdx>, CandidateRanksBefore> min_heap(cmp);
 
-  // Lambda to push a candidate into the min-heap
+  // One metadata read lock for the whole scan instead of one per row.
+  std::shared_lock<std::shared_mutex> metadata_lock;
+  if (has_filter) {
+    metadata_lock = metadata_store_->AcquireReadLock();
+  }
+
   auto push_candidate = [&](size_t idx) {
-    if (snap.IsDeleted(idx)) {
+    if (idx == excluded_idx || snap.IsDeleted(idx)) {
       return;
     }
-    if (has_filter && !metadata_store_->Matches((*snap.idx_to_id)[idx], filter)) {
+    if (has_filter && !metadata_store_->MatchesLocked((*snap.idx_to_id)[idx], filter)) {
       return;
     }
     float score;
     if (use_prenorm_) {
-      score = vectors::CosineSimilarityPreNorm(query_vector.data(), snap.matrix + idx * snap.dim, snap.dim, query_norm,
+      score = vectors::CosineSimilarityPreNorm(query_ptr, snap.matrix + idx * snap.dim, snap.dim, query_norm,
                                                snap.norms[idx]);
     } else {
-      const float* cand_ptr = snap.matrix + idx * snap.dim;
-      score = distance_func_(query_vector.data(), cand_ptr, static_cast<uint32_t>(snap.dim));
+      score = distance_func_(query_ptr, snap.matrix + idx * snap.dim, static_cast<uint32_t>(snap.dim));
     }
-    if (static_cast<int>(min_heap.size()) < k) {
+    if (static_cast<int>(min_heap.size()) < top_k) {
       min_heap.push({score, idx});
     } else if (cmp(ScoreIdx{score, idx}, min_heap.top())) {
       min_heap.pop();
@@ -757,19 +623,16 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
     }
   };
 
-  // Determine whether to sample; avoid allocating full index vector for full scan
   // A filter is applied per row, so sampling first would leave a sparse filter
   // too few survivors to fill top_k; a filtered query scans every row instead.
-  bool use_sampling = !has_filter && config_.sample_size > 0 && snap.count > config_.sample_size * 2;
+  const bool use_sampling = !has_filter && config_.sample_size > 0 && snap.count > config_.sample_size * 2;
   if (use_sampling) {
-    auto scan_indices = SampleIndices(snap.count, config_.sample_size);
-    for (size_t idx : scan_indices) {
+    for (size_t idx : SampleIndices(snap.count, config_.sample_size)) {
       push_candidate(idx);
     }
   } else {
-    // Full scan with prefetching to hide memory latency
-    constexpr size_t kPrefetchAhead = 4;
     for (size_t idx = 0; idx < snap.count; ++idx) {
+      // Prefetch upcoming vector data to hide memory latency
       if (idx + kPrefetchAhead < snap.count) {
         __builtin_prefetch(snap.matrix + (idx + kPrefetchAhead) * snap.dim, 0, 0);
       }
@@ -1082,8 +945,8 @@ void SimilarityEngine::MaybeTrainIvfIndex() {
     }
     valid_count = valid_indices.size();
 
-    // Copy only the vectors we need for training (sample up to 50K).
-    constexpr size_t kMaxCopyForTrain = 50000;
+    // Copy only what the index trains on; it caps its own sample at the same size.
+    constexpr size_t kMaxCopyForTrain = vectors::IvfIndex::kMaxTrainingSamples;
     std::vector<size_t> train_indices;
     if (valid_indices.size() <= kMaxCopyForTrain) {
       train_indices = valid_indices;

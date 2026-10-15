@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -21,6 +22,9 @@ namespace nvecd::cache {
  */
 class MD5 {
  public:
+  static constexpr size_t kDigestSize = 16;     ///< Digest length in bytes
+  static constexpr size_t kHexDigestSize = 32;  ///< Digest length as lowercase hex characters
+
   MD5();
 
   /**
@@ -35,14 +39,14 @@ class MD5 {
 
   /**
    * @brief Finalize and get digest
-   * @param digest Output buffer (must be 16 bytes)
+   * @param digest Output buffer (must be kDigestSize bytes)
    */
-  void Finalize(uint8_t digest[16]);
+  void Finalize(uint8_t digest[kDigestSize]);
 
   /**
    * @brief Convenience method to hash a string
    */
-  static void Hash(const std::string& input, uint8_t digest[16]);
+  static void Hash(const std::string& input, uint8_t digest[kDigestSize]);
 
  private:
   void Transform(const uint8_t block[64]);

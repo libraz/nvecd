@@ -55,19 +55,17 @@ namespace nvecd::events {
  * StateCache cache(10000);
  * StateKey key{"user1", "like:item1"};
  *
- * // SET like:item1 to 100
- * if (!cache.IsDuplicateSet(key, 100)) {
- *   cache.UpdateScore(key, 100);
- * }
+ * // SET like:item1 to 100 (first time: not a duplicate, state recorded)
+ * bool first = cache.CheckAndUpdateSet(key, 100);  // false
  *
  * // SET like:item1 to 100 again (duplicate)
- * if (cache.IsDuplicateSet(key, 100)) {
+ * if (cache.CheckAndUpdateSet(key, 100)) {
  *   // Skip duplicate
  * }
  *
  * // DEL like:item1
- * if (!cache.IsDuplicateDel(key)) {
- *   cache.MarkDeleted(key);
+ * if (!cache.CheckAndMarkDeleted(key)) {
+ *   // First delete: apply it
  * }
  * @endcode
  */
@@ -79,32 +77,11 @@ class StateCache {
    */
   explicit StateCache(size_t max_size);
 
-  /**
-   * @brief Check if SET operation is duplicate
-   *
-   * Returns true if the last score for this key equals the new score.
-   *
-   * @param key State key
-   * @param score New score
-   * @return true if duplicate (same score), false otherwise
-   */
-  bool IsDuplicateSet(const StateKey& key, int score);
-
   /** Check SET duplicate state without updating counters or LRU state. */
   bool WouldDeduplicateSet(const StateKey& key, int score) const;
 
   /** @brief Atomically deduplicate and record a SET state. */
   bool CheckAndUpdateSet(const StateKey& key, int score);
-
-  /**
-   * @brief Check if DEL operation is duplicate
-   *
-   * Returns true if this key is already marked as deleted.
-   *
-   * @param key State key
-   * @return true if already deleted, false otherwise
-   */
-  bool IsDuplicateDel(const StateKey& key);
 
   /** Check DEL duplicate state without updating counters or LRU state. */
   bool WouldDeduplicateDel(const StateKey& key) const;
@@ -162,7 +139,8 @@ class StateCache {
   std::list<StateKey> lru_list_;
 
   /// Key -> (score, LRU iterator)
-  std::unordered_map<StateKey, std::pair<int, std::list<StateKey>::iterator>> states_;
+  using StateMap = std::unordered_map<StateKey, std::pair<int, std::list<StateKey>::iterator>>;
+  StateMap states_;
 
   // Statistics (atomic for thread-safe access)
   mutable std::atomic<uint64_t> total_hits_{0};
@@ -175,10 +153,17 @@ class StateCache {
   void EvictIfFull();
 
   /**
-   * @brief Move key to front of LRU list
+   * @brief Move an existing entry to the front of the LRU list
+   * @pre mutex_ is locked for writing; @p it is a valid, non-end iterator
+   */
+  void TouchLocked(StateMap::iterator it);
+
+  /**
+   * @brief Record @p score for @p key and make it most recent, evicting if full
+   * @param it Result of states_.find(key)
    * @pre mutex_ is locked for writing
    */
-  void TouchLocked(const StateKey& key);
+  void UpsertLocked(StateMap::iterator it, const StateKey& key, int score);
 };
 
 }  // namespace nvecd::events

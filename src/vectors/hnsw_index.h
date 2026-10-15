@@ -154,6 +154,20 @@ class HnswIndex : public AnnIndex {
                                                       uint32_t layer, uint32_t ef) const;
 
   /**
+   * @brief Greedily walk the upper layers toward the query
+   *
+   * At each layer from @p top_level down to @p stop_level + 1, hops to the
+   * best-scoring neighbor until no neighbor improves.
+   *
+   * @param entry_node Starting node (internal ID)
+   * @param top_level First layer to descend
+   * @param stop_level Layer to stop above (not searched)
+   * @return Internal ID of the closest node found
+   */
+  uint32_t GreedyDescend(const float* query, float query_norm, uint32_t entry_node, int top_level,
+                         int stop_level) const;
+
+  /**
    * @brief Select neighbors using the diversity heuristic
    *
    * From a candidate set, select up to max_count neighbors, keeping a

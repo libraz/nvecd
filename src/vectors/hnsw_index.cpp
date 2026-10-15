@@ -236,6 +236,29 @@ float HnswIndex::NodeToNodeSimilarity(uint32_t lhs, uint32_t rhs) const {
   return distance_func_(lhs_vec, rhs_vec, dimension_);
 }
 
+uint32_t HnswIndex::GreedyDescend(const float* query, float query_norm, uint32_t entry_node, int top_level,
+                                  int stop_level) const {
+  uint32_t cur_node = entry_node;
+  for (int l = top_level; l > stop_level; --l) {
+    float cur_dist = ComputeDistance(query, query_norm, cur_node);
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      if (static_cast<uint32_t>(l) < nodes_[cur_node].neighbors.size()) {
+        for (uint32_t neighbor : nodes_[cur_node].neighbors[l]) {
+          float d = ComputeDistance(query, query_norm, neighbor);
+          if (d > cur_dist) {
+            cur_node = neighbor;
+            cur_dist = d;
+            changed = true;
+          }
+        }
+      }
+    }
+  }
+  return cur_node;
+}
+
 std::vector<uint32_t> HnswIndex::SelectNeighbors(const std::vector<std::pair<float, uint32_t>>& candidates,
                                                  uint32_t max_count) const {
   // Neighbour selection heuristic from Malkov & Yashunin, Algorithm 4.
@@ -380,25 +403,8 @@ void HnswIndex::AddLocked(uint32_t compact_index, const float* vector) {
   }
 
   // Navigate from top to the node's level, finding the closest entry at each layer
-  uint32_t cur_node = entry_point_;
-  for (int l = static_cast<int>(max_level_); l > static_cast<int>(level); --l) {
-    // Greedy search: move to closest neighbor at this layer
-    bool changed = true;
-    while (changed) {
-      changed = false;
-      float cur_dist = ComputeDistance(vector, vector_norm, cur_node);
-      if (static_cast<uint32_t>(l) < nodes_[cur_node].neighbors.size()) {
-        for (uint32_t neighbor : nodes_[cur_node].neighbors[l]) {
-          float d = ComputeDistance(vector, vector_norm, neighbor);
-          if (d > cur_dist) {
-            cur_node = neighbor;
-            cur_dist = d;
-            changed = true;
-          }
-        }
-      }
-    }
-  }
+  uint32_t cur_node =
+      GreedyDescend(vector, vector_norm, entry_point_, static_cast<int>(max_level_), static_cast<int>(level));
 
   // Insert into layers from level down to 0
   for (int l = static_cast<int>(std::min(level, max_level_)); l >= 0; --l) {
@@ -425,14 +431,10 @@ void HnswIndex::AddLocked(uint32_t compact_index, const float* vector) {
       // Prune if too many connections
       if (neighbor_links[layer].size() > max_conn) {
         // Build candidate list with distances from the neighbor's perspective
-        const float* neighbor_vec = GetNodeVector(neighbor_id);
         std::vector<std::pair<float, uint32_t>> neighbor_candidates;
         neighbor_candidates.reserve(neighbor_links[layer].size());
         for (uint32_t nid : neighbor_links[layer]) {
-          float d = use_cosine_prenorm_ ? CosineSimilarityPreNorm(neighbor_vec, GetNodeVector(nid), dimension_,
-                                                                  vector_norms_[neighbor_id], vector_norms_[nid])
-                                        : distance_func_(neighbor_vec, GetNodeVector(nid), dimension_);
-          neighbor_candidates.push_back({d, nid});
+          neighbor_candidates.push_back({NodeToNodeSimilarity(neighbor_id, nid), nid});
         }
         std::sort(neighbor_candidates.begin(), neighbor_candidates.end(),
                   [](const auto& a, const auto& b) { return a.first > b.first; });
@@ -489,24 +491,7 @@ std::vector<std::pair<uint32_t, float>> HnswIndex::Search(const float* query, ui
   const float query_norm = use_cosine_prenorm_ ? simd::GetOptimalImpl().l2_norm(query, dimension_) : 0.0F;
 
   // Navigate from top layers to layer 1, finding closest entry
-  uint32_t cur_node = entry_point_;
-  for (int l = static_cast<int>(max_level_); l > 0; --l) {
-    bool changed = true;
-    while (changed) {
-      changed = false;
-      float cur_dist = ComputeDistance(query, query_norm, cur_node);
-      if (static_cast<uint32_t>(l) < nodes_[cur_node].neighbors.size()) {
-        for (uint32_t neighbor : nodes_[cur_node].neighbors[l]) {
-          float d = ComputeDistance(query, query_norm, neighbor);
-          if (d > cur_dist) {
-            cur_node = neighbor;
-            cur_dist = d;
-            changed = true;
-          }
-        }
-      }
-    }
-  }
+  const uint32_t cur_node = GreedyDescend(query, query_norm, entry_point_, static_cast<int>(max_level_), 0);
 
   std::vector<std::pair<uint32_t, float>> results;
   while (true) {

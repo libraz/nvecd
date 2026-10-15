@@ -190,21 +190,13 @@ void CoOccurrenceIndex::AddEventIncrementalInternal(const std::vector<Event>& pr
   // hub can exceed its cap while each newly ingested leaf remains small.
   // Prune every affected ID under the same lock so the symmetric matrix never
   // exposes an over-limit existing endpoint after this update returns.
-  if (config_.max_neighbors_per_item > 0 || config_.min_support > 0.0F) {
-    std::vector<std::string> affected_ids;
-    affected_ids.reserve(prior_events.size() + 1);
-    affected_ids.push_back(new_event.item_id);
-    for (const auto& prior : prior_events) {
-      if (prior.item_id != new_event.item_id) {
-        affected_ids.push_back(prior.item_id);
-      }
-    }
-    std::sort(affected_ids.begin(), affected_ids.end());
-    affected_ids.erase(std::unique(affected_ids.begin(), affected_ids.end()), affected_ids.end());
-    for (const auto& item_id : affected_ids) {
-      state_changed = PruneItemLocked(item_id) || state_changed;
-    }
+  std::vector<std::string> affected_ids;
+  affected_ids.reserve(prior_events.size() + 1);
+  affected_ids.push_back(new_event.item_id);
+  for (const auto& prior : prior_events) {
+    affected_ids.push_back(prior.item_id);
   }
+  state_changed = PruneAffectedLocked(std::move(affected_ids)) || state_changed;
   if (state_changed) {
     generation_.fetch_add(1, std::memory_order_release);
   }
@@ -255,18 +247,12 @@ void CoOccurrenceIndex::UpdateFromEventsInternal(const std::string& ctx [[maybe_
 
   // Prune affected items after a bulk update. Apply min_support immediately
   // as well, otherwise a deployment with decay disabled never enforces it.
-  if (config_.max_neighbors_per_item > 0 || config_.min_support > 0.0F) {
-    std::vector<std::string> affected_ids;
-    affected_ids.reserve(events.size());
-    for (const auto& event : events) {
-      affected_ids.push_back(event.item_id);
-    }
-    std::sort(affected_ids.begin(), affected_ids.end());
-    affected_ids.erase(std::unique(affected_ids.begin(), affected_ids.end()), affected_ids.end());
-    for (const auto& item_id : affected_ids) {
-      state_changed = PruneItemLocked(item_id) || state_changed;
-    }
+  std::vector<std::string> affected_ids;
+  affected_ids.reserve(events.size());
+  for (const auto& event : events) {
+    affected_ids.push_back(event.item_id);
   }
+  state_changed = PruneAffectedLocked(std::move(affected_ids)) || state_changed;
   if (state_changed) {
     generation_.fetch_add(1, std::memory_order_release);
   }
@@ -307,16 +293,23 @@ void CoOccurrenceIndex::ApplyNegativeSignalLocked(const std::string& removed_id,
 
   // A reduction can create an edge that did not exist, so the retention bounds
   // apply to every ID it touched, in the same write.
-  if (config_.max_neighbors_per_item > 0 || config_.min_support > 0.0F) {
-    std::sort(affected_ids.begin(), affected_ids.end());
-    affected_ids.erase(std::unique(affected_ids.begin(), affected_ids.end()), affected_ids.end());
-    for (const auto& item_id : affected_ids) {
-      state_changed = PruneItemLocked(item_id) || state_changed;
-    }
-  }
+  state_changed = PruneAffectedLocked(std::move(affected_ids)) || state_changed;
   if (state_changed) {
     generation_.fetch_add(1, std::memory_order_release);
   }
+}
+
+bool CoOccurrenceIndex::PruneAffectedLocked(std::vector<std::string> affected_ids) {
+  if (config_.max_neighbors_per_item == 0 && !(config_.min_support > 0.0F)) {
+    return false;
+  }
+  std::sort(affected_ids.begin(), affected_ids.end());
+  affected_ids.erase(std::unique(affected_ids.begin(), affected_ids.end()), affected_ids.end());
+  bool changed = false;
+  for (const auto& item_id : affected_ids) {
+    changed = PruneItemLocked(item_id) || changed;
+  }
+  return changed;
 }
 
 size_t CoOccurrenceIndex::GetNeighborCount(const std::string& item_id) const {
@@ -326,6 +319,16 @@ size_t CoOccurrenceIndex::GetNeighborCount(const std::string& item_id) const {
     return 0;
   }
   return it->second.size();
+}
+
+size_t CoOccurrenceIndex::GetPositiveNeighborCount(const std::string& item_id) const {
+  std::shared_lock lock(mutex_);
+  auto it = co_scores_.find(item_id);
+  if (it == co_scores_.end()) {
+    return 0;
+  }
+  return static_cast<size_t>(
+      std::count_if(it->second.begin(), it->second.end(), [](const auto& entry) { return entry.second > 0.0F; }));
 }
 
 std::vector<std::pair<std::string, float>> CoOccurrenceIndex::GetSimilar(const std::string& item_id, int top_k) const {
@@ -340,28 +343,32 @@ std::vector<std::pair<std::string, float>> CoOccurrenceIndex::GetSimilar(const s
     return {};
   }
 
-  // Collect all co-occurring items with scores
-  std::vector<std::pair<std::string, float>> results;
-  results.reserve(iter->second.size());
+  // Rank by pointer so only the kept neighbours are copied.
+  std::vector<std::pair<float, const std::string*>> ranked;
+  ranked.reserve(iter->second.size());
 
   for (const auto& [other_id, score] : iter->second) {
     if (score > 0.0F) {  // Only include positive scores
-      results.emplace_back(other_id, score);
+      ranked.emplace_back(score, &other_id);
     }
   }
 
   // Score descending, ties by ascending id: the selected set at the top-k
   // boundary must not depend on hash iteration order.
-  const size_t keep = std::min(results.size(), static_cast<size_t>(top_k));
-  std::partial_sort(results.begin(), results.begin() + static_cast<ptrdiff_t>(keep), results.end(),
+  const size_t keep = std::min(ranked.size(), static_cast<size_t>(top_k));
+  std::partial_sort(ranked.begin(), ranked.begin() + static_cast<ptrdiff_t>(keep), ranked.end(),
                     [](const auto& lhs, const auto& rhs) {
-                      if (lhs.second != rhs.second) {
-                        return lhs.second > rhs.second;
+                      if (lhs.first != rhs.first) {
+                        return lhs.first > rhs.first;
                       }
-                      return lhs.first < rhs.first;
+                      return *lhs.second < *rhs.second;
                     });
-  results.resize(keep);
 
+  std::vector<std::pair<std::string, float>> results;
+  results.reserve(keep);
+  for (size_t i = 0; i < keep; ++i) {
+    results.emplace_back(*ranked[i].second, ranked[i].first);
+  }
   return results;
 }
 

@@ -692,41 +692,6 @@ TEST(SimilarityCacheTest, ConcurrentSetMinQueryCostAndInsert) {
 // Phase 2: Stats consistency tests
 // ============================================================================
 
-TEST(SimilarityCacheTest, ClearIfStatsConsistency) {
-  SimilarityCache cache(1024 * 1024, 0.0);
-
-  std::vector<similarity::SimilarityResult> results = {{"result", 0.95f}};
-
-  // Insert 10 entries
-  for (int i = 0; i < 10; ++i) {
-    auto key = MakeKey("item" + std::to_string(i), 10);
-    cache.Insert(key, results, 1.0);
-  }
-
-  auto stats_before = cache.GetStatistics();
-  EXPECT_EQ(stats_before.current_entries, 10);
-
-  // ClearIf: remove entries with even hash_high values (roughly half)
-  cache.ClearIf([](const CacheKey& key) { return (key.hash_high % 2) == 0; });
-
-  auto stats_after = cache.GetStatistics();
-  // Entries should be fewer
-  EXPECT_LT(stats_after.current_entries, stats_before.current_entries);
-  // Memory should be consistent
-  EXPECT_LT(stats_after.current_memory_bytes, stats_before.current_memory_bytes);
-
-  // Verify that looking up remaining entries works
-  uint64_t found_count = 0;
-  for (int i = 0; i < 10; ++i) {
-    auto key = MakeKey("item" + std::to_string(i), 10);
-    auto result = cache.Lookup(key);
-    if (result.has_value()) {
-      ++found_count;
-    }
-  }
-  EXPECT_EQ(found_count, stats_after.current_entries);
-}
-
 TEST(SimilarityCacheTest, EvictForSpaceStatsConsistency) {
   // Small cache: 2KB
   SimilarityCache cache(2048, 0.0);
@@ -914,8 +879,7 @@ TEST(SimilarityCacheTest, RegisterAndInvalidateByItemId) {
   auto key1 = MakeKey("query1", 10);
   std::vector<similarity::SimilarityResult> results = {{"A", 0.95f}, {"B", 0.90f}, {"C", 0.85f}};
 
-  cache.Insert(key1, results, 1.0);
-  cache.RegisterResultItems(key1, {"A", "B", "C"});
+  ASSERT_TRUE(cache.InsertAndRegister(key1, results, {"A", "B", "C"}, 1.0, SearchType::kItemSearch));
 
   // Verify entry exists before invalidation
   auto before = cache.Lookup(key1);
@@ -939,13 +903,9 @@ TEST(SimilarityCacheTest, InvalidateByItemId_OnlyAffectsMatching) {
 
   std::vector<similarity::SimilarityResult> results = {{"dummy", 0.95f}};
 
-  cache.Insert(key1, results, 1.0);
-  cache.Insert(key2, results, 1.0);
-  cache.Insert(key3, results, 1.0);
-
-  cache.RegisterResultItems(key1, {"X", "Y"});
-  cache.RegisterResultItems(key2, {"X", "Z"});
-  cache.RegisterResultItems(key3, {"W"});
+  ASSERT_TRUE(cache.InsertAndRegister(key1, results, {"X", "Y"}, 1.0, SearchType::kItemSearch));
+  ASSERT_TRUE(cache.InsertAndRegister(key2, results, {"X", "Z"}, 1.0, SearchType::kItemSearch));
+  ASSERT_TRUE(cache.InsertAndRegister(key3, results, {"W"}, 1.0, SearchType::kItemSearch));
 
   // Invalidate by "X" — should affect key1 and key2 but not key3
   cache.InvalidateByItemId("X");
@@ -968,11 +928,8 @@ TEST(SimilarityCacheTest, InvalidateByItemId_ReturnsCount) {
 
   std::vector<similarity::SimilarityResult> results = {{"dummy", 0.95f}};
 
-  cache.Insert(key1, results, 1.0);
-  cache.Insert(key2, results, 1.0);
-
-  cache.RegisterResultItems(key1, {"shared", "other1"});
-  cache.RegisterResultItems(key2, {"shared", "other2"});
+  ASSERT_TRUE(cache.InsertAndRegister(key1, results, {"shared", "other1"}, 1.0, SearchType::kItemSearch));
+  ASSERT_TRUE(cache.InsertAndRegister(key2, results, {"shared", "other2"}, 1.0, SearchType::kItemSearch));
 
   size_t invalidated = cache.InvalidateByItemId("shared");
   EXPECT_EQ(invalidated, 2);
@@ -984,8 +941,7 @@ TEST(SimilarityCacheTest, InvalidateByItemId_NonexistentItem) {
   auto key1 = MakeKey("query1", 10);
   std::vector<similarity::SimilarityResult> results = {{"dummy", 0.95f}};
 
-  cache.Insert(key1, results, 1.0);
-  cache.RegisterResultItems(key1, {"A", "B"});
+  ASSERT_TRUE(cache.InsertAndRegister(key1, results, {"A", "B"}, 1.0, SearchType::kItemSearch));
 
   // Invalidate by an item that no entry references
   size_t invalidated = cache.InvalidateByItemId("nonexistent");
@@ -996,12 +952,11 @@ TEST(SimilarityCacheTest, InvalidateByItemId_NonexistentItem) {
   EXPECT_TRUE(result.has_value());
 }
 
-TEST(SimilarityCacheTest, RegisterResultItems_CapsAtMax) {
+TEST(SimilarityCacheTest, InsertAndRegister_CapsAtMax) {
   SimilarityCache cache(1024 * 1024, 0.0);
 
   auto key1 = MakeKey("query1", 10);
   std::vector<similarity::SimilarityResult> results = {{"dummy", 0.95f}};
-  cache.Insert(key1, results, 1.0);
 
   // Register more than kMaxTrackedItemsPerEntry (50) items
   std::vector<std::string> many_items;
@@ -1009,7 +964,7 @@ TEST(SimilarityCacheTest, RegisterResultItems_CapsAtMax) {
   for (int i = 0; i < 100; ++i) {
     many_items.push_back("item_" + std::to_string(i));
   }
-  cache.RegisterResultItems(key1, many_items);
+  ASSERT_TRUE(cache.InsertAndRegister(key1, results, many_items, 1.0, SearchType::kItemSearch));
 
   // Should not crash — that is the primary assertion
 
@@ -1114,12 +1069,13 @@ TEST(SimilarityCacheTest, AccountingMatchesFullScanAcrossEveryMutation) {
     ExpectAccountingMatchesScan(cache, "InsertAndRegister #" + std::to_string(i));
   }
 
-  // Late registration onto an existing entry, including duplicate item ids.
+  // Duplicate item ids within one registration.
   for (int i = 0; i < 40; ++i) {
-    cache.RegisterResultItems(
-        MakeKey("plain_" + std::to_string(i), 10),
-        {"late_" + std::to_string(i), "shared_group_" + std::to_string(i % 4), "late_" + std::to_string(i)});
-    ExpectAccountingMatchesScan(cache, "RegisterResultItems #" + std::to_string(i));
+    ASSERT_TRUE(cache.InsertAndRegister(
+        MakeKey("late_" + std::to_string(i), 10), results,
+        {"late_" + std::to_string(i), "shared_group_" + std::to_string(i % 4), "late_" + std::to_string(i)}, 1.0,
+        SearchType::kItemSearch));
+    ExpectAccountingMatchesScan(cache, "InsertAndRegister with duplicates #" + std::to_string(i));
   }
 
   // Selective invalidation through the reverse index.
@@ -1133,10 +1089,6 @@ TEST(SimilarityCacheTest, AccountingMatchesFullScanAcrossEveryMutation) {
     cache.Erase(MakeKey("plain_" + std::to_string(i), 10));
     ExpectAccountingMatchesScan(cache, "Erase #" + std::to_string(i));
   }
-
-  // Predicate clear over whatever is left.
-  cache.ClearIf([](const CacheKey&) { return true; });
-  ExpectAccountingMatchesScan(cache, "ClearIf");
 
   cache.Clear();
   ExpectAccountingMatchesScan(cache, "Clear");
@@ -1182,19 +1134,17 @@ TEST(SimilarityCacheTest, AccountingMatchesFullScanAfterConcurrentMutations) {
   SimilarityCache cache(4 * 1024 * 1024, 0.0);
   const std::vector<similarity::SimilarityResult> results = {{"result", 0.95F}};
   constexpr int kEntryCount = 100;
-  for (int i = 0; i < kEntryCount; ++i) {
-    ASSERT_TRUE(cache.Insert(MakeKey("concurrent_" + std::to_string(i), 10), results, 1.0));
-  }
 
   std::atomic<bool> stop{false};
   std::vector<std::thread> threads;
   for (int t = 0; t < 2; ++t) {
-    threads.emplace_back([&cache, &stop, t]() {
+    threads.emplace_back([&cache, &stop, &results, t]() {
       int i = 0;
       while (!stop.load(std::memory_order_relaxed)) {
-        cache.RegisterResultItems(
-            MakeKey("concurrent_" + std::to_string(i % kEntryCount), 10),
-            {"owned_" + std::to_string(t) + "_" + std::to_string(i), "shared_" + std::to_string(i % 8)});
+        cache.InsertAndRegister(
+            MakeKey("concurrent_" + std::to_string(i % kEntryCount), 10), results,
+            {"owned_" + std::to_string(t) + "_" + std::to_string(i), "shared_" + std::to_string(i % 8)}, 1.0,
+            SearchType::kItemSearch);
         ++i;
         std::this_thread::yield();
       }
@@ -1230,30 +1180,25 @@ TEST(SimilarityCacheTest, AccountingMatchesFullScanAfterConcurrentMutations) {
   ExpectAccountingMatchesScan(cache, "Clear after concurrent mutation");
 }
 
-TEST(SimilarityCacheTest, ConcurrentRegisterAndInvalidate) {
+TEST(SimilarityCacheTest, ConcurrentInsertAndRegisterAndInvalidate) {
   SimilarityCache cache(10 * 1024 * 1024, 0.0);
 
   std::vector<similarity::SimilarityResult> results = {{"dummy", 0.95f}};
 
-  // Pre-populate cache entries
   const int entry_count = 100;
-  for (int i = 0; i < entry_count; ++i) {
-    auto key = MakeKey("query" + std::to_string(i), 10);
-    cache.Insert(key, results, 1.0);
-  }
 
   std::atomic<bool> stop{false};
 
-  // 2 threads: RegisterResultItems on various keys
+  // 2 threads: InsertAndRegister on various keys
   std::vector<std::thread> registerers;
   for (int t = 0; t < 2; ++t) {
-    registerers.emplace_back([&cache, &stop, t]() {
+    registerers.emplace_back([&cache, &stop, &results, t]() {
       int i = 0;
       while (!stop.load(std::memory_order_relaxed)) {
         auto key = MakeKey("query" + std::to_string(i % entry_count), 10);
         std::vector<std::string> items = {"item_" + std::to_string(t) + "_" + std::to_string(i),
                                           "shared_item_" + std::to_string(i % 10)};
-        cache.RegisterResultItems(key, items);
+        cache.InsertAndRegister(key, results, items, 1.0, SearchType::kItemSearch);
         ++i;
         std::this_thread::yield();
       }
@@ -1288,6 +1233,43 @@ TEST(SimilarityCacheTest, ConcurrentRegisterAndInvalidate) {
   auto stats = cache.GetStatistics();
   // Some entries may have been invalidated
   EXPECT_LE(stats.current_entries, entry_count);
+}
+
+// An invalidated entry is dead weight, so re-inserting its key replaces it
+// rather than being refused until a purge happens to run.
+TEST(SimilarityCacheTest, InsertReplacesInvalidatedEntry) {
+  SimilarityCache cache(1024 * 1024, 0.0);
+  const auto key = MakeKey("query", 10);
+
+  ASSERT_TRUE(cache.Insert(key, {{"old", 0.5F}}, 1.0));
+  ASSERT_TRUE(cache.MarkInvalidated(key));
+  EXPECT_FALSE(cache.Lookup(key).has_value());
+
+  ASSERT_TRUE(cache.Insert(key, {{"fresh", 0.9F}}, 1.0));
+  auto hit = cache.Lookup(key);
+  ASSERT_TRUE(hit.has_value());
+  ASSERT_EQ(hit->size(), 1U);
+  EXPECT_EQ((*hit)[0].item_id, "fresh");
+  EXPECT_EQ(cache.GetStatistics().current_entries, 1U);
+  ExpectAccountingMatchesScan(cache, "replace invalidated entry");
+
+  // A live entry still keeps its slot.
+  EXPECT_FALSE(cache.Insert(key, {{"ignored", 0.1F}}, 1.0));
+}
+
+// Replacing an invalidated entry must also drop its reverse-index references.
+TEST(SimilarityCacheTest, ReplacingInvalidatedEntryReleasesItsReverseIndex) {
+  SimilarityCache cache(1024 * 1024, 0.0);
+  const auto key = MakeKey("query", 10);
+
+  ASSERT_TRUE(cache.InsertAndRegister(key, {{"A", 0.5F}}, {"A"}, 1.0, SearchType::kItemSearch));
+  ASSERT_TRUE(cache.MarkInvalidated(key));
+  ASSERT_TRUE(cache.InsertAndRegister(key, {{"B", 0.5F}}, {"B"}, 1.0, SearchType::kItemSearch));
+
+  EXPECT_EQ(cache.InvalidateByItemId("A"), 0U);
+  EXPECT_TRUE(cache.Lookup(key).has_value());
+  EXPECT_EQ(cache.InvalidateByItemId("B"), 1U);
+  ExpectAccountingMatchesScan(cache, "replace invalidated registered entry");
 }
 
 }  // namespace

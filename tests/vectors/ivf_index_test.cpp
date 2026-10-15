@@ -1294,5 +1294,50 @@ TEST(IvfResetTest, SearchRejectsMismatchedDimension) {
   EXPECT_TRUE(index.Search(query.data(), query_norm, matrix.data(), norms.data(), 1, kDim * 2, 3).empty());
 }
 
+TEST(IvfBufferNormTest, CosineScoreTracksOverwriteAndSwapRemoval) {
+  constexpr uint32_t kDim = 4;
+  IvfIndex index(kDim);
+
+  // Distinct magnitudes: a stale or misplaced stored norm would change the score.
+  const std::vector<float> a{3.0F, 0.0F, 0.0F, 0.0F};
+  const std::vector<float> b{0.0F, 0.5F, 0.0F, 0.0F};
+  const std::vector<float> c{1.0F, 1.0F, 0.0F, 0.0F};
+  index.AppendToBuffer(0, a.data());
+  index.AppendToBuffer(1, b.data());
+  index.AppendToBuffer(2, c.data());
+
+  // Swap-removal moves the last entry (and its norm) into slot 0.
+  index.RemoveVector(0);
+  // Overwrite entry 1 with a vector of a different magnitude.
+  const std::vector<float> b2{0.0F, 0.0F, 8.0F, 0.0F};
+  index.AppendToBuffer(1, b2.data());
+
+  const std::vector<float> query{1.0F, 1.0F, 0.0F, 0.0F};
+  const float query_norm = L2Norm(query);
+  auto results = index.SearchBuffer(query.data(), query_norm, kDim, 5);
+
+  ASSERT_EQ(results.size(), 2U);
+  EXPECT_EQ(results[0].second, 2U);
+  EXPECT_NEAR(results[0].first, 1.0F, 1e-5F);
+  EXPECT_EQ(results[1].second, 1U);
+  EXPECT_NEAR(results[1].first, 0.0F, 1e-5F);
+}
+
+TEST(IvfBufferNormTest, DotMetricIgnoresNorms) {
+  constexpr uint32_t kDim = 2;
+  IvfIndex::Config config;
+  config.metric = IvfMetric::kDot;
+  IvfIndex index(kDim, config);
+
+  const std::vector<float> a{2.0F, 0.0F};
+  index.AppendToBuffer(7, a.data());
+
+  const std::vector<float> query{3.0F, 0.0F};
+  auto results = index.SearchBuffer(query.data(), L2Norm(query), kDim, 1);
+
+  ASSERT_EQ(results.size(), 1U);
+  EXPECT_NEAR(results[0].first, 6.0F, 1e-5F);
+}
+
 }  // namespace
 }  // namespace nvecd::vectors

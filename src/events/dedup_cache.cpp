@@ -21,31 +21,6 @@ bool DedupCache::IsWithinWindow(const CacheEntry& entry, uint64_t timestamp) con
   return event_time_distance <= window_sec_;
 }
 
-bool DedupCache::IsDuplicate(const EventKey& key, uint64_t current_timestamp) const {
-  // Window of 0 means deduplication is disabled
-  if (window_sec_ == 0) {
-    total_misses_.fetch_add(1, std::memory_order_relaxed);
-    return false;
-  }
-
-  std::shared_lock lock(mutex_);
-
-  auto it = cache_.find(key);
-  if (it == cache_.end()) {
-    total_misses_.fetch_add(1, std::memory_order_relaxed);
-    return false;  // Not in cache = new event
-  }
-
-  if (IsWithinWindow(it->second, current_timestamp)) {
-    total_hits_.fetch_add(1, std::memory_order_relaxed);
-    return true;  // Duplicate within window
-  }
-
-  // Outside window = not a duplicate (will be updated)
-  total_misses_.fetch_add(1, std::memory_order_relaxed);
-  return false;
-}
-
 bool DedupCache::WouldDeduplicate(const EventKey& key, uint64_t current_timestamp) const {
   if (window_sec_ == 0) {
     return false;
@@ -86,27 +61,6 @@ bool DedupCache::CheckAndInsert(const EventKey& key, uint64_t timestamp) {
   lru_list_.push_front(key);
   cache_[key] = CacheEntry{timestamp, lru_list_.begin()};
   return false;
-}
-
-void DedupCache::Insert(const EventKey& key, uint64_t timestamp) {
-  std::unique_lock lock(mutex_);
-
-  auto it = cache_.find(key);
-
-  if (it != cache_.end()) {
-    it->second.timestamp = timestamp;
-    lru_list_.splice(lru_list_.begin(), lru_list_, it->second.lru_iter);
-    return;
-  }
-
-  // New key: check if cache is full
-  if (cache_.size() >= max_size_) {
-    EvictLRU();
-  }
-
-  // Insert new entry
-  lru_list_.push_front(key);
-  cache_[key] = CacheEntry{timestamp, lru_list_.begin()};
 }
 
 void DedupCache::Clear() {

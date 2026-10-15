@@ -64,11 +64,10 @@ namespace nvecd::events {
  * @code
  * DedupCache cache(10000, 60);  // 10k entries, 60 second window
  * EventKey key{"user123", "item456", 95};
- * if (cache.IsDuplicate(key, current_timestamp)) {
+ * if (cache.CheckAndInsert(key, current_timestamp)) {
  *   // Skip duplicate event
  * } else {
  *   // Process new event
- *   cache.Insert(key, current_timestamp);
  * }
  * @endcode
  */
@@ -82,42 +81,25 @@ class DedupCache {
   DedupCache(size_t max_size, uint32_t window_sec);
 
   /**
-   * @brief Check if event is a duplicate within time window
+   * @brief Check duplicate state without updating counters, LRU state, or entries
    *
-   * An event is considered duplicate if:
-   * 1. Same (ctx, id, score) exists in cache
-   * 2. Previous timestamp is within window_sec from current_timestamp
-   *
-   * @param key Event key
-   * @param current_timestamp Current event timestamp (seconds since epoch)
-   * @return true if duplicate, false otherwise
+   * An event is a duplicate if the same (ctx, id, score) is cached and its
+   * previous timestamp is within window_sec of the new one (a window of 0
+   * disables deduplication). CheckAndInsert() applies the same rule.
    */
-  bool IsDuplicate(const EventKey& key, uint64_t current_timestamp) const;
-
-  /** Check duplicate state without updating counters, LRU state, or entries. */
   bool WouldDeduplicate(const EventKey& key, uint64_t current_timestamp) const;
 
   /**
    * @brief Atomically test for a duplicate and record a new event.
    *
-   * This is the ingestion-safe counterpart to IsDuplicate()+Insert(). Keeping
-   * the check and update under one exclusive lock prevents two concurrent
-   * requests for the same event from both observing a miss and being counted.
+   * Keeping the check and update under one exclusive lock prevents two
+   * concurrent requests for the same event from both observing a miss and
+   * being counted. A new key evicts the least recently used entry when full; an
+   * existing key is moved to the front.
    *
    * @return true when an in-window duplicate was already present.
    */
   bool CheckAndInsert(const EventKey& key, uint64_t timestamp);
-
-  /**
-   * @brief Insert event into cache
-   *
-   * If cache is full, evicts least recently used entry.
-   * If key already exists, updates timestamp and moves to front.
-   *
-   * @param key Event key
-   * @param timestamp Event timestamp (seconds since epoch)
-   */
-  void Insert(const EventKey& key, uint64_t timestamp);
 
   /**
    * @brief Clear all entries from cache

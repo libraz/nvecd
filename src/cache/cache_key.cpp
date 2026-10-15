@@ -26,10 +26,10 @@ std::string CacheKey::ToString() const {
 }
 
 CacheKey CacheKeyGenerator::Generate(const std::string& normalized_query) {
-  constexpr int kMD5DigestSize = 16;
-  constexpr int kHalfDigestSize = 8;
+  constexpr size_t kHalfDigestSize = MD5::kDigestSize / 2;
+  constexpr int kBitsPerByte = 8;
 
-  uint8_t digest[kMD5DigestSize];       // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+  uint8_t digest[MD5::kDigestSize];     // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
   MD5::Hash(normalized_query, digest);  // NOLINT(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
 
   // Extract two 64-bit values from MD5 digest (128 bits total)
@@ -37,14 +37,13 @@ CacheKey CacheKeyGenerator::Generate(const std::string& normalized_query) {
   uint64_t hash_low = 0;
 
   // High 64 bits (bytes 0-7)
-  for (int i = 0; i < kHalfDigestSize; ++i) {
-    hash_high =
-        (hash_high << kHalfDigestSize) | digest[i];  // NOLINT(cppcoreguidelines-pro-bounds-constant-array-index)
+  for (size_t i = 0; i < kHalfDigestSize; ++i) {
+    hash_high = (hash_high << kBitsPerByte) | digest[i];  // NOLINT(cppcoreguidelines-pro-bounds-constant-array-index)
   }
 
   // Low 64 bits (bytes 8-15)
-  for (int i = kHalfDigestSize; i < kMD5DigestSize; ++i) {
-    hash_low = (hash_low << kHalfDigestSize) | digest[i];  // NOLINT(cppcoreguidelines-pro-bounds-constant-array-index)
+  for (size_t i = kHalfDigestSize; i < MD5::kDigestSize; ++i) {
+    hash_low = (hash_low << kBitsPerByte) | digest[i];  // NOLINT(cppcoreguidelines-pro-bounds-constant-array-index)
   }
 
   return {hash_high, hash_low};

@@ -270,17 +270,13 @@ size_t EventStore::MemoryUsageLocked() const {
     // Context string
     total += sizeof(std::string) + ctx.capacity();
 
-    // Ring buffer events. Traversed in place: materializing them with GetAll()
-    // would deep-copy every stored event (and its heap-allocated item_id) on
-    // every statistics or metrics read, while the lock is held.
-    ring_buffer.ForEach([&total](const Event& event) {
-      total += sizeof(Event);
-      total += event.item_id.capacity();  // Event ID string
-    });
+    // Heap storage behind each event's item_id. Traversed in place: materializing
+    // events with GetAll() would deep-copy each one on every statistics read.
+    ring_buffer.ForEach([&total](const Event& event) { total += event.item_id.capacity(); });
 
-    // Ring buffer overhead
+    // Ring buffer overhead; the event slots themselves are counted once, here.
     total += sizeof(RingBuffer<Event>);
-    total += config_.ctx_buffer_size * sizeof(Event);  // Allocated capacity
+    total += config_.ctx_buffer_size * sizeof(Event);
   }
 
   return total;
