@@ -610,10 +610,8 @@ void SimilarityCache::Touch(const CacheKey& key) {
     return;
   }
 
-  // Move to front of LRU list
-  lru_list_.erase(iter->second.second);
-  lru_list_.push_front(key);
-  iter->second.second = lru_list_.begin();
+  // Move to front without reallocating the list node; the stored iterator stays valid.
+  lru_list_.splice(lru_list_.begin(), lru_list_, iter->second.second);
 }
 
 }  // namespace nvecd::cache

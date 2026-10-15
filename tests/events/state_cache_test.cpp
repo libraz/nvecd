@@ -130,6 +130,26 @@ TEST(StateCacheTest, LRUEviction_AccessRefreshesOrder) {
   EXPECT_TRUE(cache.IsDuplicateSet(key4, 400));
 }
 
+TEST(StateCacheTest, DuplicateSetMovesTheEntryToMostRecent) {
+  StateCache cache(3);
+  StateKey key1("ctx1", "item1");
+  StateKey key2("ctx1", "item2");
+  StateKey key3("ctx1", "item3");
+  StateKey key4("ctx1", "item4");
+
+  cache.UpdateScore(key1, 100);
+  cache.UpdateScore(key2, 200);
+  cache.UpdateScore(key3, 300);
+  ASSERT_TRUE(cache.CheckAndUpdateSet(key1, 100));
+
+  cache.UpdateScore(key4, 400);
+
+  EXPECT_TRUE(cache.WouldDeduplicateSet(key1, 100));
+  EXPECT_FALSE(cache.WouldDeduplicateSet(key2, 200));
+  EXPECT_TRUE(cache.WouldDeduplicateSet(key3, 300));
+  EXPECT_TRUE(cache.WouldDeduplicateSet(key4, 400));
+}
+
 TEST(StateCacheTest, LRUEviction_MarkDeletedRefreshesOrder) {
   StateCache cache(3);
 

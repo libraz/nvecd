@@ -170,9 +170,7 @@ void StateCache::EvictIfFull() {
 void StateCache::TouchLocked(const StateKey& key) {
   auto it = states_.find(key);
   if (it != states_.end()) {
-    lru_list_.erase(it->second.second);
-    lru_list_.push_front(key);
-    it->second.second = lru_list_.begin();
+    lru_list_.splice(lru_list_.begin(), lru_list_, it->second.second);
   }
 }
 
