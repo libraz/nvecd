@@ -8,12 +8,15 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
+#include <cstddef>
 #include <ctime>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "config/config.h"
@@ -86,6 +89,112 @@ struct ConnectionContext {
 };
 
 /**
+ * @brief Per-command accounting buckets reported by INFO, /info and /metrics
+ *
+ * Every command type belongs to exactly one group, so the group counters sum to
+ * ServerStats::total_commands.
+ */
+enum class CommandGroup : uint8_t {
+  kEvent,
+  kSim,
+  kVecset,
+  kVecdel,
+  kMetaset,
+  kInfo,
+  kConfig,
+  kDump,
+  kCache,
+  kOther,  ///< DEBUG, AUTH and requests that did not parse
+  kCount
+};
+
+inline constexpr size_t kCommandGroupCount = static_cast<size_t>(CommandGroup::kCount);
+
+/// Index of @p group into the per-group arrays of ServerStats.
+constexpr size_t GroupIndex(CommandGroup group) {
+  return static_cast<size_t>(group);
+}
+
+/// Label used for a group on every surface (INFO cmdstat_<name>, metrics command="<name>").
+constexpr std::string_view CommandGroupName(CommandGroup group) {
+  switch (group) {
+    case CommandGroup::kEvent:
+      return "event";
+    case CommandGroup::kSim:
+      return "sim";
+    case CommandGroup::kVecset:
+      return "vecset";
+    case CommandGroup::kVecdel:
+      return "vecdel";
+    case CommandGroup::kMetaset:
+      return "metaset";
+    case CommandGroup::kInfo:
+      return "info";
+    case CommandGroup::kConfig:
+      return "config";
+    case CommandGroup::kDump:
+      return "dump";
+    case CommandGroup::kCache:
+      return "cache";
+    case CommandGroup::kOther:
+    case CommandGroup::kCount:
+      return "other";
+  }
+  return "other";
+}
+
+/// Group a command is accounted under. Listed exhaustively so a new command type forces a decision here.
+constexpr CommandGroup CommandGroupOf(CommandType type) {
+  switch (type) {
+    case CommandType::kEvent:
+      return CommandGroup::kEvent;
+    case CommandType::kVecset:
+      return CommandGroup::kVecset;
+    case CommandType::kVecdel:
+      return CommandGroup::kVecdel;
+    case CommandType::kMetaset:
+      return CommandGroup::kMetaset;
+    case CommandType::kSim:
+    case CommandType::kSimv:
+      return CommandGroup::kSim;
+    case CommandType::kInfo:
+      return CommandGroup::kInfo;
+    case CommandType::kConfigHelp:
+    case CommandType::kConfigShow:
+    case CommandType::kConfigVerify:
+    case CommandType::kSet:
+    case CommandType::kGet:
+    case CommandType::kShowVariables:
+      return CommandGroup::kConfig;
+    case CommandType::kDumpSave:
+    case CommandType::kDumpLoad:
+    case CommandType::kDumpVerify:
+    case CommandType::kDumpInfo:
+    case CommandType::kDumpStatus:
+      return CommandGroup::kDump;
+    case CommandType::kCacheStats:
+    case CommandType::kCacheClear:
+    case CommandType::kCacheEnable:
+    case CommandType::kCacheDisable:
+      return CommandGroup::kCache;
+    case CommandType::kDebugOn:
+    case CommandType::kDebugOff:
+    case CommandType::kAuth:
+    case CommandType::kUnknown:
+    case CommandType::kCount:
+      return CommandGroup::kOther;
+  }
+  return CommandGroup::kOther;
+}
+
+/// Point-in-time calls and failures of one command group.
+struct CommandGroupStat {
+  CommandGroup group;
+  uint64_t calls;
+  uint64_t failed;
+};
+
+/**
  * @brief Thread-safe server statistics tracker
  *
  * Reference: ../mygram-db/src/server/server_stats.h
@@ -103,19 +212,26 @@ struct ServerStats {
   alignas(64) std::atomic<uint64_t> total_commands{0};
   std::atomic<uint64_t> failed_commands{0};
 
-  // Per-command type counters (less contended, grouped together)
-  alignas(64) std::atomic<uint64_t> event_commands{0};
-  std::atomic<uint64_t> sim_commands{0};
-  std::atomic<uint64_t> vecset_commands{0};
-  std::atomic<uint64_t> info_commands{0};
-  std::atomic<uint64_t> config_commands{0};
-  std::atomic<uint64_t> dump_commands{0};
-  std::atomic<uint64_t> cache_commands{0};
+  /// Calls and failures per command group, indexed by GroupIndex() (less contended, grouped
+  /// together). They sum to total_commands and failed_commands.
+  alignas(64) std::array<std::atomic<uint64_t>, kCommandGroupCount> calls_by_group{};
+  std::array<std::atomic<uint64_t>, kCommandGroupCount> failed_by_group{};
 
   /// WAL records that recovery classified as an intended gap and skipped.
   /// Reported by INFO so the size of a recovery gap is observable rather than
   /// only visible as individual log lines.
   std::atomic<uint64_t> wal_replay_records_skipped{0};
+
+  /// Calls and failures of every group, in CommandGroup order.
+  std::array<CommandGroupStat, kCommandGroupCount> CommandGroupStats() const {
+    std::array<CommandGroupStat, kCommandGroupCount> stats{};
+    for (size_t i = 0; i < kCommandGroupCount; ++i) {
+      const auto group = static_cast<CommandGroup>(i);
+      stats[i] = {group, calls_by_group[i].load(std::memory_order_relaxed),
+                  failed_by_group[i].load(std::memory_order_relaxed)};
+    }
+    return stats;
+  }
 
   /**
    * @brief Get uptime in seconds
@@ -139,9 +255,9 @@ struct ServerStats {
  * @brief RAII accounting for one dispatched command
  *
  * Construction counts the command in ServerStats::total_commands and in the
- * per-type counter for @p type; destruction counts it in
- * ServerStats::failed_commands unless MarkSucceeded() has been called. Handler
- * bodies therefore never touch the counters, and adding an early return cannot
+ * counter of its CommandGroup; destruction counts it in
+ * ServerStats::failed_commands (and its group's failure counter) unless
+ * MarkSucceeded() has been called. Handler bodies therefore never touch the counters, and adding an early return cannot
  * drop an increment or leave failed_commands above total_commands: every exit
  * path of a scope that owns a guard is accounted exactly once.
  *
@@ -152,9 +268,9 @@ struct ServerStats {
  */
 class CommandStatsScope {
  public:
-  CommandStatsScope(ServerStats& stats, CommandType type) : stats_(stats) {
+  CommandStatsScope(ServerStats& stats, CommandType type) : stats_(stats), group_(CommandGroupOf(type)) {
     stats_.total_commands.fetch_add(1, std::memory_order_relaxed);
-    CountByType(stats_, type);
+    stats_.calls_by_group[GroupIndex(group_)].fetch_add(1, std::memory_order_relaxed);
   }
 
   CommandStatsScope(const CommandStatsScope&) = delete;
@@ -165,6 +281,7 @@ class CommandStatsScope {
   ~CommandStatsScope() {
     if (!succeeded_) {
       stats_.failed_commands.fetch_add(1, std::memory_order_relaxed);
+      stats_.failed_by_group[GroupIndex(group_)].fetch_add(1, std::memory_order_relaxed);
     }
   }
 
@@ -172,57 +289,8 @@ class CommandStatsScope {
   void MarkSucceeded() { succeeded_ = true; }
 
  private:
-  /// Per-type accounting. Types without a dedicated counter are listed
-  /// explicitly so that adding a command type forces a decision here.
-  static void CountByType(ServerStats& stats, CommandType type) {
-    switch (type) {
-      case CommandType::kEvent:
-        stats.event_commands.fetch_add(1, std::memory_order_relaxed);
-        return;
-      case CommandType::kVecset:
-        stats.vecset_commands.fetch_add(1, std::memory_order_relaxed);
-        return;
-      case CommandType::kSim:
-      case CommandType::kSimv:
-        stats.sim_commands.fetch_add(1, std::memory_order_relaxed);
-        return;
-      case CommandType::kInfo:
-        stats.info_commands.fetch_add(1, std::memory_order_relaxed);
-        return;
-      case CommandType::kConfigHelp:
-      case CommandType::kConfigShow:
-      case CommandType::kConfigVerify:
-      case CommandType::kSet:
-      case CommandType::kGet:
-      case CommandType::kShowVariables:
-        stats.config_commands.fetch_add(1, std::memory_order_relaxed);
-        return;
-      case CommandType::kDumpSave:
-      case CommandType::kDumpLoad:
-      case CommandType::kDumpVerify:
-      case CommandType::kDumpInfo:
-      case CommandType::kDumpStatus:
-        stats.dump_commands.fetch_add(1, std::memory_order_relaxed);
-        return;
-      case CommandType::kCacheStats:
-      case CommandType::kCacheClear:
-      case CommandType::kCacheEnable:
-      case CommandType::kCacheDisable:
-        stats.cache_commands.fetch_add(1, std::memory_order_relaxed);
-        return;
-      // Counted in total_commands only: these have no per-type counter.
-      case CommandType::kVecdel:
-      case CommandType::kMetaset:
-      case CommandType::kDebugOn:
-      case CommandType::kDebugOff:
-      case CommandType::kAuth:
-      case CommandType::kUnknown:
-      case CommandType::kCount:
-        return;
-    }
-  }
-
   ServerStats& stats_;
+  CommandGroup group_;
   bool succeeded_ = false;
 };
 

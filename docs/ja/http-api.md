@@ -227,9 +227,23 @@ ID はパスやクエリ文字列ではなく JSON ボディから読むため�
   "total_requests": 52,
   "total_commands_processed": 52,
   "failed_commands": 12,
+  "wal_replay_records_skipped": 0,
+  "commandstats": {
+    "event": {"calls": 4, "failed": 0},
+    "sim": {"calls": 10, "failed": 6},
+    "vecset": {"calls": 2, "failed": 0},
+    "vecdel": {"calls": 0, "failed": 0},
+    "metaset": {"calls": 0, "failed": 0},
+    "info": {"calls": 3, "failed": 0},
+    "config": {"calls": 4, "failed": 0},
+    "dump": {"calls": 2, "failed": 0},
+    "cache": {"calls": 2, "failed": 0},
+    "other": {"calls": 2, "failed": 2}
+  },
   "memory": {
-    "used_memory_bytes": 4240,
-    "used_memory_human": "4.14KB",
+    "used_memory_bytes": 16,
+    "used_memory_human": "16B",
+    "used_memory_stores_bytes": 4240,
     "used_memory_events": "3.08KB",
     "used_memory_vectors": "578B",
     "used_memory_co_occurrence": "504B",
@@ -265,7 +279,7 @@ ID はパスやクエリ文字列ではなく JSON ボディから読むため�
 }
 ```
 
-`total_requests` と `total_commands_processed` は同じカウンタを 2 つの名前で運んでいます。`memory.used_memory_bytes` は 3 つのストアの合計であり、ベクトル行列だけを数える TCP の `INFO` の `used_memory_bytes` とは別の数値です。`process_rss*` の一群はプロセスのメモリ情報が読める場合にだけ、`*_system_memory*` の一群はシステムのメモリ情報が読める場合にだけ現れます。`stores` の下のエントリは、そのストアが存在する場合にだけ現れます。キャッシュが接続されていない場合、`cache` は `{"enabled": false}` だけになります。
+`total_requests` と `total_commands_processed` は同じカウンタを 2 つの名前で運んでいます。`memory.used_memory_bytes` は TCP の `INFO` と同じくベクトル行列だけを数えます。`memory.used_memory_stores_bytes` は `used_memory_events`、`used_memory_vectors`、`used_memory_co_occurrence` として示される 3 つのストアの合計です。`commandstats` は TCP の `INFO` の `# Commandstats` セクションと同じコマンドグループ別の呼び出し数と失敗数を、`wal_replay_records_skipped` は同じ件数を運びます。`process_rss*` の一群はプロセスのメモリ情報が読める場合にだけ、`*_system_memory*` の一群はシステムのメモリ情報が読める場合にだけ現れます。`stores` の下のエントリは、そのストアが存在する場合にだけ現れます。キャッシュが接続されていない場合、`cache` は `{"enabled": false}` だけになります。
 
 ### `GET /config`
 
@@ -431,24 +445,24 @@ JSON オブジェクトでないボディも `400` です。
 
 ### `GET /dump/status`
 
-ボディを取りません。`data` がバックグラウンドのスナップショット書き込みプロセスの状態を運びます。
+ボディを取りません。`snapshot` が TCP の `DUMP STATUS` ブロックと同じフィールドを、同じ名前で運びます。`snapshot.status` の状態名も同じ小文字です。値はすべて文字列です。このブロックは共通ハンドラのテキスト出力を解析して作られるためです。
 
-| `data` | 追加フィールド |
+| `snapshot.status` | 追加フィールド |
 |---|---|
-| `IDLE` | なし |
-| `IN_PROGRESS` | `filepath` |
-| `COMPLETED` | `filepath` |
-| `FAILED` | `filepath`、`error_message` |
+| `idle` | なし |
+| `in_progress` | `filepath`、`pid`、`start_time` |
+| `completed` | `filepath`、`start_time`、`end_time` |
+| `failed` | `filepath`、`start_time`、`end_time`、`error` |
 
 ```json
-{"data":"COMPLETED","filepath":"/var/lib/nvecd/snapshots/nvecd.nvec","status":"ok"}
+{"snapshot":{"end_time":"1788427643","filepath":"/var/lib/nvecd/snapshots/nvecd.nvec","start_time":"1788427643","status":"completed"},"status":"ok"}
 ```
 
 ```json
-{"data":"IDLE","status":"ok"}
+{"snapshot":{"status":"idle"},"status":"ok"}
 ```
 
-`snapshot.mode: lock` で設定されたサーバーにはバックグラウンドの書き込みプロセスがないため、常に `IDLE` を返します。TCP の `DUMP STATUS` ブロックは同じ状態を小文字で報告し、このルートにはない `pid`、`start_time`、`end_time` を運びます。
+`snapshot.mode: lock` で設定されたサーバーにはバックグラウンドの書き込みプロセスがないため、常に `idle` を返します。最上位の `status` は、リクエスト自体が成功していれば常に `ok` です。
 
 ## デバッグルート
 
@@ -518,9 +532,28 @@ nvecd_uptime_seconds 61
 # HELP nvecd_commands_total Total commands processed
 # TYPE nvecd_commands_total counter
 nvecd_commands_total{command="event"} 6
-nvecd_commands_total{command="vecset"} 3
 nvecd_commands_total{command="sim"} 14
-nvecd_commands_total 72
+nvecd_commands_total{command="vecset"} 3
+nvecd_commands_total{command="vecdel"} 0
+nvecd_commands_total{command="metaset"} 0
+nvecd_commands_total{command="info"} 4
+nvecd_commands_total{command="config"} 2
+nvecd_commands_total{command="dump"} 1
+nvecd_commands_total{command="cache"} 1
+nvecd_commands_total{command="other"} 0
+
+# HELP nvecd_commands_failed_total Commands that did not succeed
+# TYPE nvecd_commands_failed_total counter
+nvecd_commands_failed_total{command="event"} 0
+nvecd_commands_failed_total{command="sim"} 2
+nvecd_commands_failed_total{command="vecset"} 1
+nvecd_commands_failed_total{command="vecdel"} 0
+nvecd_commands_failed_total{command="metaset"} 0
+nvecd_commands_failed_total{command="info"} 0
+nvecd_commands_failed_total{command="config"} 0
+nvecd_commands_failed_total{command="dump"} 0
+nvecd_commands_failed_total{command="cache"} 0
+nvecd_commands_failed_total{command="other"} 0
 
 # HELP nvecd_memory_bytes Current memory usage in bytes
 # TYPE nvecd_memory_bytes gauge
@@ -542,7 +575,8 @@ nvecd_contexts_total 2
 | メトリクス | 型 | 意味 |
 |---|---|---|
 | `nvecd_uptime_seconds` | counter | 起動からの秒数 |
-| `nvecd_commands_total` | counter | 処理したコマンド数。コマンド別の系列は `command="event"`、`"vecset"`、`"sim"` のラベルを持ち、ラベルなしの系列が全コマンドの合計を運ぶ |
+| `nvecd_commands_total` | counter | 処理したコマンド数。コマンドグループ（`event`、`sim`、`vecset`、`vecdel`、`metaset`、`info`、`config`、`dump`、`cache`、`other`）ごとに 1 系列で、合計すると全体の数になる |
+| `nvecd_commands_failed_total` | counter | 成功しなかったコマンド数。`command` ラベルは同じ |
 | `nvecd_memory_bytes` | gauge | イベントストア、ベクトルストア、共起索引の合計 |
 | `nvecd_vectors_total` | gauge | 保持しているベクトル数 |
 | `nvecd_events_total` | gauge | 保持しているイベント数 |
@@ -556,7 +590,7 @@ nvecd_contexts_total 2
 
 ストア系の 3 メトリクスはそのストアが接続されている場合にだけ、キャッシュ系の 6 メトリクスはキャッシュが接続されている場合にだけ現れます。キャッシュを無効にした状態でスクレイプすると `nvecd_cache_*` の系列はひとつもないため、ダッシュボードはその状態を許容する必要があります。
 
-ラベルなしの `nvecd_commands_total` 系列はラベル付きの系列とメトリクス名を共有しています。この混在を拒否するスクレイプ設定もあるため、ラベルなしの系列を落とすリラベルルール、あるいはラベル付きを合計する記録ルールで回避します。
+ラベルなしの合計系列はありません。`command` ごとの系列を合計してください（例: `sum(rate(nvecd_commands_total[5m]))`）。
 
 ## CORS
 
@@ -610,7 +644,7 @@ curl -X POST http://127.0.0.1:8080/dump/save -H 'Authorization: Bearer s3cret' -
 # {"filepath":"/var/lib/nvecd/snapshots/nvecd.nvec","status":"ok"}
 
 until curl -s -H 'Authorization: Bearer s3cret' http://127.0.0.1:8080/dump/status \
-      | grep -q '"data":"COMPLETED"'; do sleep 1; done
+      | grep -q '"status":"completed"'; do sleep 1; done
 ```
 
 Prometheus のスクレイプ設定は次のようになります。

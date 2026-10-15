@@ -165,7 +165,7 @@ Rather than estimating the total, read it. `INFO` reports `used_memory_bytes`, b
 nvecd-cli INFO
 ```
 
-The response is grouped into sections and ends with `END`. `total_commands_processed` and `failed_commands` give the error rate; `active_connections` against `performance.max_connections` gives connection headroom; `event_commands`, `sim_commands` and `vecset_commands` give the read-write mix; `memory_health` is the server's own assessment of memory pressure; `cache_hit_rate` repeats the cache's headline number; and `id_count`, `ctx_count`, `vector_count` and `event_count` give the data volume the rest of the numbers apply to.
+The response is grouped into sections and ends with `END`. `total_commands_processed` and `failed_commands` give the error rate; `active_connections` against `performance.max_connections` gives connection headroom; `event_commands`, `sim_commands` and `vecset_commands` give the read-write mix; `memory_health` is the server's own assessment of memory pressure; `cache_hit_rate` repeats the cache's headline number; the `cmdstat_*` lines give calls and failures per command group, and `id_count`, `ctx_count`, `vector_count` and `event_count` give the data volume the rest of the numbers apply to.
 
 ### The metrics endpoint
 
@@ -175,7 +175,7 @@ With `api.http.enable` set, the server exposes Prometheus text format:
 curl http://localhost:8080/metrics
 ```
 
-It publishes `nvecd_uptime_seconds`, `nvecd_commands_total` broken down by command and in total, `nvecd_memory_bytes`, `nvecd_vectors_total`, `nvecd_events_total`, `nvecd_contexts_total`, and the cache series `nvecd_cache_queries_total`, `nvecd_cache_hits_total`, `nvecd_cache_misses_total`, `nvecd_cache_hit_rate` and `nvecd_cache_entries`.
+It publishes `nvecd_uptime_seconds`, `nvecd_commands_total` and `nvecd_commands_failed_total` broken down by command group, `nvecd_memory_bytes`, `nvecd_vectors_total`, `nvecd_events_total`, `nvecd_contexts_total`, and the cache series `nvecd_cache_queries_total`, `nvecd_cache_hits_total`, `nvecd_cache_misses_total`, `nvecd_cache_hit_rate` and `nvecd_cache_entries`.
 
 Rate of change is what to alert on. A `nvecd_cache_hit_rate` that falls while `nvecd_commands_total` for `vecset` rises means writes are invalidating faster than reads can repopulate; `nvecd_memory_bytes` rising while `nvecd_vectors_total` is flat means the growth is on the event side.
 

@@ -18,6 +18,22 @@
 
 namespace nvecd::server::handlers {
 
+MemoryFigures GatherMemoryFigures(const HandlerContext& ctx) {
+  MemoryFigures figures;
+  if (ctx.vector_store != nullptr) {
+    figures.vector_matrix_bytes = static_cast<uint64_t>(ctx.vector_store->GetVectorCount()) *
+                                  static_cast<uint64_t>(ctx.vector_store->GetDimension()) * sizeof(float);
+    figures.vectors_bytes = ctx.vector_store->MemoryUsage();
+  }
+  if (ctx.event_store != nullptr) {
+    figures.events_bytes = ctx.event_store->MemoryUsage();
+  }
+  if (ctx.co_index != nullptr) {
+    figures.co_index_bytes = ctx.co_index->MemoryUsage();
+  }
+  return figures;
+}
+
 utils::Expected<std::string, utils::Error> HandleInfo(const HandlerContext& ctx) {
   std::ostringstream oss;
 
@@ -35,16 +51,22 @@ utils::Expected<std::string, utils::Error> HandleInfo(const HandlerContext& ctx)
   oss << "failed_commands: " << ctx.stats.failed_commands.load() << "\n";
   oss << "total_connections_received: " << ctx.stats.total_connections.load() << "\n";
   oss << "active_connections: " << ctx.stats.active_connections.load() << "\n";
-  oss << "event_commands: " << ctx.stats.event_commands.load() << "\n";
-  oss << "sim_commands: " << ctx.stats.sim_commands.load() << "\n";
-  oss << "vecset_commands: " << ctx.stats.vecset_commands.load() << "\n";
+  for (const auto group : {CommandGroup::kEvent, CommandGroup::kSim, CommandGroup::kVecset}) {
+    oss << CommandGroupName(group)
+        << "_commands: " << ctx.stats.calls_by_group[GroupIndex(group)].load(std::memory_order_relaxed) << "\n";
+  }
   oss << "wal_replay_records_skipped: " << ctx.stats.wal_replay_records_skipped.load() << "\n";
   oss << "\n";
 
+  // Commandstats section
+  oss << "# Commandstats\n";
+  for (const auto& stat : ctx.stats.CommandGroupStats()) {
+    oss << "cmdstat_" << CommandGroupName(stat.group) << ": calls=" << stat.calls << ",failed=" << stat.failed << "\n";
+  }
+  oss << "\n";
+
   // Memory section
-  size_t dimension = ctx.vector_store != nullptr ? ctx.vector_store->GetDimension() : 0;
-  uint64_t vec_count = ctx.vector_store != nullptr ? ctx.vector_store->GetVectorCount() : 0;
-  uint64_t used_memory_bytes = vec_count * dimension * sizeof(float);
+  const uint64_t used_memory_bytes = GatherMemoryFigures(ctx).vector_matrix_bytes;
   double used_memory_mb = static_cast<double>(used_memory_bytes) / (1024.0 * 1024.0);
   oss << "# Memory\n";
   oss << "used_memory_bytes: " << used_memory_bytes << "\n";

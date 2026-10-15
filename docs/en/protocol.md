@@ -311,6 +311,18 @@ sim_commands: 10
 vecset_commands: 2
 wal_replay_records_skipped: 0
 
+# Commandstats
+cmdstat_event: calls=4,failed=0
+cmdstat_sim: calls=10,failed=6
+cmdstat_vecset: calls=2,failed=0
+cmdstat_vecdel: calls=0,failed=0
+cmdstat_metaset: calls=0,failed=0
+cmdstat_info: calls=3,failed=0
+cmdstat_config: calls=4,failed=0
+cmdstat_dump: calls=2,failed=0
+cmdstat_cache: calls=2,failed=0
+cmdstat_other: calls=2,failed=2
+
 # Memory
 used_memory_bytes: 16
 used_memory_human: 0.00 MB
@@ -330,7 +342,7 @@ event_count: 4
 END
 ```
 
-`used_memory_bytes` counts only the vector matrix (`vector_count × dimension × 4`); the HTTP `/info` route reports per-store totals and process RSS as well. `wal_replay_records_skipped` is the running count of WAL records that recovery could not restore, described in [persistence.md](./persistence.md).
+`used_memory_bytes` counts only the vector matrix (`vector_count × dimension × 4`); HTTP `/info` reports the same figure there and adds per-store totals and process RSS beside it. `cmdstat_<group>` lines give the calls and failures of each command group; the call counts sum to `total_commands_processed` and the failures to `failed_commands`, and HTTP `/info` and `/metrics` report the same groups. `wal_replay_records_skipped` is the running count of WAL records that recovery could not restore, described in [persistence.md](./persistence.md).
 
 ### `CONFIG`
 

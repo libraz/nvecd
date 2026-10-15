@@ -165,7 +165,7 @@ bytes ≈ vectors × dimension × 4      （行列。float32）
 nvecd-cli INFO
 ```
 
-応答はセクションに分かれ、`END` で終わります。`total_commands_processed` と `failed_commands` がエラー率を、`active_connections` と `performance.max_connections` の対比が接続の余裕を、`event_commands`、`sim_commands`、`vecset_commands` が読み書きの比率を、`memory_health` がメモリ逼迫についてのサーバー自身の判断を、`cache_hit_rate` がキャッシュの代表値を、そして `id_count`、`ctx_count`、`vector_count`、`event_count` が他の数値の前提となるデータ量を示します。
+応答はセクションに分かれ、`END` で終わります。`total_commands_processed` と `failed_commands` がエラー率を、`active_connections` と `performance.max_connections` の対比が接続の余裕を、`event_commands`、`sim_commands`、`vecset_commands` が読み書きの比率を、`memory_health` がメモリ逼迫についてのサーバー自身の判断を、`cache_hit_rate` がキャッシュの代表値を、`cmdstat_*` の行がコマンドグループ別の呼び出し数と失敗数を、そして `id_count`、`ctx_count`、`vector_count`、`event_count` が他の数値の前提となるデータ量を示します。
 
 ### メトリクスエンドポイント
 
@@ -175,7 +175,7 @@ nvecd-cli INFO
 curl http://localhost:8080/metrics
 ```
 
-公開されるのは `nvecd_uptime_seconds`、コマンド別と合計の `nvecd_commands_total`、`nvecd_memory_bytes`、`nvecd_vectors_total`、`nvecd_events_total`、`nvecd_contexts_total`、そしてキャッシュの系列である `nvecd_cache_queries_total`、`nvecd_cache_hits_total`、`nvecd_cache_misses_total`、`nvecd_cache_hit_rate`、`nvecd_cache_entries` です。
+公開されるのは `nvecd_uptime_seconds`、コマンドグループ別の `nvecd_commands_total` と `nvecd_commands_failed_total`、`nvecd_memory_bytes`、`nvecd_vectors_total`、`nvecd_events_total`、`nvecd_contexts_total`、そしてキャッシュの系列である `nvecd_cache_queries_total`、`nvecd_cache_hits_total`、`nvecd_cache_misses_total`、`nvecd_cache_hit_rate`、`nvecd_cache_entries` です。
 
 アラートを設定すべきなのは変化率です。`vecset` の `nvecd_commands_total` が伸びながら `nvecd_cache_hit_rate` が下がるなら、書き込みが読み込みによる再充填を上回っています。`nvecd_vectors_total` が横ばいのまま `nvecd_memory_bytes` が伸びるなら、増えているのはイベント側です。
 

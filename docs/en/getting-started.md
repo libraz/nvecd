@@ -225,6 +225,18 @@ sim_commands: 9
 vecset_commands: 4
 wal_replay_records_skipped: 0
 
+# Commandstats
+cmdstat_event: calls=6,failed=0
+cmdstat_sim: calls=9,failed=0
+cmdstat_vecset: calls=4,failed=0
+cmdstat_vecdel: calls=0,failed=0
+cmdstat_metaset: calls=1,failed=0
+cmdstat_info: calls=1,failed=0
+cmdstat_config: calls=1,failed=0
+cmdstat_dump: calls=1,failed=0
+cmdstat_cache: calls=1,failed=0
+cmdstat_other: calls=0,failed=0
+
 # Memory
 used_memory_bytes: 64
 used_memory_human: 0.00 MB

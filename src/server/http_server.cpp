@@ -38,6 +38,7 @@
 #include "server/filter_parser.h"
 #include "server/handlers/cache_handler.h"
 #include "server/handlers/dump_handler.h"
+#include "server/handlers/info_handler.h"
 #include "server/request_dispatcher.h"
 #include "server/score_format.h"
 #include "server/wal_codec.h"
@@ -923,40 +924,30 @@ void HttpServer::HandleInfo(const httplib::Request& /*req*/, httplib::Response& 
     response["total_requests"] = effective_stats.total_commands.load();
     response["total_commands_processed"] = effective_stats.total_commands.load();
     response["failed_commands"] = effective_stats.failed_commands.load();
+    response["wal_replay_records_skipped"] = effective_stats.wal_replay_records_skipped.load();
 
-    // Memory statistics
-    size_t total_memory = 0;
-
-    // Event store memory
-    size_t event_memory = 0;
-    if (handler_context_ != nullptr && handler_context_->event_store) {
-      event_memory = handler_context_->event_store->MemoryUsage();
-      total_memory += event_memory;
+    // Same per-group figures as the TCP INFO Commandstats section.
+    json commandstats = json::object();
+    for (const auto& stat : effective_stats.CommandGroupStats()) {
+      commandstats[std::string(CommandGroupName(stat.group))] = {{"calls", stat.calls}, {"failed", stat.failed}};
     }
+    response["commandstats"] = commandstats;
 
-    // Vector store memory
-    size_t vector_memory = 0;
-    if (handler_context_ != nullptr && handler_context_->vector_store) {
-      vector_memory = handler_context_->vector_store->MemoryUsage();
-      total_memory += vector_memory;
-    }
-
-    // Co-occurrence index memory
-    size_t co_memory = 0;
-    if (handler_context_ != nullptr && handler_context_->co_index) {
-      co_memory = handler_context_->co_index->MemoryUsage();
-      total_memory += co_memory;
-    }
-
-    // Memory tracking (simple ServerStats doesn't have UpdateMemoryUsage method)
-    // Memory is tracked through store statistics instead
+    // Memory statistics, computed by the same routine TCP INFO uses.
+    const auto memory_figures =
+        handler_context_ != nullptr ? handlers::GatherMemoryFigures(*handler_context_) : handlers::MemoryFigures{};
+    const size_t event_memory = memory_figures.events_bytes;
+    const size_t vector_memory = memory_figures.vectors_bytes;
+    const size_t co_memory = memory_figures.co_index_bytes;
 
     // Process memory information (retrieved early for peak memory fields)
     auto proc_info = utils::GetProcessMemoryInfo();
 
     json memory_obj;
-    memory_obj["used_memory_bytes"] = total_memory;
-    memory_obj["used_memory_human"] = utils::FormatBytes(total_memory);
+    // Vector matrix only, as TCP INFO reports it; store totals follow separately.
+    memory_obj["used_memory_bytes"] = memory_figures.vector_matrix_bytes;
+    memory_obj["used_memory_human"] = utils::FormatBytes(memory_figures.vector_matrix_bytes);
+    memory_obj["used_memory_stores_bytes"] = memory_figures.StoresTotal();
     memory_obj["peak_memory_bytes"] = proc_info ? proc_info->peak_rss_bytes : 0;
     memory_obj["peak_memory_human"] = utils::FormatBytes(proc_info ? proc_info->peak_rss_bytes : 0);
     memory_obj["used_memory_events"] = utils::FormatBytes(event_memory);
@@ -1556,6 +1547,25 @@ void HttpServer::HandleSimv(const httplib::Request& req, httplib::Response& res)
 //
 
 namespace {
+/// Parse a handler's "key: value" text block into a JSON object of strings.
+/// Lines without a ": " separator (status line, END) are skipped.
+json KeyValueBlockToJson(const std::string& block) {
+  json fields = json::object();
+  std::istringstream iss(block);
+  std::string line;
+  while (std::getline(iss, line)) {
+    if (!line.empty() && line.back() == '\r') {
+      line.pop_back();
+    }
+    const auto sep = line.find(": ");
+    if (sep == std::string::npos) {
+      continue;
+    }
+    fields[line.substr(0, sep)] = line.substr(sep + 2);
+  }
+  return fields;
+}
+
 /// Extract the resolved path the dump handlers append after their status
 /// keyword ("OK <VERB> <path>\r\n"). The path is the rest of the line, so a
 /// path containing whitespace is returned whole.
@@ -1700,19 +1710,7 @@ void HttpServer::HandleDumpInfo(const httplib::Request& req, httplib::Response& 
 
     // The structured handler returns a "key: value" block; surface the parsed
     // fields as JSON so callers get a typed shape rather than a raw text blob.
-    json info = json::object();
-    std::istringstream iss(*result);
-    std::string line;
-    while (std::getline(iss, line)) {
-      if (!line.empty() && line.back() == '\r') {
-        line.pop_back();
-      }
-      auto sep = line.find(": ");
-      if (sep == std::string::npos) {
-        continue;
-      }
-      info[line.substr(0, sep)] = line.substr(sep + 2);
-    }
+    const json info = KeyValueBlockToJson(*result);
 
     json response;
     response["status"] = "ok";
@@ -1758,25 +1756,25 @@ void HttpServer::HandleMetrics(const httplib::Request& /*req*/, httplib::Respons
     metrics << "# TYPE nvecd_uptime_seconds counter\n";
     metrics << "nvecd_uptime_seconds " << effective_stats.GetUptimeSeconds() << "\n\n";
 
-    // Total commands
+    // Per-group commands; the series sum to the total.
+    const auto group_stats = effective_stats.CommandGroupStats();
     metrics << "# HELP nvecd_commands_total Total commands processed\n";
     metrics << "# TYPE nvecd_commands_total counter\n";
-    metrics << "nvecd_commands_total{command=\"event\"} " << effective_stats.event_commands.load() << "\n";
-    metrics << "nvecd_commands_total{command=\"vecset\"} " << effective_stats.vecset_commands.load() << "\n";
-    metrics << "nvecd_commands_total{command=\"sim\"} " << effective_stats.sim_commands.load() << "\n";
-    metrics << "nvecd_commands_total " << effective_stats.total_commands.load() << "\n\n";
+    for (const auto& stat : group_stats) {
+      metrics << "nvecd_commands_total{command=\"" << CommandGroupName(stat.group) << "\"} " << stat.calls << "\n";
+    }
+    metrics << "\n";
+    metrics << "# HELP nvecd_commands_failed_total Commands that did not succeed\n";
+    metrics << "# TYPE nvecd_commands_failed_total counter\n";
+    for (const auto& stat : group_stats) {
+      metrics << "nvecd_commands_failed_total{command=\"" << CommandGroupName(stat.group) << "\"} " << stat.failed
+              << "\n";
+    }
+    metrics << "\n";
 
     // Memory usage
-    size_t total_memory = 0;
-    if (handler_context_ != nullptr && handler_context_->event_store) {
-      total_memory += handler_context_->event_store->MemoryUsage();
-    }
-    if (handler_context_ != nullptr && handler_context_->vector_store) {
-      total_memory += handler_context_->vector_store->MemoryUsage();
-    }
-    if (handler_context_ != nullptr && handler_context_->co_index) {
-      total_memory += handler_context_->co_index->MemoryUsage();
-    }
+    const size_t total_memory =
+        handler_context_ != nullptr ? handlers::GatherMemoryFigures(*handler_context_).StoresTotal() : 0;
 
     metrics << "# HELP nvecd_memory_bytes Current memory usage in bytes\n";
     metrics << "# TYPE nvecd_memory_bytes gauge\n";
@@ -1983,41 +1981,16 @@ void HttpServer::HandleCacheDisable(const httplib::Request& /*req*/, httplib::Re
 void HttpServer::HandleDumpStatus(const httplib::Request& /*req*/, httplib::Response& res) {
   // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
-    if (handler_context_ == nullptr || handler_context_->fork_snapshot_writer == nullptr) {
-      json response;
-      response["status"] = "ok";
-      response["data"] = "IDLE";
-      SendJson(res, kHttpOk, response);
+    auto result = handlers::HandleDumpStatus(*handler_context_);
+    if (!result) {
+      SendError(res, ErrorCodeToHttpStatus(result.error().code()), result.error().message());
       return;
     }
 
-    // Reap any finished child
-    handler_context_->fork_snapshot_writer->CheckChild();
-
-    auto snapshot_status = handler_context_->fork_snapshot_writer->GetStatus();
-
+    // Same fields and spelling as the TCP DUMP STATUS block.
     json response;
     response["status"] = "ok";
-
-    switch (snapshot_status.status) {
-      case storage::SnapshotStatus::kIdle:
-        response["data"] = "IDLE";
-        break;
-      case storage::SnapshotStatus::kInProgress:
-        response["data"] = "IN_PROGRESS";
-        response["filepath"] = snapshot_status.filepath;
-        break;
-      case storage::SnapshotStatus::kCompleted:
-        response["data"] = "COMPLETED";
-        response["filepath"] = snapshot_status.filepath;
-        break;
-      case storage::SnapshotStatus::kFailed:
-        response["data"] = "FAILED";
-        response["filepath"] = snapshot_status.filepath;
-        response["error_message"] = snapshot_status.error_message;
-        break;
-    }
-
+    response["snapshot"] = KeyValueBlockToJson(*result);
     SendJson(res, kHttpOk, response);
 
   } catch (const std::exception& e) {

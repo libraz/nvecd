@@ -311,6 +311,18 @@ sim_commands: 10
 vecset_commands: 2
 wal_replay_records_skipped: 0
 
+# Commandstats
+cmdstat_event: calls=4,failed=0
+cmdstat_sim: calls=10,failed=6
+cmdstat_vecset: calls=2,failed=0
+cmdstat_vecdel: calls=0,failed=0
+cmdstat_metaset: calls=0,failed=0
+cmdstat_info: calls=3,failed=0
+cmdstat_config: calls=4,failed=0
+cmdstat_dump: calls=2,failed=0
+cmdstat_cache: calls=2,failed=0
+cmdstat_other: calls=2,failed=2
+
 # Memory
 used_memory_bytes: 16
 used_memory_human: 0.00 MB
@@ -330,7 +342,7 @@ event_count: 4
 END
 ```
 
-`used_memory_bytes` が数えるのはベクトル行列だけです（`vector_count × dimension × 4`）。HTTP の `/info` はストアごとの合計とプロセスの RSS も報告します。`wal_replay_records_skipped` は復旧が復元できなかった WAL レコードの累計で、[persistence.md](./persistence.md) で説明します。
+`used_memory_bytes` が数えるのはベクトル行列だけです（`vector_count × dimension × 4`）。HTTP の `/info` は同じ値を報告し、その横にストアごとの合計とプロセスの RSS を加えます。`cmdstat_<group>` の行はコマンドグループごとの呼び出し数と失敗数で、呼び出し数の合計は `total_commands_processed` に、失敗数の合計は `failed_commands` に一致します。HTTP の `/info` と `/metrics` も同じグループを報告します。`wal_replay_records_skipped` は復旧が復元できなかった WAL レコードの累計で、[persistence.md](./persistence.md) で説明します。
 
 ### `CONFIG`
 

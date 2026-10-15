@@ -370,7 +370,7 @@ TEST_F(HttpServerTest, VecdelRemovesVectorAndMetadata) {
   ASSERT_TRUE(deleted);
   EXPECT_EQ(deleted->status, 200);
   EXPECT_FALSE(vector_store_->HasVector("delete_me"));
-  EXPECT_EQ(metadata_store_->Get("delete_me"), nullptr);
+  EXPECT_FALSE(metadata_store_->Get("delete_me").has_value());
 
   auto missing = client_->Delete("/vecset", R"({"id":"delete_me"})", "application/json");
   ASSERT_TRUE(missing);
@@ -1091,8 +1091,8 @@ TEST_F(HttpServerTest, MetadataIntegerBeyondInt64IsStoredAsTheDoubleTcpWouldStor
   auto res = client_->Post("/metaset", R"({"id":"item","metadata":{"big":18446744073709551615}})", "application/json");
   ASSERT_TRUE(res);
   ASSERT_EQ(res->status, 200) << res->body;
-  const auto* metadata = metadata_store_->Get("item");
-  ASSERT_NE(metadata, nullptr);
+  const auto metadata = metadata_store_->Get("item");
+  ASSERT_TRUE(metadata.has_value());
   EXPECT_DOUBLE_EQ(std::get<double>(metadata->at("big")), 18446744073709551615.0);
 }
 
@@ -1254,7 +1254,7 @@ TEST_F(HttpServerTest, ExcludedVectorPayloadsStillLogInlineMetadata) {
   ASSERT_TRUE(metadata_res);
   EXPECT_EQ(metadata_res->status, 503) << metadata_res->body;
   EXPECT_FALSE(vector_store_->HasVector("with-metadata"));
-  EXPECT_EQ(metadata_store_->Get("with-metadata"), nullptr);
+  EXPECT_FALSE(metadata_store_->Get("with-metadata").has_value());
   handler_ctx_.wal = nullptr;
 }
 
@@ -1342,14 +1342,14 @@ TEST_F(HttpServerTest, RoutesWithoutASuccessBodyAreStillCountedByType) {
   // /config and /cache/stats have no per-handler counter of their own: the
   // route declaration is what puts them in the command statistics, exactly as
   // the TCP dispatcher counts CONFIG SHOW and CACHE STATS.
-  const uint64_t config_before = stats_.config_commands.load();
-  const uint64_t cache_before = stats_.cache_commands.load();
+  const uint64_t config_before = stats_.calls_by_group[server::GroupIndex(server::CommandGroup::kConfig)].load();
+  const uint64_t cache_before = stats_.calls_by_group[server::GroupIndex(server::CommandGroup::kCache)].load();
 
   ASSERT_TRUE(client_->Get("/config"));
   ASSERT_TRUE(client_->Get("/cache/stats"));
 
-  EXPECT_EQ(stats_.config_commands.load(), config_before + 1);
-  EXPECT_EQ(stats_.cache_commands.load(), cache_before + 1);
+  EXPECT_EQ(stats_.calls_by_group[server::GroupIndex(server::CommandGroup::kConfig)].load(), config_before + 1);
+  EXPECT_EQ(stats_.calls_by_group[server::GroupIndex(server::CommandGroup::kCache)].load(), cache_before + 1);
 }
 
 TEST_F(HttpServerTest, HealthAndMetricsAreNotCountedAsCommands) {
@@ -1578,7 +1578,7 @@ TEST_F(HttpServerAuthTest, EveryGatedRouteRejectsAnAbsentCredential) {
   // No gated request may have changed state on its way to the rejection.
   EXPECT_TRUE(vector_store_->HasVector("seeded"));
   EXPECT_FALSE(vector_store_->HasVector("gated"));
-  ASSERT_NE(metadata_store_->Get("seeded"), nullptr);
+  ASSERT_TRUE(metadata_store_->Get("seeded").has_value());
   EXPECT_EQ(std::get<std::string>(metadata_store_->Get("seeded")->at("k")), "original");
   EXPECT_EQ(event_store_->GetTotalEventCount(), 0U);
 }
@@ -1686,7 +1686,7 @@ TEST_F(HttpServerAuthTest, AcceptedRequestIsAccountedWithoutAFailure) {
   const httplib::Headers headers = {{"Authorization", std::string("Bearer ") + kPassword}};
   const uint64_t total_before = stats_.total_commands.load();
   const uint64_t failed_before = stats_.failed_commands.load();
-  const uint64_t vecset_before = stats_.vecset_commands.load();
+  const uint64_t vecset_before = stats_.calls_by_group[server::GroupIndex(server::CommandGroup::kVecset)].load();
 
   const json body = {{"id", "authorized"}, {"vector", {0.1F, 0.2F, 0.3F, 0.4F}}};
   auto res = client_->Post("/vecset", headers, body.dump(), "application/json");
@@ -1695,7 +1695,7 @@ TEST_F(HttpServerAuthTest, AcceptedRequestIsAccountedWithoutAFailure) {
 
   EXPECT_EQ(stats_.total_commands.load(), total_before + 1);
   EXPECT_EQ(stats_.failed_commands.load(), failed_before);
-  EXPECT_EQ(stats_.vecset_commands.load(), vecset_before + 1);
+  EXPECT_EQ(stats_.calls_by_group[server::GroupIndex(server::CommandGroup::kVecset)].load(), vecset_before + 1);
 }
 
 class HttpServerRateLimitTest : public HttpServerAuthTest {

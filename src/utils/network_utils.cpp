@@ -6,13 +6,14 @@
 #include "utils/network_utils.h"
 
 #include <arpa/inet.h>
-#include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <cctype>
 #include <optional>
 #include <sstream>
 #include <vector>
+
+#include "utils/structured_log.h"
 
 namespace nvecd::utils {
 
@@ -100,7 +101,7 @@ std::vector<CIDR> ParseCidrList(const std::vector<std::string>& cidr_strs) {
   for (const auto& cidr_str : cidr_strs) {
     auto cidr = CIDR::Parse(cidr_str);
     if (!cidr) {
-      spdlog::warn("Invalid CIDR entry ignored: {}", cidr_str);
+      StructuredLog().Event("server_warning").Field("type", "invalid_cidr_entry").Field("cidr", cidr_str).Warn();
       continue;
     }
     parsed.push_back(*cidr);

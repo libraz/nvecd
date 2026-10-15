@@ -227,9 +227,23 @@ The ID is read from a JSON body, not from the path or query string, so a client 
   "total_requests": 52,
   "total_commands_processed": 52,
   "failed_commands": 12,
+  "wal_replay_records_skipped": 0,
+  "commandstats": {
+    "event": {"calls": 4, "failed": 0},
+    "sim": {"calls": 10, "failed": 6},
+    "vecset": {"calls": 2, "failed": 0},
+    "vecdel": {"calls": 0, "failed": 0},
+    "metaset": {"calls": 0, "failed": 0},
+    "info": {"calls": 3, "failed": 0},
+    "config": {"calls": 4, "failed": 0},
+    "dump": {"calls": 2, "failed": 0},
+    "cache": {"calls": 2, "failed": 0},
+    "other": {"calls": 2, "failed": 2}
+  },
   "memory": {
-    "used_memory_bytes": 4240,
-    "used_memory_human": "4.14KB",
+    "used_memory_bytes": 16,
+    "used_memory_human": "16B",
+    "used_memory_stores_bytes": 4240,
     "used_memory_events": "3.08KB",
     "used_memory_vectors": "578B",
     "used_memory_co_occurrence": "504B",
@@ -265,7 +279,7 @@ The ID is read from a JSON body, not from the path or query string, so a client 
 }
 ```
 
-`total_requests` and `total_commands_processed` carry the same counter under two names. `memory.used_memory_bytes` is the sum of the three store totals, which is a different figure from TCP `INFO`, where `used_memory_bytes` counts only the vector matrix. The `process_rss*` group appears only when process memory information is readable, and the `*_system_memory*` group only when system memory information is. A store's entry under `stores` is present only when that store exists. When no cache is attached, `cache` is `{"enabled": false}` alone.
+`total_requests` and `total_commands_processed` carry the same counter under two names. `memory.used_memory_bytes` counts only the vector matrix, as TCP `INFO` does; `memory.used_memory_stores_bytes` is the sum of the three store totals shown as `used_memory_events`, `used_memory_vectors` and `used_memory_co_occurrence`. `commandstats` carries the same per-group calls and failures as the `# Commandstats` section of TCP `INFO`, and `wal_replay_records_skipped` the same count. The `process_rss*` group appears only when process memory information is readable, and the `*_system_memory*` group only when system memory information is. A store's entry under `stores` is present only when that store exists. When no cache is attached, `cache` is `{"enabled": false}` alone.
 
 ### `GET /config`
 
@@ -431,24 +445,24 @@ Every value under `info` is a string, because the block is parsed out of the sha
 
 ### `GET /dump/status`
 
-Takes no body. `data` carries the state of the background snapshot writer.
+Takes no body. `snapshot` carries the fields of the TCP `DUMP STATUS` block, with the same names and the same lower-case state in `snapshot.status`; every value is a string, because the block is parsed out of the shared handler's text output.
 
-| `data` | Extra fields |
+| `snapshot.status` | Extra fields |
 |---|---|
-| `IDLE` | none |
-| `IN_PROGRESS` | `filepath` |
-| `COMPLETED` | `filepath` |
-| `FAILED` | `filepath`, `error_message` |
+| `idle` | none |
+| `in_progress` | `filepath`, `pid`, `start_time` |
+| `completed` | `filepath`, `start_time`, `end_time` |
+| `failed` | `filepath`, `start_time`, `end_time`, `error` |
 
 ```json
-{"data":"COMPLETED","filepath":"/var/lib/nvecd/snapshots/nvecd.nvec","status":"ok"}
+{"snapshot":{"end_time":"1788427643","filepath":"/var/lib/nvecd/snapshots/nvecd.nvec","start_time":"1788427643","status":"completed"},"status":"ok"}
 ```
 
 ```json
-{"data":"IDLE","status":"ok"}
+{"snapshot":{"status":"idle"},"status":"ok"}
 ```
 
-A server configured with `snapshot.mode: lock` has no background writer and always answers `IDLE`. The TCP `DUMP STATUS` block reports the same states in lower case and carries `pid`, `start_time` and `end_time`, which this route does not.
+A server configured with `snapshot.mode: lock` has no background writer and always answers `idle`. The top-level `status` is `ok` whenever the request itself succeeded.
 
 ## Debug routes
 
@@ -518,9 +532,28 @@ nvecd_uptime_seconds 61
 # HELP nvecd_commands_total Total commands processed
 # TYPE nvecd_commands_total counter
 nvecd_commands_total{command="event"} 6
-nvecd_commands_total{command="vecset"} 3
 nvecd_commands_total{command="sim"} 14
-nvecd_commands_total 72
+nvecd_commands_total{command="vecset"} 3
+nvecd_commands_total{command="vecdel"} 0
+nvecd_commands_total{command="metaset"} 0
+nvecd_commands_total{command="info"} 4
+nvecd_commands_total{command="config"} 2
+nvecd_commands_total{command="dump"} 1
+nvecd_commands_total{command="cache"} 1
+nvecd_commands_total{command="other"} 0
+
+# HELP nvecd_commands_failed_total Commands that did not succeed
+# TYPE nvecd_commands_failed_total counter
+nvecd_commands_failed_total{command="event"} 0
+nvecd_commands_failed_total{command="sim"} 2
+nvecd_commands_failed_total{command="vecset"} 1
+nvecd_commands_failed_total{command="vecdel"} 0
+nvecd_commands_failed_total{command="metaset"} 0
+nvecd_commands_failed_total{command="info"} 0
+nvecd_commands_failed_total{command="config"} 0
+nvecd_commands_failed_total{command="dump"} 0
+nvecd_commands_failed_total{command="cache"} 0
+nvecd_commands_failed_total{command="other"} 0
 
 # HELP nvecd_memory_bytes Current memory usage in bytes
 # TYPE nvecd_memory_bytes gauge
@@ -542,7 +575,8 @@ nvecd_contexts_total 2
 | Metric | Type | Meaning |
 |---|---|---|
 | `nvecd_uptime_seconds` | counter | seconds since start |
-| `nvecd_commands_total` | counter | commands processed; per-command series carry `command="event"`, `"vecset"` and `"sim"`, and an unlabelled series carries the total across all commands |
+| `nvecd_commands_total` | counter | commands processed, one series per command group (`event`, `sim`, `vecset`, `vecdel`, `metaset`, `info`, `config`, `dump`, `cache`, `other`); the series sum to the total |
+| `nvecd_commands_failed_total` | counter | commands that did not succeed, with the same `command` labels |
 | `nvecd_memory_bytes` | gauge | event store, vector store and co-occurrence index combined |
 | `nvecd_vectors_total` | gauge | vectors stored |
 | `nvecd_events_total` | gauge | events stored |
@@ -556,7 +590,7 @@ nvecd_contexts_total 2
 
 The three store metrics appear only when their store is wired, and the six cache metrics only when a cache is attached — a scrape taken with the cache disabled has no `nvecd_cache_*` series at all, which a dashboard has to tolerate.
 
-The unlabelled `nvecd_commands_total` series shares a metric name with the labelled ones. Some scrape configurations reject that mixture; a relabelling rule that drops the unlabelled series, or a recording rule that sums the labelled ones, avoids it.
+There is no unlabelled total: sum the `command` series, for example `sum(rate(nvecd_commands_total[5m]))`.
 
 ## CORS
 
@@ -610,7 +644,7 @@ curl -X POST http://127.0.0.1:8080/dump/save -H 'Authorization: Bearer s3cret' -
 # {"filepath":"/var/lib/nvecd/snapshots/nvecd.nvec","status":"ok"}
 
 until curl -s -H 'Authorization: Bearer s3cret' http://127.0.0.1:8080/dump/status \
-      | grep -q '"data":"COMPLETED"'; do sleep 1; done
+      | grep -q '"status":"completed"'; do sleep 1; done
 ```
 
 Scrape configuration for Prometheus:

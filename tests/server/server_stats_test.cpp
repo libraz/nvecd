@@ -33,13 +33,13 @@ TEST_F(ServerStatsTest, InitializedToZero) {
   EXPECT_EQ(stats_->active_connections, 0);
   EXPECT_EQ(stats_->total_commands, 0);
   EXPECT_EQ(stats_->failed_commands, 0);
-  EXPECT_EQ(stats_->event_commands, 0);
-  EXPECT_EQ(stats_->sim_commands, 0);
-  EXPECT_EQ(stats_->vecset_commands, 0);
-  EXPECT_EQ(stats_->info_commands, 0);
-  EXPECT_EQ(stats_->config_commands, 0);
-  EXPECT_EQ(stats_->dump_commands, 0);
-  EXPECT_EQ(stats_->cache_commands, 0);
+  EXPECT_EQ(stats_->calls_by_group[GroupIndex(CommandGroup::kEvent)], 0);
+  EXPECT_EQ(stats_->calls_by_group[GroupIndex(CommandGroup::kSim)], 0);
+  EXPECT_EQ(stats_->calls_by_group[GroupIndex(CommandGroup::kVecset)], 0);
+  EXPECT_EQ(stats_->calls_by_group[GroupIndex(CommandGroup::kInfo)], 0);
+  EXPECT_EQ(stats_->calls_by_group[GroupIndex(CommandGroup::kConfig)], 0);
+  EXPECT_EQ(stats_->calls_by_group[GroupIndex(CommandGroup::kDump)], 0);
+  EXPECT_EQ(stats_->calls_by_group[GroupIndex(CommandGroup::kCache)], 0);
 }
 
 /**
@@ -94,29 +94,29 @@ TEST_F(ServerStatsTest, CommandStats) {
   stats_->total_commands++;
   EXPECT_EQ(stats_->total_commands, 1);
 
-  stats_->event_commands++;
-  stats_->event_commands++;
-  EXPECT_EQ(stats_->event_commands, 2);
+  stats_->calls_by_group[GroupIndex(CommandGroup::kEvent)]++;
+  stats_->calls_by_group[GroupIndex(CommandGroup::kEvent)]++;
+  EXPECT_EQ(stats_->calls_by_group[GroupIndex(CommandGroup::kEvent)], 2);
 
-  stats_->sim_commands++;
-  EXPECT_EQ(stats_->sim_commands, 1);
+  stats_->calls_by_group[GroupIndex(CommandGroup::kSim)]++;
+  EXPECT_EQ(stats_->calls_by_group[GroupIndex(CommandGroup::kSim)], 1);
 
-  stats_->vecset_commands++;
-  stats_->vecset_commands++;
-  stats_->vecset_commands++;
-  EXPECT_EQ(stats_->vecset_commands, 3);
+  stats_->calls_by_group[GroupIndex(CommandGroup::kVecset)]++;
+  stats_->calls_by_group[GroupIndex(CommandGroup::kVecset)]++;
+  stats_->calls_by_group[GroupIndex(CommandGroup::kVecset)]++;
+  EXPECT_EQ(stats_->calls_by_group[GroupIndex(CommandGroup::kVecset)], 3);
 
-  stats_->info_commands++;
-  EXPECT_EQ(stats_->info_commands, 1);
+  stats_->calls_by_group[GroupIndex(CommandGroup::kInfo)]++;
+  EXPECT_EQ(stats_->calls_by_group[GroupIndex(CommandGroup::kInfo)], 1);
 
-  stats_->config_commands++;
-  EXPECT_EQ(stats_->config_commands, 1);
+  stats_->calls_by_group[GroupIndex(CommandGroup::kConfig)]++;
+  EXPECT_EQ(stats_->calls_by_group[GroupIndex(CommandGroup::kConfig)], 1);
 
-  stats_->dump_commands++;
-  EXPECT_EQ(stats_->dump_commands, 1);
+  stats_->calls_by_group[GroupIndex(CommandGroup::kDump)]++;
+  EXPECT_EQ(stats_->calls_by_group[GroupIndex(CommandGroup::kDump)], 1);
 
-  stats_->cache_commands++;
-  EXPECT_EQ(stats_->cache_commands, 1);
+  stats_->calls_by_group[GroupIndex(CommandGroup::kCache)]++;
+  EXPECT_EQ(stats_->calls_by_group[GroupIndex(CommandGroup::kCache)], 1);
 
   stats_->failed_commands++;
   stats_->failed_commands++;
@@ -158,9 +158,9 @@ TEST_F(ServerStatsTest, ThreadSafety) {
     threads.emplace_back([this]() {
       for (int j = 0; j < kIncrementsPerThread; ++j) {
         stats_->total_commands++;
-        stats_->event_commands++;
-        stats_->sim_commands++;
-        stats_->vecset_commands++;
+        stats_->calls_by_group[GroupIndex(CommandGroup::kEvent)]++;
+        stats_->calls_by_group[GroupIndex(CommandGroup::kSim)]++;
+        stats_->calls_by_group[GroupIndex(CommandGroup::kVecset)]++;
       }
     });
   }
@@ -172,9 +172,9 @@ TEST_F(ServerStatsTest, ThreadSafety) {
 
   // Verify counts
   EXPECT_EQ(stats_->total_commands, kNumThreads * kIncrementsPerThread);
-  EXPECT_EQ(stats_->event_commands, kNumThreads * kIncrementsPerThread);
-  EXPECT_EQ(stats_->sim_commands, kNumThreads * kIncrementsPerThread);
-  EXPECT_EQ(stats_->vecset_commands, kNumThreads * kIncrementsPerThread);
+  EXPECT_EQ(stats_->calls_by_group[GroupIndex(CommandGroup::kEvent)], kNumThreads * kIncrementsPerThread);
+  EXPECT_EQ(stats_->calls_by_group[GroupIndex(CommandGroup::kSim)], kNumThreads * kIncrementsPerThread);
+  EXPECT_EQ(stats_->calls_by_group[GroupIndex(CommandGroup::kVecset)], kNumThreads * kIncrementsPerThread);
 }
 
 /**
@@ -199,32 +199,32 @@ TEST_F(ServerStatsTest, CombinedStatisticsScenario) {
   }
 
   for (int i = 0; i < 1000; ++i) {
-    stats_->event_commands++;
+    stats_->calls_by_group[GroupIndex(CommandGroup::kEvent)]++;
     stats_->total_commands++;
   }
 
   for (int i = 0; i < 500; ++i) {
-    stats_->sim_commands++;
+    stats_->calls_by_group[GroupIndex(CommandGroup::kSim)]++;
     stats_->total_commands++;
   }
 
   for (int i = 0; i < 300; ++i) {
-    stats_->vecset_commands++;
+    stats_->calls_by_group[GroupIndex(CommandGroup::kVecset)]++;
     stats_->total_commands++;
   }
 
   for (int i = 0; i < 10; ++i) {
-    stats_->info_commands++;
+    stats_->calls_by_group[GroupIndex(CommandGroup::kInfo)]++;
     stats_->total_commands++;
   }
 
   for (int i = 0; i < 5; ++i) {
-    stats_->config_commands++;
+    stats_->calls_by_group[GroupIndex(CommandGroup::kConfig)]++;
     stats_->total_commands++;
   }
 
   for (int i = 0; i < 2; ++i) {
-    stats_->dump_commands++;
+    stats_->calls_by_group[GroupIndex(CommandGroup::kDump)]++;
     stats_->total_commands++;
   }
 
@@ -236,12 +236,12 @@ TEST_F(ServerStatsTest, CombinedStatisticsScenario) {
   EXPECT_EQ(stats_->total_connections, 100);
   EXPECT_EQ(stats_->active_connections, 50);
   EXPECT_EQ(stats_->total_commands, 1817);  // 1000+500+300+10+5+2
-  EXPECT_EQ(stats_->event_commands, 1000);
-  EXPECT_EQ(stats_->sim_commands, 500);
-  EXPECT_EQ(stats_->vecset_commands, 300);
-  EXPECT_EQ(stats_->info_commands, 10);
-  EXPECT_EQ(stats_->config_commands, 5);
-  EXPECT_EQ(stats_->dump_commands, 2);
+  EXPECT_EQ(stats_->calls_by_group[GroupIndex(CommandGroup::kEvent)], 1000);
+  EXPECT_EQ(stats_->calls_by_group[GroupIndex(CommandGroup::kSim)], 500);
+  EXPECT_EQ(stats_->calls_by_group[GroupIndex(CommandGroup::kVecset)], 300);
+  EXPECT_EQ(stats_->calls_by_group[GroupIndex(CommandGroup::kInfo)], 10);
+  EXPECT_EQ(stats_->calls_by_group[GroupIndex(CommandGroup::kConfig)], 5);
+  EXPECT_EQ(stats_->calls_by_group[GroupIndex(CommandGroup::kDump)], 2);
   EXPECT_EQ(stats_->failed_commands, 20);
 }
 
@@ -250,10 +250,10 @@ TEST_F(ServerStatsTest, CombinedStatisticsScenario) {
  */
 TEST_F(ServerStatsTest, AtomicLoadOperations) {
   stats_->total_commands = 100;
-  stats_->event_commands = 50;
+  stats_->calls_by_group[GroupIndex(CommandGroup::kEvent)] = 50;
 
   uint64_t total = stats_->total_commands.load();
-  uint64_t events = stats_->event_commands.load();
+  uint64_t events = stats_->calls_by_group[GroupIndex(CommandGroup::kEvent)].load();
 
   EXPECT_EQ(total, 100);
   EXPECT_EQ(events, 50);
