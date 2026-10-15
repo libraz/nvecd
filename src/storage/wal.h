@@ -171,7 +171,6 @@ class WriteAheadLog {
   struct WalFile {
     std::string path;
     uint32_t file_number = 0;
-    uint64_t min_sequence = 0;
     uint64_t max_sequence = 0;
     uint64_t file_size = 0;
   };

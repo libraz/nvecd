@@ -24,6 +24,11 @@
 
 #ifndef O_NOFOLLOW
 #define O_NOFOLLOW 0
+constexpr int kWalNoFollowFlag = 0;
+constexpr bool kWalNeedsPathIdentityCheck = true;
+#else
+constexpr int kWalNoFollowFlag = O_NOFOLLOW;
+constexpr bool kWalNeedsPathIdentityCheck = false;
 #endif
 
 namespace nvecd::storage {
@@ -123,6 +128,42 @@ bool FsyncDirectory(const std::string& directory) {
   const bool synced = ::fsync(fd) == 0;
   const bool closed = ::close(fd) == 0;
   return synced && closed;
+}
+
+/// Open a WAL segment without following links or blocking on special files,
+/// then validate the opened inode before any reads or recovery truncation.
+Expected<int, Error> OpenWalSegment(const std::string& path, int access_flags, struct stat& file_info) {
+  struct stat path_info {};
+  if (kWalNeedsPathIdentityCheck &&
+      (::lstat(path.c_str(), &path_info) != 0 || !S_ISREG(path_info.st_mode) || path_info.st_size < 0)) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kWalReadError, "WAL segment path is not a regular file: " + path, path));
+  }
+
+  const int fd = ::open(path.c_str(), access_flags | kWalNoFollowFlag | O_NONBLOCK | O_CLOEXEC);
+  if (fd < 0) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kWalReadError,
+                         "Failed to open WAL segment: " + path + ": " + std::string(std::strerror(errno)), path));
+  }
+  if (::fstat(fd, &file_info) != 0) {
+    const int saved_errno = errno;
+    ::close(fd);
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kWalReadError,
+                         "Failed to stat WAL segment: " + path + ": " + std::string(std::strerror(saved_errno)), path));
+  }
+  if (!S_ISREG(file_info.st_mode) || file_info.st_size < 0) {
+    ::close(fd);
+    return utils::MakeUnexpected(utils::MakeError(
+        utils::ErrorCode::kWalReadError, "WAL segment is not a regular file with a valid size: " + path, path));
+  }
+  if (kWalNeedsPathIdentityCheck && (file_info.st_dev != path_info.st_dev || file_info.st_ino != path_info.st_ino)) {
+    ::close(fd);
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kWalReadError, "WAL segment path changed while opening: " + path, path));
+  }
+  return fd;
 }
 
 }  // namespace
@@ -373,12 +414,12 @@ Expected<uint64_t, Error> WriteAheadLog::ReplayValidated(
   for (size_t path_index = 0; path_index < paths.size(); ++path_index) {
     const auto& path = paths[path_index];
     const bool latest_segment = path_index + 1 == paths.size();
-    int fd = ::open(path.c_str(), O_RDONLY);
-    if (fd < 0) {
-      return utils::MakeUnexpected(
-          utils::MakeError(utils::ErrorCode::kWalReadError,
-                           "Failed to open WAL segment: " + path + ": " + std::string(std::strerror(errno))));
+    struct stat file_info {};
+    auto opened = OpenWalSegment(path, O_RDONLY, file_info);
+    if (!opened) {
+      return utils::MakeUnexpected(opened.error());
     }
+    const int fd = *opened;
 
     // Validate file header
     auto header_result = ValidateFileHeader(fd, path);
@@ -387,18 +428,16 @@ Expected<uint64_t, Error> WriteAheadLog::ReplayValidated(
       return utils::MakeUnexpected(header_result.error());
     }
 
-    struct stat file_info {};
-    if (::fstat(fd, &file_info) != 0) {
-      const auto error = utils::MakeError(utils::ErrorCode::kWalReadError, "Failed to stat WAL segment: " + path);
-      ::close(fd);
-      return utils::MakeUnexpected(error);
-    }
-
     // Read records
     while (true) {
       // Read length + crc
       uint8_t rec_header[8];
       const off_t record_offset = ::lseek(fd, 0, SEEK_CUR);
+      if (record_offset < 0 || record_offset > file_info.st_size) {
+        const auto error = utils::MakeError(utils::ErrorCode::kWalReadError, "Invalid offset in WAL segment: " + path);
+        ::close(fd);
+        return utils::MakeUnexpected(error);
+      }
       const auto remaining_file_bytes = static_cast<uint64_t>(file_info.st_size - record_offset);
       if (remaining_file_bytes == 0) {
         break;
@@ -470,6 +509,12 @@ Expected<uint64_t, Error> WriteAheadLog::ReplayValidated(
       record.sequence = ReadU64(body.data());
       record.timestamp_us = ReadU64(body.data() + 8);
       record.op = static_cast<WalOpType>(body[16]);
+
+      if (record.sequence == 0) {
+        ::close(fd);
+        return utils::MakeUnexpected(
+            utils::MakeError(utils::ErrorCode::kStorageCorrupted, "WAL sequence zero is invalid in " + path));
+      }
 
       if (previous_sequence.has_value() && (previous_sequence.value() == std::numeric_limits<uint64_t>::max() ||
                                             record.sequence != previous_sequence.value() + 1)) {
@@ -655,7 +700,6 @@ Expected<void, Error> WriteAheadLog::RotateFile() {
   WalFile wf;
   wf.path = path;
   wf.file_number = current_file_number_;
-  wf.min_sequence = current_sequence_ + 1;
   wf.max_sequence = 0;
   wf.file_size = current_file_size_;
   files_.push_back(std::move(wf));
@@ -741,18 +785,12 @@ Expected<void, Error> WriteAheadLog::ScanExistingFiles() {
     const uint32_t num = file_numbers[file_index];
     const bool latest_segment = file_index + 1 == file_numbers.size();
     std::string path = MakeFilePath(num);
-    int fd = ::open(path.c_str(), latest_segment ? O_RDWR : O_RDONLY);
-    if (fd < 0) {
-      return utils::MakeUnexpected(
-          utils::MakeError(utils::ErrorCode::kWalReadError, "Failed to open WAL segment: " + path));
-    }
-
     struct stat initial_info {};
-    if (::fstat(fd, &initial_info) != 0) {
-      ::close(fd);
-      return utils::MakeUnexpected(
-          utils::MakeError(utils::ErrorCode::kWalReadError, "Failed to stat WAL segment: " + path));
+    auto opened = OpenWalSegment(path, latest_segment ? O_RDWR : O_RDONLY, initial_info);
+    if (!opened) {
+      return utils::MakeUnexpected(opened.error());
     }
+    const int fd = *opened;
 
     WalFile wf;
     wf.path = path;
@@ -773,14 +811,18 @@ Expected<void, Error> WriteAheadLog::ScanExistingFiles() {
       ::close(fd);
       return utils::MakeUnexpected(header_result.error());
     }
-    wf.min_sequence = UINT64_MAX;
     wf.max_sequence = 0;
     off_t last_valid_offset = kWalFileHeaderSize;
 
-    // Scan records to find min/max sequence
+    // Scan records to find the max sequence
     while (true) {
       uint8_t rec_header[8];
       const off_t record_offset = ::lseek(fd, 0, SEEK_CUR);
+      if (record_offset < 0 || record_offset > initial_info.st_size) {
+        ::close(fd);
+        return utils::MakeUnexpected(
+            utils::MakeError(utils::ErrorCode::kWalReadError, "Invalid offset in WAL segment: " + path));
+      }
       const uint64_t remaining = static_cast<uint64_t>(initial_info.st_size - record_offset);
       if (remaining == 0) {
         break;
@@ -828,6 +870,11 @@ Expected<void, Error> WriteAheadLog::ScanExistingFiles() {
       }
 
       uint64_t seq = ReadU64(body.data());
+      if (seq == 0) {
+        ::close(fd);
+        return utils::MakeUnexpected(
+            utils::MakeError(utils::ErrorCode::kWalCorrupted, "WAL sequence zero is invalid in " + path));
+      }
       if (previous_sequence.has_value() &&
           (*previous_sequence == std::numeric_limits<uint64_t>::max() || seq != *previous_sequence + 1)) {
         ::close(fd);
@@ -837,25 +884,21 @@ Expected<void, Error> WriteAheadLog::ScanExistingFiles() {
                                  ", current=" + std::to_string(seq)));
       }
       previous_sequence = seq;
-      if (seq < wf.min_sequence)
-        wf.min_sequence = seq;
       if (seq > wf.max_sequence)
         wf.max_sequence = seq;
       last_valid_offset = ::lseek(fd, 0, SEEK_CUR);
     }
 
     struct stat st {};
-    if (::fstat(fd, &st) != 0) {
+    if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0) {
+      const int saved_errno = errno;
       ::close(fd);
       return utils::MakeUnexpected(
-          utils::MakeError(utils::ErrorCode::kWalReadError, "Failed to restat WAL segment: " + path));
+          utils::MakeError(utils::ErrorCode::kWalReadError,
+                           "Failed to restat WAL segment: " + path + ": " + std::string(std::strerror(saved_errno))));
     }
     wf.file_size = static_cast<uint64_t>(st.st_size);
     ::close(fd);
-
-    if (wf.min_sequence == UINT64_MAX) {
-      wf.min_sequence = 0;  // Empty file
-    }
 
     if (wf.max_sequence > current_sequence_) {
       current_sequence_ = wf.max_sequence;

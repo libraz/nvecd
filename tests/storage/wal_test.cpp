@@ -855,6 +855,84 @@ TEST_F(WalTest, TornHeaderInNonLatestSegmentIsRejected) {
   EXPECT_FALSE(wal.Open(config).has_value());
 }
 
+TEST_F(WalTest, RecoveryRejectsSegmentSymlinkWithoutModifyingItsTarget) {
+  const std::filesystem::path target_dir = fs::path(test_dir_) / "target";
+  fs::create_directories(target_dir);
+  auto target_config = MakeConfig();
+  target_config.directory = target_dir.string();
+  {
+    WriteAheadLog target_wal;
+    ASSERT_TRUE(target_wal.Open(target_config));
+    const std::string payload = "protected";
+    ASSERT_TRUE(target_wal.Append(WalOpType::kEventAdd, payload.data(), static_cast<uint32_t>(payload.size())));
+  }
+
+  const auto target = target_dir / "wal-000001.log";
+  {
+    const int fd = ::open(target.c_str(), O_WRONLY | O_APPEND);
+    ASSERT_GE(fd, 0);
+    const uint8_t torn_header[4]{};
+    ASSERT_EQ(::write(fd, torn_header, sizeof(torn_header)), static_cast<ssize_t>(sizeof(torn_header)));
+    ASSERT_EQ(::close(fd), 0);
+  }
+  const auto segment = fs::path(test_dir_) / "wal-000001.log";
+  const auto original_size = fs::file_size(target);
+  std::error_code link_error;
+  fs::create_symlink(target, segment, link_error);
+  ASSERT_FALSE(link_error) << link_error.message();
+
+  WriteAheadLog wal;
+  const auto opened = wal.Open(MakeConfig());
+  EXPECT_FALSE(opened.has_value());
+  EXPECT_EQ(fs::file_size(target), original_size);
+  EXPECT_TRUE(fs::is_symlink(segment));
+}
+
+TEST_F(WalTest, RecoveryRejectsFifoSegmentWithoutBlocking) {
+  const auto segment = fs::path(test_dir_) / "wal-000001.log";
+  ASSERT_EQ(::mkfifo(segment.c_str(), 0600), 0);
+
+  WriteAheadLog wal;
+  const auto opened = wal.Open(MakeConfig());
+  EXPECT_FALSE(opened.has_value());
+  EXPECT_TRUE(fs::is_fifo(segment));
+}
+
+TEST_F(WalTest, SequenceZeroRecordIsRejectedAndRetainedDuringRecovery) {
+  const auto config = MakeConfig();
+  const auto segment = test_dir_ + "/wal-000001.log";
+  {
+    WriteAheadLog wal;
+    ASSERT_TRUE(wal.Open(config));
+    const std::string payload = "zero-is-invalid";
+    ASSERT_TRUE(wal.Append(WalOpType::kEventAdd, payload.data(), static_cast<uint32_t>(payload.size())));
+  }
+  const auto original_size = fs::file_size(segment);
+  ASSERT_TRUE(RewriteRecordSequence(segment, 0, 0));
+
+  WriteAheadLog recovered;
+  const auto opened = recovered.Open(config);
+  ASSERT_FALSE(opened.has_value());
+  EXPECT_EQ(opened.error().code(), utils::ErrorCode::kWalCorrupted);
+  EXPECT_EQ(fs::file_size(segment), original_size) << "the CRC-valid record must not be cleaned as an empty file";
+}
+
+TEST_F(WalTest, ReplayRejectsSequenceZeroBeforeCallingTheCallback) {
+  const auto config = MakeConfig();
+  const auto segment = test_dir_ + "/wal-000001.log";
+  WriteAheadLog wal;
+  ASSERT_TRUE(wal.Open(config));
+  const std::string payload = "zero-is-invalid";
+  ASSERT_TRUE(wal.Append(WalOpType::kEventAdd, payload.data(), static_cast<uint32_t>(payload.size())));
+
+  ASSERT_TRUE(RewriteRecordSequence(segment, 0, 0));
+  size_t callbacks = 0;
+  const auto replayed = wal.Replay(0, [&](const WalRecord&) { ++callbacks; });
+  EXPECT_FALSE(replayed.has_value());
+  EXPECT_EQ(replayed.error().code(), utils::ErrorCode::kStorageCorrupted);
+  EXPECT_EQ(callbacks, 0U);
+}
+
 // --- Batch Fsync ---
 
 TEST_F(WalTest, BatchFsyncMode) {
