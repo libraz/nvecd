@@ -11,11 +11,11 @@
 #include <atomic>
 #include <functional>
 #include <memory>
-#include <thread>
 
 #include "events/co_occurrence_index.h"
 #include "utils/error.h"
 #include "utils/expected.h"
+#include "utils/periodic_worker.h"
 
 namespace nvecd::server {
 
@@ -63,7 +63,7 @@ class DecayScheduler {
   /**
    * @brief Stop the scheduler
    *
-   * Sets running_ to false and joins the scheduler thread.
+   * Sets running_ to false and wakes and joins the scheduler thread.
    */
   void Stop();
 
@@ -75,13 +75,11 @@ class DecayScheduler {
 
  private:
   /**
-   * @brief Scheduler loop (runs in background thread)
+   * @brief One decay pass (runs on the worker thread once per interval)
    *
-   * Calculates the next decay time, sleeps in 1-second intervals checking for
-   * shutdown, and triggers ApplyDecay (and periodically Prune) when time
-   * expires.
+   * Triggers ApplyDecay, and Prune every few cycles.
    */
-  void SchedulerLoop();
+  void RunCycle();
 
   events::CoOccurrenceIndex* co_index_;
   int interval_sec_;
@@ -89,7 +87,8 @@ class DecayScheduler {
   MaintenanceCallback maintenance_callback_;
 
   std::atomic<bool> running_{false};
-  std::unique_ptr<std::thread> scheduler_thread_;
+  int cycles_since_prune_ = 0;  // Worker thread only
+  utils::PeriodicWorker worker_;
 };
 
 }  // namespace nvecd::server

@@ -31,7 +31,7 @@
 namespace nvecd::server {
 
 namespace {
-constexpr int kCheckIntervalMs = 1000;  // Check for shutdown every second
+constexpr int kTickIntervalMs = 1000;  // Cadence for polling a finished fork session
 
 /**
  * @brief True for a snapshot temporary file whose writing process is gone
@@ -102,7 +102,8 @@ void SnapshotScheduler::Start() {
       .Info();
 
   running_ = true;
-  scheduler_thread_ = std::make_unique<std::thread>(&SnapshotScheduler::SchedulerLoop, this);
+  next_save_time_ = std::chrono::steady_clock::now() + std::chrono::seconds(config_.interval_sec);
+  worker_.Start(std::chrono::milliseconds(kTickIntervalMs), [this]() { Tick(); });
 }
 
 void SnapshotScheduler::Stop() {
@@ -113,66 +114,44 @@ void SnapshotScheduler::Stop() {
   utils::StructuredLog().Event("snapshot_scheduler_stopping").Info();
   running_ = false;
 
-  if (scheduler_thread_ && scheduler_thread_->joinable()) {
-    scheduler_thread_->join();
-  }
+  worker_.Stop();
+
+  // Drain a final CheckChild on shutdown so a snapshot that completed just
+  // before Stop() still records its checkpoint and truncates the WAL.
+  CheckFinishedSnapshot();
 
   utils::StructuredLog().Event("snapshot_scheduler_stopped").Info();
 }
 
-void SnapshotScheduler::SchedulerLoop() {
-  const int interval_sec = config_.interval_sec;
-
-  utils::StructuredLog().Event("snapshot_scheduler_thread_started").Info();
-
-  // Calculate next save time
-  auto next_save_time = std::chrono::steady_clock::now() + std::chrono::seconds(interval_sec);
-
-  while (running_) {
-    // Publish the outcome of a finished session every tick. This is the only
-    // place the auto-snapshot path drives ForkSnapshotWriter::CheckChild().
-    // Reaping the child, writing the WAL checkpoint sidecar and truncating the
-    // WAL all happen on the session's own completion thread and do not depend
-    // on this call; CheckChild() only picks up the finished outcome and clears
-    // the session. Without it the writer stays kInProgress forever, so a single
-    // fork would be the only snapshot the process ever takes.
-    if (ctx_.fork_snapshot_writer != nullptr) {
-      const bool was_in_progress = ctx_.fork_snapshot_writer->IsInProgress();
-      ctx_.fork_snapshot_writer->CheckChild();
-      // A forked child creates its output asynchronously. Retention cleanup
-      // must run only after that child is reaped; otherwise the newly started
-      // snapshot can appear after CleanupOldSnapshots() has counted files and
-      // leave retain + 1 files behind.
-      if (was_in_progress && !ctx_.fork_snapshot_writer->IsInProgress()) {
-        CleanupOldSnapshots();
-      }
-    }
-
-    auto now = std::chrono::steady_clock::now();
-
-    // Check if it's time to save
-    if (now >= next_save_time) {
-      TakeSnapshot();
-
-      // Schedule next save
-      next_save_time = std::chrono::steady_clock::now() + std::chrono::seconds(interval_sec);
-    }
-
-    // Sleep for check interval
-    std::this_thread::sleep_for(std::chrono::milliseconds(kCheckIntervalMs));
+void SnapshotScheduler::CheckFinishedSnapshot() {
+  if (ctx_.fork_snapshot_writer == nullptr) {
+    return;
   }
-
-  // Drain a final CheckChild on shutdown so a snapshot that completed just
-  // before Stop() still records its checkpoint and truncates the WAL.
-  if (ctx_.fork_snapshot_writer != nullptr) {
-    const bool was_in_progress = ctx_.fork_snapshot_writer->IsInProgress();
-    ctx_.fork_snapshot_writer->CheckChild();
-    if (was_in_progress && !ctx_.fork_snapshot_writer->IsInProgress()) {
-      CleanupOldSnapshots();
-    }
+  const bool was_in_progress = ctx_.fork_snapshot_writer->IsInProgress();
+  ctx_.fork_snapshot_writer->CheckChild();
+  // A forked child creates its output asynchronously. Retention cleanup
+  // must run only after that child is reaped; otherwise the newly started
+  // snapshot can appear after CleanupOldSnapshots() has counted files and
+  // leave retain + 1 files behind.
+  if (was_in_progress && !ctx_.fork_snapshot_writer->IsInProgress()) {
+    CleanupOldSnapshots();
   }
+}
 
-  utils::StructuredLog().Event("snapshot_scheduler_thread_exiting").Info();
+void SnapshotScheduler::Tick() {
+  // Publish the outcome of a finished session every tick. This is the only
+  // place the auto-snapshot path drives ForkSnapshotWriter::CheckChild().
+  // Reaping the child, writing the WAL checkpoint sidecar and truncating the
+  // WAL all happen on the session's own completion thread and do not depend
+  // on this call; CheckChild() only picks up the finished outcome and clears
+  // the session. Without it the writer stays kInProgress forever, so a single
+  // fork would be the only snapshot the process ever takes.
+  CheckFinishedSnapshot();
+
+  if (std::chrono::steady_clock::now() >= next_save_time_) {
+    TakeSnapshot();
+    next_save_time_ = std::chrono::steady_clock::now() + std::chrono::seconds(config_.interval_sec);
+  }
 }
 
 void SnapshotScheduler::TakeSnapshot() {

@@ -587,6 +587,19 @@ TEST(NvecdClientValidationTest, PasswordByteRuleMatchesTheWireProtocol) {
   }
 }
 
+TEST(NvecdClientValidationTest, PasswordOverTheSharedCapIsRejectedBeforeAnythingIsSent) {
+  NvecdClient client(ClientConfig{});
+
+  const auto too_long = client.Auth(std::string(transport::kMaxPasswordBytes + 1, 'a'));
+  ASSERT_FALSE(too_long);
+  EXPECT_EQ(too_long.error().code(), ErrorCode::kClientInvalidArgument);
+
+  // At the cap the password is accepted, so the failure is only the missing connection.
+  const auto at_cap = client.Auth(std::string(transport::kMaxPasswordBytes, 'a'));
+  ASSERT_FALSE(at_cap);
+  EXPECT_EQ(at_cap.error().code(), ErrorCode::kClientNotConnected);
+}
+
 TEST(NvecdClientValidationTest, AcceptsEveryIdentifierTheEventLayerAccepts) {
   // Identifiers are checked again server-side (events::ValidateIdentifier), so
   // the client only has to avoid being stricter than that rule.

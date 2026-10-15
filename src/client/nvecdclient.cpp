@@ -706,6 +706,10 @@ class NvecdClient::Impl {
     if (password.empty()) {
       return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, "Password cannot be empty"));
     }
+    if (password.size() > transport::kMaxPasswordBytes) {
+      return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument,
+                                      "Password exceeds " + std::to_string(transport::kMaxPasswordBytes) + " bytes"));
+    }
     if (auto err = transport::ValidateNoFramingBytes(password, "password")) {
       return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, *err));
     }

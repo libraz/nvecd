@@ -91,6 +91,24 @@ target_link_libraries(structured_log_test
 )
 gtest_discover_tests(structured_log_test)
 
+add_executable(periodic_worker_test
+  utils/periodic_worker_test.cpp
+)
+target_link_libraries(periodic_worker_test
+  nvecd_utils
+  gtest_main
+)
+gtest_discover_tests(periodic_worker_test)
+
+add_executable(decay_scheduler_shutdown_test
+  server/decay_scheduler_shutdown_test.cpp
+)
+target_link_libraries(decay_scheduler_shutdown_test
+  nvecd_server
+  gtest_main
+)
+gtest_discover_tests(decay_scheduler_shutdown_test)
+
 add_executable(log_level_test
   utils/log_level_test.cpp
 )
@@ -152,15 +170,6 @@ target_link_libraries(argument_validation_test
 )
 gtest_discover_tests(argument_validation_test)
 
-add_executable(connection_io_handler_test
-  server/connection_io_handler_test.cpp
-)
-target_link_libraries(connection_io_handler_test
-  nvecd_server
-  gtest_main
-)
-gtest_discover_tests(connection_io_handler_test)
-
 add_executable(io_reactor_test
   server/io_reactor_test.cpp
 )
@@ -170,6 +179,40 @@ target_link_libraries(io_reactor_test
 )
 gtest_discover_tests(io_reactor_test
   PROPERTIES TIMEOUT 30
+)
+
+add_executable(command_stats_test
+  server/command_stats_test.cpp
+)
+target_link_libraries(command_stats_test
+  nvecd_server
+  nvecd_cache
+  nvecd_similarity
+  nvecd_events
+  nvecd_vectors
+  nvecd_config
+  nvecd_utils
+  gtest
+  gtest_main
+)
+gtest_discover_tests(command_stats_test)
+
+add_executable(http_info_parity_test
+  server/http_info_parity_test.cpp
+)
+target_link_libraries(http_info_parity_test
+  nvecd_server
+  nvecd_cache
+  nvecd_similarity
+  nvecd_events
+  nvecd_vectors
+  nvecd_config
+  nvecd_utils
+  gtest
+  gtest_main
+)
+gtest_discover_tests(http_info_parity_test
+  DISCOVERY_TIMEOUT 30
 )
 
 add_executable(http_server_test
@@ -462,6 +505,37 @@ target_link_libraries(hnsw_index_test
 )
 gtest_discover_tests(hnsw_index_test PROPERTIES LABELS "sanitizer;concurrency")
 
+add_executable(hnsw_visited_marks_test
+  vectors/hnsw_visited_marks_test.cpp
+)
+target_link_libraries(hnsw_visited_marks_test
+  nvecd_vectors
+  nvecd_utils
+  gtest
+  gtest_main
+)
+gtest_discover_tests(hnsw_visited_marks_test PROPERTIES LABELS "sanitizer;concurrency")
+
+add_executable(ivf_index_training_concurrency_test
+  vectors/ivf_index_training_concurrency_test.cpp
+)
+target_link_libraries(ivf_index_training_concurrency_test
+  nvecd_vectors
+  nvecd_utils
+  gtest
+  gtest_main
+)
+gtest_discover_tests(ivf_index_training_concurrency_test PROPERTIES LABELS "sanitizer;concurrency")
+
+add_executable(vector_store_compaction_generation_test
+  vectors/vector_store_compaction_generation_test.cpp
+)
+target_link_libraries(vector_store_compaction_generation_test
+  nvecd_vectors
+  gtest_main
+)
+gtest_discover_tests(vector_store_compaction_generation_test)
+
 # Shared ANN contract tests (every AnnIndex implementation)
 add_executable(ann_contract_test
   vectors/ann_contract_test.cpp
@@ -562,6 +636,15 @@ target_link_libraries(similarity_engine_test
   gtest_main
 )
 gtest_discover_tests(similarity_engine_test)
+
+add_executable(similarity_engine_compaction_test
+  similarity/similarity_engine_compaction_test.cpp
+)
+target_link_libraries(similarity_engine_compaction_test
+  nvecd_similarity
+  gtest_main
+)
+gtest_discover_tests(similarity_engine_compaction_test)
 
 add_executable(adaptive_fusion_test
   similarity/adaptive_fusion_test.cpp
@@ -723,6 +806,34 @@ target_compile_definitions(snapshot_format_v1_test PRIVATE
   NVECD_SNAPSHOT_V1_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/storage/fixtures/snapshot_v1_compat.dmp"
 )
 gtest_discover_tests(snapshot_format_v1_test)
+
+add_executable(wal_record_corruption_test
+  storage/wal_record_corruption_test.cpp
+)
+target_link_libraries(wal_record_corruption_test
+  nvecd_storage
+  nvecd_events
+  nvecd_vectors
+  nvecd_config
+  nvecd_utils
+  gtest
+  gtest_main
+)
+gtest_discover_tests(wal_record_corruption_test)
+
+add_executable(snapshot_file_checksum_test
+  storage/snapshot_file_checksum_test.cpp
+)
+target_link_libraries(snapshot_file_checksum_test
+  nvecd_storage
+  nvecd_events
+  nvecd_vectors
+  nvecd_config
+  nvecd_utils
+  gtest
+  gtest_main
+)
+gtest_discover_tests(snapshot_file_checksum_test)
 
 add_executable(snapshot_lock_test
   storage/snapshot_lock_test.cpp

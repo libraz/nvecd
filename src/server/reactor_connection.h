@@ -12,7 +12,7 @@
 #include <mutex>
 #include <string>
 
-#include "server/connection_io_handler.h"
+#include "server/io_config.h"
 #include "server/server_types.h"
 #include "utils/fd_guard.h"
 

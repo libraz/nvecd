@@ -25,7 +25,7 @@ void MergeScheduler::Start(TieredVectorStore* store) {
 
   store_ = store;
   running_.store(true, std::memory_order_release);
-  worker_ = std::thread(&MergeScheduler::CheckLoop, this);
+  worker_.Start(config_.check_interval, [this]() { CheckAndMaintain(); });
 }
 
 void MergeScheduler::Stop() {
@@ -34,60 +34,41 @@ void MergeScheduler::Stop() {
   }
 
   running_.store(false, std::memory_order_release);
-  {
-    std::lock_guard lock(cv_mutex_);
-    cv_.notify_all();
-  }
-
-  if (worker_.joinable()) {
-    worker_.join();
-  }
+  worker_.Stop();
 }
 
-void MergeScheduler::CheckLoop() {
-  while (running_.load(std::memory_order_acquire)) {
-    // Wait for check_interval or until stopped
-    {
-      std::unique_lock lock(cv_mutex_);
-      cv_.wait_for(lock, config_.check_interval, [this] { return !running_.load(std::memory_order_acquire); });
-    }
-
-    if (!running_.load(std::memory_order_acquire)) {
-      break;
-    }
-
-    // Check and perform merge if needed
-    if (store_->NeedsMerge()) {
+void MergeScheduler::CheckAndMaintain() {
+  // Check and perform merge if needed
+  if (store_->NeedsMerge()) {
+    utils::StructuredLog()
+        .Event("merge_triggered")
+        .Field("component", "merge_scheduler")
+        .Field("delta_size", static_cast<uint64_t>(store_->DeltaSize()))
+        .Info();
+    auto result = store_->MergeDeltaToMain();
+    if (!result) {
       utils::StructuredLog()
-          .Event("merge_triggered")
+          .Event("merge_failed")
           .Field("component", "merge_scheduler")
-          .Field("delta_size", static_cast<uint64_t>(store_->DeltaSize()))
-          .Info();
-      auto result = store_->MergeDeltaToMain();
-      if (!result) {
-        utils::StructuredLog()
-            .Event("merge_failed")
-            .Field("component", "merge_scheduler")
-            .Field("error", result.error().message())
-            .Error();
-      }
+          .Field("error", result.error().message())
+          .Error();
     }
+  }
 
-    // Check and perform rebuild if needed
-    if (store_->NeedsRebuild()) {
+  // Check and perform rebuild if needed
+  if (store_->NeedsRebuild()) {
+    utils::StructuredLog()
+        .Event("rebuild_triggered")
+        .Field("component", "merge_scheduler")
+        .Field("deleted_count", static_cast<uint64_t>(store_->DeletedCount()))
+        .Info();
+    auto result = store_->RebuildMain();
+    if (!result) {
       utils::StructuredLog()
-          .Event("rebuild_triggered")
+          .Event("rebuild_failed")
           .Field("component", "merge_scheduler")
-          .Field("deleted_count", static_cast<uint64_t>(store_->DeletedCount()))
-          .Info();
-      auto result = store_->RebuildMain();
-      if (!result) {
-        utils::StructuredLog()
-            .Event("rebuild_failed")
-            .Field("component", "merge_scheduler")
-            .Field("error", result.error().message())
-            .Error();
-      }
+          .Field("error", result.error().message())
+          .Error();
     }
   }
 }

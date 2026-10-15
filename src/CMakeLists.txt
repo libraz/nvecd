@@ -21,7 +21,6 @@ target_link_libraries(nvecd_utils PUBLIC
 add_library(nvecd_server STATIC
   server/thread_pool.cpp
   server/connection_acceptor.cpp
-  server/connection_io_handler.cpp
   server/reactor/event_multiplexer.cpp
   server/io_reactor.cpp
   server/reactor_connection.cpp

@@ -13,9 +13,8 @@
 
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
-#include <mutex>
-#include <thread>
+
+#include "utils/periodic_worker.h"
 
 namespace nvecd::vectors {
 
@@ -54,14 +53,12 @@ class MergeScheduler {
   bool IsRunning() const { return running_.load(std::memory_order_acquire); }
 
  private:
-  void CheckLoop();
+  void CheckAndMaintain();
 
   Config config_;
   TieredVectorStore* store_ = nullptr;
-  std::thread worker_;
+  utils::PeriodicWorker worker_;
   std::atomic<bool> running_{false};
-  std::mutex cv_mutex_;
-  std::condition_variable cv_;
 };
 
 }  // namespace nvecd::vectors

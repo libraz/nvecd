@@ -146,7 +146,7 @@ struct SimResponse { std::vector<SimResultItem> results; std::string mode; };
 
 | シグネチャ | 戻り値 |
 |---|---|
-| `Expected<void, Error> Auth(const std::string& password) const` | 成功、またはパスワード誤りのエラー |
+| `Expected<void, Error> Auth(const std::string& password) const` | 成功、またはパスワード誤りのエラー。4096 バイトを超えるパスワードは送信前に拒否する |
 | `Expected<ServerInfo, Error> Info() const` | 解析済みの `INFO` カウンタ |
 | `Expected<std::string, Error> GetConfig() const` | `CONFIG SHOW` の生ブロック |
 | `Expected<SaveResult, Error> Save(const std::string& filepath = "") const` | スナップショットのパスと完了状態 |

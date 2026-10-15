@@ -146,7 +146,7 @@ An empty query vector is rejected locally with `kClientInvalidArgument`.
 
 | Signature | Returns |
 |---|---|
-| `Expected<void, Error> Auth(const std::string& password) const` | success, or an error on a wrong password |
+| `Expected<void, Error> Auth(const std::string& password) const` | success, or an error on a wrong password; a password over 4096 bytes is rejected before anything is sent |
 | `Expected<ServerInfo, Error> Info() const` | parsed `INFO` counters |
 | `Expected<std::string, Error> GetConfig() const` | the raw `CONFIG SHOW` block |
 | `Expected<SaveResult, Error> Save(const std::string& filepath = "") const` | snapshot path and completion state |

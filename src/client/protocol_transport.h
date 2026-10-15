@@ -87,6 +87,9 @@ constexpr size_t kMaxBufferedResponseBytes = 64U * 1024U * 1024U;
 // a query by far (ResponseFrame::long_running).
 constexpr uint32_t kAdminTimeoutMs = 3600U * 1000U;
 
+// Longest AUTH password any client surface sends.
+constexpr size_t kMaxPasswordBytes = 4096;
+
 constexpr std::string_view kErrorPrefix = "ERROR ";
 
 inline bool EqualsAsciiIgnoreCase(std::string_view lhs, std::string_view rhs) {

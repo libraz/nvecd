@@ -13,7 +13,6 @@
 namespace nvecd::server {
 
 namespace {
-constexpr int kCheckIntervalMs = 1000;  // Check for shutdown every second
 constexpr int kPruneEveryNCycles = 10;  // Prune once per this many decay cycles
 }  // namespace
 
@@ -55,7 +54,7 @@ void DecayScheduler::Start() {
       .Info();
 
   running_ = true;
-  scheduler_thread_ = std::make_unique<std::thread>(&DecayScheduler::SchedulerLoop, this);
+  worker_.Start(std::chrono::seconds(interval_sec_), [this]() { RunCycle(); });
 }
 
 void DecayScheduler::Stop() {
@@ -66,51 +65,28 @@ void DecayScheduler::Stop() {
   utils::StructuredLog().Event("decay_scheduler_stopping").Info();
   running_ = false;
 
-  if (scheduler_thread_ && scheduler_thread_->joinable()) {
-    scheduler_thread_->join();
-  }
+  worker_.Stop();
 
   utils::StructuredLog().Event("decay_scheduler_stopped").Info();
 }
 
-void DecayScheduler::SchedulerLoop() {
-  utils::StructuredLog().Event("decay_scheduler_thread_started").Info();
-
-  // Calculate next decay time
-  auto next_decay_time = std::chrono::steady_clock::now() + std::chrono::seconds(interval_sec_);
-  int cycles_since_prune = 0;
-
-  while (running_) {
-    auto now = std::chrono::steady_clock::now();
-
-    // Check if it's time to decay
-    if (now >= next_decay_time) {
-      const bool prune = ++cycles_since_prune >= kPruneEveryNCycles;
-      utils::Expected<void, utils::Error> maintained;
-      if (maintenance_callback_) {
-        maintained = maintenance_callback_(alpha_, prune);
-      } else {
-        co_index_->ApplyDecay(alpha_);
-        if (prune) {
-          co_index_->Prune();
-        }
-      }
-      if (!maintained) {
-        utils::StructuredLog().Event("decay_maintenance_failed").Field("error", maintained.error().message()).Error();
-      } else if (prune) {
-        // A refused pass leaves the counter high so the next cycle retries the prune.
-        cycles_since_prune = 0;
-      }
-
-      // Schedule next decay
-      next_decay_time = std::chrono::steady_clock::now() + std::chrono::seconds(interval_sec_);
+void DecayScheduler::RunCycle() {
+  const bool prune = ++cycles_since_prune_ >= kPruneEveryNCycles;
+  utils::Expected<void, utils::Error> maintained;
+  if (maintenance_callback_) {
+    maintained = maintenance_callback_(alpha_, prune);
+  } else {
+    co_index_->ApplyDecay(alpha_);
+    if (prune) {
+      co_index_->Prune();
     }
-
-    // Sleep for check interval
-    std::this_thread::sleep_for(std::chrono::milliseconds(kCheckIntervalMs));
   }
-
-  utils::StructuredLog().Event("decay_scheduler_thread_exiting").Info();
+  if (!maintained) {
+    utils::StructuredLog().Event("decay_maintenance_failed").Field("error", maintained.error().message()).Error();
+  } else if (prune) {
+    // A refused pass leaves the counter high so the next cycle retries the prune.
+    cycles_since_prune_ = 0;
+  }
 }
 
 }  // namespace nvecd::server

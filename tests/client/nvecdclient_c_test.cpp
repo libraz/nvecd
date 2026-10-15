@@ -510,6 +510,18 @@ TEST_F(NvecdClientCTest, MemoryManagement) {
   // Should not crash
 }
 
+TEST(NvecdClientCFailureTest, OverlongPasswordIsRejectedByTheClientLibrary) {
+  NvecdClientConfig_C config = {};
+  NvecdClient_C* client = nvecdclient_create(&config);
+  ASSERT_NE(client, nullptr);
+
+  const std::string password(5000, 'a');
+  EXPECT_EQ(nvecdclient_auth(client, password.c_str()), -1);
+  EXPECT_NE(std::string(nvecdclient_get_last_error(client)).find("Password exceeds"), std::string::npos);
+
+  nvecdclient_destroy(client);
+}
+
 TEST(NvecdClientCFailureTest, FailureOutputsAreAlwaysInitialized) {
   auto* sim_sentinel = reinterpret_cast<NvecdSimResponse_C*>(std::uintptr_t{1});
   EXPECT_EQ(nvecdclient_sim(nullptr, "item", 1, "vectors", &sim_sentinel), -1);

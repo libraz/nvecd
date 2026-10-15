@@ -9,12 +9,13 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <string>
-#include <thread>
 
 #include "config/config.h"
 #include "server/server_types.h"
+#include "utils/periodic_worker.h"
 
 namespace nvecd::server {
 
@@ -75,7 +76,8 @@ class SnapshotScheduler {
   /**
    * @brief Stop the scheduler
    *
-   * Sets running_ to false and joins the scheduler thread.
+   * Sets running_ to false, wakes and joins the scheduler thread, then drains
+   * a finished snapshot session.
    */
   void Stop();
 
@@ -87,12 +89,17 @@ class SnapshotScheduler {
 
  private:
   /**
-   * @brief Scheduler loop (runs in background thread)
+   * @brief One scheduler tick (runs on the worker thread every second)
    *
-   * Calculates next save time, sleeps in 1-second intervals checking
-   * for shutdown, and triggers snapshot + cleanup when time expires.
+   * Publishes a finished snapshot session, then takes a snapshot when the
+   * interval has elapsed.
    */
-  void SchedulerLoop();
+  void Tick();
+
+  /**
+   * @brief Publish the outcome of a finished fork session and clean up after it
+   */
+  void CheckFinishedSnapshot();
 
   /**
    * @brief Take a snapshot using ForkSnapshotWriter
@@ -115,7 +122,8 @@ class SnapshotScheduler {
   HandlerContext& ctx_;
 
   std::atomic<bool> running_{false};
-  std::unique_ptr<std::thread> scheduler_thread_;
+  std::chrono::steady_clock::time_point next_save_time_;  // Worker thread only
+  utils::PeriodicWorker worker_;
 };
 
 }  // namespace nvecd::server

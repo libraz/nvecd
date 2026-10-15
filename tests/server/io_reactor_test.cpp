@@ -195,6 +195,50 @@ TEST(IoReactorTest, MixedLineEndingsFrameOneRequestPerLine) {
   ::close(sockets[1]);
 }
 
+TEST(IoReactorTest, RequestOverTheConfiguredLimitIsRefusedWithoutReachingTheProcessor) {
+  ThreadPool pool(1);
+  IoReactor reactor({10, 0});
+  ASSERT_TRUE(reactor.Start());
+
+  int sockets[2];
+  ASSERT_EQ(MakeSocketPair(sockets), 0);
+  IOConfig config = TestIoConfig();
+  config.recv_buffer_size = 32;
+  config.max_query_length = 8;
+  config.max_accumulated_bytes = 16;
+  std::atomic<int> processor_calls{0};
+  ASSERT_TRUE(reactor.Register(sockets[0], &pool, config, [&processor_calls](const std::string&, ConnectionContext&) {
+    ++processor_calls;
+    return std::string("OK");
+  }));
+
+  ASSERT_EQ(::write(sockets[1], "123456789\n", 10), 10);
+  EXPECT_NE(ReadAvailable(sockets[1]).find("ERROR Request too large"), std::string::npos);
+  EXPECT_EQ(processor_calls.load(), 0);
+
+  reactor.Stop();
+  pool.Shutdown();
+  ::close(sockets[1]);
+}
+
+TEST(IoReactorTest, AlreadyTerminatedResponseIsNormalizedExactlyOnce) {
+  ThreadPool pool(1);
+  IoReactor reactor({10, 0});
+  ASSERT_TRUE(reactor.Start());
+
+  int sockets[2];
+  ASSERT_EQ(MakeSocketPair(sockets), 0);
+  ASSERT_TRUE(reactor.Register(sockets[0], &pool, TestIoConfig(),
+                               [](const std::string&, ConnectionContext&) { return std::string("+OK\r\n"); }));
+
+  ASSERT_EQ(::write(sockets[1], "AUTH secret\n", 12), 12);
+  EXPECT_EQ(ReadAvailable(sockets[1]), "+OK\r\n");
+
+  reactor.Stop();
+  pool.Shutdown();
+  ::close(sockets[1]);
+}
+
 TEST(IoReactorTest, HalfClosedClientReceivesReplyAfterBlockedProcessorResumes) {
   ThreadPool pool(1);
   ReactorConfig config;

@@ -14,7 +14,7 @@
 #include <thread>
 #include <unordered_map>
 
-#include "server/connection_io_handler.h"
+#include "server/io_config.h"
 #include "server/reactor/event_multiplexer.h"
 #include "utils/error.h"
 #include "utils/expected.h"

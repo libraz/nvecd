@@ -44,16 +44,15 @@ namespace {
 constexpr size_t kReceiveBufferSize = 65536;  // Receive buffer size (64KB)
 constexpr size_t kOkPrefixLength = 3;         // "OK " length
 constexpr int kMaxWaitReadyRetries = 100;     // Maximum retries for --wait-ready (~5 minutes)
-constexpr size_t kMaxPasswordBytes = 4096;
-constexpr uint32_t kCliTimeoutMs = 5000;  // Interactive send/receive deadline
+constexpr uint32_t kCliTimeoutMs = 5000;      // Interactive send/receive deadline
 
 bool ValidatePassword(std::string* password, std::string* error) {
   if (password->empty()) {
     *error = "password is empty";
     return false;
   }
-  if (password->size() > kMaxPasswordBytes) {
-    *error = "password exceeds 4096 bytes";
+  if (password->size() > nvecd::client::transport::kMaxPasswordBytes) {
+    *error = "password exceeds " + std::to_string(nvecd::client::transport::kMaxPasswordBytes) + " bytes";
     return false;
   }
   if (auto invalid = nvecd::client::transport::ValidateNoFramingBytes(*password, "password")) {
@@ -83,7 +82,7 @@ std::optional<std::string> ReadPasswordFile(const std::string& path, std::string
   }
 
   std::string password;
-  password.resize(kMaxPasswordBytes + 2);
+  password.resize(nvecd::client::transport::kMaxPasswordBytes + 2);
   const ssize_t count = ::read(fd, password.data(), password.size());
   const int read_error = errno;
   ::close(fd);
