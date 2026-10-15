@@ -184,7 +184,7 @@ TEST_F(RequestDispatcherTest, WalFailureLeavesEveryMutationTypeUnchanged) {
   EXPECT_NE(Dispatch("VECDEL existing\r\n").find("WAL is not open"), std::string::npos);
 
   EXPECT_TRUE(event_store_->GetEvents("ctx").empty());
-  ASSERT_NE(metadata_store_->Get("existing"), nullptr);
+  ASSERT_TRUE(metadata_store_->Get("existing").has_value());
   EXPECT_EQ(std::get<std::string>(metadata_store_->Get("existing")->at("state")), "before");
   EXPECT_TRUE(vector_store_->HasVector("existing"));
 }
@@ -368,7 +368,7 @@ TEST_F(RequestDispatcherTest, VecdelRemovesVectorAndMetadata) {
   const auto response = Dispatch("VECDEL item\r\n");
   EXPECT_NE(response.find("OK VECDEL"), std::string::npos);
   EXPECT_FALSE(vector_store_->HasVector("item"));
-  EXPECT_EQ(metadata_store_->Get("item"), nullptr);
+  EXPECT_FALSE(metadata_store_->Get("item").has_value());
   EXPECT_NE(Dispatch("VECDEL item\r\n").find("Vector not found"), std::string::npos);
 }
 
@@ -876,7 +876,7 @@ TEST_F(RequestDispatcherTest, MetasetRejectsNonEqualityPairsWithoutTouchingMetad
   for (const char* request : {"METASET item price>10", "METASET item k=in(a|b)", "METASET item ,"}) {
     EXPECT_EQ(Dispatch(std::string(request) + "\r\n").rfind("ERROR", 0), 0U) << request;
   }
-  ASSERT_NE(metadata_store_->Get("item"), nullptr);
+  ASSERT_TRUE(metadata_store_->Get("item").has_value());
   EXPECT_EQ(std::get<int64_t>(metadata_store_->Get("item")->at("price")), 5);
   EXPECT_EQ(ctx_->metadata_generation.load(), generation);
 }
@@ -980,7 +980,7 @@ TEST_F(RequestDispatcherTest, ReplayTypesLegacyMetasetTextWithTheMetasetGrammar)
   legacy.id = "item";
   legacy.filter_expr = "category:books,price:12";
   ASSERT_TRUE(dispatcher_->ReplayRecord(CommandRecord(legacy)).has_value());
-  ASSERT_NE(metadata_store_->Get("item"), nullptr);
+  ASSERT_TRUE(metadata_store_->Get("item").has_value());
   EXPECT_EQ(std::get<int64_t>(metadata_store_->Get("item")->at("price")), 12);
 
   // A comparison was once reduced to its value; it is skipped, not stored.

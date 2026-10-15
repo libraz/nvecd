@@ -567,7 +567,6 @@ utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
     wal_config.max_file_size = config_.wal.max_file_size;
     wal_config.sync_on_write = config_.wal.sync_on_write;
     wal_config.sync_interval_ms = config_.wal.sync_interval_ms;
-    wal_config.include_vectors = config_.wal.include_vectors;
 
     // The checkpoint floors the sequence so a WAL emptied by truncation never
     // reissues numbers the snapshot already covers.

@@ -449,13 +449,13 @@ TEST_F(SnapshotFormatV1Test, WriteAndRead_MetadataRoundTrip) {
                                     nullptr, &loaded_metadata);
   ASSERT_TRUE(read_result.has_value()) << "ReadSnapshotV1 failed: " << read_result.error().message();
 
-  const auto* metadata = loaded_metadata.Get("item2");
-  ASSERT_NE(metadata, nullptr);
+  const auto metadata = loaded_metadata.Get("item2");
+  ASSERT_TRUE(metadata.has_value());
   EXPECT_EQ(std::get<std::string>(metadata->at("category")), "electronics");
   EXPECT_EQ(std::get<bool>(metadata->at("active")), true);
   EXPECT_EQ(std::get<int64_t>(metadata->at("rank")), 10);
   EXPECT_DOUBLE_EQ(std::get<double>(metadata->at("score")), 0.75);
-  EXPECT_EQ(loaded_metadata.Get("empty"), nullptr) << "empty metadata entries are omitted from the V1 section";
+  EXPECT_FALSE(loaded_metadata.Get("empty").has_value()) << "empty metadata entries are omitted from the V1 section";
 
   std::ostringstream encoded_metadata(std::ios::binary | std::ios::out);
   auto serialized_metadata = SerializeMetadataStore(encoded_metadata, *metadata_store_);

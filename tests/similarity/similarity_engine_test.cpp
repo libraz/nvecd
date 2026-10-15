@@ -1321,9 +1321,9 @@ TEST_F(MetadataDesyncTest, SlotReuseDoesNotLeakDeletedMetadata) {
   ASSERT_TRUE(vector_store_->SetVector("dave_item", {0.5f, 0.5f, 0.5f}).has_value());
 
   // The deleted item's metadata must be gone.
-  EXPECT_EQ(metadata_store_->Get("alice_item"), nullptr);
+  EXPECT_FALSE(metadata_store_->Get("alice_item").has_value());
   // The new item must not have inherited any metadata.
-  EXPECT_EQ(metadata_store_->Get("dave_item"), nullptr);
+  EXPECT_FALSE(metadata_store_->Get("dave_item").has_value());
 
   // A filter for owner=alice must now return nothing: alice_item is deleted and
   // no live item should match. This property holds purely from id-keying even

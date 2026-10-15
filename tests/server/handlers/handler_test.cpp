@@ -820,7 +820,7 @@ TEST_F(HandlerTest, DumpLoadSemanticFailureIsAtomic) {
   ASSERT_FALSE(result.has_value());
   EXPECT_TRUE(vector_store_->HasVector("live-item"));
   EXPECT_FALSE(vector_store_->HasVector("snapshot-item"));
-  ASSERT_NE(metadata_store_->Get("live-item"), nullptr);
+  ASSERT_TRUE(metadata_store_->Get("live-item").has_value());
   EXPECT_EQ(ctx_->vector_generation.load(std::memory_order_acquire), 13U);
   EXPECT_EQ(cache_->GetStatistics().current_entries, 1U);
 }

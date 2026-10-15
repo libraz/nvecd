@@ -85,7 +85,6 @@ class WalTest : public ::testing::Test {
     cfg.directory = test_dir_;
     cfg.max_file_size = max_file_size;
     cfg.sync_on_write = true;  // Deterministic in tests
-    cfg.include_vectors = true;
     return cfg;
   }
 
@@ -929,7 +928,7 @@ TEST_F(WalTest, ReplayRejectsSequenceZeroBeforeCallingTheCallback) {
   size_t callbacks = 0;
   const auto replayed = wal.Replay(0, [&](const WalRecord&) { ++callbacks; });
   EXPECT_FALSE(replayed.has_value());
-  EXPECT_EQ(replayed.error().code(), utils::ErrorCode::kStorageCorrupted);
+  EXPECT_EQ(replayed.error().code(), utils::ErrorCode::kWalCorrupted);
   EXPECT_EQ(callbacks, 0U);
 }
 

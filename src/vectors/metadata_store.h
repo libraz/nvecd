@@ -18,6 +18,7 @@
 
 #include <cstdint>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
@@ -50,10 +51,10 @@ class MetadataStore {
   /**
    * @brief Get metadata for an item
    * @param id Item's stable external ID
-   * @return Pointer to metadata (null only if the item was never set, non-null
-   *         for an item set with an empty map), valid while holding read lock
+   * @return Copy of the metadata (nullopt only if the item was never set, a
+   *         value for an item set with an empty map)
    */
-  const Metadata* Get(const std::string& id) const;
+  std::optional<Metadata> Get(const std::string& id) const;
 
   /**
    * @brief Delete metadata for an item

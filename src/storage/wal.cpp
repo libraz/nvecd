@@ -72,6 +72,110 @@ Expected<void, Error> RepairTornTail(bool latest_segment, int fd, off_t length, 
   return {};
 }
 
+/// One record read from a segment; `body` is the full record body (header + payload).
+struct SegmentRecord {
+  uint64_t sequence = 0;
+  uint64_t timestamp_us = 0;
+  WalOpType op = WalOpType::kVecSet;
+  std::vector<uint8_t> body;
+  off_t end_offset = 0;  ///< File offset just past this record
+};
+
+enum class NextRecord : uint8_t {
+  kRecord,      ///< `record` holds a fully validated record
+  kEnd,         ///< Clean end of the segment
+  kTornHeader,  ///< Record frame header cut short by EOF
+  kTornBody,    ///< Record body cut short by EOF
+};
+
+/// Description of a torn tail, for error messages.
+const char* TornTailDescription(NextRecord status) {
+  return status == NextRecord::kTornHeader ? "Torn WAL header" : "Torn WAL body";
+}
+
+/// Length(4) + crc32(4) frame preceding every record body.
+constexpr size_t kRecordFrameSize = 8;
+
+/**
+ * Read and validate the record at the descriptor's offset.
+ *
+ * Every corruption is reported here, so recovery and replay agree on the code
+ * for the same damage. A torn tail is not an error: the caller decides whether
+ * it is recoverable. `previous_sequence` carries contiguity across segments.
+ */
+Expected<NextRecord, Error> ReadNextRecord(int fd, off_t file_size, const std::string& path,
+                                           std::optional<uint64_t>& previous_sequence, SegmentRecord& record) {
+  const off_t offset = ::lseek(fd, 0, SEEK_CUR);
+  if (offset < 0 || offset > file_size) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kWalReadError, "Invalid offset in WAL segment: " + path));
+  }
+  const auto remaining = static_cast<uint64_t>(file_size - offset);
+  if (remaining == 0) {
+    return NextRecord::kEnd;
+  }
+  if (remaining < kRecordFrameSize) {
+    return NextRecord::kTornHeader;
+  }
+  uint8_t frame[kRecordFrameSize];
+  if (!fd_io::ReadAll(fd, frame, sizeof(frame))) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kWalReadError, "Failed to read WAL record header: " + path));
+  }
+
+  const uint32_t body_length = fd_io::ReadU32(frame);
+  const uint32_t expected_crc = fd_io::ReadU32(frame + 4);
+  if (body_length < kWalRecordHeaderSize || body_length > kMaxWalRecordBodySize) {
+    utils::StructuredLog()
+        .Event("wal_record_length_invalid")
+        .Field("file", path)
+        .Field("body_length", static_cast<int64_t>(body_length))
+        .Warn();
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kWalCorrupted, "Invalid WAL record length in " + path));
+  }
+  if (remaining - kRecordFrameSize < body_length) {
+    return NextRecord::kTornBody;
+  }
+  record.body.resize(body_length);
+  if (!fd_io::ReadAll(fd, record.body.data(), body_length)) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kWalReadError, "Failed to read WAL record body: " + path));
+  }
+
+  // A CRC mismatch marks a corrupt/torn tail whose length prefix is itself
+  // untrustworthy, so the rest of the segment is never reinterpreted as records.
+  const uint32_t actual_crc = snapshot_v1::CalculateCRC32(record.body.data(), record.body.size());
+  if (actual_crc != expected_crc) {
+    utils::StructuredLog()
+        .Event("wal_crc_mismatch")
+        .Field("file", path)
+        .Field("expected_crc", static_cast<int64_t>(expected_crc))
+        .Field("actual_crc", static_cast<int64_t>(actual_crc))
+        .Warn();
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kWalCRCMismatch, "WAL record CRC mismatch in " + path));
+  }
+
+  record.sequence = fd_io::ReadU64(record.body.data());
+  record.timestamp_us = fd_io::ReadU64(record.body.data() + 8);
+  record.op = static_cast<WalOpType>(record.body[16]);
+  if (record.sequence == 0) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kWalCorrupted, "WAL sequence zero is invalid in " + path));
+  }
+  if (previous_sequence.has_value() &&
+      (*previous_sequence == std::numeric_limits<uint64_t>::max() || record.sequence != *previous_sequence + 1)) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kWalCorrupted,
+                         "WAL sequence is not contiguous: previous=" + std::to_string(*previous_sequence) +
+                             ", current=" + std::to_string(record.sequence)));
+  }
+  previous_sequence = record.sequence;
+  record.end_offset = offset + static_cast<off_t>(kRecordFrameSize + body_length);
+  return NextRecord::kRecord;
+}
+
 /// Open a WAL segment without following links or blocking on special files,
 /// then validate the opened inode before any reads or recovery truncation.
 Expected<int, Error> OpenWalSegment(const std::string& path, int access_flags, struct stat& file_info) {
@@ -374,114 +478,37 @@ Expected<uint64_t, Error> WriteAheadLog::ReplayValidated(
 
     // Read records
     while (true) {
-      // Read length + crc
-      uint8_t rec_header[8];
-      const off_t record_offset = ::lseek(fd, 0, SEEK_CUR);
-      if (record_offset < 0 || record_offset > file_info.st_size) {
-        const auto error = utils::MakeError(utils::ErrorCode::kWalReadError, "Invalid offset in WAL segment: " + path);
+      SegmentRecord segment_record;
+      auto next = ReadNextRecord(fd, file_info.st_size, path, previous_sequence, segment_record);
+      if (!next) {
         ::close(fd);
-        return utils::MakeUnexpected(error);
+        return utils::MakeUnexpected(next.error());
       }
-      const auto remaining_file_bytes = static_cast<uint64_t>(file_info.st_size - record_offset);
-      if (remaining_file_bytes == 0) {
+      if (*next == NextRecord::kEnd) {
         break;
       }
-      if (remaining_file_bytes < sizeof(rec_header)) {
+      if (*next != NextRecord::kRecord) {
         ::close(fd);
         if (latest_segment) {
-          return count;  // Recoverable torn header at newest segment tail.
+          return count;  // Recoverable torn tail at the newest segment's end.
         }
         return utils::MakeUnexpected(
-            utils::MakeError(utils::ErrorCode::kStorageCorrupted, "Torn WAL header in non-latest segment: " + path));
-      }
-      if (!fd_io::ReadAll(fd, rec_header, sizeof(rec_header))) {
-        const auto error = utils::MakeError(utils::ErrorCode::kWalReadError, "Failed to read WAL record header");
-        ::close(fd);
-        return utils::MakeUnexpected(error);
+            utils::MakeError(utils::ErrorCode::kWalCorrupted,
+                             std::string(TornTailDescription(*next)) + " in non-latest segment: " + path));
       }
 
-      uint32_t body_length = fd_io::ReadU32(rec_header);
-      uint32_t expected_crc = fd_io::ReadU32(rec_header + 4);
-
-      if (body_length < kWalRecordHeaderSize || body_length > kMaxWalRecordBodySize) {
-        utils::StructuredLog()
-            .Event("wal_record_length_invalid")
-            .Field("file", path)
-            .Field("body_length", static_cast<int64_t>(body_length))
-            .Warn();
-        ::close(fd);
-        return utils::MakeUnexpected(
-            utils::MakeError(utils::ErrorCode::kStorageCorrupted, "Invalid WAL record length in " + path));
-      }
-
-      // Read body
-      if (remaining_file_bytes - sizeof(rec_header) < body_length) {
-        ::close(fd);
-        if (latest_segment) {
-          return count;  // Recoverable torn body at newest segment tail.
-        }
-        return utils::MakeUnexpected(
-            utils::MakeError(utils::ErrorCode::kStorageCorrupted, "Torn WAL body in non-latest segment: " + path));
-      }
-      std::vector<uint8_t> body(body_length);
-      if (!fd_io::ReadAll(fd, body.data(), body_length)) {
-        const auto error = utils::MakeError(utils::ErrorCode::kWalReadError, "Failed to read WAL record body");
-        ::close(fd);
-        return utils::MakeUnexpected(error);
-      }
-
-      // Verify CRC
-      uint32_t actual_crc = snapshot_v1::CalculateCRC32(body.data(), body.size());
-      if (actual_crc != expected_crc) {
-        // CRC mismatch marks the start of a corrupt/torn tail (e.g. a partial
-        // write at crash time). The length prefix of this record is itself
-        // untrustworthy, so stop replaying this file rather than reinterpreting
-        // the remaining bytes as further records.
-        utils::StructuredLog()
-            .Event("wal_crc_mismatch")
-            .Field("file", path)
-            .Field("expected_crc", static_cast<int64_t>(expected_crc))
-            .Field("actual_crc", static_cast<int64_t>(actual_crc))
-            .Warn();
-        ::close(fd);
-        return utils::MakeUnexpected(
-            utils::MakeError(utils::ErrorCode::kWalCRCMismatch, "WAL record CRC mismatch in " + path));
-      }
-
-      // Parse record
-      WalRecord record;
-      record.sequence = fd_io::ReadU64(body.data());
-      record.timestamp_us = fd_io::ReadU64(body.data() + 8);
-      record.op = static_cast<WalOpType>(body[16]);
-
-      if (record.sequence == 0) {
-        ::close(fd);
-        return utils::MakeUnexpected(
-            utils::MakeError(utils::ErrorCode::kStorageCorrupted, "WAL sequence zero is invalid in " + path));
-      }
-
-      if (previous_sequence.has_value() && (previous_sequence.value() == std::numeric_limits<uint64_t>::max() ||
-                                            record.sequence != previous_sequence.value() + 1)) {
-        ::close(fd);
-        return utils::MakeUnexpected(
-            utils::MakeError(utils::ErrorCode::kStorageCorrupted,
-                             "WAL sequence is not contiguous: previous=" + std::to_string(*previous_sequence) +
-                                 ", current=" + std::to_string(record.sequence)));
-      }
-      previous_sequence = record.sequence;
-
-      if (record.sequence == from_sequence) {
+      if (segment_record.sequence == from_sequence) {
         replay_floor_seen = true;
       }
-
-      if (record.sequence < from_sequence) {
+      if (segment_record.sequence < from_sequence) {
         continue;  // Skip records before requested sequence
       }
 
-      uint32_t payload_size = body_length - kWalRecordHeaderSize;
-      if (payload_size > 0) {
-        record.payload.assign(body.begin() + kWalRecordHeaderSize, body.end());
-      }
+      WalRecord record;
+      record.sequence = segment_record.sequence;
+      record.timestamp_us = segment_record.timestamp_us;
+      record.op = segment_record.op;
+      record.payload.assign(segment_record.body.begin() + kWalRecordHeaderSize, segment_record.body.end());
 
       auto applied = callback(record);
       if (!applied) {
@@ -767,77 +794,25 @@ Expected<void, Error> WriteAheadLog::ScanExistingFiles() {
 
     // Scan records to find the max sequence
     while (true) {
-      uint8_t rec_header[8];
-      const off_t record_offset = ::lseek(fd, 0, SEEK_CUR);
-      if (record_offset < 0 || record_offset > initial_info.st_size) {
+      SegmentRecord segment_record;
+      auto next = ReadNextRecord(fd, initial_info.st_size, path, previous_sequence, segment_record);
+      if (!next) {
         ::close(fd);
-        return utils::MakeUnexpected(
-            utils::MakeError(utils::ErrorCode::kWalReadError, "Invalid offset in WAL segment: " + path));
+        return utils::MakeUnexpected(next.error());
       }
-      const uint64_t remaining = static_cast<uint64_t>(initial_info.st_size - record_offset);
-      if (remaining == 0) {
+      if (*next == NextRecord::kEnd) {
         break;
       }
-      if (remaining < sizeof(rec_header)) {
-        auto repaired = RepairTornTail(latest_segment, fd, last_valid_offset, path, "Torn WAL header");
+      if (*next != NextRecord::kRecord) {
+        auto repaired = RepairTornTail(latest_segment, fd, last_valid_offset, path, TornTailDescription(*next));
         if (!repaired) {
           ::close(fd);
           return utils::MakeUnexpected(repaired.error());
         }
         break;
       }
-      if (!fd_io::ReadAll(fd, rec_header, sizeof(rec_header))) {
-        ::close(fd);
-        return utils::MakeUnexpected(
-            utils::MakeError(utils::ErrorCode::kWalReadError, "Failed to read WAL record header: " + path));
-      }
-
-      uint32_t body_length = fd_io::ReadU32(rec_header);
-      uint32_t expected_crc = fd_io::ReadU32(rec_header + 4);
-      if (body_length < kWalRecordHeaderSize || body_length > kMaxWalRecordBodySize) {
-        ::close(fd);
-        return utils::MakeUnexpected(
-            utils::MakeError(utils::ErrorCode::kWalCorrupted, "Invalid WAL record length: " + path));
-      }
-      if (remaining - sizeof(rec_header) < body_length) {
-        auto repaired = RepairTornTail(latest_segment, fd, last_valid_offset, path, "Torn WAL body");
-        if (!repaired) {
-          ::close(fd);
-          return utils::MakeUnexpected(repaired.error());
-        }
-        break;
-      }
-
-      std::vector<uint8_t> body(body_length);
-      if (!fd_io::ReadAll(fd, body.data(), body_length)) {
-        ::close(fd);
-        return utils::MakeUnexpected(
-            utils::MakeError(utils::ErrorCode::kWalReadError, "Failed to read WAL record body: " + path));
-      }
-      if (snapshot_v1::CalculateCRC32(body.data(), body.size()) != expected_crc) {
-        ::close(fd);
-        return utils::MakeUnexpected(
-            utils::MakeError(utils::ErrorCode::kWalCRCMismatch, "WAL record CRC mismatch: " + path));
-      }
-
-      uint64_t seq = fd_io::ReadU64(body.data());
-      if (seq == 0) {
-        ::close(fd);
-        return utils::MakeUnexpected(
-            utils::MakeError(utils::ErrorCode::kWalCorrupted, "WAL sequence zero is invalid in " + path));
-      }
-      if (previous_sequence.has_value() &&
-          (*previous_sequence == std::numeric_limits<uint64_t>::max() || seq != *previous_sequence + 1)) {
-        ::close(fd);
-        return utils::MakeUnexpected(
-            utils::MakeError(utils::ErrorCode::kWalCorrupted,
-                             "WAL sequence is not contiguous: previous=" + std::to_string(*previous_sequence) +
-                                 ", current=" + std::to_string(seq)));
-      }
-      previous_sequence = seq;
-      if (seq > wf.max_sequence)
-        wf.max_sequence = seq;
-      last_valid_offset = ::lseek(fd, 0, SEEK_CUR);
+      wf.max_sequence = std::max(wf.max_sequence, segment_record.sequence);
+      last_valid_offset = segment_record.end_offset;
     }
 
     ::close(fd);

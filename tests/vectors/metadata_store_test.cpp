@@ -21,23 +21,37 @@ TEST_F(MetadataStoreTest, SetAndGet) {
   Metadata meta = {{"status", std::string("active")}, {"count", int64_t(42)}};
   store_.Set("item0", meta);
 
-  const auto* result = store_.Get("item0");
-  ASSERT_NE(result, nullptr);
+  const auto result = store_.Get("item0");
+  ASSERT_TRUE(result.has_value());
   EXPECT_EQ(std::get<std::string>(result->at("status")), "active");
   EXPECT_EQ(std::get<int64_t>(result->at("count")), 42);
 }
 
+TEST_F(MetadataStoreTest, GetResultOutlivesLaterWrites) {
+  store_.Set("item0", {{"status", std::string("before")}});
+  const auto copy = store_.Get("item0");
+  ASSERT_TRUE(copy.has_value());
+
+  // The result is a copy: rewriting, deleting or clearing the entry afterwards
+  // must not change or invalidate what the caller already holds.
+  store_.Set("item0", {{"status", std::string("after")}});
+  store_.Delete("item0");
+  store_.Clear();
+
+  EXPECT_EQ(std::get<std::string>(copy->at("status")), "before");
+}
+
 TEST_F(MetadataStoreTest, GetNonExistent) {
-  EXPECT_EQ(store_.Get("item0"), nullptr);
-  EXPECT_EQ(store_.Get("missing"), nullptr);
+  EXPECT_FALSE(store_.Get("item0").has_value());
+  EXPECT_FALSE(store_.Get("missing").has_value());
 }
 
 TEST_F(MetadataStoreTest, Delete) {
   store_.Set("item0", {{"key", std::string("value")}});
-  EXPECT_NE(store_.Get("item0"), nullptr);
+  EXPECT_TRUE(store_.Get("item0").has_value());
 
   store_.Delete("item0");
-  EXPECT_EQ(store_.Get("item0"), nullptr);
+  EXPECT_FALSE(store_.Get("item0").has_value());
 }
 
 TEST_F(MetadataStoreTest, DeleteNonExistent) {
@@ -48,10 +62,10 @@ TEST_F(MetadataStoreTest, DeleteNonExistent) {
   // for that ID and must leave every other entry untouched.
   store_.Delete("missing");
 
-  EXPECT_EQ(store_.Get("missing"), nullptr);
+  EXPECT_FALSE(store_.Get("missing").has_value());
   EXPECT_EQ(store_.Size(), 1U);
-  const auto* present = store_.Get("present");
-  ASSERT_NE(present, nullptr);
+  const auto present = store_.Get("present");
+  ASSERT_TRUE(present.has_value());
   EXPECT_EQ(std::get<std::string>(present->at("status")), "active");
 
   // A no-op delete must not leave a phantom entry behind.
@@ -62,29 +76,29 @@ TEST_F(MetadataStoreTest, Update) {
   store_.Set("item0", {{"status", std::string("draft")}});
   store_.Set("item0", {{"status", std::string("published")}});
 
-  const auto* result = store_.Get("item0");
-  ASSERT_NE(result, nullptr);
+  const auto result = store_.Get("item0");
+  ASSERT_TRUE(result.has_value());
   EXPECT_EQ(std::get<std::string>(result->at("status")), "published");
 }
 
 TEST_F(MetadataStoreTest, SetEmptyIsPresentButEmpty) {
   store_.Set("item0", {{"status", std::string("active")}});
-  EXPECT_NE(store_.Get("item0"), nullptr);
+  EXPECT_TRUE(store_.Get("item0").has_value());
 
   // Setting an empty metadata map keeps the item present with an empty value,
   // distinct from an item that was never set. Removal requires Delete().
   store_.Set("item0", {});
-  const auto* result = store_.Get("item0");
-  ASSERT_NE(result, nullptr);
+  const auto result = store_.Get("item0");
+  ASSERT_TRUE(result.has_value());
   EXPECT_TRUE(result->empty());
   EXPECT_EQ(store_.Size(), 1U);
 
   // A never-set item reports as absent.
-  EXPECT_EQ(store_.Get("never_set"), nullptr);
+  EXPECT_FALSE(store_.Get("never_set").has_value());
 
   // Delete removes presence.
   store_.Delete("item0");
-  EXPECT_EQ(store_.Get("item0"), nullptr);
+  EXPECT_FALSE(store_.Get("item0").has_value());
   EXPECT_EQ(store_.Size(), 0U);
 }
 
@@ -127,7 +141,7 @@ TEST_F(MetadataStoreTest, Clear) {
   store_.Set("b", {{"b", std::string("2")}});
   store_.Clear();
   EXPECT_EQ(store_.Size(), 0U);
-  EXPECT_EQ(store_.Get("a"), nullptr);
+  EXPECT_FALSE(store_.Get("a").has_value());
 }
 
 TEST_F(MetadataStoreTest, MatchesSingleCondition) {
@@ -215,10 +229,10 @@ TEST_F(MetadataStoreTest, MultipleIds) {
   store_.Set("beta", {{"b", std::string("y")}});
   store_.Set("gamma", {{"c", std::string("z")}});
 
-  EXPECT_NE(store_.Get("alpha"), nullptr);
-  EXPECT_NE(store_.Get("beta"), nullptr);
-  EXPECT_NE(store_.Get("gamma"), nullptr);
-  EXPECT_EQ(store_.Get("delta"), nullptr);
+  EXPECT_TRUE(store_.Get("alpha").has_value());
+  EXPECT_TRUE(store_.Get("beta").has_value());
+  EXPECT_TRUE(store_.Get("gamma").has_value());
+  EXPECT_FALSE(store_.Get("delta").has_value());
   EXPECT_EQ(store_.Size(), 3U);
 }
 

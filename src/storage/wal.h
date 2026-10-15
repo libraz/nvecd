@@ -86,7 +86,6 @@ class WriteAheadLog {
     uint64_t max_file_size = 64ULL * 1024 * 1024;  ///< 64MB per file
     bool sync_on_write = false;                    ///< fsync every write (high durability)
     uint32_t sync_interval_ms = 100;               ///< Batch fsync interval
-    bool include_vectors = true;                   ///< Include vector bodies in VECSET
   };
 
   WriteAheadLog() = default;

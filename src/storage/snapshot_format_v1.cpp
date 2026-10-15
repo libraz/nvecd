@@ -60,6 +60,45 @@ enum class MetadataValueType : uint8_t {
 /// kFixedHeaderSize (8) + header_size(4) + flags(4) + snapshot_timestamp(8) + total_file_size(8) = 32
 constexpr size_t kFileCRC32Offset = snapshot_format::kFixedHeaderSize + 24;
 
+/**
+ * @brief Running whole-file CRC32 built from the bytes as they are written or read
+ *
+ * The file CRC32 covers the file with its own field zeroed, so both directions
+ * can fold bytes in file order and compare once at the end instead of making a
+ * separate pass over the finished file.
+ */
+class FileCrc {
+ public:
+  void Fold(const void* data, size_t length) {
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    const auto* cursor = reinterpret_cast<const Bytef*>(data);
+    size_t remaining = length;
+    while (remaining > 0) {
+      // zlib takes a uInt length, which is narrower than a section can be.
+      const auto chunk = static_cast<uInt>(std::min<size_t>(remaining, kFoldChunkBytes));
+      crc_ = crc32(crc_, cursor, chunk);
+      cursor += chunk;
+      remaining -= chunk;
+    }
+    length_ += length;
+  }
+
+  /// Append a run whose CRC32 and length are already known.
+  void FoldRun(uint32_t run_crc, uint64_t run_length) {
+    crc_ = crc32_combine(crc_, run_crc, static_cast<z_off_t>(run_length));
+    length_ += run_length;
+  }
+
+  [[nodiscard]] uint32_t Value() const { return static_cast<uint32_t>(crc_); }
+  [[nodiscard]] uint64_t Length() const { return length_; }
+
+ private:
+  static constexpr size_t kFoldChunkBytes = 1U << 20;
+
+  uLong crc_ = crc32(0L, Z_NULL, 0);
+  uint64_t length_ = 0;
+};
+
 Expected<uint32_t, Error> CalculateFileCRC32Streaming(std::istream& input_stream, uint64_t file_size) {
   if (file_size > kMaxSnapshotFileSize) {
     return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Snapshot exceeds maximum total file size"));
@@ -268,7 +307,8 @@ class CrcTeeStreambuf : public std::streambuf {
  public:
   explicit CrcTeeStreambuf(std::ostream& sink) : sink_(sink) {}
 
-  [[nodiscard]] uint32_t Crc() const { return static_cast<uint32_t>(crc_); }
+  [[nodiscard]] FileCrc& Tracker() { return crc_; }
+  [[nodiscard]] uint32_t Crc() const { return crc_.Value(); }
 
  protected:
   std::streamsize xsputn(const char* data, std::streamsize count) override {
@@ -276,15 +316,7 @@ class CrcTeeStreambuf : public std::streambuf {
     if (!sink_.good()) {
       return 0;
     }
-    // zlib takes a uInt length, which is narrower than a section can be.
-    std::streamsize remaining = count;
-    const auto* cursor = reinterpret_cast<const Bytef*>(data);  // NOLINT
-    while (remaining > 0) {
-      const auto chunk = static_cast<uInt>(std::min<std::streamsize>(remaining, kCrcChunkBytes));
-      crc_ = crc32(crc_, cursor, chunk);
-      cursor += chunk;
-      remaining -= chunk;
-    }
+    crc_.Fold(data, static_cast<size_t>(count));
     return count;
   }
 
@@ -297,10 +329,8 @@ class CrcTeeStreambuf : public std::streambuf {
   }
 
  private:
-  static constexpr std::streamsize kCrcChunkBytes = 1 << 20;
-
   std::ostream& sink_;
-  uLong crc_ = crc32(0L, Z_NULL, 0);
+  FileCrc crc_;
 };
 
 /**
@@ -310,14 +340,15 @@ class CrcTeeStreambuf : public std::streambuf {
  * so snapshots written before and after this change are interchangeable.
  *
  * @param output_stream Seekable destination
+ * @param file_crc Whole-file checksum that receives the finished section in file order
  * @param limit Largest payload this section may occupy
  * @param label Section name used in error messages
  * @param serialize Callable invoked with the payload stream
  * @return Success, or the serializer's error / a kStorageDumpWriteError
  */
 template <typename SerializeFn>
-Expected<void, Error> WriteStreamedSection(std::ostream& output_stream, uint32_t limit, const std::string& label,
-                                           SerializeFn&& serialize) {
+Expected<void, Error> WriteStreamedSection(std::ostream& output_stream, FileCrc& file_crc, uint32_t limit,
+                                           const std::string& label, SerializeFn&& serialize) {
   const std::streampos header_pos = output_stream.tellp();
   if (header_pos == std::streampos(-1)) {
     return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Cannot locate " + label + " header"));
@@ -353,6 +384,9 @@ Expected<void, Error> WriteStreamedSection(std::ostream& output_stream, uint32_t
   if (!WriteBinary(output_stream, *size) || !WriteBinary(output_stream, crc)) {
     return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to patch " + label + " header"));
   }
+  file_crc.Fold(&*size, sizeof(uint32_t));
+  file_crc.Fold(&crc, sizeof(uint32_t));
+  file_crc.FoldRun(crc, *size);
   output_stream.seekp(end_pos, std::ios::beg);
   if (!output_stream.good()) {
     return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to resume after " + label + " header"));
@@ -377,60 +411,66 @@ uint32_t CalculateCRC32(const std::string& str) {
 
 namespace {
 
+Expected<void, Error> FailFileIntegrity(snapshot_format::IntegrityError* integrity_error, const std::string& message) {
+  if (integrity_error != nullptr) {
+    integrity_error->type = snapshot_format::CRCErrorType::FileCRC;
+    integrity_error->message = message;
+  }
+  return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, message));
+}
+
 /**
- * @brief Verify the whole-file size and CRC32 recorded in the V1 header.
+ * @brief Check the header's size and CRC declarations against the file, without reading its bytes
  *
- * Validates the stored total_file_size against the actual on-disk size and
- * recomputes the CRC32 over the entire file (with the file_crc32 field zeroed)
- * to compare against header.file_crc32. This is the same check performed by
- * VerifySnapshotIntegrity and is shared so the two code paths cannot diverge.
- *
- * The input stream position is modified by this function (seeks to end/begin).
- *
- * @param input_stream Open binary input stream for the snapshot file
- * @param header Parsed V1 header containing total_file_size and file_crc32
- * @param integrity_error Optional output populated with FileCRC details on failure
- * @return Expected<void, Error> Success or a FileCRC failure
+ * Leaves the stream positioned at the end of the file.
  */
-Expected<void, Error> VerifyFileLevelIntegrity(std::istream& input_stream, const HeaderV1& header,
-                                               snapshot_format::IntegrityError* integrity_error) {
-  const auto fail_file_integrity = [&](const std::string& message) -> Expected<void, Error> {
-    if (integrity_error != nullptr) {
-      integrity_error->type = snapshot_format::CRCErrorType::FileCRC;
-      integrity_error->message = message;
-    }
-    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, message));
-  };
-  // Verify file size against the value recorded in the header.
+Expected<void, Error> CheckFileBounds(std::istream& input_stream, const HeaderV1& header,
+                                      snapshot_format::IntegrityError* integrity_error) {
   input_stream.seekg(0, std::ios::end);
   const auto end_position = input_stream.tellg();
   if (end_position < 0) {
-    return fail_file_integrity("Failed to determine snapshot file size");
+    return FailFileIntegrity(integrity_error, "Failed to determine snapshot file size");
   }
   const auto actual_file_size = static_cast<uint64_t>(end_position);
   if (actual_file_size > kMaxSnapshotFileSize || header.total_file_size > kMaxSnapshotFileSize) {
-    return fail_file_integrity("Snapshot exceeds maximum total file size");
+    return FailFileIntegrity(integrity_error, "Snapshot exceeds maximum total file size");
   }
   if (actual_file_size != header.total_file_size) {
-    std::string message = "File size mismatch: expected " + std::to_string(header.total_file_size) + ", got " +
-                          std::to_string(actual_file_size);
-    return fail_file_integrity(message);
+    return FailFileIntegrity(integrity_error, "File size mismatch: expected " + std::to_string(header.total_file_size) +
+                                                  ", got " + std::to_string(actual_file_size));
   }
-
   if ((header.flags & snapshot_format::flags_v1::kWithCRC) == 0) {
-    return fail_file_integrity("Snapshot does not declare required CRC32 protection");
+    return FailFileIntegrity(integrity_error, "Snapshot does not declare required CRC32 protection");
   }
-  auto computed_crc = CalculateFileCRC32Streaming(input_stream, actual_file_size);
+  return {};
+}
+
+Expected<void, Error> CheckFileCrc(uint32_t actual_crc, const HeaderV1& header,
+                                   snapshot_format::IntegrityError* integrity_error) {
+  if (actual_crc != header.file_crc32) {
+    return FailFileIntegrity(integrity_error, "File CRC32 mismatch: expected " + std::to_string(header.file_crc32) +
+                                                  ", got " + std::to_string(actual_crc));
+  }
+  return {};
+}
+
+/**
+ * @brief Verify the whole-file size and CRC32 recorded in the V1 header with a pass over the file.
+ *
+ * Used where the file is checked on its own (DUMP VERIFY) and to classify a
+ * failed load, whose single-pass read cannot say whether the file was damaged.
+ */
+Expected<void, Error> VerifyFileLevelIntegrity(std::istream& input_stream, const HeaderV1& header,
+                                               snapshot_format::IntegrityError* integrity_error) {
+  auto bounds = CheckFileBounds(input_stream, header, integrity_error);
+  if (!bounds) {
+    return bounds;
+  }
+  auto computed_crc = CalculateFileCRC32Streaming(input_stream, header.total_file_size);
   if (!computed_crc) {
     return MakeUnexpected(computed_crc.error());
   }
-  if (*computed_crc != header.file_crc32) {
-    std::string message =
-        "File CRC32 mismatch: expected " + std::to_string(header.file_crc32) + ", got " + std::to_string(*computed_crc);
-    return fail_file_integrity(message);
-  }
-
-  return {};
+  return CheckFileCrc(*computed_crc, header, integrity_error);
 }
 
 }  // namespace
@@ -1171,13 +1211,22 @@ Expected<void, Error> DeserializeMetadataStore(std::istream& input_stream, vecto
 
 namespace {
 
+/// Snapshot file stream plus the running checksum of everything written after the header.
+struct SnapshotSink {
+  explicit SnapshotSink(std::ostream& file_stream) : file(file_stream), tee(file_stream), tracked(&tee) {}
+
+  std::ostream& file;    ///< The seekable file; streamed sections patch their headers here
+  CrcTeeStreambuf tee;   ///< Forwards to `file` and folds each byte into the checksum
+  std::ostream tracked;  ///< Writes through `tee`
+  FileCrc& Crc() { return tee.Tracker(); }
+};
+
 /// Write one store section: name, optional statistics, then the streamed payload.
 template <typename SerializeFn>
-Expected<void, Error> WriteStoreSection(std::ostream& output_stream, const std::string& store_name,
-                                        const std::string& label,
+Expected<void, Error> WriteStoreSection(SnapshotSink& sink, const std::string& store_name, const std::string& label,
                                         const std::unordered_map<std::string, StoreStatistics>* store_stats,
                                         uint32_t max_stats_size, uint32_t max_data_size, SerializeFn&& serialize) {
-  WriteString(output_stream, store_name);
+  WriteString(sink.tracked, store_name);
   if (store_stats != nullptr && store_stats->count(store_name) > 0) {
     std::ostringstream store_stats_ss;
     auto store_stats_result = SerializeStoreStatistics(store_stats_ss, store_stats->at(store_name));
@@ -1185,15 +1234,16 @@ Expected<void, Error> WriteStoreSection(std::ostream& output_stream, const std::
       return store_stats_result;
     }
     auto stats_write =
-        WriteSizedPayload(output_stream, store_stats_ss.str(), max_stats_size, label + " store statistics");
+        WriteSizedPayload(sink.tracked, store_stats_ss.str(), max_stats_size, label + " store statistics");
     if (!stats_write) {
       return stats_write;
     }
   } else {
     uint32_t zero = 0;
-    WriteBinary(output_stream, zero);  // No store stats
+    WriteBinary(sink.tracked, zero);  // No store stats
   }
-  return WriteStreamedSection(output_stream, max_data_size, label + " store", std::forward<SerializeFn>(serialize));
+  return WriteStreamedSection(sink.file, sink.Crc(), max_data_size, label + " store",
+                              std::forward<SerializeFn>(serialize));
 }
 
 /// A snapshot opened for reading with its fixed header and V1 header parsed.
@@ -1274,8 +1324,8 @@ struct SectionSpec {
 };
 
 /// Read a section whose size and CRC32 were already parsed: bound it, read it, verify its CRC32.
-Expected<std::string, Error> ReadCheckedSection(std::istream& input_stream, uint32_t size, uint32_t expected_crc,
-                                                const SectionSpec& spec,
+Expected<std::string, Error> ReadCheckedSection(std::istream& input_stream, FileCrc& file_crc, uint32_t size,
+                                                uint32_t expected_crc, const SectionSpec& spec,
                                                 snapshot_format::IntegrityError* integrity_error) {
   if (size > spec.max_size) {
     return MakeUnexpected(
@@ -1302,7 +1352,43 @@ Expected<std::string, Error> ReadCheckedSection(std::istream& input_stream, uint
     }
     return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, message));
   }
+  file_crc.FoldRun(actual_crc, size);
   return data;
+}
+
+/// Read a fixed-size field and fold its bytes into the file checksum.
+template <typename T>
+bool ReadFolded(std::istream& input_stream, FileCrc& file_crc, T& value) {
+  if (!ReadBinary(input_stream, value)) {
+    return false;
+  }
+  file_crc.Fold(&value, sizeof(T));
+  return true;
+}
+
+/// Read a length-prefixed string and fold its bytes into the file checksum.
+bool ReadStringFolded(std::istream& input_stream, FileCrc& file_crc, std::string& str) {
+  if (!ReadString(input_stream, str)) {
+    return false;
+  }
+  const auto length = static_cast<uint32_t>(str.size());
+  file_crc.Fold(&length, sizeof(length));
+  file_crc.Fold(str.data(), str.size());
+  return true;
+}
+
+/// Fold the bytes before the first section into the file checksum, with the CRC field zeroed.
+Expected<void, Error> FoldHeaderPrefix(std::istream& input_stream, std::streampos sections_begin, FileCrc& file_crc) {
+  std::string prefix(static_cast<size_t>(sections_begin), '\0');
+  input_stream.clear();
+  input_stream.seekg(0, std::ios::beg);
+  input_stream.read(prefix.data(), static_cast<std::streamsize>(prefix.size()));
+  if (!input_stream.good()) {
+    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to re-read snapshot header"));
+  }
+  std::fill_n(prefix.begin() + static_cast<ptrdiff_t>(kFileCRC32Offset), sizeof(uint32_t), '\0');
+  file_crc.Fold(prefix.data(), prefix.size());
+  return {};
 }
 
 }  // namespace
@@ -1381,6 +1467,9 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
       return write_header_result;
     }
 
+    // Everything past the header is folded into the file checksum as it is written.
+    SnapshotSink sink(output_stream);
+
     // Write config section
     std::ostringstream config_ss;
     auto config_result = SerializeConfig(config_ss, config);
@@ -1388,7 +1477,7 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
       return config_result;
     }
     std::string config_data = config_ss.str();
-    auto config_write = WriteSizedPayload(output_stream, config_data, max_config_size, "config section");
+    auto config_write = WriteSizedPayload(sink.tracked, config_data, max_config_size, "config section");
     if (!config_write) {
       return config_write;
     }
@@ -1401,7 +1490,7 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
         return stats_result;
       }
       std::string stats_data = stats_ss.str();
-      auto stats_write = WriteSizedPayload(output_stream, stats_data, max_stats_size, "statistics section");
+      auto stats_write = WriteSizedPayload(sink.tracked, stats_data, max_stats_size, "statistics section");
       if (!stats_write) {
         return stats_write;
       }
@@ -1409,33 +1498,33 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
 
     // Write store data section
     uint32_t store_count = metadata_store != nullptr ? 4 : 3;  // events, co_occurrence, vectors, metadata
-    WriteBinary(output_stream, store_count);
+    WriteBinary(sink.tracked, store_count);
 
-    auto events_write = WriteStoreSection(
-        output_stream, kEventsStoreName, "events", store_stats, max_store_stats_size, max_store_data_size,
-        [&](std::ostream& section) { return SerializeEventStore(section, event_store); });
+    auto events_write =
+        WriteStoreSection(sink, kEventsStoreName, "events", store_stats, max_store_stats_size, max_store_data_size,
+                          [&](std::ostream& section) { return SerializeEventStore(section, event_store); });
     if (!events_write) {
       return events_write;
     }
 
     auto co_occurrence_write = WriteStoreSection(
-        output_stream, kCoOccurrenceStoreName, "co-occurrence", store_stats, max_store_stats_size, max_store_data_size,
+        sink, kCoOccurrenceStoreName, "co-occurrence", store_stats, max_store_stats_size, max_store_data_size,
         [&](std::ostream& section) { return SerializeCoOccurrenceIndex(section, co_index); });
     if (!co_occurrence_write) {
       return co_occurrence_write;
     }
 
-    auto vectors_write = WriteStoreSection(
-        output_stream, kVectorsStoreName, "vectors", store_stats, max_store_stats_size, max_store_data_size,
-        [&](std::ostream& section) { return SerializeVectorStore(section, vector_store); });
+    auto vectors_write =
+        WriteStoreSection(sink, kVectorsStoreName, "vectors", store_stats, max_store_stats_size, max_store_data_size,
+                          [&](std::ostream& section) { return SerializeVectorStore(section, vector_store); });
     if (!vectors_write) {
       return vectors_write;
     }
 
     if (metadata_store != nullptr) {
-      auto metadata_write = WriteStoreSection(
-          output_stream, kMetadataStoreName, "metadata", nullptr, max_store_stats_size, max_store_data_size,
-          [&](std::ostream& section) { return SerializeMetadataStore(section, *metadata_store); });
+      auto metadata_write =
+          WriteStoreSection(sink, kMetadataStoreName, "metadata", nullptr, max_store_stats_size, max_store_data_size,
+                            [&](std::ostream& section) { return SerializeMetadataStore(section, *metadata_store); });
       if (!metadata_write) {
         return metadata_write;
       }
@@ -1453,12 +1542,31 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
       return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Snapshot exceeds maximum total file size"));
     }
 
-    // Write header with correct total_file_size (file_crc32 still 0 as placeholder)
+    // Rewrite the header with the final total_file_size (file_crc32 still 0 as placeholder)
     header.file_crc32 = 0;
     output_stream.seekp(snapshot_format::kFixedHeaderSize, std::ios::beg);
     auto rewrite_header_result = WriteHeaderV1(output_stream, header);
     if (!rewrite_header_result) {
       return rewrite_header_result;
+    }
+
+    // The file CRC32 is the checksum of the final prefix followed by the body folded above.
+    std::ostringstream prefix_ss;
+    prefix_ss.write(snapshot_format::kMagicNumber.data(), snapshot_format::kMagicNumber.size());
+    WriteBinary(prefix_ss, version);
+    auto prefix_result = WriteHeaderV1(prefix_ss, header);
+    if (!prefix_result) {
+      return prefix_result;
+    }
+    const std::string prefix = prefix_ss.str();
+    FileCrc prefix_crc;
+    prefix_crc.Fold(prefix.data(), prefix.size());
+    prefix_crc.FoldRun(sink.Crc().Value(), sink.Crc().Length());
+    header.file_crc32 = prefix_crc.Value();
+
+    output_stream.seekp(static_cast<std::streamoff>(kFileCRC32Offset), std::ios::beg);
+    if (!WriteBinary(output_stream, header.file_crc32)) {
+      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write snapshot file CRC32"));
     }
 
     // Close file to flush all data and surface buffered write failures.
@@ -1467,42 +1575,8 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
       return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to close snapshot temp file"));
     }
 
-    // Compute file-level CRC32: read entire file, zero the file_crc32 field, compute CRC
-    {
-      std::ifstream crc_input(temp_stream_path, std::ios::binary);
-      if (!crc_input) {
-        return MakeUnexpected(
-            MakeError(ErrorCode::kStorageDumpWriteError, "Failed to reopen secure temp inode for CRC32 computation"));
-      }
-      auto file_crc = CalculateFileCRC32Streaming(crc_input, header.total_file_size);
-      if (!file_crc) {
-        return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, file_crc.error().message()));
-      }
-      crc_input.close();
-      if (crc_input.fail()) {
-        return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to close snapshot CRC input"));
-      }
-
-      header.file_crc32 = *file_crc;
-
-      // Write the computed CRC32 at the file_crc32 position
-      std::ofstream crc_output(temp_stream_path, std::ios::binary | std::ios::in | std::ios::out);
-      if (!crc_output) {
-        return MakeUnexpected(
-            MakeError(ErrorCode::kStorageDumpWriteError, "Failed to reopen secure temp inode for CRC32 write"));
-      }
-      crc_output.seekp(static_cast<std::streamoff>(kFileCRC32Offset), std::ios::beg);
-      if (!WriteBinary(crc_output, header.file_crc32)) {
-        return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write snapshot file CRC32"));
-      }
-      crc_output.close();
-      if (crc_output.fail()) {
-        return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to close snapshot CRC output"));
-      }
-    }
-
 #ifndef _WIN32
-    // Persist the same opened inode that was written and CRC-checked.
+    // Persist the same opened inode that was written.
     if (::fsync(temp_file.Get()) != 0) {
       return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError,
                                       "Failed to fsync snapshot temp file: " + std::string(std::strerror(errno))));
@@ -1530,43 +1604,43 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
   }
 }
 
-Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config& config,
-                                     events::EventStore& event_store, events::CoOccurrenceIndex& co_index,
-                                     vectors::VectorStore& vector_store, SnapshotStatistics* stats,
-                                     std::unordered_map<std::string, StoreStatistics>* store_stats,
-                                     snapshot_format::IntegrityError* integrity_error,
-                                     vectors::MetadataStore* metadata_store) {
-  auto opened = OpenSnapshotWithHeader(filepath);
-  if (!opened) {
-    return MakeUnexpected(opened.error());
-  }
-  std::ifstream& input_stream = opened->stream;
-  const HeaderV1& header = opened->header;
+namespace {
+
+/// Parse every section of an opened snapshot, folding the bytes read into the file checksum.
+Expected<void, Error> ReadSnapshotSections(OpenedSnapshot& opened, const std::string& filepath, config::Config& config,
+                                           events::EventStore& event_store, events::CoOccurrenceIndex& co_index,
+                                           vectors::VectorStore& vector_store, SnapshotStatistics* stats,
+                                           std::unordered_map<std::string, StoreStatistics>* store_stats,
+                                           snapshot_format::IntegrityError* integrity_error,
+                                           vectors::MetadataStore* metadata_store) {
+  std::ifstream& input_stream = opened.stream;
+  const HeaderV1& header = opened.header;
 
   {
-    // Verify whole-file integrity (size + CRC32) before deserializing any
-    // section. This catches truncation and bit-rot anywhere in the file. The
-    // helper repositions the stream, so remember where the sections begin and
-    // seek back afterwards.
-    auto sections_begin = input_stream.tellg();
-    auto file_integrity_result = VerifyFileLevelIntegrity(input_stream, header, integrity_error);
-    if (!file_integrity_result) {
-      return file_integrity_result;
+    // The size and CRC declarations are checked up front; the CRC value itself
+    // is checked once every section has been read, so the file is read once.
+    const auto sections_begin = input_stream.tellg();
+    auto bounds_result = CheckFileBounds(input_stream, header, integrity_error);
+    if (!bounds_result) {
+      return bounds_result;
     }
-    input_stream.clear();
-    input_stream.seekg(sections_begin, std::ios::beg);
+    FileCrc file_crc;
+    auto prefix_result = FoldHeaderPrefix(input_stream, sections_begin, file_crc);
+    if (!prefix_result) {
+      return prefix_result;
+    }
 
     // Read config section
     uint32_t config_size = 0;
     uint32_t config_crc = 0;
-    if (!ReadBinary(input_stream, config_size)) {
+    if (!ReadFolded(input_stream, file_crc, config_size)) {
       return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read config size"));
     }
-    if (!ReadBinary(input_stream, config_crc)) {
+    if (!ReadFolded(input_stream, file_crc, config_crc)) {
       return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read config CRC"));
     }
     auto config_data = ReadCheckedSection(
-        input_stream, config_size, config_crc,
+        input_stream, file_crc, config_size, config_crc,
         {"config section", kMaxConfigSize, snapshot_format::CRCErrorType::ConfigCRC, ""}, integrity_error);
     if (!config_data) {
       return MakeUnexpected(config_data.error());
@@ -1584,14 +1658,14 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
     if ((header.flags & snapshot_format::flags_v1::kWithStatistics) != 0) {
       uint32_t stats_size = 0;
       uint32_t stats_crc = 0;
-      if (!ReadBinary(input_stream, stats_size)) {
+      if (!ReadFolded(input_stream, file_crc, stats_size)) {
         return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read statistics size"));
       }
-      if (!ReadBinary(input_stream, stats_crc)) {
+      if (!ReadFolded(input_stream, file_crc, stats_crc)) {
         return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read statistics CRC"));
       }
       auto stats_data = ReadCheckedSection(
-          input_stream, stats_size, stats_crc,
+          input_stream, file_crc, stats_size, stats_crc,
           {"statistics section", kMaxStatsSize, snapshot_format::CRCErrorType::StatsCRC, ""}, integrity_error);
       if (!stats_data) {
         return MakeUnexpected(stats_data.error());
@@ -1610,7 +1684,7 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
 
     // Read store data section
     uint32_t store_count = 0;
-    if (!ReadBinary(input_stream, store_count)) {
+    if (!ReadFolded(input_stream, file_crc, store_count)) {
       return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read store count"));
     }
     if (store_count < 3 || store_count > 4) {
@@ -1623,7 +1697,7 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
     for (uint32_t store_idx = 0; store_idx < store_count; ++store_idx) {
       // Read store name
       std::string store_name;
-      if (!ReadString(input_stream, store_name)) {
+      if (!ReadStringFolded(input_stream, file_crc, store_name)) {
         return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read store name"));
       }
       if (store_name != kEventsStoreName && store_name != kCoOccurrenceStoreName && store_name != kVectorsStoreName &&
@@ -1637,17 +1711,17 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
 
       // Read store statistics (if present)
       uint32_t store_stats_size = 0;
-      if (!ReadBinary(input_stream, store_stats_size)) {
+      if (!ReadFolded(input_stream, file_crc, store_stats_size)) {
         return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError,
                                         "Failed to read store statistics size for '" + store_name + "'"));
       }
       if (store_stats_size > 0) {
         uint32_t store_stats_crc = 0;
-        if (!ReadBinary(input_stream, store_stats_crc)) {
+        if (!ReadFolded(input_stream, file_crc, store_stats_crc)) {
           return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError,
                                           "Failed to read store statistics CRC for '" + store_name + "'"));
         }
-        auto store_stats_data = ReadCheckedSection(input_stream, store_stats_size, store_stats_crc,
+        auto store_stats_data = ReadCheckedSection(input_stream, file_crc, store_stats_size, store_stats_crc,
                                                    {"store statistics for '" + store_name + "'", kMaxStoreStatsSize,
                                                     snapshot_format::CRCErrorType::StoreStatsCRC, store_name},
                                                    integrity_error);
@@ -1672,16 +1746,16 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
       // Read store data
       uint32_t store_data_size = 0;
       uint32_t store_data_crc = 0;
-      if (!ReadBinary(input_stream, store_data_size)) {
+      if (!ReadFolded(input_stream, file_crc, store_data_size)) {
         return MakeUnexpected(
             MakeError(ErrorCode::kStorageDumpReadError, "Failed to read store data size for '" + store_name + "'"));
       }
-      if (!ReadBinary(input_stream, store_data_crc)) {
+      if (!ReadFolded(input_stream, file_crc, store_data_crc)) {
         return MakeUnexpected(
             MakeError(ErrorCode::kStorageDumpReadError, "Failed to read store data CRC for '" + store_name + "'"));
       }
       auto store_data = ReadCheckedSection(
-          input_stream, store_data_size, store_data_crc,
+          input_stream, file_crc, store_data_size, store_data_crc,
           {"store data for '" + store_name + "'", kMaxStoreDataSize, StoreDataCrcErrorType(store_name), store_name},
           integrity_error);
       if (!store_data) {
@@ -1742,9 +1816,42 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
       return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Trailing bytes after final store section"));
     }
 
+    auto crc_result = CheckFileCrc(file_crc.Value(), header, integrity_error);
+    if (!crc_result) {
+      return crc_result;
+    }
+
     LogStorageInfo("snapshot_read", "Snapshot loaded successfully from " + filepath);
     return {};
   }
+}
+
+}  // namespace
+
+Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config& config,
+                                     events::EventStore& event_store, events::CoOccurrenceIndex& co_index,
+                                     vectors::VectorStore& vector_store, SnapshotStatistics* stats,
+                                     std::unordered_map<std::string, StoreStatistics>* store_stats,
+                                     snapshot_format::IntegrityError* integrity_error,
+                                     vectors::MetadataStore* metadata_store) {
+  auto opened = OpenSnapshotWithHeader(filepath);
+  if (!opened) {
+    return MakeUnexpected(opened.error());
+  }
+  auto sections = ReadSnapshotSections(*opened, filepath, config, event_store, co_index, vector_store, stats,
+                                       store_stats, integrity_error, metadata_store);
+  if (sections) {
+    return sections;
+  }
+
+  // The single pass cannot tell damage from a semantically invalid file, and a
+  // damaged file is reported as such ahead of whatever the parse tripped over.
+  opened->stream.clear();
+  auto integrity = VerifyFileLevelIntegrity(opened->stream, opened->header, integrity_error);
+  if (!integrity) {
+    return integrity;
+  }
+  return sections;
 }
 
 Expected<void, Error> VerifySnapshotIntegrity(const std::string& filepath,

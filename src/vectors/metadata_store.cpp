@@ -27,13 +27,13 @@ void MetadataStore::Set(const std::string& id, Metadata meta) {
   metadata_[id] = std::move(meta);
 }
 
-const Metadata* MetadataStore::Get(const std::string& id) const {
+std::optional<Metadata> MetadataStore::Get(const std::string& id) const {
   std::shared_lock lock(mutex_);
   auto it = metadata_.find(id);
   if (it == metadata_.end()) {
-    return nullptr;
+    return std::nullopt;
   }
-  return &it->second;
+  return it->second;
 }
 
 void MetadataStore::Delete(const std::string& id) {

@@ -202,8 +202,8 @@ TEST(WalRecoveryIntegration, RecoversStateFromWalReplay) {
     EXPECT_TRUE(b.vector_store->HasVector("item_b"));
 
     // Metadata recovered (typed when logged).
-    const auto* meta = b.metadata_store->Get("item_a");
-    ASSERT_NE(meta, nullptr);
+    const auto meta = b.metadata_store->Get("item_a");
+    ASSERT_TRUE(meta.has_value());
     EXPECT_NE(meta->find("status"), meta->end());
 
     // Co-occurrence score recovered identically.
@@ -232,7 +232,7 @@ TEST(WalRecoveryIntegration, VecdelPersistsAcrossWalReplay) {
     b.OpenWal(wal_dir);
     EXPECT_GE(b.Replay(/*from=*/0), 3U);
     EXPECT_FALSE(b.vector_store->HasVector("removed"));
-    EXPECT_EQ(b.metadata_store->Get("removed"), nullptr);
+    EXPECT_FALSE(b.metadata_store->Get("removed").has_value());
   }
 
   fs::remove_all(root);
@@ -270,7 +270,7 @@ TEST(WalRecoveryIntegration, ReplaySkipsRecordsWhoseVectorTheConfigOmitted) {
     ASSERT_TRUE(replayed.has_value()) << replayed.error().message();
     EXPECT_EQ(*replayed, 2U);  // the METASET and the VECDEL, both skipped
     EXPECT_FALSE(b.vector_store->HasVector("orphan"));
-    EXPECT_EQ(b.metadata_store->Get("orphan"), nullptr);
+    EXPECT_FALSE(b.metadata_store->Get("orphan").has_value());
   }
 
   fs::remove_all(root);
@@ -306,8 +306,8 @@ TEST(WalRecoveryIntegration, InlineVecsetMetadataSurvivesReplayWithoutVectorPayl
     ASSERT_TRUE(replayed.has_value()) << replayed.error().message();
     EXPECT_EQ(*replayed, 1U);
     EXPECT_EQ(b.stats.wal_replay_records_skipped.load(), 0U);
-    const auto* meta = b.metadata_store->Get("kept");
-    ASSERT_NE(meta, nullptr);
+    const auto meta = b.metadata_store->Get("kept");
+    ASSERT_TRUE(meta.has_value());
     EXPECT_EQ(std::get<std::string>(meta->at("tier")), "gold");
   }
 
