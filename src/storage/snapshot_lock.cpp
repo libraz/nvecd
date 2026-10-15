@@ -35,7 +35,7 @@ utils::Expected<void, utils::Error> WriteSnapshotWithLock(
   // consistent point-in-time boundary.
   //
   // After this barrier, the caller should have set the read_only flag
-  // (via FlagGuard in dump_handler) to prevent new writes from starting.
+  // (cleared by a FlagResetGuard in dump_handler) to prevent new writes from starting.
   // WriteSnapshotV1 then serializes via const getters that acquire
   // shared (read) locks internally.
   {

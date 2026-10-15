@@ -19,9 +19,15 @@
 #include <utility>
 #include <vector>
 
+#include "storage/fd_io.h"
+#include "storage/snapshot_format_v1.h"
 #include "utils/path_utils.h"
 
 namespace nvecd::storage {
+
+std::string WalCheckpointPath(const std::string& snapshot_path) {
+  return snapshot_path + kWalCheckpointSuffix;
+}
 
 namespace {
 
@@ -29,88 +35,9 @@ constexpr uint32_t kCheckpointMagic = 0x5043574E;  // "NWCP" little-endian
 constexpr uint32_t kCheckpointVersion = 1;
 constexpr size_t kCheckpointSize = 32;
 constexpr size_t kFrameCrcOffset = 28;
-constexpr uint64_t kMaxBoundSnapshotSize = 3ULL * 1024ULL * 1024ULL * 1024ULL;
 
 /// File mode for newly created sidecar files (rw-------).
 constexpr mode_t kSidecarMode = 0600;
-
-std::string SidecarPath(const std::string& snapshot_path) {
-  return snapshot_path + kWalCheckpointSuffix;
-}
-
-/// Write exactly n bytes to fd, retrying on EINTR.
-bool WriteAll(int fd, const void* buf, size_t n) {
-  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
-  const auto* ptr = reinterpret_cast<const uint8_t*>(buf);
-  size_t remaining = n;
-  while (remaining > 0) {
-    const auto written = ::write(fd, ptr, remaining);
-    if (written < 0) {
-      if (errno == EINTR) {
-        continue;
-      }
-      return false;
-    }
-    ptr += written;
-    remaining -= static_cast<size_t>(written);
-  }
-  return true;
-}
-
-/// Read exactly n bytes from fd, retrying on EINTR.
-bool ReadAll(int fd, void* buf, size_t n) {
-  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
-  auto* ptr = reinterpret_cast<uint8_t*>(buf);
-  size_t remaining = n;
-  while (remaining > 0) {
-    const auto bytes_read = ::read(fd, ptr, remaining);
-    if (bytes_read < 0) {
-      if (errno == EINTR) {
-        continue;
-      }
-      return false;
-    }
-    if (bytes_read == 0) {
-      return false;  // EOF before the full record
-    }
-    ptr += bytes_read;
-    remaining -= static_cast<size_t>(bytes_read);
-  }
-  return true;
-}
-
-void WriteU32(uint8_t* output, uint32_t value) {
-  for (size_t i = 0; i < sizeof(value); ++i) {
-    output[i] = static_cast<uint8_t>((value >> (8 * i)) & 0xFFU);
-  }
-}
-
-void WriteU64(uint8_t* output, uint64_t value) {
-  for (size_t i = 0; i < sizeof(value); ++i) {
-    output[i] = static_cast<uint8_t>((value >> (8 * i)) & 0xFFU);
-  }
-}
-
-uint32_t ReadU32(const uint8_t* input) {
-  uint32_t value = 0;
-  for (size_t i = 0; i < sizeof(value); ++i) {
-    value |= static_cast<uint32_t>(input[i]) << (8 * i);
-  }
-  return value;
-}
-
-uint64_t ReadU64(const uint8_t* input) {
-  uint64_t value = 0;
-  for (size_t i = 0; i < sizeof(value); ++i) {
-    value |= static_cast<uint64_t>(input[i]) << (8 * i);
-  }
-  return value;
-}
-
-uint32_t CalculateCrc32(const void* data, size_t length) {
-  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
-  return static_cast<uint32_t>(crc32(0L, reinterpret_cast<const Bytef*>(data), length));
-}
 
 struct SnapshotBinding {
   uint64_t size = 0;
@@ -126,7 +53,7 @@ utils::Expected<SnapshotBinding, utils::Error> ReadSnapshotBinding(const std::st
   }
   struct stat info {};
   if (::fstat(fd, &info) != 0 || !S_ISREG(info.st_mode) || info.st_size < 0 ||
-      static_cast<uint64_t>(info.st_size) > kMaxBoundSnapshotSize) {
+      static_cast<uint64_t>(info.st_size) > snapshot_v1::kMaxSnapshotFileSize) {
     const int saved_errno = errno;
     ::close(fd);
     return utils::MakeUnexpected(utils::MakeError(
@@ -140,7 +67,7 @@ utils::Expected<SnapshotBinding, utils::Error> ReadSnapshotBinding(const std::st
   uLong crc = crc32(0L, Z_NULL, 0);
   while (remaining > 0) {
     const size_t chunk = static_cast<size_t>(std::min<uint64_t>(remaining, buffer.size()));
-    if (!ReadAll(fd, buffer.data(), chunk)) {
+    if (!fd_io::ReadAll(fd, buffer.data(), chunk)) {
       const int saved_errno = errno;
       ::close(fd);
       return utils::MakeUnexpected(utils::MakeError(
@@ -162,15 +89,7 @@ utils::Expected<SnapshotBinding, utils::Error> ReadSnapshotBinding(const std::st
 /// is not sufficient: after a power loss the directory can lose the rename and
 /// leave a completed snapshot without its checkpoint sidecar.
 bool FsyncParentDirectory(const std::string& path) {
-  const auto parent = std::filesystem::path(path).parent_path();
-  const std::string directory = parent.empty() ? "." : parent.string();
-  const int dir_fd = ::open(directory.c_str(), O_RDONLY | O_DIRECTORY);
-  if (dir_fd < 0) {
-    return false;
-  }
-  const bool ok = ::fsync(dir_fd) == 0;
-  ::close(dir_fd);
-  return ok;
+  return fd_io::FsyncDirectory(std::filesystem::path(path).parent_path().string());
 }
 
 }  // namespace
@@ -184,7 +103,7 @@ utils::Expected<void, utils::Error> WriteWalCheckpoint(const std::string& snapsh
   if (!binding) {
     return utils::MakeUnexpected(binding.error());
   }
-  auto resolved_path_result = utils::ResolvePrivateStoragePath(SidecarPath(snapshot_path));
+  auto resolved_path_result = utils::ResolvePrivateStoragePath(WalCheckpointPath(snapshot_path));
   if (!resolved_path_result) {
     return utils::MakeUnexpected(resolved_path_result.error());
   }
@@ -195,12 +114,12 @@ utils::Expected<void, utils::Error> WriteWalCheckpoint(const std::string& snapsh
   mutable_template.push_back('\0');
 
   std::array<uint8_t, kCheckpointSize> bytes{};
-  WriteU32(bytes.data(), kCheckpointMagic);
-  WriteU32(bytes.data() + 4, kCheckpointVersion);
-  WriteU64(bytes.data() + 8, sequence);
-  WriteU64(bytes.data() + 16, binding->size);
-  WriteU32(bytes.data() + 24, binding->crc32);
-  WriteU32(bytes.data() + kFrameCrcOffset, CalculateCrc32(bytes.data(), kFrameCrcOffset));
+  fd_io::WriteU32(bytes.data(), kCheckpointMagic);
+  fd_io::WriteU32(bytes.data() + 4, kCheckpointVersion);
+  fd_io::WriteU64(bytes.data() + 8, sequence);
+  fd_io::WriteU64(bytes.data() + 16, binding->size);
+  fd_io::WriteU32(bytes.data() + 24, binding->crc32);
+  fd_io::WriteU32(bytes.data() + kFrameCrcOffset, snapshot_v1::CalculateCRC32(bytes.data(), kFrameCrcOffset));
 
   const int fd = ::mkstemp(mutable_template.data());
   if (fd < 0) {
@@ -218,7 +137,7 @@ utils::Expected<void, utils::Error> WriteWalCheckpoint(const std::string& snapsh
                          "Failed to set WAL checkpoint permissions: " + std::string(std::strerror(saved_errno))));
   }
 
-  if (!WriteAll(fd, bytes.data(), bytes.size())) {
+  if (!fd_io::WriteAll(fd, bytes.data(), bytes.size())) {
     const int saved_errno = errno;
     ::close(fd);
     ::unlink(tmp_path.c_str());
@@ -266,7 +185,7 @@ utils::Expected<uint64_t, utils::Error> ReadWalCheckpoint(const std::string& sna
   if (!binding) {
     return utils::MakeUnexpected(binding.error());
   }
-  const std::string final_path = SidecarPath(snapshot_path);
+  const std::string final_path = WalCheckpointPath(snapshot_path);
 
   const int fd = ::open(final_path.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
   if (fd < 0) {
@@ -282,27 +201,27 @@ utils::Expected<uint64_t, utils::Error> ReadWalCheckpoint(const std::string& sna
         utils::MakeError(utils::ErrorCode::kStorageCorrupted, "Invalid WAL checkpoint file type or size", final_path));
   }
   std::array<uint8_t, kCheckpointSize> bytes{};
-  const bool ok = ReadAll(fd, bytes.data(), bytes.size());
+  const bool ok = fd_io::ReadAll(fd, bytes.data(), bytes.size());
   const bool closed = ::close(fd) == 0;
   if (!ok || !closed) {
     return utils::MakeUnexpected(
         utils::MakeError(utils::ErrorCode::kWalReadError, "Failed to read WAL checkpoint frame", final_path));
   }
 
-  if (ReadU32(bytes.data()) != kCheckpointMagic || ReadU32(bytes.data() + 4) != kCheckpointVersion) {
+  if (fd_io::ReadU32(bytes.data()) != kCheckpointMagic || fd_io::ReadU32(bytes.data() + 4) != kCheckpointVersion) {
     return utils::MakeUnexpected(
         utils::MakeError(utils::ErrorCode::kStorageCorrupted, "Invalid WAL checkpoint magic or version", final_path));
   }
-  if (ReadU32(bytes.data() + kFrameCrcOffset) != CalculateCrc32(bytes.data(), kFrameCrcOffset)) {
+  if (fd_io::ReadU32(bytes.data() + kFrameCrcOffset) != snapshot_v1::CalculateCRC32(bytes.data(), kFrameCrcOffset)) {
     return utils::MakeUnexpected(
         utils::MakeError(utils::ErrorCode::kStorageCorrupted, "WAL checkpoint CRC32 mismatch", final_path));
   }
-  const uint64_t sequence = ReadU64(bytes.data() + 8);
+  const uint64_t sequence = fd_io::ReadU64(bytes.data() + 8);
   if (sequence == std::numeric_limits<uint64_t>::max()) {
     return utils::MakeUnexpected(
         utils::MakeError(utils::ErrorCode::kStorageCorrupted, "WAL checkpoint sequence is exhausted", final_path));
   }
-  if (ReadU64(bytes.data() + 16) != binding->size || ReadU32(bytes.data() + 24) != binding->crc32) {
+  if (fd_io::ReadU64(bytes.data() + 16) != binding->size || fd_io::ReadU32(bytes.data() + 24) != binding->crc32) {
     return utils::MakeUnexpected(
         utils::MakeError(utils::ErrorCode::kStorageCorrupted, "WAL checkpoint does not match snapshot", final_path));
   }

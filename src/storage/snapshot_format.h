@@ -84,17 +84,6 @@ inline std::string RecoverableExtensionList() {
 }
 
 /**
- * @brief Format version enum for type safety
- */
-// NOLINTNEXTLINE(performance-enum-size) - Must match file format uint32_t
-enum class FormatVersion : uint32_t {
-  V1 = 1,  // Initial version
-  // Future versions can be added here
-  // V2 = 2,
-  // V3 = 3,
-};
-
-/**
  * @brief Flags for future extensions (Version 1)
  *
  * These flags are stored in the V1 header and indicate which features
@@ -111,7 +100,6 @@ enum class FormatVersion : uint32_t {
  * - kIncremental: Incremental snapshot (not yet implemented)
  */
 namespace flags_v1 {
-constexpr uint32_t kNone = 0x00000000;            // No flags set
 constexpr uint32_t kCompressed = 0x00000001;      // Data is compressed (reserved for future)
 constexpr uint32_t kEncrypted = 0x00000002;       // Data is encrypted (reserved for future)
 constexpr uint32_t kIncremental = 0x00000004;     // Incremental snapshot (reserved for future)

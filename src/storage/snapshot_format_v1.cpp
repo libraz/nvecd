@@ -26,21 +26,10 @@
 #include "utils/path_utils.h"
 #include "utils/structured_log.h"
 
-#ifdef _WIN32
-#include <io.h>
-#define CHMOD _chmod
-#else
+#ifndef _WIN32
 #include <fcntl.h>
-#include <sys/fcntl.h>  // For O_NOFOLLOW on macOS
 #include <sys/stat.h>
 #include <unistd.h>
-#define CHMOD chmod
-
-// Ensure O_NOFOLLOW is defined (standard on POSIX systems)
-#ifndef O_NOFOLLOW
-// NOLINTNEXTLINE(cppcoreguidelines-macro-usage): Platform compatibility constant for symlink protection
-#define O_NOFOLLOW 0x00000100
-#endif
 #endif
 
 namespace nvecd::storage::snapshot_v1 {
@@ -53,6 +42,12 @@ constexpr uint32_t kMaxStringLength = 256 * 1024 * 1024;  // 256MB max for lengt
 /// Reader-side dimension bound. Shares the store's single limit so a snapshot
 /// can never carry a dimension the live store would refuse.
 constexpr uint64_t kMaxVectorDimension = vectors::VectorStore::kMaxDimension;
+
+/// Store section names as they appear on disk.
+constexpr const char* kEventsStoreName = "events";
+constexpr const char* kCoOccurrenceStoreName = "co_occurrence";
+constexpr const char* kVectorsStoreName = "vectors";
+constexpr const char* kMetadataStoreName = "metadata";
 
 enum class MetadataValueType : uint8_t {
   kString = 1,
@@ -900,16 +895,17 @@ Expected<void, Error> SerializeVectorStore(std::ostream& output_stream, const ve
   // Write dimension as a fixed-width integer so snapshots are portable across
   // 32/64-bit builds (a bare size_t is 8 bytes on LP64, 4 on ILP32, which would
   // desync the vectors section on a cross-bit load).
+  // The snapshot is taken first so the dimension and the rows cannot diverge; it
+  // is held for the whole section so rows are read in place, not copied per id.
+  auto snap = vector_store.GetCompactSnapshot();
   auto dimension = static_cast<uint64_t>(vector_store.GetDimension());
   if (!WriteBinary(output_stream, dimension)) {
     return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write dimension"));
   }
-
-  // Get all vector IDs
-  std::vector<std::string> ids = vector_store.GetAllIds();
+  const size_t live_count = snap.Empty() ? 0 : snap.id_to_idx->size();
 
   // Write vector count
-  auto vector_count = CheckedSizeToU32(ids.size(), std::numeric_limits<uint32_t>::max(), "vector count");
+  auto vector_count = CheckedSizeToU32(live_count, std::numeric_limits<uint32_t>::max(), "vector count");
   if (!vector_count) {
     return MakeUnexpected(vector_count.error());
   }
@@ -917,28 +913,17 @@ Expected<void, Error> SerializeVectorStore(std::ostream& output_stream, const ve
     return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write vector count"));
   }
 
-  // Write each vector
-  for (const auto& vector_id : ids) {
-    // Write vector ID
+  // Write each live row, skipping tombstones
+  const size_t vector_bytes = snap.dim * sizeof(float);
+  for (size_t row = 0; row < snap.count; ++row) {
+    if (snap.IsDeleted(row)) {
+      continue;
+    }
+    const std::string& vector_id = (*snap.idx_to_id)[row];
     if (!WriteString(output_stream, vector_id)) {
       return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write vector ID: " + vector_id));
     }
-
-    // Get vector
-    auto vec_opt = vector_store.GetVector(vector_id);
-    if (!vec_opt) {
-      return MakeUnexpected(
-          MakeError(ErrorCode::kStorageDumpWriteError, "Vector not found during serialization: " + vector_id));
-    }
-
-    const auto& vec = vec_opt.value();
-
-    // Write vector data
-    if (vec.data.size() > std::numeric_limits<size_t>::max() / sizeof(float)) {
-      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Vector data size overflows byte count"));
-    }
-    const size_t vector_bytes = vec.data.size() * sizeof(float);
-    if (!WriteRawBytes(output_stream, vec.data.data(), vector_bytes)) {
+    if (!WriteRawBytes(output_stream, snap.matrix + row * snap.dim, vector_bytes)) {
       return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write vector data"));
     }
   }
@@ -974,14 +959,14 @@ Expected<void, Error> DeserializeVectorStore(std::istream& input_stream, vectors
   }
 
   // Read each vector
-  std::unordered_set<std::string> seen_vector_ids;
+  std::vector<float> data(static_cast<size_t>(dimension));
   for (uint32_t vec_idx = 0; vec_idx < vector_count; ++vec_idx) {
     // Read vector ID
     std::string vector_id;
     if (!ReadString(input_stream, vector_id)) {
       return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read vector ID"));
     }
-    if (!seen_vector_ids.insert(vector_id).second) {
+    if (vector_store.HasVector(vector_id)) {
       return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Duplicate vector ID: " + vector_id));
     }
 
@@ -990,7 +975,6 @@ Expected<void, Error> DeserializeVectorStore(std::istream& input_stream, vectors
     if (!HasRemainingBytes(input_stream, vector_bytes)) {
       return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Vector exceeds remaining store data"));
     }
-    std::vector<float> data(static_cast<size_t>(dimension));
     if (!ReadRawBytes(input_stream, data.data(), static_cast<size_t>(vector_bytes))) {
       return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read vector data"));
     }
@@ -1023,8 +1007,8 @@ Expected<void, Error> DeserializeVectorStore(std::istream& input_stream, vectors
 // MetadataStore Serialization
 // ============================================================================
 
-Expected<void, Error> SerializeMetadataStore(std::ostream& output_stream, const vectors::MetadataStore& metadata_store,
-                                             const vectors::VectorStore& /*vector_store*/) {
+Expected<void, Error> SerializeMetadataStore(std::ostream& output_stream,
+                                             const vectors::MetadataStore& metadata_store) {
   // Snapshot the id -> metadata map under a read lock so the iteration is
   // consistent with concurrent writers.
   auto read_lock = metadata_store.AcquireReadLock();
@@ -1095,8 +1079,7 @@ Expected<void, Error> SerializeMetadataStore(std::ostream& output_stream, const 
   return {};
 }
 
-Expected<void, Error> DeserializeMetadataStore(std::istream& input_stream, vectors::MetadataStore& metadata_store,
-                                               const vectors::VectorStore& /*vector_store*/) {
+Expected<void, Error> DeserializeMetadataStore(std::istream& input_stream, vectors::MetadataStore& metadata_store) {
   metadata_store.Clear();
 
   uint32_t item_count = 0;
@@ -1185,6 +1168,144 @@ Expected<void, Error> DeserializeMetadataStore(std::istream& input_stream, vecto
 // ============================================================================
 // Main Snapshot Write/Read Functions
 // ============================================================================
+
+namespace {
+
+/// Write one store section: name, optional statistics, then the streamed payload.
+template <typename SerializeFn>
+Expected<void, Error> WriteStoreSection(std::ostream& output_stream, const std::string& store_name,
+                                        const std::string& label,
+                                        const std::unordered_map<std::string, StoreStatistics>* store_stats,
+                                        uint32_t max_stats_size, uint32_t max_data_size, SerializeFn&& serialize) {
+  WriteString(output_stream, store_name);
+  if (store_stats != nullptr && store_stats->count(store_name) > 0) {
+    std::ostringstream store_stats_ss;
+    auto store_stats_result = SerializeStoreStatistics(store_stats_ss, store_stats->at(store_name));
+    if (!store_stats_result) {
+      return store_stats_result;
+    }
+    auto stats_write =
+        WriteSizedPayload(output_stream, store_stats_ss.str(), max_stats_size, label + " store statistics");
+    if (!stats_write) {
+      return stats_write;
+    }
+  } else {
+    uint32_t zero = 0;
+    WriteBinary(output_stream, zero);  // No store stats
+  }
+  return WriteStreamedSection(output_stream, max_data_size, label + " store", std::forward<SerializeFn>(serialize));
+}
+
+/// A snapshot opened for reading with its fixed header and V1 header parsed.
+struct OpenedSnapshot {
+  SecureFileDescriptor fd;  ///< Keeps the validated inode open behind `stream`
+  std::ifstream stream;     ///< Positioned at the first section
+  uint32_t version = 0;
+  HeaderV1 header;
+};
+
+Expected<OpenedSnapshot, Error> OpenSnapshotWithHeader(const std::string& filepath) {
+  auto storage_target_result = PrivateStorageTarget::Open(filepath);
+  if (!storage_target_result) {
+    return MakeUnexpected(storage_target_result.error());
+  }
+  auto storage_target = std::move(storage_target_result.value());
+  auto snapshot_fd_result = storage_target.OpenRegularFileReadOnly();
+  if (!snapshot_fd_result) {
+    return MakeUnexpected(snapshot_fd_result.error());
+  }
+  OpenedSnapshot opened;
+  opened.fd = std::move(snapshot_fd_result.value());
+  opened.stream.open(opened.fd.StreamPath(), std::ios::binary);
+  if (!opened.stream) {
+    return MakeUnexpected(MakeError(
+        ErrorCode::kStorageDumpReadError,
+        "Failed to open validated snapshot inode for reading: " + filepath + " (" + std::strerror(errno) + ")"));
+  }
+
+  // Read and verify fixed header (magic + version)
+  std::array<char, 4> magic{};
+  opened.stream.read(magic.data(), magic.size());
+  if (!opened.stream.good()) {
+    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read magic number"));
+  }
+  if (magic != snapshot_format::kMagicNumber) {
+    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Invalid magic number"));
+  }
+  if (!ReadBinary(opened.stream, opened.version)) {
+    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read version"));
+  }
+  if (opened.version < snapshot_format::kMinSupportedVersion ||
+      opened.version > snapshot_format::kMaxSupportedVersion) {
+    return MakeUnexpected(
+        MakeError(ErrorCode::kStorageDumpReadError, "Unsupported version: " + std::to_string(opened.version)));
+  }
+
+  auto read_header_result = ReadHeaderV1(opened.stream, opened.header);
+  if (!read_header_result) {
+    return MakeUnexpected(read_header_result.error());
+  }
+  return opened;
+}
+
+/// CRC error class reported for a mismatch in the named store's data section.
+snapshot_format::CRCErrorType StoreDataCrcErrorType(const std::string& store_name) {
+  if (store_name == kEventsStoreName) {
+    return snapshot_format::CRCErrorType::EventStoreCRC;
+  }
+  if (store_name == kCoOccurrenceStoreName) {
+    return snapshot_format::CRCErrorType::CoOccurrenceCRC;
+  }
+  if (store_name == kVectorsStoreName) {
+    return snapshot_format::CRCErrorType::VectorStoreCRC;
+  }
+  if (store_name == kMetadataStoreName) {
+    return snapshot_format::CRCErrorType::MetadataStoreCRC;
+  }
+  return snapshot_format::CRCErrorType::FileCRC;
+}
+
+/// Where a sized section sits in the file, for bounds checks and error reporting.
+struct SectionSpec {
+  std::string label;  ///< Names the section in error messages
+  uint32_t max_size = 0;
+  snapshot_format::CRCErrorType crc_error_type = snapshot_format::CRCErrorType::FileCRC;
+  std::string store_name;  ///< Empty for sections that belong to no store
+};
+
+/// Read a section whose size and CRC32 were already parsed: bound it, read it, verify its CRC32.
+Expected<std::string, Error> ReadCheckedSection(std::istream& input_stream, uint32_t size, uint32_t expected_crc,
+                                                const SectionSpec& spec,
+                                                snapshot_format::IntegrityError* integrity_error) {
+  if (size > spec.max_size) {
+    return MakeUnexpected(
+        MakeError(ErrorCode::kStorageDumpReadError, spec.label + " size exceeds maximum: " + std::to_string(size)));
+  }
+  if (!HasRemainingBytes(input_stream, size)) {
+    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, spec.label + " exceeds remaining file"));
+  }
+  std::string data(size, '\0');
+  input_stream.read(data.data(), size);
+  if (!input_stream.good()) {
+    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read " + spec.label));
+  }
+  const uint32_t actual_crc = CalculateCRC32(data);
+  if (actual_crc != expected_crc) {
+    const std::string message = "CRC32 mismatch in " + spec.label + ": expected " + std::to_string(expected_crc) +
+                                ", got " + std::to_string(actual_crc);
+    if (integrity_error != nullptr) {
+      integrity_error->type = spec.crc_error_type;
+      if (!spec.store_name.empty()) {
+        integrity_error->store_name = spec.store_name;
+      }
+      integrity_error->message = message;
+    }
+    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, message));
+  }
+  return data;
+}
+
+}  // namespace
 
 Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config::Config& config,
                                       const events::EventStore& event_store, const events::CoOccurrenceIndex& co_index,
@@ -1290,101 +1411,33 @@ Expected<void, Error> WriteSnapshotV1(const std::string& filepath, const config:
     uint32_t store_count = metadata_store != nullptr ? 4 : 3;  // events, co_occurrence, vectors, metadata
     WriteBinary(output_stream, store_count);
 
-    // Store 1: EventStore
-    {
-      WriteString(output_stream, "events");
-      if (store_stats != nullptr && store_stats->count("events") > 0) {
-        std::ostringstream store_stats_ss;
-        auto store_stats_result = SerializeStoreStatistics(store_stats_ss, store_stats->at("events"));
-        if (!store_stats_result) {
-          return store_stats_result;
-        }
-        std::string store_stats_data = store_stats_ss.str();
-        auto write_result =
-            WriteSizedPayload(output_stream, store_stats_data, max_store_stats_size, "events store statistics");
-        if (!write_result) {
-          return write_result;
-        }
-      } else {
-        uint32_t zero = 0;
-        WriteBinary(output_stream, zero);  // No store stats
-      }
-
-      auto write_result =
-          WriteStreamedSection(output_stream, max_store_data_size, "events store",
-                               [&](std::ostream& section) { return SerializeEventStore(section, event_store); });
-      if (!write_result) {
-        return write_result;
-      }
+    auto events_write = WriteStoreSection(
+        output_stream, kEventsStoreName, "events", store_stats, max_store_stats_size, max_store_data_size,
+        [&](std::ostream& section) { return SerializeEventStore(section, event_store); });
+    if (!events_write) {
+      return events_write;
     }
 
-    // Store 2: CoOccurrenceIndex
-    {
-      WriteString(output_stream, "co_occurrence");
-      if (store_stats != nullptr && store_stats->count("co_occurrence") > 0) {
-        std::ostringstream store_stats_ss;
-        auto store_stats_result = SerializeStoreStatistics(store_stats_ss, store_stats->at("co_occurrence"));
-        if (!store_stats_result) {
-          return store_stats_result;
-        }
-        std::string store_stats_data = store_stats_ss.str();
-        auto write_result =
-            WriteSizedPayload(output_stream, store_stats_data, max_store_stats_size, "co-occurrence store statistics");
-        if (!write_result) {
-          return write_result;
-        }
-      } else {
-        uint32_t zero = 0;
-        WriteBinary(output_stream, zero);  // No store stats
-      }
-
-      auto write_result =
-          WriteStreamedSection(output_stream, max_store_data_size, "co-occurrence store",
-                               [&](std::ostream& section) { return SerializeCoOccurrenceIndex(section, co_index); });
-      if (!write_result) {
-        return write_result;
-      }
+    auto co_occurrence_write = WriteStoreSection(
+        output_stream, kCoOccurrenceStoreName, "co-occurrence", store_stats, max_store_stats_size, max_store_data_size,
+        [&](std::ostream& section) { return SerializeCoOccurrenceIndex(section, co_index); });
+    if (!co_occurrence_write) {
+      return co_occurrence_write;
     }
 
-    // Store 3: VectorStore
-    {
-      WriteString(output_stream, "vectors");
-      if (store_stats != nullptr && store_stats->count("vectors") > 0) {
-        std::ostringstream store_stats_ss;
-        auto store_stats_result = SerializeStoreStatistics(store_stats_ss, store_stats->at("vectors"));
-        if (!store_stats_result) {
-          return store_stats_result;
-        }
-        std::string store_stats_data = store_stats_ss.str();
-        auto write_result =
-            WriteSizedPayload(output_stream, store_stats_data, max_store_stats_size, "vectors store statistics");
-        if (!write_result) {
-          return write_result;
-        }
-      } else {
-        uint32_t zero = 0;
-        WriteBinary(output_stream, zero);  // No store stats
-      }
-
-      auto write_result =
-          WriteStreamedSection(output_stream, max_store_data_size, "vectors store",
-                               [&](std::ostream& section) { return SerializeVectorStore(section, vector_store); });
-      if (!write_result) {
-        return write_result;
-      }
+    auto vectors_write = WriteStoreSection(
+        output_stream, kVectorsStoreName, "vectors", store_stats, max_store_stats_size, max_store_data_size,
+        [&](std::ostream& section) { return SerializeVectorStore(section, vector_store); });
+    if (!vectors_write) {
+      return vectors_write;
     }
 
-    // Store 4: MetadataStore
     if (metadata_store != nullptr) {
-      WriteString(output_stream, "metadata");
-      uint32_t zero = 0;
-      WriteBinary(output_stream, zero);  // No store stats
-
-      auto write_result = WriteStreamedSection(
-          output_stream, max_store_data_size, "metadata store",
-          [&](std::ostream& section) { return SerializeMetadataStore(section, *metadata_store, vector_store); });
-      if (!write_result) {
-        return write_result;
+      auto metadata_write = WriteStoreSection(
+          output_stream, kMetadataStoreName, "metadata", nullptr, max_store_stats_size, max_store_data_size,
+          [&](std::ostream& section) { return SerializeMetadataStore(section, *metadata_store); });
+      if (!metadata_write) {
+        return metadata_write;
       }
     }
 
@@ -1483,50 +1536,14 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
                                      std::unordered_map<std::string, StoreStatistics>* store_stats,
                                      snapshot_format::IntegrityError* integrity_error,
                                      vectors::MetadataStore* metadata_store) {
-  auto storage_target_result = PrivateStorageTarget::Open(filepath);
-  if (!storage_target_result) {
-    return MakeUnexpected(storage_target_result.error());
+  auto opened = OpenSnapshotWithHeader(filepath);
+  if (!opened) {
+    return MakeUnexpected(opened.error());
   }
-  auto storage_target = std::move(storage_target_result.value());
-  auto snapshot_fd_result = storage_target.OpenRegularFileReadOnly();
-  if (!snapshot_fd_result) {
-    return MakeUnexpected(snapshot_fd_result.error());
-  }
-  auto snapshot_fd = std::move(snapshot_fd_result.value());
-  std::ifstream input_stream(snapshot_fd.StreamPath(), std::ios::binary);
-  if (!input_stream) {
-    return MakeUnexpected(MakeError(
-        ErrorCode::kStorageDumpReadError,
-        "Failed to open validated snapshot inode for reading: " + filepath + " (" + std::strerror(errno) + ")"));
-  }
+  std::ifstream& input_stream = opened->stream;
+  const HeaderV1& header = opened->header;
 
   {
-    // Read and verify fixed header (magic + version)
-    std::array<char, 4> magic{};
-    input_stream.read(magic.data(), magic.size());
-    if (!input_stream.good()) {
-      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read magic number"));
-    }
-    if (magic != snapshot_format::kMagicNumber) {
-      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Invalid magic number"));
-    }
-
-    uint32_t version = 0;
-    if (!ReadBinary(input_stream, version)) {
-      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read version"));
-    }
-    if (version != 1) {
-      return MakeUnexpected(
-          MakeError(ErrorCode::kStorageDumpReadError, "Unsupported version: " + std::to_string(version)));
-    }
-
-    // Read V1 header
-    HeaderV1 header;
-    auto read_header_result = ReadHeaderV1(input_stream, header);
-    if (!read_header_result) {
-      return read_header_result;
-    }
-
     // Verify whole-file integrity (size + CRC32) before deserializing any
     // section. This catches truncation and bit-rot anywhere in the file. The
     // helper repositions the stream, so remember where the sections begin and
@@ -1548,32 +1565,13 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
     if (!ReadBinary(input_stream, config_crc)) {
       return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read config CRC"));
     }
-    if (config_size > kMaxConfigSize) {
-      return MakeUnexpected(
-          MakeError(ErrorCode::kStorageDumpReadError, "Config size exceeds maximum: " + std::to_string(config_size)));
+    auto config_data = ReadCheckedSection(
+        input_stream, config_size, config_crc,
+        {"config section", kMaxConfigSize, snapshot_format::CRCErrorType::ConfigCRC, ""}, integrity_error);
+    if (!config_data) {
+      return MakeUnexpected(config_data.error());
     }
-    if (!HasRemainingBytes(input_stream, config_size)) {
-      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Config section exceeds remaining file"));
-    }
-    std::string config_data(config_size, '\0');
-    input_stream.read(config_data.data(), config_size);
-    if (!input_stream.good()) {
-      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read config data"));
-    }
-    {
-      uint32_t actual_crc = CalculateCRC32(config_data);
-      if (actual_crc != config_crc) {
-        if (integrity_error != nullptr) {
-          integrity_error->type = snapshot_format::CRCErrorType::ConfigCRC;
-          integrity_error->message = "CRC32 mismatch in config section: expected " + std::to_string(config_crc) +
-                                     ", got " + std::to_string(actual_crc);
-        }
-        return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError,
-                                        "CRC32 mismatch in config section: expected " + std::to_string(config_crc) +
-                                            ", got " + std::to_string(actual_crc)));
-      }
-    }
-    std::istringstream config_ss(config_data);
+    std::istringstream config_ss(*config_data);
     auto deserialize_config_result = DeserializeConfig(config_ss, config);
     if (!deserialize_config_result) {
       return deserialize_config_result;
@@ -1592,33 +1590,14 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
       if (!ReadBinary(input_stream, stats_crc)) {
         return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read statistics CRC"));
       }
-      if (stats_size > kMaxStatsSize) {
-        return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError,
-                                        "Statistics size exceeds maximum: " + std::to_string(stats_size)));
-      }
-      if (!HasRemainingBytes(input_stream, stats_size)) {
-        return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Statistics section exceeds remaining file"));
-      }
-      std::string stats_data(stats_size, '\0');
-      input_stream.read(stats_data.data(), stats_size);
-      if (!input_stream.good()) {
-        return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read statistics data"));
-      }
-      {
-        uint32_t actual_crc = CalculateCRC32(stats_data);
-        if (actual_crc != stats_crc) {
-          if (integrity_error != nullptr) {
-            integrity_error->type = snapshot_format::CRCErrorType::StatsCRC;
-            integrity_error->message = "CRC32 mismatch in statistics section: expected " + std::to_string(stats_crc) +
-                                       ", got " + std::to_string(actual_crc);
-          }
-          return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError,
-                                          "CRC32 mismatch in statistics section: expected " +
-                                              std::to_string(stats_crc) + ", got " + std::to_string(actual_crc)));
-        }
+      auto stats_data = ReadCheckedSection(
+          input_stream, stats_size, stats_crc,
+          {"statistics section", kMaxStatsSize, snapshot_format::CRCErrorType::StatsCRC, ""}, integrity_error);
+      if (!stats_data) {
+        return MakeUnexpected(stats_data.error());
       }
       if (stats != nullptr) {
-        std::istringstream stats_ss(stats_data);
+        std::istringstream stats_ss(*stats_data);
         auto deserialize_stats_result = DeserializeStatistics(stats_ss, *stats);
         if (!deserialize_stats_result) {
           return deserialize_stats_result;
@@ -1647,8 +1626,8 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
       if (!ReadString(input_stream, store_name)) {
         return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read store name"));
       }
-      if (store_name != "events" && store_name != "co_occurrence" && store_name != "vectors" &&
-          store_name != "metadata") {
+      if (store_name != kEventsStoreName && store_name != kCoOccurrenceStoreName && store_name != kVectorsStoreName &&
+          store_name != kMetadataStoreName) {
         return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Unknown store name: '" + store_name + "'"));
       }
       if (!seen_stores.insert(store_name).second) {
@@ -1668,36 +1647,15 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
           return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError,
                                           "Failed to read store statistics CRC for '" + store_name + "'"));
         }
-        if (store_stats_size > kMaxStoreStatsSize) {
-          return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Store statistics size exceeds maximum: " +
-                                                                                std::to_string(store_stats_size)));
-        }
-        if (!HasRemainingBytes(input_stream, store_stats_size)) {
-          return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Store statistics exceed remaining file"));
-        }
-        std::string store_stats_data(store_stats_size, '\0');
-        input_stream.read(store_stats_data.data(), store_stats_size);
-        if (!input_stream.good()) {
-          return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError,
-                                          "Failed to read store statistics data for '" + store_name + "'"));
-        }
-        {
-          uint32_t actual_crc = CalculateCRC32(store_stats_data);
-          if (actual_crc != store_stats_crc) {
-            if (integrity_error != nullptr) {
-              integrity_error->type = snapshot_format::CRCErrorType::StoreStatsCRC;
-              integrity_error->store_name = store_name;
-              integrity_error->message = "CRC32 mismatch in store statistics for '" + store_name + "': expected " +
-                                         std::to_string(store_stats_crc) + ", got " + std::to_string(actual_crc);
-            }
-            return MakeUnexpected(
-                MakeError(ErrorCode::kStorageDumpReadError, "CRC32 mismatch in store statistics for '" + store_name +
-                                                                "': expected " + std::to_string(store_stats_crc) +
-                                                                ", got " + std::to_string(actual_crc)));
-          }
+        auto store_stats_data = ReadCheckedSection(input_stream, store_stats_size, store_stats_crc,
+                                                   {"store statistics for '" + store_name + "'", kMaxStoreStatsSize,
+                                                    snapshot_format::CRCErrorType::StoreStatsCRC, store_name},
+                                                   integrity_error);
+        if (!store_stats_data) {
+          return MakeUnexpected(store_stats_data.error());
         }
         if (store_stats != nullptr) {
-          std::istringstream store_stats_ss(store_stats_data);
+          std::istringstream store_stats_ss(*store_stats_data);
           StoreStatistics parsed_stats;
           auto deserialize_store_stats_result = DeserializeStoreStatistics(store_stats_ss, parsed_stats);
           if (!deserialize_store_stats_result) {
@@ -1722,69 +1680,38 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
         return MakeUnexpected(
             MakeError(ErrorCode::kStorageDumpReadError, "Failed to read store data CRC for '" + store_name + "'"));
       }
-      if (store_data_size > kMaxStoreDataSize) {
-        return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError,
-                                        "Store data size exceeds maximum: " + std::to_string(store_data_size)));
-      }
-      if (!HasRemainingBytes(input_stream, store_data_size)) {
-        return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Store data exceeds remaining file"));
-      }
-      std::string store_data(store_data_size, '\0');
-      input_stream.read(store_data.data(), store_data_size);
-      if (!input_stream.good()) {
-        return MakeUnexpected(
-            MakeError(ErrorCode::kStorageDumpReadError, "Failed to read store data for '" + store_name + "'"));
-      }
-      {
-        uint32_t actual_crc = CalculateCRC32(store_data);
-        if (actual_crc != store_data_crc) {
-          // Determine store-specific CRC error type
-          auto crc_error_type = snapshot_format::CRCErrorType::FileCRC;
-          if (store_name == "events") {
-            crc_error_type = snapshot_format::CRCErrorType::EventStoreCRC;
-          } else if (store_name == "co_occurrence") {
-            crc_error_type = snapshot_format::CRCErrorType::CoOccurrenceCRC;
-          } else if (store_name == "vectors") {
-            crc_error_type = snapshot_format::CRCErrorType::VectorStoreCRC;
-          } else if (store_name == "metadata") {
-            crc_error_type = snapshot_format::CRCErrorType::MetadataStoreCRC;
-          }
-          if (integrity_error != nullptr) {
-            integrity_error->type = crc_error_type;
-            integrity_error->store_name = store_name;
-            integrity_error->message = "CRC32 mismatch in store data for '" + store_name + "': expected " +
-                                       std::to_string(store_data_crc) + ", got " + std::to_string(actual_crc);
-          }
-          return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError,
-                                          "CRC32 mismatch in store data for '" + store_name + "': expected " +
-                                              std::to_string(store_data_crc) + ", got " + std::to_string(actual_crc)));
-        }
+      auto store_data = ReadCheckedSection(
+          input_stream, store_data_size, store_data_crc,
+          {"store data for '" + store_name + "'", kMaxStoreDataSize, StoreDataCrcErrorType(store_name), store_name},
+          integrity_error);
+      if (!store_data) {
+        return MakeUnexpected(store_data.error());
       }
 
       // Parse the bytes that were already read rather than handing them to an
       // istringstream, which would copy the whole section a second time.
-      BufferViewStreambuf store_data_buffer(store_data.data(), store_data.size());
+      BufferViewStreambuf store_data_buffer(store_data->data(), store_data->size());
       std::istream store_data_ss(&store_data_buffer);
 
       // Deserialize based on store name
-      if (store_name == "events") {
+      if (store_name == kEventsStoreName) {
         auto deserialize_result = DeserializeEventStore(store_data_ss, event_store);
         if (!deserialize_result) {
           return deserialize_result;
         }
-      } else if (store_name == "co_occurrence") {
+      } else if (store_name == kCoOccurrenceStoreName) {
         auto deserialize_result = DeserializeCoOccurrenceIndex(store_data_ss, co_index);
         if (!deserialize_result) {
           return deserialize_result;
         }
-      } else if (store_name == "vectors") {
+      } else if (store_name == kVectorsStoreName) {
         auto deserialize_result = DeserializeVectorStore(store_data_ss, vector_store);
         if (!deserialize_result) {
           return deserialize_result;
         }
-      } else if (store_name == "metadata") {
+      } else if (store_name == kMetadataStoreName) {
         auto& metadata_target = metadata_store != nullptr ? *metadata_store : discarded_metadata_store;
-        auto deserialize_result = DeserializeMetadataStore(store_data_ss, metadata_target, vector_store);
+        auto deserialize_result = DeserializeMetadataStore(store_data_ss, metadata_target);
         if (!deserialize_result) {
           return deserialize_result;
         }
@@ -1795,13 +1722,13 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
       }
     }
 
-    for (const std::string required_store : {"events", "co_occurrence", "vectors"}) {
+    for (const std::string required_store : {kEventsStoreName, kCoOccurrenceStoreName, kVectorsStoreName}) {
       if (seen_stores.count(required_store) == 0) {
         return MakeUnexpected(
             MakeError(ErrorCode::kStorageDumpReadError, "Missing required store: '" + required_store + "'"));
       }
     }
-    if (seen_stores.count("metadata") > 0) {
+    if (seen_stores.count(kMetadataStoreName) > 0) {
       const auto* validated_metadata = metadata_store != nullptr ? metadata_store : &discarded_metadata_store;
       auto metadata_lock = validated_metadata->AcquireReadLock();
       for (const auto& [item_id, _] : validated_metadata->GetAll()) {
@@ -1822,120 +1749,32 @@ Expected<void, Error> ReadSnapshotV1(const std::string& filepath, config::Config
 
 Expected<void, Error> VerifySnapshotIntegrity(const std::string& filepath,
                                               snapshot_format::IntegrityError& integrity_error) {
-  auto storage_target_result = PrivateStorageTarget::Open(filepath);
-  if (!storage_target_result) {
+  auto opened = OpenSnapshotWithHeader(filepath);
+  if (!opened) {
     integrity_error.type = snapshot_format::CRCErrorType::FileCRC;
-    integrity_error.message = storage_target_result.error().message();
-    return MakeUnexpected(storage_target_result.error());
-  }
-  auto storage_target = std::move(storage_target_result.value());
-  auto snapshot_fd_result = storage_target.OpenRegularFileReadOnly();
-  if (!snapshot_fd_result) {
-    integrity_error.type = snapshot_format::CRCErrorType::FileCRC;
-    integrity_error.message = snapshot_fd_result.error().message();
-    return MakeUnexpected(snapshot_fd_result.error());
-  }
-  auto snapshot_fd = std::move(snapshot_fd_result.value());
-  std::ifstream input_stream(snapshot_fd.StreamPath(), std::ios::binary);
-  if (!input_stream) {
-    integrity_error.type = snapshot_format::CRCErrorType::FileCRC;
-    integrity_error.message = "Failed to open file: " + std::string(std::strerror(errno));
-    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, integrity_error.message));
+    integrity_error.message = opened.error().message();
+    return MakeUnexpected(opened.error());
   }
 
-  {
-    // Read and verify fixed header (magic + version)
-    std::array<char, 4> magic{};
-    input_stream.read(magic.data(), magic.size());
-    if (!input_stream.good()) {
-      integrity_error.type = snapshot_format::CRCErrorType::FileCRC;
-      integrity_error.message = "Failed to read magic number";
-      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, integrity_error.message));
-    }
-    if (magic != snapshot_format::kMagicNumber) {
-      integrity_error.type = snapshot_format::CRCErrorType::FileCRC;
-      integrity_error.message = "Invalid magic number";
-      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, integrity_error.message));
-    }
-
-    uint32_t version = 0;
-    if (!ReadBinary(input_stream, version)) {
-      integrity_error.type = snapshot_format::CRCErrorType::FileCRC;
-      integrity_error.message = "Failed to read version";
-      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, integrity_error.message));
-    }
-    if (version < snapshot_format::kMinSupportedVersion || version > snapshot_format::kMaxSupportedVersion) {
-      integrity_error.type = snapshot_format::CRCErrorType::FileCRC;
-      integrity_error.message = "Unsupported version: " + std::to_string(version);
-      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, integrity_error.message));
-    }
-
-    // Read V1 header
-    HeaderV1 header;
-    auto read_header_result = ReadHeaderV1(input_stream, header);
-    if (!read_header_result) {
-      integrity_error.type = snapshot_format::CRCErrorType::FileCRC;
-      integrity_error.message = read_header_result.error().message();
-      return read_header_result;
-    }
-
-    // Verify whole-file size and CRC32 via the shared helper.
-    auto file_integrity_result = VerifyFileLevelIntegrity(input_stream, header, &integrity_error);
-    if (!file_integrity_result) {
-      return file_integrity_result;
-    }
-
-    LogStorageInfo("snapshot_verify", "Snapshot integrity verified: " + filepath);
-    return {};
+  // Verify whole-file size and CRC32 via the shared helper.
+  auto file_integrity_result = VerifyFileLevelIntegrity(opened->stream, opened->header, &integrity_error);
+  if (!file_integrity_result) {
+    return file_integrity_result;
   }
+
+  LogStorageInfo("snapshot_verify", "Snapshot integrity verified: " + filepath);
+  return {};
 }
 
 Expected<void, Error> GetSnapshotInfo(const std::string& filepath, SnapshotInfo& info) {
-  auto storage_target_result = PrivateStorageTarget::Open(filepath);
-  if (!storage_target_result) {
-    return MakeUnexpected(storage_target_result.error());
+  auto opened = OpenSnapshotWithHeader(filepath);
+  if (!opened) {
+    return MakeUnexpected(opened.error());
   }
-  auto storage_target = std::move(storage_target_result.value());
-  auto snapshot_fd_result = storage_target.OpenRegularFileReadOnly();
-  if (!snapshot_fd_result) {
-    return MakeUnexpected(snapshot_fd_result.error());
-  }
-  auto snapshot_fd = std::move(snapshot_fd_result.value());
-  std::ifstream input_stream(snapshot_fd.StreamPath(), std::ios::binary);
-  if (!input_stream) {
-    return MakeUnexpected(MakeError(
-        ErrorCode::kStorageDumpReadError,
-        "Failed to open validated snapshot inode for reading: " + filepath + " (" + std::strerror(errno) + ")"));
-  }
+  std::ifstream& input_stream = opened->stream;
+  const HeaderV1& header = opened->header;
 
-  // Read and verify fixed header (magic + version)
-  std::array<char, 4> magic{};
-  input_stream.read(magic.data(), magic.size());
-  if (!input_stream.good()) {
-    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read magic number"));
-  }
-  if (magic != snapshot_format::kMagicNumber) {
-    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Invalid magic number"));
-  }
-
-  uint32_t version = 0;
-  if (!ReadBinary(input_stream, version)) {
-    return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read version"));
-  }
-  info.version = version;
-
-  if (version != 1) {
-    return MakeUnexpected(
-        MakeError(ErrorCode::kStorageDumpReadError, "Unsupported version: " + std::to_string(version)));
-  }
-
-  // Read V1 header
-  HeaderV1 header;
-  auto read_header_result = ReadHeaderV1(input_stream, header);
-  if (!read_header_result) {
-    return read_header_result;
-  }
-
+  info.version = opened->version;
   info.flags = header.flags;
   info.timestamp = header.snapshot_timestamp;
   info.file_size = header.total_file_size;

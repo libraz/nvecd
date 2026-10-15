@@ -245,6 +245,32 @@ TEST_F(SnapshotFormatV1Test, DISABLED_WritesAndReadsASectionAboveTheOldPerSectio
   EXPECT_EQ(loaded_vectors.GetDimension(), kDimension);
 }
 
+TEST_F(SnapshotFormatV1Test, VectorStoreRoundTripOmitsTombstones) {
+  for (const char* id : {"keep_a", "dropped", "keep_b"}) {
+    ASSERT_TRUE(vector_store_->SetVector(id, {1.0F, 2.0F, 3.0F}).has_value());
+  }
+  ASSERT_TRUE(vector_store_->DeleteVector("dropped"));
+
+  std::ostringstream encoded(std::ios::binary | std::ios::out);
+  ASSERT_TRUE(SerializeVectorStore(encoded, *vector_store_).has_value());
+
+  config::VectorsConfig vectors_cfg;
+  vectors::VectorStore loaded(vectors_cfg);
+  std::istringstream input(encoded.str(), std::ios::binary);
+  auto decoded = DeserializeVectorStore(input, loaded);
+  ASSERT_TRUE(decoded.has_value()) << decoded.error().message();
+
+  EXPECT_EQ(loaded.GetVectorCount(), 2U);
+  EXPECT_TRUE(loaded.HasVector("keep_a"));
+  EXPECT_TRUE(loaded.HasVector("keep_b"));
+  EXPECT_FALSE(loaded.HasVector("dropped"));
+  auto kept = loaded.GetVector("keep_b");
+  auto original = vector_store_->GetVector("keep_b");
+  ASSERT_TRUE(kept.has_value());
+  ASSERT_TRUE(original.has_value());
+  EXPECT_EQ(kept->data, original->data);
+}
+
 // ---------------------------------------------------------------------------
 // 1. WriteAndRead_RoundTrip
 // ---------------------------------------------------------------------------
@@ -432,7 +458,7 @@ TEST_F(SnapshotFormatV1Test, WriteAndRead_MetadataRoundTrip) {
   EXPECT_EQ(loaded_metadata.Get("empty"), nullptr) << "empty metadata entries are omitted from the V1 section";
 
   std::ostringstream encoded_metadata(std::ios::binary | std::ios::out);
-  auto serialized_metadata = SerializeMetadataStore(encoded_metadata, *metadata_store_, *vector_store_);
+  auto serialized_metadata = SerializeMetadataStore(encoded_metadata, *metadata_store_);
   ASSERT_TRUE(serialized_metadata.has_value()) << serialized_metadata.error().message();
   uint32_t serialized_item_count = 0;
   ASSERT_GE(encoded_metadata.str().size(), sizeof(serialized_item_count));
@@ -1134,7 +1160,5 @@ TEST_F(SnapshotFormatV1Test, ImpossibleRecordCountsAreRejectedBeforeIteration) {
 
   std::istringstream metadata_input(count_only, std::ios::binary);
   vectors::MetadataStore metadata;
-  config::VectorsConfig vectors_config;
-  vectors::VectorStore vectors(vectors_config);
-  EXPECT_FALSE(DeserializeMetadataStore(metadata_input, metadata, vectors).has_value());
+  EXPECT_FALSE(DeserializeMetadataStore(metadata_input, metadata).has_value());
 }

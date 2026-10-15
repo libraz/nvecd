@@ -9,7 +9,6 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <zlib.h>
 
 #include <algorithm>
 #include <cctype>
@@ -18,7 +17,10 @@
 #include <cstring>
 #include <limits>
 #include <optional>
+#include <string_view>
 
+#include "storage/fd_io.h"
+#include "storage/snapshot_format_v1.h"
 #include "utils/path_utils.h"
 #include "utils/structured_log.h"
 
@@ -35,81 +37,17 @@ namespace nvecd::storage {
 
 namespace {
 
-/// Calculate CRC32 using zlib
-uint32_t CalcCRC32(const void* data, size_t length) {
-  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
-  return static_cast<uint32_t>(crc32(0L, reinterpret_cast<const Bytef*>(data), length));
-}
-
 /// Get current time in microseconds
 uint64_t NowMicros() {
   auto now = std::chrono::system_clock::now();
   return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count());
 }
 
-/// Write exactly n bytes to fd
-bool WriteAll(int fd, const void* buf, size_t n) {
-  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
-  auto ptr = reinterpret_cast<const uint8_t*>(buf);
-  size_t remaining = n;
-  while (remaining > 0) {
-    auto written = ::write(fd, ptr, remaining);
-    if (written < 0) {
-      if (errno == EINTR)
-        continue;
-      return false;
-    }
-    ptr += written;
-    remaining -= static_cast<size_t>(written);
-  }
-  return true;
-}
+/// WAL segment file name parts: "wal-NNNNNN.log".
+constexpr std::string_view kSegmentPrefix = "wal-";
+constexpr std::string_view kSegmentSuffix = ".log";
 
-/// Read exactly n bytes from fd
-bool ReadAll(int fd, void* buf, size_t n) {
-  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
-  auto ptr = reinterpret_cast<uint8_t*>(buf);
-  size_t remaining = n;
-  while (remaining > 0) {
-    auto bytes_read = ::read(fd, ptr, remaining);
-    if (bytes_read < 0) {
-      if (errno == EINTR)
-        continue;
-      return false;
-    }
-    if (bytes_read == 0)
-      return false;  // EOF
-    ptr += bytes_read;
-    remaining -= static_cast<size_t>(bytes_read);
-  }
-  return true;
-}
-
-/// Write a uint32_t in little-endian
-void WriteU32(uint8_t* buf, uint32_t val) {
-  std::memcpy(buf, &val, sizeof(val));
-}
-
-/// Write a uint64_t in little-endian
-void WriteU64(uint8_t* buf, uint64_t val) {
-  std::memcpy(buf, &val, sizeof(val));
-}
-
-/// Read a uint32_t in little-endian
-uint32_t ReadU32(const uint8_t* buf) {
-  uint32_t val = 0;
-  std::memcpy(&val, buf, sizeof(val));
-  return val;
-}
-
-/// Read a uint64_t in little-endian
-uint64_t ReadU64(const uint8_t* buf) {
-  uint64_t val = 0;
-  std::memcpy(&val, buf, sizeof(val));
-  return val;
-}
-
-/// Number of digits in a WAL segment file name ("wal-NNNNNN.log").
+/// Number of digits in a WAL segment file name.
 constexpr int kFileNumberDigits = 6;
 
 /// Highest segment number that still fits kFileNumberDigits. A larger number
@@ -117,17 +55,21 @@ constexpr int kFileNumberDigits = 6;
 /// so such a segment would be invisible to recovery and to truncation.
 constexpr uint32_t kMaxFileNumber = 999999;
 
-/// Length of a WAL segment file name: "wal-" + digits + ".log".
-constexpr size_t kFileNameLength = 4 + kFileNumberDigits + 4;
+/// Length of a WAL segment file name: prefix + digits + suffix.
+constexpr size_t kFileNameLength = kSegmentPrefix.size() + kFileNumberDigits + kSegmentSuffix.size();
 
-bool FsyncDirectory(const std::string& directory) {
-  const int fd = ::open(directory.c_str(), O_RDONLY | O_DIRECTORY);
-  if (fd < 0) {
-    return false;
+/// A torn tail is repairable only on the newest segment: cut it off and make the cut durable.
+Expected<void, Error> RepairTornTail(bool latest_segment, int fd, off_t length, const std::string& path,
+                                     const char* what) {
+  const std::string message = std::string(what) + " in segment: " + path;
+  if (!latest_segment) {
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kWalCorrupted, message));
   }
-  const bool synced = ::fsync(fd) == 0;
-  const bool closed = ::close(fd) == 0;
-  return synced && closed;
+  if (::ftruncate(fd, length) != 0 || ::fsync(fd) != 0) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kWalCorrupted, message + " (repair failed: " + std::strerror(errno) + ")"));
+  }
+  return {};
 }
 
 /// Open a WAL segment without following links or blocking on special files,
@@ -239,7 +181,7 @@ Expected<void, Error> WriteAheadLog::Open(const Config& config, uint64_t sequenc
     removed_empty_segment = true;
   }
   files_ = std::move(nonempty_files);
-  if (removed_empty_segment && !FsyncDirectory(config_.directory)) {
+  if (removed_empty_segment && !fd_io::FsyncDirectory(config_.directory)) {
     return utils::MakeUnexpected(utils::MakeError(
         utils::ErrorCode::kWalTruncateFailed,
         "Failed to fsync WAL directory after removing empty segments: " + std::string(std::strerror(errno))));
@@ -296,8 +238,12 @@ void WriteAheadLog::Close() {
 
   std::lock_guard<std::mutex> lock(mutex_);
   if (current_fd_ >= 0) {
-    ::fsync(current_fd_);
-    ::close(current_fd_);
+    if (::fsync(current_fd_) != 0) {
+      utils::StructuredLog().Event("wal_close_fsync_failed").Field("error", std::string(std::strerror(errno))).Error();
+    }
+    if (::close(current_fd_) != 0) {
+      utils::StructuredLog().Event("wal_close_failed").Field("error", std::string(std::strerror(errno))).Error();
+    }
     current_fd_ = -1;
   }
   open_ = false;
@@ -326,7 +272,6 @@ Expected<uint64_t, Error> WriteAheadLog::Append(WalOpType op, const void* payloa
     // Finalize current file info
     if (!files_.empty()) {
       files_.back().max_sequence = current_sequence_;
-      files_.back().file_size = current_file_size_;
     }
     auto result = RotateFile();
     if (!result) {
@@ -340,20 +285,20 @@ Expected<uint64_t, Error> WriteAheadLog::Append(WalOpType op, const void* payloa
 
   // Build record body: sequence(8) + timestamp(8) + op(1) + payload
   std::vector<uint8_t> body(record_body_size);
-  WriteU64(body.data(), seq);
-  WriteU64(body.data() + 8, timestamp);
+  fd_io::WriteU64(body.data(), seq);
+  fd_io::WriteU64(body.data() + 8, timestamp);
   body[16] = static_cast<uint8_t>(op);
   if (payload_size > 0 && payload != nullptr) {
     std::memcpy(body.data() + kWalRecordHeaderSize, payload, payload_size);
   }
 
   // Calculate CRC32 of the body
-  uint32_t crc = CalcCRC32(body.data(), body.size());
+  uint32_t crc = snapshot_v1::CalculateCRC32(body.data(), body.size());
 
   // Write: [length:u32] [crc32:u32] [body...]
   uint8_t header[8];
-  WriteU32(header, record_body_size);
-  WriteU32(header + 4, crc);
+  fd_io::WriteU32(header, record_body_size);
+  fd_io::WriteU32(header + 4, crc);
 
   auto poison_current_segment = [this](const std::string& message) -> Expected<uint64_t, Error> {
     // A short/failed write leaves an untrusted tail. Never append another ACKed
@@ -368,10 +313,10 @@ Expected<uint64_t, Error> WriteAheadLog::Append(WalOpType op, const void* payloa
     return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kWalWriteError, message));
   };
 
-  if (!WriteAll(current_fd_, header, sizeof(header))) {
+  if (!fd_io::WriteAll(current_fd_, header, sizeof(header))) {
     return poison_current_segment("Failed to write record header: " + std::string(std::strerror(errno)));
   }
-  if (!WriteAll(current_fd_, body.data(), body.size())) {
+  if (!fd_io::WriteAll(current_fd_, body.data(), body.size())) {
     return poison_current_segment("Failed to write record body: " + std::string(std::strerror(errno)));
   }
 
@@ -380,7 +325,6 @@ Expected<uint64_t, Error> WriteAheadLog::Append(WalOpType op, const void* payloa
   // Update file metadata
   if (!files_.empty()) {
     files_.back().max_sequence = seq;
-    files_.back().file_size = current_file_size_;
   }
 
   if (config_.sync_on_write) {
@@ -450,14 +394,14 @@ Expected<uint64_t, Error> WriteAheadLog::ReplayValidated(
         return utils::MakeUnexpected(
             utils::MakeError(utils::ErrorCode::kStorageCorrupted, "Torn WAL header in non-latest segment: " + path));
       }
-      if (!ReadAll(fd, rec_header, sizeof(rec_header))) {
+      if (!fd_io::ReadAll(fd, rec_header, sizeof(rec_header))) {
         const auto error = utils::MakeError(utils::ErrorCode::kWalReadError, "Failed to read WAL record header");
         ::close(fd);
         return utils::MakeUnexpected(error);
       }
 
-      uint32_t body_length = ReadU32(rec_header);
-      uint32_t expected_crc = ReadU32(rec_header + 4);
+      uint32_t body_length = fd_io::ReadU32(rec_header);
+      uint32_t expected_crc = fd_io::ReadU32(rec_header + 4);
 
       if (body_length < kWalRecordHeaderSize || body_length > kMaxWalRecordBodySize) {
         utils::StructuredLog()
@@ -480,14 +424,14 @@ Expected<uint64_t, Error> WriteAheadLog::ReplayValidated(
             utils::MakeError(utils::ErrorCode::kStorageCorrupted, "Torn WAL body in non-latest segment: " + path));
       }
       std::vector<uint8_t> body(body_length);
-      if (!ReadAll(fd, body.data(), body_length)) {
+      if (!fd_io::ReadAll(fd, body.data(), body_length)) {
         const auto error = utils::MakeError(utils::ErrorCode::kWalReadError, "Failed to read WAL record body");
         ::close(fd);
         return utils::MakeUnexpected(error);
       }
 
       // Verify CRC
-      uint32_t actual_crc = CalcCRC32(body.data(), body.size());
+      uint32_t actual_crc = snapshot_v1::CalculateCRC32(body.data(), body.size());
       if (actual_crc != expected_crc) {
         // CRC mismatch marks the start of a corrupt/torn tail (e.g. a partial
         // write at crash time). The length prefix of this record is itself
@@ -506,8 +450,8 @@ Expected<uint64_t, Error> WriteAheadLog::ReplayValidated(
 
       // Parse record
       WalRecord record;
-      record.sequence = ReadU64(body.data());
-      record.timestamp_us = ReadU64(body.data() + 8);
+      record.sequence = fd_io::ReadU64(body.data());
+      record.timestamp_us = fd_io::ReadU64(body.data() + 8);
       record.op = static_cast<WalOpType>(body[16]);
 
       if (record.sequence == 0) {
@@ -594,7 +538,7 @@ Expected<void, Error> WriteAheadLog::Truncate(uint64_t up_to_sequence) {
 
   files_ = std::move(remaining);
 
-  if (deleted_count > 0 && !FsyncDirectory(config_.directory)) {
+  if (deleted_count > 0 && !fd_io::FsyncDirectory(config_.directory)) {
     return utils::MakeUnexpected(
         utils::MakeError(utils::ErrorCode::kWalTruncateFailed,
                          "Failed to fsync WAL directory after truncate: " + std::string(std::strerror(errno))));
@@ -633,18 +577,24 @@ bool WriteAheadLog::IsOpen() const {
 Expected<void, Error> WriteAheadLog::RotateFile() {
   // Close current file if open
   if (current_fd_ >= 0) {
-    if (::fsync(current_fd_) != 0) {
+    // After a failed fsync the segment's durability is unknown: drop it so a
+    // retry cannot succeed against state the kernel may already have discarded.
+    const int old_fd = current_fd_;
+    current_fd_ = -1;
+    if (::fsync(old_fd) != 0) {
+      const int saved_errno = errno;
+      ::close(old_fd);
+      open_ = false;
       return utils::MakeUnexpected(
           utils::MakeError(utils::ErrorCode::kWalRotationFailed,
-                           "Failed to fsync WAL segment before rotation: " + std::string(std::strerror(errno))));
+                           "Failed to fsync WAL segment before rotation: " + std::string(std::strerror(saved_errno))));
     }
-    if (::close(current_fd_) != 0) {
-      current_fd_ = -1;
+    if (::close(old_fd) != 0) {
+      open_ = false;
       return utils::MakeUnexpected(
           utils::MakeError(utils::ErrorCode::kWalRotationFailed,
                            "Failed to close WAL segment before rotation: " + std::string(std::strerror(errno))));
     }
-    current_fd_ = -1;
   }
 
   std::string path;
@@ -660,7 +610,7 @@ Expected<void, Error> WriteAheadLog::RotateFile() {
     }
     ++current_file_number_;
     path = MakeFilePath(current_file_number_);
-    fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+    fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | kWalNoFollowFlag | O_CLOEXEC, 0600);
   } while (fd < 0 && errno == EEXIST);
 
   if (fd < 0) {
@@ -675,6 +625,7 @@ Expected<void, Error> WriteAheadLog::RotateFile() {
   if (!result) {
     ::close(current_fd_);
     current_fd_ = -1;
+    ::unlink(path.c_str());
     return utils::MakeUnexpected(result.error());
   }
   if (::fsync(current_fd_) != 0) {
@@ -686,7 +637,7 @@ Expected<void, Error> WriteAheadLog::RotateFile() {
         utils::MakeError(utils::ErrorCode::kWalRotationFailed,
                          "Failed to fsync new WAL segment: " + std::string(std::strerror(saved_errno))));
   }
-  if (!FsyncDirectory(config_.directory)) {
+  if (!fd_io::FsyncDirectory(config_.directory)) {
     const int saved_errno = errno;
     ::close(current_fd_);
     current_fd_ = -1;
@@ -701,7 +652,6 @@ Expected<void, Error> WriteAheadLog::RotateFile() {
   wf.path = path;
   wf.file_number = current_file_number_;
   wf.max_sequence = 0;
-  wf.file_size = current_file_size_;
   files_.push_back(std::move(wf));
 
   return {};
@@ -709,10 +659,10 @@ Expected<void, Error> WriteAheadLog::RotateFile() {
 
 Expected<void, Error> WriteAheadLog::WriteFileHeader() {
   uint8_t header[kWalFileHeaderSize];
-  WriteU32(header, kWalMagic);
-  WriteU32(header + 4, kWalVersion);
+  fd_io::WriteU32(header, kWalMagic);
+  fd_io::WriteU32(header + 4, kWalVersion);
 
-  if (!WriteAll(current_fd_, header, sizeof(header))) {
+  if (!fd_io::WriteAll(current_fd_, header, sizeof(header))) {
     return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kWalWriteError, "Failed to write WAL file header"));
   }
 
@@ -722,13 +672,13 @@ Expected<void, Error> WriteAheadLog::WriteFileHeader() {
 
 Expected<void, Error> WriteAheadLog::ValidateFileHeader(int fd, const std::string& path) {
   uint8_t header[kWalFileHeaderSize];
-  if (!ReadAll(fd, header, sizeof(header))) {
+  if (!fd_io::ReadAll(fd, header, sizeof(header))) {
     return utils::MakeUnexpected(
         utils::MakeError(utils::ErrorCode::kWalReadError, "Failed to read WAL file header", path));
   }
 
-  uint32_t magic = ReadU32(header);
-  uint32_t version = ReadU32(header + 4);
+  uint32_t magic = fd_io::ReadU32(header);
+  uint32_t version = fd_io::ReadU32(header + 4);
 
   if (magic != kWalMagic) {
     return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kWalCorrupted, "Invalid WAL magic number", path));
@@ -748,7 +698,9 @@ Expected<void, Error> WriteAheadLog::ScanExistingFiles() {
 
   DIR* dir = ::opendir(config_.directory.c_str());
   if (dir == nullptr) {
-    return {};  // Directory doesn't exist yet — fresh start
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kWalReadError,
+                                                  "Failed to open WAL directory: " + std::string(std::strerror(errno)),
+                                                  config_.directory));
   }
 
   std::vector<uint32_t> file_numbers;
@@ -756,9 +708,9 @@ Expected<void, Error> WriteAheadLog::ScanExistingFiles() {
   while ((entry = ::readdir(dir)) != nullptr) {
     std::string name(entry->d_name);
     // Match wal-NNNNNN.log
-    if (name.size() == kFileNameLength && name.substr(0, 4) == "wal-" &&
-        name.substr(4 + kFileNumberDigits, 4) == ".log") {
-      std::string num_str = name.substr(4, kFileNumberDigits);
+    if (name.size() == kFileNameLength && name.compare(0, kSegmentPrefix.size(), kSegmentPrefix) == 0 &&
+        name.compare(kSegmentPrefix.size() + kFileNumberDigits, kSegmentSuffix.size(), kSegmentSuffix) == 0) {
+      std::string num_str = name.substr(kSegmentPrefix.size(), kFileNumberDigits);
       if (!std::all_of(num_str.begin(), num_str.end(),
                        [](unsigned char character) { return std::isdigit(character) != 0; })) {
         continue;
@@ -800,7 +752,6 @@ Expected<void, Error> WriteAheadLog::ScanExistingFiles() {
     // header. It holds no record, so it is reported empty and Open removes it.
     if (latest_segment && static_cast<uint64_t>(initial_info.st_size) < kWalFileHeaderSize) {
       ::close(fd);
-      wf.file_size = static_cast<uint64_t>(initial_info.st_size);
       current_file_number_ = std::max(current_file_number_, num);
       files_.push_back(std::move(wf));
       continue;
@@ -828,48 +779,48 @@ Expected<void, Error> WriteAheadLog::ScanExistingFiles() {
         break;
       }
       if (remaining < sizeof(rec_header)) {
-        if (!latest_segment || ::ftruncate(fd, last_valid_offset) != 0) {
+        auto repaired = RepairTornTail(latest_segment, fd, last_valid_offset, path, "Torn WAL header");
+        if (!repaired) {
           ::close(fd);
-          return utils::MakeUnexpected(
-              utils::MakeError(utils::ErrorCode::kWalCorrupted, "Torn WAL header in segment: " + path));
+          return utils::MakeUnexpected(repaired.error());
         }
         break;
       }
-      if (!ReadAll(fd, rec_header, sizeof(rec_header))) {
+      if (!fd_io::ReadAll(fd, rec_header, sizeof(rec_header))) {
         ::close(fd);
         return utils::MakeUnexpected(
             utils::MakeError(utils::ErrorCode::kWalReadError, "Failed to read WAL record header: " + path));
       }
 
-      uint32_t body_length = ReadU32(rec_header);
-      uint32_t expected_crc = ReadU32(rec_header + 4);
+      uint32_t body_length = fd_io::ReadU32(rec_header);
+      uint32_t expected_crc = fd_io::ReadU32(rec_header + 4);
       if (body_length < kWalRecordHeaderSize || body_length > kMaxWalRecordBodySize) {
         ::close(fd);
         return utils::MakeUnexpected(
             utils::MakeError(utils::ErrorCode::kWalCorrupted, "Invalid WAL record length: " + path));
       }
       if (remaining - sizeof(rec_header) < body_length) {
-        if (!latest_segment || ::ftruncate(fd, last_valid_offset) != 0) {
+        auto repaired = RepairTornTail(latest_segment, fd, last_valid_offset, path, "Torn WAL body");
+        if (!repaired) {
           ::close(fd);
-          return utils::MakeUnexpected(
-              utils::MakeError(utils::ErrorCode::kWalCorrupted, "Torn WAL body in segment: " + path));
+          return utils::MakeUnexpected(repaired.error());
         }
         break;
       }
 
       std::vector<uint8_t> body(body_length);
-      if (!ReadAll(fd, body.data(), body_length)) {
+      if (!fd_io::ReadAll(fd, body.data(), body_length)) {
         ::close(fd);
         return utils::MakeUnexpected(
             utils::MakeError(utils::ErrorCode::kWalReadError, "Failed to read WAL record body: " + path));
       }
-      if (CalcCRC32(body.data(), body.size()) != expected_crc) {
+      if (snapshot_v1::CalculateCRC32(body.data(), body.size()) != expected_crc) {
         ::close(fd);
         return utils::MakeUnexpected(
             utils::MakeError(utils::ErrorCode::kWalCRCMismatch, "WAL record CRC mismatch: " + path));
       }
 
-      uint64_t seq = ReadU64(body.data());
+      uint64_t seq = fd_io::ReadU64(body.data());
       if (seq == 0) {
         ::close(fd);
         return utils::MakeUnexpected(
@@ -889,15 +840,6 @@ Expected<void, Error> WriteAheadLog::ScanExistingFiles() {
       last_valid_offset = ::lseek(fd, 0, SEEK_CUR);
     }
 
-    struct stat st {};
-    if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0) {
-      const int saved_errno = errno;
-      ::close(fd);
-      return utils::MakeUnexpected(
-          utils::MakeError(utils::ErrorCode::kWalReadError,
-                           "Failed to restat WAL segment: " + path + ": " + std::string(std::strerror(saved_errno))));
-    }
-    wf.file_size = static_cast<uint64_t>(st.st_size);
     ::close(fd);
 
     if (wf.max_sequence > current_sequence_) {
@@ -914,9 +856,9 @@ Expected<void, Error> WriteAheadLog::ScanExistingFiles() {
 }
 
 std::string WriteAheadLog::MakeFilePath(uint32_t file_number) const {
-  char buf[32];
-  std::snprintf(buf, sizeof(buf), "wal-%0*u.log", kFileNumberDigits, file_number);
-  return config_.directory + "/" + buf;
+  char digits[32];
+  std::snprintf(digits, sizeof(digits), "%0*u", kFileNumberDigits, file_number);
+  return config_.directory + "/" + std::string(kSegmentPrefix) + digits + std::string(kSegmentSuffix);
 }
 
 void WriteAheadLog::SyncLoop() {

@@ -24,6 +24,9 @@ namespace nvecd::storage {
 /// Filename suffix appended to the snapshot path for the WAL checkpoint sidecar.
 constexpr const char* kWalCheckpointSuffix = ".walseq";
 
+/// Path of the checkpoint sidecar belonging to a snapshot path.
+std::string WalCheckpointPath(const std::string& snapshot_path);
+
 /**
  * @brief Write the WAL sequence checkpoint sidecar for a snapshot
  *

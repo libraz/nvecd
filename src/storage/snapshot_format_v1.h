@@ -212,11 +212,9 @@ Expected<void, Error> SerializeVectorStore(std::ostream& output_stream, const ve
  */
 Expected<void, Error> DeserializeVectorStore(std::istream& input_stream, vectors::VectorStore& vector_store);
 
-Expected<void, Error> SerializeMetadataStore(std::ostream& output_stream, const vectors::MetadataStore& metadata_store,
-                                             const vectors::VectorStore& vector_store);
+Expected<void, Error> SerializeMetadataStore(std::ostream& output_stream, const vectors::MetadataStore& metadata_store);
 
-Expected<void, Error> DeserializeMetadataStore(std::istream& input_stream, vectors::MetadataStore& metadata_store,
-                                               const vectors::VectorStore& vector_store);
+Expected<void, Error> DeserializeMetadataStore(std::istream& input_stream, vectors::MetadataStore& metadata_store);
 
 /**
  * @brief Write Version 1 snapshot header

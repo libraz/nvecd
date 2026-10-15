@@ -5,7 +5,6 @@
 
 #include "storage/snapshot_session.h"
 
-#include <fcntl.h>
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -17,6 +16,7 @@
 #include <thread>
 #include <utility>
 
+#include "storage/fd_io.h"
 #include "storage/wal.h"
 #include "storage/wal_checkpoint.h"
 #include "utils/structured_log.h"
@@ -34,21 +34,11 @@ std::filesystem::path PreservedBasePath(const std::filesystem::path& snapshot_pa
          ("." + snapshot_path.filename().string() + ".prev" + snapshot_path.extension().string());
 }
 
-bool FsyncDirectory(const std::filesystem::path& directory) {
-  const int fd = ::open(directory.empty() ? "." : directory.c_str(), O_RDONLY | O_DIRECTORY);
-  if (fd < 0) {
-    return false;
-  }
-  const bool synced = ::fsync(fd) == 0;
-  const bool closed = ::close(fd) == 0;
-  return synced && closed;
-}
-
 }  // namespace
 
 utils::Expected<void, utils::Error> PreserveRecoveryBase(const std::string& snapshot_path) {
   const std::filesystem::path path(snapshot_path);
-  const std::string sidecar = snapshot_path + kWalCheckpointSuffix;
+  const std::string sidecar = WalCheckpointPath(snapshot_path);
   std::error_code error;
   if (!std::filesystem::is_regular_file(path, error) || !std::filesystem::exists(sidecar, error)) {
     return {};
@@ -56,7 +46,7 @@ utils::Expected<void, utils::Error> PreserveRecoveryBase(const std::string& snap
   error.clear();
 
   const auto preserved = PreservedBasePath(path);
-  const std::string preserved_sidecar = preserved.string() + kWalCheckpointSuffix;
+  const std::string preserved_sidecar = WalCheckpointPath(preserved.string());
   // A pair left by an interrupted save stays the base unless the path has
   // validated since; only then is it replaced, sidecar first.
   if (std::filesystem::exists(preserved, error) && !ReadWalCheckpoint(snapshot_path)) {
@@ -72,7 +62,7 @@ utils::Expected<void, utils::Error> PreserveRecoveryBase(const std::string& snap
                                                   preserved.string()));
   }
   if (::link(snapshot_path.c_str(), preserved.c_str()) != 0 ||
-      ::link(sidecar.c_str(), preserved_sidecar.c_str()) != 0 || !FsyncDirectory(path.parent_path())) {
+      ::link(sidecar.c_str(), preserved_sidecar.c_str()) != 0 || !fd_io::FsyncDirectory(path.parent_path().string())) {
     return utils::MakeUnexpected(utils::MakeError(
         utils::ErrorCode::kStorageWriteError,
         "Failed to preserve snapshot recovery base: " + std::string(std::strerror(errno)), preserved.string()));
@@ -331,7 +321,7 @@ void SnapshotSession::ReleasePreservedBase(bool checkpoint_known_valid) const {
   if (!checkpoint_known_valid && !ReadWalCheckpoint(filepath_)) {
     return;
   }
-  std::filesystem::remove(preserved.string() + kWalCheckpointSuffix, error);
+  std::filesystem::remove(WalCheckpointPath(preserved.string()), error);
   if (!error) {
     std::filesystem::remove(preserved, error);
   }

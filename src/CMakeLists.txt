@@ -165,6 +165,7 @@ target_link_libraries(nvecd_config PUBLIC nvecd_cache)
 
 # Storage library
 add_library(nvecd_storage STATIC
+  storage/fd_io.cpp
   storage/snapshot_format_v1.cpp
   storage/snapshot_fork.cpp
   storage/snapshot_lock.cpp
