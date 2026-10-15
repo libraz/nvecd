@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -403,6 +404,7 @@ TEST_F(SnapshotFormatV1Test, WriteAndRead_MetadataRoundTrip) {
 
   metadata_store_->Set(
       "item2", {{"category", std::string("electronics")}, {"active", true}, {"rank", int64_t{10}}, {"score", 0.75}});
+  metadata_store_->Set("empty", {});
 
   const std::string path = TestFilePath("metadata_round_trip.dmp");
   auto write_result = WriteSnapshotV1(path, config_, *event_store_, *co_index_, *vector_store_, nullptr, nullptr,
@@ -427,6 +429,15 @@ TEST_F(SnapshotFormatV1Test, WriteAndRead_MetadataRoundTrip) {
   EXPECT_EQ(std::get<bool>(metadata->at("active")), true);
   EXPECT_EQ(std::get<int64_t>(metadata->at("rank")), 10);
   EXPECT_DOUBLE_EQ(std::get<double>(metadata->at("score")), 0.75);
+  EXPECT_EQ(loaded_metadata.Get("empty"), nullptr) << "empty metadata entries are omitted from the V1 section";
+
+  std::ostringstream encoded_metadata(std::ios::binary | std::ios::out);
+  auto serialized_metadata = SerializeMetadataStore(encoded_metadata, *metadata_store_, *vector_store_);
+  ASSERT_TRUE(serialized_metadata.has_value()) << serialized_metadata.error().message();
+  uint32_t serialized_item_count = 0;
+  ASSERT_GE(encoded_metadata.str().size(), sizeof(serialized_item_count));
+  std::memcpy(&serialized_item_count, encoded_metadata.str().data(), sizeof(serialized_item_count));
+  EXPECT_EQ(serialized_item_count, 1U);
 
   SnapshotInfo info;
   auto info_result = GetSnapshotInfo(path, info);
@@ -585,6 +596,41 @@ TEST_F(SnapshotFormatV1Test, VectorDimension_RoundTrip) {
   auto loaded_vec = loaded_vectors.GetVector("item1");
   ASSERT_TRUE(loaded_vec.has_value());
   EXPECT_EQ(loaded_vec->data.size(), vector_store_->GetDimension());
+}
+
+TEST_F(SnapshotFormatV1Test, VectorSerializationPreservesRawV1Bytes) {
+  config::VectorsConfig vectors_cfg;
+  vectors::VectorStore vectors(vectors_cfg);
+  const std::vector<float> original{0.25F, -0.0F, 3.5F};
+  ASSERT_TRUE(vectors.SetVector("raw", original, false).has_value());
+
+  std::ostringstream encoded(std::ios::binary | std::ios::out);
+  auto serialized = SerializeVectorStore(encoded, vectors);
+  ASSERT_TRUE(serialized.has_value()) << serialized.error().message();
+
+  std::ostringstream expected(std::ios::binary | std::ios::out);
+  const uint64_t dimension = original.size();
+  const uint32_t vector_count = 1;
+  const uint32_t id_length = 3;
+  expected.write(reinterpret_cast<const char*>(&dimension), sizeof(dimension));
+  expected.write(reinterpret_cast<const char*>(&vector_count), sizeof(vector_count));
+  expected.write(reinterpret_cast<const char*>(&id_length), sizeof(id_length));
+  expected.write("raw", id_length);
+  expected.write(reinterpret_cast<const char*>(original.data()),
+                 static_cast<std::streamsize>(original.size() * sizeof(float)));
+  ASSERT_TRUE(expected.good());
+  EXPECT_EQ(encoded.str(), expected.str());
+
+  std::istringstream input(encoded.str(), std::ios::binary | std::ios::in);
+  vectors::VectorStore restored(vectors_cfg);
+  auto deserialized = DeserializeVectorStore(input, restored);
+  ASSERT_TRUE(deserialized.has_value()) << deserialized.error().message();
+  const auto actual = restored.GetVector("raw");
+  ASSERT_TRUE(actual.has_value());
+  ASSERT_EQ(actual->data.size(), original.size());
+  for (size_t index = 0; index < original.size(); ++index) {
+    EXPECT_FLOAT_EQ(actual->data[index], original[index]);
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdint>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
@@ -116,6 +117,28 @@ template <typename T>
 bool ReadBinary(std::istream& input_stream, T& value) {
   // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
   input_stream.read(reinterpret_cast<char*>(&value), sizeof(T));
+  return input_stream.good();
+}
+
+bool WriteRawBytes(std::ostream& output_stream, const void* data, size_t size) {
+  if (static_cast<std::uintmax_t>(size) > static_cast<std::uintmax_t>(std::numeric_limits<std::streamsize>::max())) {
+    return false;
+  }
+  if (size > 0) {
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    output_stream.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(size));
+  }
+  return output_stream.good();
+}
+
+bool ReadRawBytes(std::istream& input_stream, void* data, size_t size) {
+  if (static_cast<std::uintmax_t>(size) > static_cast<std::uintmax_t>(std::numeric_limits<std::streamsize>::max())) {
+    return false;
+  }
+  if (size > 0) {
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    input_stream.read(reinterpret_cast<char*>(data), static_cast<std::streamsize>(size));
+  }
   return input_stream.good();
 }
 
@@ -911,10 +934,12 @@ Expected<void, Error> SerializeVectorStore(std::ostream& output_stream, const ve
     const auto& vec = vec_opt.value();
 
     // Write vector data
-    for (float component : vec.data) {
-      if (!WriteBinary(output_stream, component)) {
-        return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write vector component"));
-      }
+    if (vec.data.size() > std::numeric_limits<size_t>::max() / sizeof(float)) {
+      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Vector data size overflows byte count"));
+    }
+    const size_t vector_bytes = vec.data.size() * sizeof(float);
+    if (!WriteRawBytes(output_stream, vec.data.data(), vector_bytes)) {
+      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write vector data"));
     }
   }
 
@@ -966,10 +991,8 @@ Expected<void, Error> DeserializeVectorStore(std::istream& input_stream, vectors
       return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Vector exceeds remaining store data"));
     }
     std::vector<float> data(static_cast<size_t>(dimension));
-    for (uint64_t i = 0; i < dimension; ++i) {
-      if (!ReadBinary(input_stream, data[i])) {
-        return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read vector component"));
-      }
+    if (!ReadRawBytes(input_stream, data.data(), static_cast<size_t>(vector_bytes))) {
+      return MakeUnexpected(MakeError(ErrorCode::kStorageDumpReadError, "Failed to read vector data"));
     }
 
     // Add vector to store. Vectors are persisted verbatim (already in their
@@ -1005,16 +1028,15 @@ Expected<void, Error> SerializeMetadataStore(std::ostream& output_stream, const 
   // Snapshot the id -> metadata map under a read lock so the iteration is
   // consistent with concurrent writers.
   auto read_lock = metadata_store.AcquireReadLock();
-  std::vector<std::pair<std::string, vectors::Metadata>> entries;
   const auto& all = metadata_store.GetAll();
-  entries.reserve(all.size());
-  for (const auto& [id, metadata] : all) {
-    if (!metadata.empty()) {
-      entries.emplace_back(id, metadata);
+  size_t nonempty_count = 0;
+  for (const auto& entry : all) {
+    if (!entry.second.empty()) {
+      ++nonempty_count;
     }
   }
 
-  auto item_count = CheckedSizeToU32(entries.size(), std::numeric_limits<uint32_t>::max(), "metadata item count");
+  auto item_count = CheckedSizeToU32(nonempty_count, std::numeric_limits<uint32_t>::max(), "metadata item count");
   if (!item_count) {
     return MakeUnexpected(item_count.error());
   }
@@ -1022,7 +1044,10 @@ Expected<void, Error> SerializeMetadataStore(std::ostream& output_stream, const 
     return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write metadata item count"));
   }
 
-  for (const auto& [id, metadata] : entries) {
+  for (const auto& [id, metadata] : all) {
+    if (metadata.empty()) {
+      continue;
+    }
     if (!WriteString(output_stream, id)) {
       return MakeUnexpected(MakeError(ErrorCode::kStorageDumpWriteError, "Failed to write metadata item ID: " + id));
     }
