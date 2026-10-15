@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <thread>
 #include <utility>
 
 #include "storage/wal.h"
@@ -139,23 +140,38 @@ utils::Expected<SnapshotOutcome, utils::Error> SnapshotSession::Finish(uint32_t 
   {
     std::unique_lock<std::mutex> lock(mutex_);
     if (!finished_ && writer_timeout_ms > 0) {
-      finished_cv_.wait_for(lock, std::chrono::milliseconds(writer_timeout_ms), [this] { return finished_; });
+      finished_cv_.wait_for(lock, std::chrono::milliseconds(writer_timeout_ms),
+                            [this] { return finished_ || child_reaped_; });
     }
   }
 
   // The writer overran its deadline. Ask the child to stop, escalate if it does
-  // not, and let the completion thread reap it: the session still ends in a
-  // terminal state instead of leaking a zombie and an unreclaimed temp file.
-  if (child_pid_ > 0 && !IsFinished()) {
-    ::kill(child_pid_, SIGTERM);
+  // not, and let the completion thread reap it. The completion thread marks
+  // ownership lost while holding the same lock used here to signal, so a PID
+  // cannot be reused between reaping and a timeout signal.
+  bool sent_sigterm = false;
+  if (child_pid_ > 0) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!finished_ && !child_reaped_) {
+      sent_sigterm = ::kill(child_pid_, SIGTERM) == 0;
+    }
+  }
+  if (sent_sigterm) {
     utils::LogStorageInfo("snapshot_session",
                           "Sent SIGTERM to snapshot child (pid: " + std::to_string(child_pid_) + ")");
     {
       std::unique_lock<std::mutex> lock(mutex_);
-      finished_cv_.wait_for(lock, std::chrono::milliseconds(kChildSigtermGraceMs), [this] { return finished_; });
+      finished_cv_.wait_for(lock, std::chrono::milliseconds(kChildSigtermGraceMs),
+                            [this] { return finished_ || child_reaped_; });
     }
-    if (!IsFinished()) {
-      ::kill(child_pid_, SIGKILL);
+    bool sent_sigkill = false;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!finished_ && !child_reaped_) {
+        sent_sigkill = ::kill(child_pid_, SIGKILL) == 0;
+      }
+    }
+    if (sent_sigkill) {
       utils::LogStorageInfo("snapshot_session",
                             "Sent SIGKILL to snapshot child (pid: " + std::to_string(child_pid_) + ")");
     }
@@ -169,19 +185,65 @@ utils::Expected<SnapshotOutcome, utils::Error> SnapshotSession::Finish(uint32_t 
 void SnapshotSession::ReapAndComplete() {
   int status = 0;
   pid_t reaped = -1;
+  int wait_error = 0;
   while (true) {
-    reaped = ::waitpid(child_pid_, &status, 0);
-    if (reaped >= 0 || errno != EINTR) {
+    siginfo_t child_info{};
+    int waitid_result = -1;
+    do {
+      waitid_result = ::waitid(P_PID, static_cast<id_t>(child_pid_), &child_info, WEXITED | WNOWAIT);
+    } while (waitid_result < 0 && errno == EINTR);
+
+    if (waitid_result < 0) {
+      wait_error = errno;
+      std::lock_guard<std::mutex> lock(mutex_);
+      child_reaped_ = true;
+      finished_cv_.notify_all();
       break;
+    }
+
+    if (child_info.si_pid == child_pid_) {
+      // WNOWAIT reserved the PID; stop/continue reports are consumed here but keep the child owned.
+      bool received_status = false;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        pid_t waited = -1;
+        do {
+          waited = ::waitpid(child_pid_, &status, WNOHANG | WUNTRACED | WCONTINUED);
+        } while (waited < 0 && errno == EINTR);
+
+        if (waited == child_pid_) {
+          received_status = true;
+          if (WIFEXITED(status) || WIFSIGNALED(status)) {
+            reaped = waited;
+            child_reaped_ = true;
+            finished_cv_.notify_all();
+          }
+        } else if (waited < 0) {
+          wait_error = errno;
+          child_reaped_ = true;
+          finished_cv_.notify_all();
+        }
+      }
+
+      if (reaped == child_pid_ || wait_error != 0) {
+        break;
+      }
+      if (!received_status) {
+        // waitid can report before waitpid exposes a status; back off instead of spinning.
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+    } else {
+      // A waitid return that does not name this child carries no status to consume yet.
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
   }
 
   utils::Expected<void, utils::Error> write_result;
-  if (reaped < 0) {
+  if (reaped != child_pid_) {
     // An existing pathname is not proof of success — it may predate this child.
     write_result = utils::MakeUnexpected(utils::MakeError(
         utils::ErrorCode::kSnapshotChildFailed,
-        "Snapshot child ownership lost before its exit status was collected: " + std::string(std::strerror(errno)),
+        "Snapshot child ownership lost before its exit status was collected: " + std::string(std::strerror(wait_error)),
         filepath_));
   } else if (WIFEXITED(status)) {
     const int exit_code = WEXITSTATUS(status);
@@ -205,7 +267,8 @@ void SnapshotSession::ReapAndComplete() {
 void SnapshotSession::Complete(const utils::Expected<void, utils::Error>& write_result) {
   auto outcome = RunDurabilityHandshake(write_result);
   if (wal_ != nullptr) {
-    ReleasePreservedBase();
+    // A successful handshake already bound the snapshot, so only a failure re-hashes it.
+    ReleasePreservedBase(outcome.has_value());
   }
 
   std::lock_guard<std::mutex> lock(mutex_);
@@ -258,14 +321,14 @@ utils::Expected<SnapshotOutcome, utils::Error> SnapshotSession::RunDurabilityHan
   return outcome;
 }
 
-void SnapshotSession::ReleasePreservedBase() const {
+void SnapshotSession::ReleasePreservedBase(bool checkpoint_known_valid) const {
   const auto preserved = PreservedBasePath(filepath_);
   std::error_code error;
   if (!std::filesystem::exists(preserved, error)) {
     return;
   }
   // While the path itself does not validate, the preserved pair is the base.
-  if (!ReadWalCheckpoint(filepath_)) {
+  if (!checkpoint_known_valid && !ReadWalCheckpoint(filepath_)) {
     return;
   }
   std::filesystem::remove(preserved.string() + kWalCheckpointSuffix, error);

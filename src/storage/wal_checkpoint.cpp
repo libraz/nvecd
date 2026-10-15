@@ -118,7 +118,7 @@ struct SnapshotBinding {
 };
 
 utils::Expected<SnapshotBinding, utils::Error> ReadSnapshotBinding(const std::string& snapshot_path) {
-  const int fd = ::open(snapshot_path.c_str(), O_RDONLY | O_NOFOLLOW);
+  const int fd = ::open(snapshot_path.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
   if (fd < 0) {
     return utils::MakeUnexpected(
         utils::MakeError(utils::ErrorCode::kWalReadError,
@@ -268,7 +268,7 @@ utils::Expected<uint64_t, utils::Error> ReadWalCheckpoint(const std::string& sna
   }
   const std::string final_path = SidecarPath(snapshot_path);
 
-  const int fd = ::open(final_path.c_str(), O_RDONLY | O_NOFOLLOW);
+  const int fd = ::open(final_path.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
   if (fd < 0) {
     return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kWalReadError,
                                                   "Failed to open WAL checkpoint: " + std::string(std::strerror(errno)),

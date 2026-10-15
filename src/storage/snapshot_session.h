@@ -157,7 +157,7 @@ class SnapshotSession {
   void ReclaimChildTemporaries() const;
 
   /// Drop the generation PreserveRecoveryBase kept once the path validates again.
-  void ReleasePreservedBase() const;
+  void ReleasePreservedBase(bool checkpoint_known_valid) const;
 
   const std::string filepath_;
   const pid_t child_pid_;
@@ -167,6 +167,8 @@ class SnapshotSession {
   mutable std::mutex mutex_;
   std::condition_variable finished_cv_;
   bool finished_ = false;
+  /// True once the session has reaped (or lost ownership of) its child PID.
+  bool child_reaped_ = false;
   std::optional<utils::Expected<SnapshotOutcome, utils::Error>> result_;
   /// Set for a lock-mode session until the handshake consumes it.
   std::optional<utils::Expected<void, utils::Error>> pending_write_result_;

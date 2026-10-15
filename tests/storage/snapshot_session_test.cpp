@@ -11,11 +11,16 @@
 
 #include "storage/snapshot_session.h"
 
+#include <fcntl.h>
 #include <gtest/gtest.h>
+#include <signal.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <filesystem>
 #include <memory>
@@ -74,6 +79,41 @@ std::vector<std::string> ListWalSegments(const std::filesystem::path& wal_dir) {
   }
   std::sort(segments.begin(), segments.end());
   return segments;
+}
+
+bool CheckpointReadFailsPromptly(const std::string& snapshot_path) {
+  const pid_t child = ::fork();
+  if (child < 0) {
+    return false;
+  }
+  if (child == 0) {
+    const auto result = storage::ReadWalCheckpoint(snapshot_path);
+    ::_exit(result ? 1 : 0);
+  }
+
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  int status = 0;
+  while (std::chrono::steady_clock::now() < deadline) {
+    const pid_t waited = ::waitpid(child, &status, WNOHANG);
+    if (waited == child) {
+      return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    }
+    if (waited < 0 && errno != EINTR) {
+      return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+
+  static_cast<void>(::kill(child, SIGKILL));
+  while (::waitpid(child, &status, 0) < 0 && errno == EINTR) {
+  }
+  return false;
+}
+
+volatile sig_atomic_t g_received_sigterm = 0;
+
+void RecordSigterm(int) {
+  g_received_sigterm = 1;
 }
 
 }  // namespace
@@ -286,6 +326,133 @@ TEST_F(SnapshotSessionTest, DroppingAStartedSessionStillCompletesTheHandshake) {
   EXPECT_EQ(*sidecar, captured);
   EXPECT_EQ(ListWalSegments(dir / "wal").size(), 1U);
   wal.Close();
+}
+
+TEST_F(SnapshotSessionTest, ConcurrentFinishCallsShareTheChildReapAndTerminalResult) {
+  const pid_t child_pid = ::fork();
+  ASSERT_GE(child_pid, 0);
+  if (child_pid == 0) {
+    ::usleep(50'000);
+    ::_exit(storage::kSnapshotChildExitSuccess);
+  }
+
+  storage::SnapshotSession session("unused-snapshot.nvec", child_pid, 0, nullptr);
+  std::atomic<bool> start{false};
+  std::atomic<size_t> successful_results{0};
+  auto finish = [&] {
+    while (!start.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    auto result = session.Finish(2000);
+    if (result.has_value()) {
+      successful_results.fetch_add(1, std::memory_order_relaxed);
+    }
+  };
+
+  std::thread first(finish);
+  std::thread second(finish);
+  start.store(true, std::memory_order_release);
+  first.join();
+  second.join();
+
+  EXPECT_EQ(successful_results.load(std::memory_order_relaxed), 2U);
+  EXPECT_TRUE(session.IsFinished());
+  int status = 0;
+  EXPECT_EQ(::waitpid(child_pid, &status, WNOHANG), -1);
+  EXPECT_EQ(errno, ECHILD) << "the session must perform the only reap";
+}
+
+TEST_F(SnapshotSessionTest, StoppedChildIsNotTreatedAsReaped) {
+  const pid_t child_pid = ::fork();
+  ASSERT_GE(child_pid, 0);
+  if (child_pid == 0) {
+    static_cast<void>(::raise(SIGSTOP));
+    ::_exit(storage::kSnapshotChildExitSuccess);
+  }
+
+  siginfo_t child_info{};
+  ASSERT_EQ(::waitid(P_PID, static_cast<id_t>(child_pid), &child_info, WSTOPPED | WNOWAIT), 0);
+  ASSERT_EQ(child_info.si_pid, child_pid);
+
+  storage::SnapshotSession session("unused-snapshot.nvec", child_pid, 0, nullptr);
+  // Keep the child stopped long enough for the completion thread to consume
+  // the stop notification. A stopped writer is still alive and owns its PID.
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  EXPECT_FALSE(session.IsFinished());
+
+  ASSERT_EQ(::kill(child_pid, SIGCONT), 0);
+  const auto result = session.Finish(2000);
+  EXPECT_TRUE(result.has_value());
+  EXPECT_TRUE(session.IsFinished());
+  int status = 0;
+  EXPECT_EQ(::waitpid(child_pid, &status, WNOHANG), -1);
+  EXPECT_EQ(errno, ECHILD) << "the session must reap the child after its terminal exit";
+}
+
+TEST_F(SnapshotSessionTest, CheckpointReadersRejectFifosWithoutBlocking) {
+  const auto dir = root_dir_ / "fifo_checkpoint";
+  std::filesystem::create_directories(dir);
+
+  const auto fifo_snapshot = dir / "snapshot.nvec";
+  ASSERT_EQ(::mkfifo(fifo_snapshot.c_str(), 0600), 0);
+  EXPECT_TRUE(CheckpointReadFailsPromptly(fifo_snapshot.string()));
+
+  const auto regular_snapshot = dir / "regular.nvec";
+  const int snapshot_fd = ::open(regular_snapshot.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+  ASSERT_GE(snapshot_fd, 0);
+  const char payload[] = "snapshot";
+  ASSERT_EQ(::write(snapshot_fd, payload, sizeof(payload)), static_cast<ssize_t>(sizeof(payload)));
+  ASSERT_EQ(::close(snapshot_fd), 0);
+
+  const auto fifo_sidecar = regular_snapshot.string() + storage::kWalCheckpointSuffix;
+  ASSERT_EQ(::mkfifo(fifo_sidecar.c_str(), 0600), 0);
+  EXPECT_TRUE(CheckpointReadFailsPromptly(regular_snapshot.string()));
+}
+
+TEST_F(SnapshotSessionTest, FinishDoesNotSignalAfterChildOwnershipIsLost) {
+  const auto dir = root_dir_ / "lost_child";
+  std::filesystem::create_directories(dir);
+  const auto snapshot = dir / "ownership.nvec";
+  const int snapshot_fd = ::open(snapshot.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600);
+  ASSERT_GE(snapshot_fd, 0);
+  constexpr off_t kSnapshotSize = 128LL * 1024LL * 1024LL;
+  ASSERT_EQ(::ftruncate(snapshot_fd, kSnapshotSize), 0);
+  ASSERT_EQ(::close(snapshot_fd), 0);
+
+  const auto preserved = dir / ".ownership.nvec.prev.nvec";
+  const int preserved_fd = ::open(preserved.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+  ASSERT_GE(preserved_fd, 0);
+  ASSERT_EQ(::close(preserved_fd), 0);
+
+  const auto temporary = dir / (".ownership.nvec.tmp." + std::to_string(::getpid()) + ".0");
+  const int temporary_fd = ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+  ASSERT_GE(temporary_fd, 0);
+  ASSERT_EQ(::close(temporary_fd), 0);
+
+  struct sigaction action {};
+  action.sa_handler = RecordSigterm;
+  ASSERT_EQ(sigemptyset(&action.sa_mask), 0);
+  struct sigaction previous_action {};
+  ASSERT_EQ(::sigaction(SIGTERM, &action, &previous_action), 0);
+  g_received_sigterm = 0;
+
+  {
+    storage::WriteAheadLog wal;
+    storage::SnapshotSession session(snapshot.string(), ::getpid(), 0, &wal);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::filesystem::exists(temporary) && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_FALSE(std::filesystem::exists(temporary)) << "the lost-child failure path should reclaim its temp";
+    EXPECT_FALSE(session.IsFinished()) << "the checkpoint-binding read should still be in progress";
+
+    const auto result = session.Finish(0);
+    EXPECT_FALSE(result.has_value()) << "the synthetic non-child PID must be reported as lost ownership";
+    EXPECT_TRUE(session.IsFinished());
+  }
+
+  EXPECT_EQ(g_received_sigterm, 0) << "Finish must not signal a PID after the reaper observed ECHILD";
+  EXPECT_EQ(::sigaction(SIGTERM, &previous_action, nullptr), 0);
 }
 
 TEST_F(SnapshotSessionTest, ConcurrentStatusChecksNeverDowngradeACompletedSnapshot) {
