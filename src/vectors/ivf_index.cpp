@@ -163,24 +163,48 @@ void IvfIndex::Train(const float* matrix, const size_t* valid_indices, size_t nu
     return;  // Another thread is already training
   }
 
-  // Ensure training_in_progress_ is reset when we exit
+  // Reset the training flag and stop recording changes on every exit path.
   struct TrainingGuard {
-    std::atomic<bool>& flag;
-    ~TrainingGuard() { flag.store(false); }
-  } guard{training_in_progress_};
-
-  std::unique_lock lock(mutex_);
+    IvfIndex& index;
+    ~TrainingGuard() {
+      {
+        std::unique_lock lock(index.mutex_);
+        index.recording_changes_ = false;
+        index.change_log_.clear();
+      }
+      index.training_in_progress_.store(false);
+    }
+  } guard{*this};
 
   if (num_valid == 0 || matrix == nullptr || valid_indices == nullptr) {
     return;
   }
 
-  dimension_.store(dimension, std::memory_order_relaxed);
+  // Snapshot the settings under the lock, then train without it: searches and
+  // writes keep running against the current layout. Changes that land meanwhile
+  // are recorded and replayed once the new layout is installed.
+  uint32_t configured_nlist = 0;
+  uint32_t max_iterations = 0;
+  float convergence_threshold = 0.0F;
+  IvfMetric metric = IvfMetric::kCosine;
+  uint64_t start_generation = 0;
+  {
+    std::unique_lock lock(mutex_);
+    configured_nlist = configured_nlist_;
+    max_iterations = config_.max_iterations;
+    convergence_threshold = config_.convergence_threshold;
+    metric = config_.metric;
+    start_generation = layout_generation_;
+    // Set before recording so a first-run AddVector can copy its vector.
+    dimension_.store(dimension, std::memory_order_relaxed);
+    change_log_.clear();
+    recording_changes_ = true;
+  }
 
   // Derive the effective nlist from the operator-configured value on every run
   // rather than from whatever the previous run left in config_.nlist, so an
   // explicit setting keeps applying and the auto sentinel keeps auto-scaling.
-  uint32_t effective_nlist = configured_nlist_;
+  uint32_t effective_nlist = configured_nlist;
 
   // Auto-scale nlist if set to 0: use sqrt(n), capped at kMaxAutoNlist
   if (effective_nlist == 0) {
@@ -218,43 +242,76 @@ void IvfIndex::Train(const float* matrix, const size_t* valid_indices, size_t nu
   if (effective_nlist > train_size) {
     effective_nlist = static_cast<uint32_t>(train_size);
   }
-  config_.nlist = effective_nlist;
 
-  // Run K-means
-  KMeansTrain(matrix, train_ptr, train_size, dimension);
+  std::vector<float> centroids;
+  std::vector<float> centroid_norms;
+  KMeansTrain(matrix, train_ptr, train_size, dimension, effective_nlist, metric, max_iterations, convergence_threshold,
+              centroids, centroid_norms);
 
-  // Initialize inverted lists
-  inverted_lists_.clear();
-  inverted_lists_.resize(config_.nlist);
-  cluster_of_.clear();
+  if (train_hook_) {
+    train_hook_();
+  }
 
-  // Assign vectors to clusters if requested
-  if (assign_vectors) {
+  size_t total_indexed = 0;
+  uint32_t nprobe = 0;
+  {
+    std::unique_lock lock(mutex_);
+    recording_changes_ = false;
+    if (layout_generation_ != start_generation) {
+      // A reset or reconfiguration replaced the index while this run was
+      // training; its centroids describe a layout that no longer exists.
+      utils::StructuredLog().Event("ivf_training_discarded").Info();
+      return;
+    }
+
+    dimension_.store(dimension, std::memory_order_relaxed);
+    config_.nlist = effective_nlist;
+    centroids_ = std::move(centroids);
+    centroid_norms_ = std::move(centroid_norms);
+    inverted_lists_.clear();
+    inverted_lists_.resize(config_.nlist);
+    cluster_of_.clear();
+
     const auto& simd_impl = simd::GetOptimalImpl();
     const uint32_t nlist = config_.nlist;
-
-    for (size_t i = 0; i < num_valid; ++i) {
-      size_t idx = valid_indices[i];
-      const float* vec = matrix + idx * dimension;
-      float vec_norm = simd_impl.l2_norm(vec, dimension);
+    const auto assign = [&](size_t idx, const float* vec) {
+      const float vec_norm = simd_impl.l2_norm(vec, dimension);
       AppendToListLocked(AssignCluster(config_.metric, centroids_.data(), centroid_norms_.data(), nlist, vec, vec_norm,
                                        idx, dimension),
                          idx);
+    };
+
+    // Assign vectors to clusters if requested
+    if (assign_vectors) {
+      for (size_t i = 0; i < num_valid; ++i) {
+        const size_t idx = valid_indices[i];
+        assign(idx, matrix + idx * dimension);
+      }
     }
+
+    // Replay what changed while training, in order, so vectors added or removed
+    // meanwhile end up reflected in the new layout.
+    for (const auto& change : change_log_) {
+      if (change.removed) {
+        EraseIndexedLocked(change.compact_index);
+      } else if (change.vector.size() == dimension) {
+        assign(change.compact_index, change.vector.data());
+      }
+    }
+    change_log_.clear();
+
+    trained_ = true;
+    ++layout_generation_;
+    for (const auto& list : inverted_lists_) {
+      total_indexed += list.size();
+    }
+    nprobe = config_.nprobe;
   }
 
-  trained_ = true;
-  ++layout_generation_;
-
-  // Log training completion
-  size_t total_indexed = 0;
-  for (const auto& list : inverted_lists_) {
-    total_indexed += list.size();
-  }
   utils::StructuredLog()
       .Event("ivf_index_trained")
-      .Field("nlist", static_cast<int64_t>(config_.nlist))
-      .Field("nprobe", static_cast<int64_t>(config_.nprobe))
+      .Field("nlist", static_cast<int64_t>(effective_nlist))
+      .Field("nprobe", static_cast<int64_t>(nprobe))
       .Field("indexed_count", static_cast<int64_t>(total_indexed))
       .Field("dimension", static_cast<int64_t>(dimension))
       .Info();
@@ -263,7 +320,13 @@ void IvfIndex::Train(const float* matrix, const size_t* valid_indices, size_t nu
 void IvfIndex::AddVector(size_t compact_index, const float* vector) {
   std::unique_lock lock(mutex_);
 
-  if (!trained_ || vector == nullptr) {
+  if (vector == nullptr) {
+    return;
+  }
+  if (recording_changes_) {
+    change_log_.push_back({compact_index, false, std::vector<float>(vector, vector + GetDimension())});
+  }
+  if (!trained_) {
     return;
   }
 
@@ -274,7 +337,16 @@ void IvfIndex::AddVector(size_t compact_index, const float* vector) {
 void IvfIndex::BulkAddVectors(const size_t* compact_indices, const float* vectors, size_t count, uint32_t dimension) {
   std::unique_lock lock(mutex_);
 
-  if (!trained_ || compact_indices == nullptr || vectors == nullptr || count == 0) {
+  if (compact_indices == nullptr || vectors == nullptr || count == 0) {
+    return;
+  }
+  if (recording_changes_) {
+    for (size_t i = 0; i < count; ++i) {
+      const float* vec = vectors + i * dimension;
+      change_log_.push_back({compact_indices[i], false, std::vector<float>(vec, vec + dimension)});
+    }
+  }
+  if (!trained_) {
     return;
   }
 
@@ -323,11 +395,14 @@ void IvfIndex::RemoveVector(size_t compact_index) {
   // so the exclusive lock is taken only when the index is actually sealed.
   {
     std::shared_lock lock(mutex_);
-    if (compact_index >= cluster_of_.size() || cluster_of_[compact_index] == kNoCluster) {
+    if (!recording_changes_ && (compact_index >= cluster_of_.size() || cluster_of_[compact_index] == kNoCluster)) {
       return;
     }
   }
   std::unique_lock lock(mutex_);
+  if (recording_changes_) {
+    change_log_.push_back({compact_index, true, {}});
+  }
   EraseIndexedLocked(compact_index);
 }
 
@@ -720,17 +795,11 @@ std::vector<std::pair<float, size_t>> IvfIndex::SearchBuffer(const float* query_
 // K-Means Training (Lloyd's Algorithm)
 // ============================================================================
 
-void IvfIndex::KMeansTrain(const float* matrix, const size_t* sample_indices, size_t sample_size, uint32_t dim) {
-  // Centroid seeding consumes one distinct training sample per cluster, so the
-  // cluster count can never exceed the sample count. Callers clamp already;
-  // repeating it here keeps the seeding loop in range for any future caller,
-  // and the write-back keeps the inverted lists sized to the same value.
-  if (config_.nlist > sample_size) {
-    config_.nlist = static_cast<uint32_t>(sample_size);
-  }
-  const uint32_t nlist = config_.nlist;
-
-  // Random initialization: pick nlist random vectors as initial centroids
+void IvfIndex::KMeansTrain(const float* matrix, const size_t* sample_indices, size_t sample_size, uint32_t dim,
+                           uint32_t nlist, IvfMetric metric, uint32_t max_iterations, float convergence_threshold,
+                           std::vector<float>& centroids, std::vector<float>& centroid_norms) {
+  // Random initialization: pick nlist random vectors as initial centroids.
+  // Seeding consumes one distinct sample per cluster, so nlist <= sample_size.
   std::vector<size_t> init_indices(sample_size);
   std::iota(init_indices.begin(), init_indices.end(), size_t{0});
 
@@ -738,11 +807,11 @@ void IvfIndex::KMeansTrain(const float* matrix, const size_t* sample_indices, si
   std::shuffle(init_indices.begin(), init_indices.end(), rng);
   std::uniform_int_distribution<size_t> sample_distribution(0, sample_size - 1);
 
-  centroids_.resize(static_cast<size_t>(nlist) * dim);
+  centroids.resize(static_cast<size_t>(nlist) * dim);
   for (uint32_t c = 0; c < nlist; ++c) {
     size_t vec_idx = sample_indices[init_indices[c]];
     const float* src = matrix + vec_idx * dim;
-    std::copy(src, src + dim, centroids_.data() + static_cast<size_t>(c) * dim);
+    std::copy(src, src + dim, centroids.data() + static_cast<size_t>(c) * dim);
   }
 
   // Lloyd's iterations
@@ -752,18 +821,33 @@ void IvfIndex::KMeansTrain(const float* matrix, const size_t* sample_indices, si
 
   const auto& simd_impl = simd::GetOptimalImpl();
 
-  // Compute initial centroid norms before first iteration
-  centroid_norms_.resize(nlist);
-  for (uint32_t c = 0; c < nlist; ++c) {
-    centroid_norms_[c] = simd_impl.l2_norm(centroids_.data() + static_cast<size_t>(c) * dim, dim);
-  }
+  const auto refresh_norms = [&] {
+    centroid_norms.resize(nlist);
+    for (uint32_t c = 0; c < nlist; ++c) {
+      centroid_norms[c] = simd_impl.l2_norm(centroids.data() + static_cast<size_t>(c) * dim, dim);
+    }
+  };
+  refresh_norms();
 
-  for (uint32_t iter = 0; iter < config_.max_iterations; ++iter) {
+  const auto nearest_centroid = [&](const float* vec) {
+    const float vec_norm = simd_impl.l2_norm(vec, dim);
+    size_t best = 0;
+    float best_sim = kWorstScore;
+    for (uint32_t c = 0; c < nlist; ++c) {
+      const float sim =
+          SimilarityFor(metric, vec, vec_norm, centroids.data() + static_cast<size_t>(c) * dim, centroid_norms[c], dim);
+      if (sim > best_sim) {
+        best_sim = sim;
+        best = c;
+      }
+    }
+    return best;
+  };
+
+  for (uint32_t iter = 0; iter < max_iterations; ++iter) {
     // Assignment step: assign each sample to nearest centroid
     for (size_t i = 0; i < sample_size; ++i) {
-      size_t vec_idx = sample_indices[i];
-      const float* vec = matrix + vec_idx * dim;
-      assignments[i] = FindNearestCentroid(vec);
+      assignments[i] = nearest_centroid(matrix + sample_indices[i] * dim);
     }
 
     // Update step: recompute centroids
@@ -772,8 +856,7 @@ void IvfIndex::KMeansTrain(const float* matrix, const size_t* sample_indices, si
 
     for (size_t i = 0; i < sample_size; ++i) {
       size_t cluster = assignments[i];
-      size_t vec_idx = sample_indices[i];
-      const float* vec = matrix + vec_idx * dim;
+      const float* vec = matrix + sample_indices[i] * dim;
       float* centroid = new_centroids.data() + cluster * dim;
       for (uint32_t d = 0; d < dim; ++d) {
         centroid[d] += vec[d];
@@ -800,19 +883,15 @@ void IvfIndex::KMeansTrain(const float* matrix, const size_t* sample_indices, si
     // Check convergence: maximum centroid movement
     float max_delta = 0.0F;
     for (uint32_t c = 0; c < nlist; ++c) {
-      float delta = simd_impl.l2_distance(centroids_.data() + static_cast<size_t>(c) * dim,
+      float delta = simd_impl.l2_distance(centroids.data() + static_cast<size_t>(c) * dim,
                                           new_centroids.data() + static_cast<size_t>(c) * dim, dim);
       max_delta = std::max(max_delta, delta);
     }
 
-    centroids_ = new_centroids;
+    centroids = new_centroids;
+    refresh_norms();
 
-    // Recompute centroid norms for next iteration's FindNearestCentroid
-    for (uint32_t c = 0; c < nlist; ++c) {
-      centroid_norms_[c] = simd_impl.l2_norm(centroids_.data() + static_cast<size_t>(c) * dim, dim);
-    }
-
-    if (max_delta < config_.convergence_threshold) {
+    if (max_delta < convergence_threshold) {
       utils::StructuredLog()
           .Event("ivf_kmeans_converged")
           .Field("iterations", static_cast<int64_t>(iter + 1))
@@ -821,8 +900,6 @@ void IvfIndex::KMeansTrain(const float* matrix, const size_t* sample_indices, si
       break;
     }
   }
-
-  // centroid_norms_ is already up to date from the last iteration
 }
 
 size_t IvfIndex::FindNearestCentroid(const float* vec) const {

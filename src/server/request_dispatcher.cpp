@@ -246,9 +246,8 @@ utils::Expected<WriteOutcome, utils::Error> ApplyVecdel(HandlerContext& ctx, con
     return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kInternalError, "VectorStore not initialized"));
   }
 
-  // Capture the compact index before deletion. The store may compact during
-  // DeleteVector(), invalidating every later compact index, so the ANN cleanup
-  // decision is made from row counts observed around the mutation.
+  // Capture the compact index before deletion; the engine decides from the
+  // store generation whether it can retire that one label or must rebuild.
   const auto compact_index = ctx.vector_store->GetCompactIndex(cmd.id);
   if (!compact_index.has_value()) {
     return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kVectorNotFound, "Vector not found: " + cmd.id));
@@ -257,7 +256,6 @@ utils::Expected<WriteOutcome, utils::Error> ApplyVecdel(HandlerContext& ctx, con
   if (!wal_result) {
     return utils::MakeUnexpected(wal_result.error());
   }
-  const size_t rows_before = ctx.vector_store->GetCompactCount();
   if (!ctx.vector_store->DeleteVector(cmd.id)) {
     LatchDurabilityFailure(ctx);
     return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kVectorNotFound, "Vector not found: " + cmd.id));
@@ -267,15 +265,10 @@ utils::Expected<WriteOutcome, utils::Error> ApplyVecdel(HandlerContext& ctx, con
     ctx.metadata_store->Delete(cmd.id);
   }
   if (ctx.similarity_engine != nullptr) {
-    // The store compacts itself once its own fragmentation threshold is
-    // reached; a delete that left a tombstone in place has not moved any other
-    // row, so removing the single label is enough. Only a compaction re-keys
-    // every live compact index and therefore requires a full rebuild.
-    if (ctx.vector_store->GetCompactCount() < rows_before) {
-      ctx.similarity_engine->RebuildAnnFromStore();
-    } else {
-      ctx.similarity_engine->NotifyVectorRemoved(*compact_index);
-    }
+    // A delete that left a tombstone in place moved no other row. When the
+    // store compacted, its generation advanced past the single step the engine
+    // expects and NotifyVectorRemoved rebuilds the index from the store.
+    ctx.similarity_engine->NotifyVectorRemoved(*compact_index);
   }
 
   ctx.vector_generation.fetch_add(1, std::memory_order_acq_rel);

@@ -125,16 +125,11 @@ void RunStress(const std::string& index_type, bool exercise_dispatcher_path, int
         std::string id = "item" + std::to_string(id_num);
         if ((iter & 3) == 0) {
           if (exercise_dispatcher_path) {
-            // The production delete sequence: a compaction re-keys every row and
-            // rebuilds the index, a tombstone retires the one entry.
+            // The production delete sequence: the engine retires the one entry,
+            // or rebuilds when the delete compacted the store.
             const auto compact_index = vector_store.GetCompactIndex(id);
-            const size_t rows_before = vector_store.GetCompactCount();
             if (compact_index.has_value() && vector_store.DeleteVector(id)) {
-              if (vector_store.GetCompactCount() < rows_before) {
-                engine.RebuildAnnFromStore();
-              } else {
-                engine.NotifyVectorRemoved(*compact_index);
-              }
+              engine.NotifyVectorRemoved(*compact_index);
             }
           } else {
             vector_store.DeleteVector(id);

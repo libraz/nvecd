@@ -54,6 +54,14 @@ class HnswIndex : public AnnIndex {
   };
 
   /**
+   * @brief Times a search thread had to grow its reusable visited-marks buffer
+   *
+   * Process-wide. Stays flat across repeated searches on a warm thread; a
+   * per-search allocation would advance it on every call.
+   */
+  static uint64_t VisitedBufferAllocations();
+
+  /**
    * @brief Construct HNSW index
    * @param dimension Vector dimension
    * @param distance_func Distance function (higher = more similar)

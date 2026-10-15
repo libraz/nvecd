@@ -300,8 +300,12 @@ class VectorStore {
    * Rebuilds compact storage by copying only non-deleted entries.
    * Called automatically when tombstone ratio exceeds 25%.
    * Thread-safe: acquires exclusive lock internally.
+   *
+   * @return true if rows were rewritten, in which case the generation advanced
+   *         and every compact index is invalid. A delete that triggers the
+   *         automatic compaction advances the generation by two.
    */
-  void Defragment();
+  bool Defragment();
 
  private:
   /// Validate vector input and return its already-computed L2 norm.
@@ -309,7 +313,8 @@ class VectorStore {
                                                                 const std::vector<float>& vec) const;
 
   /// @brief Internal defragment that assumes caller holds unique_lock
-  void DefragmentLocked();
+  /// @return true if rows were rewritten (compact indices changed)
+  bool DefragmentLocked();
 
   /// @brief Internal memory usage calculation that assumes caller holds lock
   size_t MemoryUsageLocked() const;

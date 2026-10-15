@@ -6,11 +6,11 @@
 #include "vectors/hnsw_index.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <queue>
-#include <unordered_set>
 
 #include "utils/error.h"
 #include "utils/structured_log.h"
@@ -50,7 +50,46 @@ bool HasRemainingBytes(std::istream& in, size_t required) {
   return static_cast<uint64_t>(end - current) >= required;
 }
 
+std::atomic<uint64_t> g_visited_allocations{0};
+
+/// Epoch-stamped visited marks, reused across searches on the same thread. A
+/// node is visited when its stamp equals the current epoch, so starting a new
+/// search is one increment instead of clearing or reallocating a set.
+class VisitedMarks {
+ public:
+  /// Start a search over @p node_count nodes.
+  void Begin(size_t node_count) {
+    if (stamps_.size() < node_count) {
+      if (stamps_.capacity() < node_count) {
+        g_visited_allocations.fetch_add(1, std::memory_order_relaxed);
+      }
+      stamps_.resize(node_count, 0);
+    }
+    if (++epoch_ == 0) {  // Wrapped: stale stamps could alias the new epoch
+      std::fill(stamps_.begin(), stamps_.end(), 0U);
+      epoch_ = 1;
+    }
+  }
+
+  /// Mark @p id visited. Returns true if it was not already.
+  bool Mark(uint32_t id) {
+    if (stamps_[id] == epoch_) {
+      return false;
+    }
+    stamps_[id] = epoch_;
+    return true;
+  }
+
+ private:
+  std::vector<uint32_t> stamps_;
+  uint32_t epoch_ = 0;
+};
+
 }  // namespace
+
+uint64_t HnswIndex::VisitedBufferAllocations() {
+  return g_visited_allocations.load(std::memory_order_relaxed);
+}
 
 // ============================================================================
 // Construction / Move
@@ -173,8 +212,10 @@ std::vector<std::pair<float, uint32_t>> HnswIndex::SearchLayer(const float* quer
   std::priority_queue<std::pair<float, uint32_t>, std::vector<std::pair<float, uint32_t>>, decltype(cmp_min)> to_visit(
       cmp_min);
 
-  std::unordered_set<uint32_t> visited;
-  visited.insert(entry_node);
+  // One buffer per thread: concurrent searches share the index but not the marks.
+  thread_local VisitedMarks visited;
+  visited.Begin(nodes_.size());
+  visited.Mark(entry_node);
 
   candidates.push({entry_dist, entry_node});
   to_visit.push({entry_dist, entry_node});
@@ -197,10 +238,9 @@ std::vector<std::pair<float, uint32_t>> HnswIndex::SearchLayer(const float* quer
     }
 
     for (uint32_t neighbor_id : neighbors[layer]) {
-      if (visited.count(neighbor_id) != 0) {
+      if (!visited.Mark(neighbor_id)) {
         continue;
       }
-      visited.insert(neighbor_id);
 
       float dist = ComputeDistance(query, query_norm, neighbor_id);
 

@@ -230,7 +230,12 @@ bool VectorStore::DeleteVector(const std::string& vector_id) {
   // Auto-defragment when fragmentation exceeds 25%
   size_t total_slots = idx_to_id_.size();
   if (total_slots > 0 && tombstone_count_ * 4 > total_slots) {
-    DefragmentLocked();
+    if (DefragmentLocked()) {
+      // Compaction re-keys rows independently of the delete itself. A second
+      // bump lets a consumer tracking the generation see more than one step
+      // and rebuild instead of treating this as a single-row removal.
+      generation_.fetch_add(1, std::memory_order_release);
+    }
   }
 
   generation_.fetch_add(1, std::memory_order_release);
@@ -398,17 +403,20 @@ std::optional<size_t> VectorStore::GetCompactIndex(const std::string& id) const 
   return it->second;
 }
 
-void VectorStore::Defragment() {
+bool VectorStore::Defragment() {
   std::unique_lock lock(mutex_);
-  DefragmentLocked();
+  if (!DefragmentLocked()) {
+    return false;
+  }
   generation_.fetch_add(1, std::memory_order_release);
+  return true;
 }
 
-void VectorStore::DefragmentLocked() {
+bool VectorStore::DefragmentLocked() {
   // Nothing to reclaim: compacting here would copy the whole matrix and force
   // every consumer keyed by compact index to rebuild, for no change in layout.
   if (tombstone_count_ == 0) {
-    return;
+    return false;
   }
 
   size_t dim = dimension_.load(std::memory_order_relaxed);
@@ -422,7 +430,7 @@ void VectorStore::DefragmentLocked() {
     free_slots_.clear();
     active_count_ = 0;
     tombstone_count_ = 0;
-    return;
+    return true;
   }
 
   size_t new_n = active_count_;
@@ -461,6 +469,7 @@ void VectorStore::DefragmentLocked() {
   deleted_ = std::move(new_deleted);
   free_slots_.clear();
   tombstone_count_ = 0;
+  return true;
 }
 
 std::unique_lock<std::shared_mutex> VectorStore::AcquireWriteLock() {

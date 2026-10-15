@@ -25,6 +25,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
@@ -126,7 +127,11 @@ class IvfIndex {
   /**
    * @brief Train the index using K-means clustering
    *
-   * Builds Voronoi cells from the provided vectors.
+   * Builds Voronoi cells from the provided vectors. K-means runs without the
+   * index lock, so searches and writes proceed meanwhile; the new layout is
+   * installed under a brief exclusive lock, after which vectors added or removed
+   * during the run are replayed against it. A reset or reconfiguration during the
+   * run discards the result.
    *
    * @param matrix Pointer to contiguous [n x dim] float matrix
    * @param valid_indices Array of indices into the matrix that are not deleted
@@ -139,6 +144,13 @@ class IvfIndex {
    */
   void Train(const float* matrix, const size_t* valid_indices, size_t num_valid, uint32_t dimension,
              bool assign_vectors = true, size_t corpus_size = 0);
+
+  /**
+   * @brief Install a callback run during Train() after k-means, before the new
+   *        layout is published. No lock is held while it runs. Test seam; set it
+   *        before training starts.
+   */
+  void SetTrainHook(std::function<void()> hook) { train_hook_ = std::move(hook); }
 
   /**
    * @brief Add a single vector directly to the IVF inverted lists
@@ -322,12 +334,23 @@ class IvfIndex {
  private:
   /**
    * @brief Run K-means (Lloyd's algorithm) on a sample of vectors
+   *
+   * Touches no index state, so it runs without any lock held.
+   *
    * @param matrix Full matrix pointer
    * @param sample_indices Indices of vectors to use for training
    * @param sample_size Number of training samples
    * @param dim Vector dimension
+   * @param nlist Number of clusters (<= sample_size)
+   * @param metric Similarity metric for assignment
+   * @param max_iterations Iteration cap
+   * @param convergence_threshold Stop when the largest centroid move falls below this
+   * @param centroids Output: nlist x dim centroid matrix
+   * @param centroid_norms Output: L2 norm of each centroid
    */
-  void KMeansTrain(const float* matrix, const size_t* sample_indices, size_t sample_size, uint32_t dim);
+  static void KMeansTrain(const float* matrix, const size_t* sample_indices, size_t sample_size, uint32_t dim,
+                          uint32_t nlist, IvfMetric metric, uint32_t max_iterations, float convergence_threshold,
+                          std::vector<float>& centroids, std::vector<float>& centroid_norms);
 
   /**
    * @brief Append a compact index to an inverted list
@@ -452,6 +475,21 @@ class IvfIndex {
 
   /// True while Train() is executing (prevents concurrent training attempts)
   std::atomic<bool> training_in_progress_{false};
+
+  /// A vector added or removed while Train() runs without mutex_. Replayed after
+  /// the new layout is installed.
+  struct PendingChange {
+    size_t compact_index;
+    bool removed;
+    std::vector<float> vector;  ///< Empty for a removal
+  };
+
+  /// Guarded by mutex_. True from the start of a training run until install.
+  bool recording_changes_ = false;
+  std::vector<PendingChange> change_log_;
+
+  /// Invoked by Train() after k-means and before install, with no lock held.
+  std::function<void()> train_hook_;
 
   // =========================================================================
   // Write buffer state
