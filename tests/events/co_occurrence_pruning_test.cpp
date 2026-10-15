@@ -299,11 +299,13 @@ TEST(CoOccurrencePruningTest, PruneIncrementsGeneration) {
   CoOccurrenceIndex index(cfg);
 
   index.SetScore("item0", "item1", 100.0F);
+  index.SetScore("item0", "item2", 50.0F);
   uint64_t gen_before = index.GetGeneration();
 
   index.Prune();
 
   EXPECT_GT(index.GetGeneration(), gen_before);
+  EXPECT_FLOAT_EQ(index.GetScore("item0", "item2"), 0.0F);
 }
 
 // ============================================================================

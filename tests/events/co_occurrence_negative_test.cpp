@@ -120,6 +120,25 @@ TEST(CoOccurrenceNegativeTest, ZeroScoredPriorEventCreatesNoEdge) {
   EXPECT_EQ(index.GetNeighborCount("a"), 1U);
 }
 
+TEST(CoOccurrenceNegativeTest, NoOpNegativeSignalDoesNotAdvanceGeneration) {
+  CoOccurrenceIndex index;
+  const uint64_t initial_generation = index.GetGeneration();
+
+  {
+    auto lock = index.AcquireWriteLock();
+    index.ApplyNegativeSignalLocked("a", {Event("a", 10, 1), Event("b", 0, 2)}, 0.5);
+  }
+  EXPECT_EQ(index.GetGeneration(), initial_generation);
+  EXPECT_EQ(index.GetItemCount(), 0U);
+
+  {
+    auto lock = index.AcquireWriteLock();
+    index.ApplyNegativeSignalLocked("a", {Event("b", 10, 1)}, 0.0);
+  }
+  EXPECT_EQ(index.GetGeneration(), initial_generation);
+  EXPECT_EQ(index.GetItemCount(), 0U);
+}
+
 // Edges a negative pass creates are subject to the retention bounds of the
 // write that created them.
 TEST(CoOccurrenceNegativeTest, NegativeEdgesRespectNeighborCap) {

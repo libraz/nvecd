@@ -236,7 +236,7 @@ class CoOccurrenceIndex {
   size_t GetNeighborCount(const std::string& item_id) const;
 
   /**
-   * @brief Get the generation counter (incremented on every write)
+   * @brief Get the generation counter (advanced when co-occurrence state changes)
    * @return Current generation value
    */
   uint64_t GetGeneration() const { return generation_.load(std::memory_order_acquire); }
@@ -377,7 +377,8 @@ class CoOccurrenceIndex {
   void SetValidatedScore(const ValidatedEdge& edge);
 
   /// @brief Prune a single item's neighbor list (caller must hold write lock)
-  void PruneItemLocked(const std::string& item_id);
+  /// @return true if the index changed
+  bool PruneItemLocked(const std::string& item_id);
 
   /// @brief Estimate memory usage assuming the caller already holds the lock
   size_t MemoryUsageLocked() const;

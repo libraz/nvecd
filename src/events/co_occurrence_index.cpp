@@ -13,6 +13,59 @@
 
 namespace nvecd::events {
 
+namespace {
+
+using CoScoreMap = std::unordered_map<std::string, std::unordered_map<std::string, float>>;
+
+// Decay is pair-local, so a streaming update stays bit-for-bit equal to a batch rebuild in any arrival order.
+float PairContribution(const Event& first, const Event& second, bool temporal_enabled, double inv_half_life) {
+  // Widen first: snapshot restore can supply scores outside [0,100], and int*int could overflow.
+  float score = static_cast<float>(static_cast<int64_t>(first.score) * second.score);
+  if (!temporal_enabled) {
+    return score;
+  }
+
+  // Skip the newer endpoint (decay one): exp2(-0 * inf) is NaN for a subnormal half-life.
+  const uint64_t newer_timestamp = std::max(first.timestamp, second.timestamp);
+  const uint64_t older_timestamp = std::min(first.timestamp, second.timestamp);
+  if (newer_timestamp != older_timestamp) {
+    constexpr float kMinDecay = 1e-6F;
+    const double age = static_cast<double>(newer_timestamp - older_timestamp);
+    const float decay = std::max(static_cast<float>(std::exp2(-age * inv_half_life)), kMinDecay);
+    score *= decay;
+  }
+  return score;
+}
+
+bool AddDirectedScore(CoScoreMap& scores, const std::string& item_id, const std::string& neighbor_id, float delta) {
+  if (delta == 0.0F) {
+    return false;
+  }
+
+  auto [item_it, item_inserted] = scores.try_emplace(item_id);
+  auto [neighbor_it, neighbor_inserted] = item_it->second.try_emplace(neighbor_id, 0.0F);
+  const float updated = neighbor_it->second + delta;
+  if (updated == neighbor_it->second) {
+    if (neighbor_inserted) {
+      item_it->second.erase(neighbor_it);
+      if (item_inserted) {
+        scores.erase(item_it);
+      }
+    }
+    return false;
+  }
+  neighbor_it->second = updated;
+  return true;
+}
+
+bool AddSymmetricScore(CoScoreMap& scores, const std::string& item1, const std::string& item2, float delta) {
+  const bool forward_changed = AddDirectedScore(scores, item1, item2, delta);
+  const bool reverse_changed = AddDirectedScore(scores, item2, item1, delta);
+  return forward_changed || reverse_changed;
+}
+
+}  // namespace
+
 utils::Expected<ValidatedEdge, utils::Error> CoOccurrenceEdgeValidator::Validate(const std::string& item1,
                                                                                  const std::string& item2,
                                                                                  float score) {
@@ -105,6 +158,10 @@ void CoOccurrenceIndex::AddEventIncrementalInternal(const std::vector<Event>& pr
     return;
   }
 
+  const bool apply_temporal_decay = temporal_enabled && half_life_sec > 0.0;
+  const double inv_half_life = apply_temporal_decay ? 1.0 / half_life_sec : 0.0;
+  bool state_changed = false;
+
   // Add only the pairs (new_event, prior_events[i]) once each (symmetric).
   for (size_t i = 0; i < prior_events.size(); ++i) {
     const auto& prior = prior_events[i];
@@ -115,23 +172,9 @@ void CoOccurrenceIndex::AddEventIncrementalInternal(const std::vector<Event>& pr
       continue;
     }
 
-    // Widen to int64_t before the float cast: callers such as snapshot
-    // restore can supply scores outside the validated [0,100] range, and a
-    // 32-bit int*int product could otherwise overflow.
-    auto score = static_cast<float>(static_cast<int64_t>(new_event.score) * prior.score);
-    if (temporal_enabled && half_life_sec > 0.0) {
-      // Decay is pair-local: this keeps a streaming update bit-for-bit
-      // equivalent to a batch rebuild regardless of the arrival order of
-      // other events in the context.
-      const uint64_t pair_max_ts = std::max(new_event.timestamp, prior.timestamp);
-      const double inv_half_life = 1.0 / half_life_sec;
-      constexpr float kMinDecay = 1e-6F;
-      const auto decay_for = [&](uint64_t ts) {
-        const double age = static_cast<double>(pair_max_ts - ts);
-        return std::max(static_cast<float>(std::exp2(-age * inv_half_life)), kMinDecay);
-      };
-      score *= decay_for(new_event.timestamp) * decay_for(prior.timestamp);
-    }
+    // Pair-local scoring keeps incremental updates equivalent to the batch
+    // rebuild regardless of event arrival order.
+    const float score = PairContribution(new_event, prior, apply_temporal_decay, inv_half_life);
 
     // A zero contribution must not materialize a pair.  Besides wasting
     // memory, such entries inflate neighbor/item statistics even though they
@@ -140,11 +183,8 @@ void CoOccurrenceIndex::AddEventIncrementalInternal(const std::vector<Event>& pr
       continue;
     }
 
-    co_scores_[new_event.item_id][prior.item_id] += score;
-    co_scores_[prior.item_id][new_event.item_id] += score;
+    state_changed = AddSymmetricScore(co_scores_, new_event.item_id, prior.item_id, score) || state_changed;
   }
-
-  generation_.fetch_add(1, std::memory_order_release);
 
   // Both endpoints of every new edge grow. In particular, a frequently seen
   // hub can exceed its cap while each newly ingested leaf remains small.
@@ -162,8 +202,11 @@ void CoOccurrenceIndex::AddEventIncrementalInternal(const std::vector<Event>& pr
     std::sort(affected_ids.begin(), affected_ids.end());
     affected_ids.erase(std::unique(affected_ids.begin(), affected_ids.end()), affected_ids.end());
     for (const auto& item_id : affected_ids) {
-      PruneItemLocked(item_id);
+      state_changed = PruneItemLocked(item_id) || state_changed;
     }
+  }
+  if (state_changed) {
+    generation_.fetch_add(1, std::memory_order_release);
   }
 }
 
@@ -177,6 +220,10 @@ void CoOccurrenceIndex::UpdateFromEventsInternal(const std::string& ctx [[maybe_
   for (size_t i = 0; i < events.size(); ++i) {
     usable[i] = static_cast<char>(ValidateIdentifier("ID", events[i].item_id).has_value());
   }
+
+  const bool apply_temporal_decay = temporal_enabled && half_life_sec > 0.0;
+  const double inv_half_life = apply_temporal_decay ? 1.0 / half_life_sec : 0.0;
+  bool state_changed = false;
 
   // Compute pairwise co-occurrence scores
   for (size_t i = 0; i < events.size(); ++i) {
@@ -194,22 +241,7 @@ void CoOccurrenceIndex::UpdateFromEventsInternal(const std::string& ctx [[maybe_
         continue;
       }
 
-      // Widen to int64_t before the float cast: callers such as snapshot
-      // restore can supply scores outside the validated [0,100] range, and a
-      // 32-bit int*int product could otherwise overflow.
-      auto score = static_cast<float>(static_cast<int64_t>(event1.score) * event2.score);
-
-      // Apply temporal decay if enabled
-      if (temporal_enabled && half_life_sec > 0.0) {
-        const uint64_t pair_max_ts = std::max(event1.timestamp, event2.timestamp);
-        const double inv_half_life = 1.0 / half_life_sec;
-        constexpr float kMinDecay = 1e-6F;
-        const auto decay_for = [&](uint64_t ts) {
-          const double age = static_cast<double>(pair_max_ts - ts);
-          return std::max(static_cast<float>(std::exp2(-age * inv_half_life)), kMinDecay);
-        };
-        score *= decay_for(event1.timestamp) * decay_for(event2.timestamp);
-      }
+      const float score = PairContribution(event1, event2, apply_temporal_decay, inv_half_life);
 
       // Do not create map entries for a non-contribution (for example an
       // event with score zero).
@@ -217,12 +249,9 @@ void CoOccurrenceIndex::UpdateFromEventsInternal(const std::string& ctx [[maybe_
         continue;
       }
 
-      co_scores_[event1.item_id][event2.item_id] += score;
-      co_scores_[event2.item_id][event1.item_id] += score;
+      state_changed = AddSymmetricScore(co_scores_, event1.item_id, event2.item_id, score) || state_changed;
     }
   }
-
-  generation_.fetch_add(1, std::memory_order_release);
 
   // Prune affected items after a bulk update. Apply min_support immediately
   // as well, otherwise a deployment with decay disabled never enforces it.
@@ -235,8 +264,11 @@ void CoOccurrenceIndex::UpdateFromEventsInternal(const std::string& ctx [[maybe_
     std::sort(affected_ids.begin(), affected_ids.end());
     affected_ids.erase(std::unique(affected_ids.begin(), affected_ids.end()), affected_ids.end());
     for (const auto& item_id : affected_ids) {
-      PruneItemLocked(item_id);
+      state_changed = PruneItemLocked(item_id) || state_changed;
     }
+  }
+  if (state_changed) {
+    generation_.fetch_add(1, std::memory_order_release);
   }
 }
 
@@ -251,6 +283,7 @@ void CoOccurrenceIndex::ApplyNegativeSignalLocked(const std::string& removed_id,
     return;
   }
 
+  bool state_changed = false;
   std::vector<std::string> affected_ids{removed_id};
   for (const auto& event : context_events) {
     if (event.item_id == removed_id) {
@@ -268,12 +301,9 @@ void CoOccurrenceIndex::ApplyNegativeSignalLocked(const std::string& removed_id,
     }
 
     // Symmetric reduction (both directions)
-    co_scores_[removed_id][event.item_id] -= reduction;
-    co_scores_[event.item_id][removed_id] -= reduction;
+    state_changed = AddSymmetricScore(co_scores_, removed_id, event.item_id, -reduction) || state_changed;
     affected_ids.push_back(event.item_id);
   }
-
-  generation_.fetch_add(1, std::memory_order_release);
 
   // A reduction can create an edge that did not exist, so the retention bounds
   // apply to every ID it touched, in the same write.
@@ -281,8 +311,11 @@ void CoOccurrenceIndex::ApplyNegativeSignalLocked(const std::string& removed_id,
     std::sort(affected_ids.begin(), affected_ids.end());
     affected_ids.erase(std::unique(affected_ids.begin(), affected_ids.end()), affected_ids.end());
     for (const auto& item_id : affected_ids) {
-      PruneItemLocked(item_id);
+      state_changed = PruneItemLocked(item_id) || state_changed;
     }
+  }
+  if (state_changed) {
+    generation_.fetch_add(1, std::memory_order_release);
   }
 }
 
@@ -364,14 +397,18 @@ void CoOccurrenceIndex::ApplyDecay(double alpha) {
 
   constexpr float kDecayThreshold = 1e-6F;
   float threshold = (config_.min_support > 0.0F) ? config_.min_support : kDecayThreshold;
+  bool state_changed = false;
 
   for (auto outer_it = co_scores_.begin(); outer_it != co_scores_.end();) {
     auto& scores_map = outer_it->second;
     for (auto inner_it = scores_map.begin(); inner_it != scores_map.end();) {
+      const float previous = inner_it->second;
       inner_it->second *= static_cast<float>(alpha);
       if (std::abs(inner_it->second) < threshold) {
         inner_it = scores_map.erase(inner_it);
+        state_changed = true;
       } else {
+        state_changed = (inner_it->second != previous) || state_changed;
         ++inner_it;
       }
     }
@@ -384,7 +421,9 @@ void CoOccurrenceIndex::ApplyDecay(double alpha) {
     }
   }
 
-  generation_.fetch_add(1, std::memory_order_release);
+  if (state_changed) {
+    generation_.fetch_add(1, std::memory_order_release);
+  }
 }
 
 size_t CoOccurrenceIndex::GetItemCount() const {
@@ -435,6 +474,17 @@ utils::Expected<void, utils::Error> CoOccurrenceIndex::SetScore(const std::strin
 
 void CoOccurrenceIndex::SetValidatedScore(const ValidatedEdge& edge) {
   std::unique_lock lock(mutex_);
+  const auto existing1 = co_scores_.find(edge->item1);
+  if (existing1 != co_scores_.end()) {
+    const auto score12 = existing1->second.find(edge->item2);
+    const auto existing2 = co_scores_.find(edge->item2);
+    if (score12 != existing1->second.end() && existing2 != co_scores_.end()) {
+      const auto score21 = existing2->second.find(edge->item1);
+      if (score21 != existing2->second.end() && score12->second == edge->score && score21->second == edge->score) {
+        return;
+      }
+    }
+  }
   co_scores_[edge->item1][edge->item2] = edge->score;
   co_scores_[edge->item2][edge->item1] = edge->score;
   generation_.fetch_add(1, std::memory_order_release);
@@ -450,20 +500,24 @@ void CoOccurrenceIndex::Prune() {
     items.push_back(id);
   }
 
+  bool state_changed = false;
   for (const auto& id : items) {
-    PruneItemLocked(id);
+    state_changed = PruneItemLocked(id) || state_changed;
   }
 
-  generation_.fetch_add(1, std::memory_order_release);
+  if (state_changed) {
+    generation_.fetch_add(1, std::memory_order_release);
+  }
 }
 
-void CoOccurrenceIndex::PruneItemLocked(const std::string& item_id) {
+bool CoOccurrenceIndex::PruneItemLocked(const std::string& item_id) {
   auto it = co_scores_.find(item_id);
   if (it == co_scores_.end()) {
-    return;
+    return false;
   }
 
   auto& neighbors = it->second;
+  bool state_changed = false;
 
   // Remove entries below min_support
   if (config_.min_support > 0.0F) {
@@ -481,6 +535,7 @@ void CoOccurrenceIndex::PruneItemLocked(const std::string& item_id) {
           }
         }
         nit = neighbors.erase(nit);
+        state_changed = true;
       } else {
         ++nit;
       }
@@ -489,22 +544,24 @@ void CoOccurrenceIndex::PruneItemLocked(const std::string& item_id) {
 
   // Trim to max_neighbors if needed
   if (config_.max_neighbors_per_item > 0 && neighbors.size() > config_.max_neighbors_per_item) {
-    // Collect into vector, sort by absolute score descending (ties by ascending
-    // id, so the kept set does not depend on hash order), keep top-K
+    // Deterministic top-K by |score| descending, ties by ascending ID; the tail stays unordered.
     std::vector<std::pair<std::string, float>> sorted_neighbors(neighbors.begin(), neighbors.end());
-    std::sort(sorted_neighbors.begin(), sorted_neighbors.end(), [](const auto& a, const auto& b) {
+    const auto ranks_before = [](const auto& a, const auto& b) {
       const float score_a = std::abs(a.second);
       const float score_b = std::abs(b.second);
       if (score_a != score_b) {
         return score_a > score_b;
       }
       return a.first < b.first;
-    });
+    };
+    const auto keep_end = sorted_neighbors.begin() + config_.max_neighbors_per_item;
+    std::partial_sort(sorted_neighbors.begin(), keep_end, sorted_neighbors.end(), ranks_before);
 
     // Remove entries beyond max_neighbors
     for (size_t i = config_.max_neighbors_per_item; i < sorted_neighbors.size(); ++i) {
       const auto& removed_id = sorted_neighbors[i].first;
       neighbors.erase(removed_id);
+      state_changed = true;
       // Also remove reverse entry, except when it is this node (self-edge):
       // erasing it here would leave `neighbors` dangling for the rest of the
       // loop, and the trailing erase below already covers that case.
@@ -520,11 +577,16 @@ void CoOccurrenceIndex::PruneItemLocked(const std::string& item_id) {
 
   if (neighbors.empty()) {
     co_scores_.erase(it);
+    state_changed = true;
   }
+  return state_changed;
 }
 
 void CoOccurrenceIndex::Clear() {
   std::unique_lock lock(mutex_);
+  if (co_scores_.empty()) {
+    return;
+  }
   co_scores_.clear();
   generation_.fetch_add(1, std::memory_order_release);
 }

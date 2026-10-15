@@ -384,6 +384,86 @@ TEST(CoOccurrenceIndexTest, TemporalIncrementalMatchesBatchRebuild) {
   EXPECT_FLOAT_EQ(incremental.GetScore("item2", "item3"), batch.GetScore("item2", "item3"));
 }
 
+TEST(CoOccurrenceIndexTest, TemporalBatchIncrementalParityForTimestampAndHalfLifeExtremes) {
+  const uint64_t largest_timestamp = std::numeric_limits<uint64_t>::max();
+  const double shortest_half_life = std::numeric_limits<double>::denorm_min();
+  const double longest_half_life = std::numeric_limits<double>::max();
+  struct Case {
+    const char* name;
+    std::vector<Event> events;
+    double half_life_sec;
+    float expected_score;
+  };
+  const std::vector<Case> cases = {
+      {"equal timestamps", {Event("a", 10, 42), Event("b", 20, 42)}, 100.0, 200.0F},
+      {"newer event second", {Event("a", 10, 100), Event("b", 20, 200)}, 100.0, 100.0F},
+      {"newer event first", {Event("b", 20, 200), Event("a", 10, 100)}, 100.0, 100.0F},
+      {"huge gap", {Event("a", 10, 0), Event("b", 20, largest_timestamp)}, 100.0, 200.0F * 1e-6F},
+      {"huge gap reversed", {Event("b", 20, largest_timestamp), Event("a", 10, 0)}, 100.0, 200.0F * 1e-6F},
+      {"equal timestamps with tiny half-life", {Event("a", 10, 42), Event("b", 20, 42)}, shortest_half_life, 200.0F},
+      {"different timestamps with tiny half-life",
+       {Event("a", 10, 0), Event("b", 20, 1)},
+       shortest_half_life,
+       200.0F * 1e-6F},
+      {"huge half-life", {Event("a", 10, 0), Event("b", 20, largest_timestamp)}, longest_half_life, 200.0F},
+  };
+
+  for (const auto& test_case : cases) {
+    CoOccurrenceIndex batch;
+    batch.UpdateFromEvents("ctx", test_case.events, true, test_case.half_life_sec);
+
+    CoOccurrenceIndex incremental;
+    std::vector<Event> prior;
+    for (const auto& event : test_case.events) {
+      incremental.AddEventIncremental("ctx", prior, event, true, test_case.half_life_sec);
+      prior.push_back(event);
+    }
+
+    EXPECT_FLOAT_EQ(batch.GetScore("a", "b"), test_case.expected_score) << test_case.name;
+    EXPECT_FLOAT_EQ(incremental.GetScore("a", "b"), batch.GetScore("a", "b")) << test_case.name;
+  }
+}
+
+TEST(CoOccurrenceIndexTest, NoOpUpdatesDoNotAdvanceGeneration) {
+  CoOccurrenceIndex index;
+  const uint64_t initial_generation = index.GetGeneration();
+
+  index.UpdateFromEvents("ctx", {Event("self", 3, 1), Event("self", 4, 2), Event("zero", 0, 3)});
+  EXPECT_EQ(index.GetGeneration(), initial_generation);
+  EXPECT_EQ(index.GetItemCount(), 0U);
+
+  index.AddEventIncremental("ctx", {Event("self", 3, 1), Event("zero", 0, 2)}, Event("self", 4, 3), false, 0.0);
+  EXPECT_EQ(index.GetGeneration(), initial_generation);
+  EXPECT_EQ(index.GetItemCount(), 0U);
+
+  ASSERT_TRUE(index.SetScore("large", "small", 1e20F).has_value());
+  const uint64_t before_rounded_noop = index.GetGeneration();
+  index.AddEventIncremental("ctx", {Event("small", 1, 1)}, Event("large", 1, 2), false, 0.0);
+  EXPECT_EQ(index.GetScore("large", "small"), 1e20F);
+  EXPECT_EQ(index.GetGeneration(), before_rounded_noop);
+}
+
+TEST(CoOccurrenceIndexTest, NoOpStateMutatorsDoNotAdvanceGeneration) {
+  CoOccurrenceIndex index;
+  const uint64_t empty_generation = index.GetGeneration();
+  index.Clear();
+  index.Prune();
+  index.ApplyDecay(0.5);
+  EXPECT_EQ(index.GetGeneration(), empty_generation);
+
+  ASSERT_TRUE(index.SetScore("a", "b", 10.0F).has_value());
+  const uint64_t populated_generation = index.GetGeneration();
+  ASSERT_TRUE(index.SetScore("a", "b", 10.0F).has_value());
+  index.ApplyDecay(1.0);
+  index.Prune();
+  EXPECT_EQ(index.GetGeneration(), populated_generation);
+
+  index.Clear();
+  const uint64_t cleared_generation = index.GetGeneration();
+  index.Clear();
+  EXPECT_EQ(index.GetGeneration(), cleared_generation);
+}
+
 TEST(CoOccurrenceIndexTest, LargeNumberOfEvents) {
   CoOccurrenceIndex index;
   std::vector<Event> events;
