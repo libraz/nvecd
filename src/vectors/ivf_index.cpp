@@ -19,6 +19,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "utils/random_sampling.h"
 #include "utils/structured_log.h"
 #include "vectors/distance.h"
 #include "vectors/distance_simd.h"
@@ -168,16 +169,12 @@ void IvfIndex::Train(const float* matrix, const size_t* valid_indices, size_t nu
   size_t train_size = num_valid;
 
   if (num_valid > kMaxTrainingSamples) {
-    // Random sample using reservoir sampling
-    train_indices.resize(kMaxTrainingSamples);
-    std::copy(valid_indices, valid_indices + kMaxTrainingSamples, train_indices.begin());
-
+    // Sample positions from the live-row index list so tombstones stay excluded.
     thread_local std::mt19937 rng(std::random_device{}());
-    for (size_t i = kMaxTrainingSamples; i < num_valid; ++i) {
-      size_t j = rng() % (i + 1);
-      if (j < kMaxTrainingSamples) {
-        train_indices[j] = valid_indices[i];
-      }
+    const auto sample_positions = utils::SampleIndices(num_valid, kMaxTrainingSamples, rng);
+    train_indices.reserve(kMaxTrainingSamples);
+    for (size_t position : sample_positions) {
+      train_indices.push_back(valid_indices[position]);
     }
 
     train_ptr = train_indices.data();
@@ -786,6 +783,7 @@ void IvfIndex::KMeansTrain(const float* matrix, const size_t* sample_indices, si
 
   thread_local std::mt19937 rng(std::random_device{}());
   std::shuffle(init_indices.begin(), init_indices.end(), rng);
+  std::uniform_int_distribution<size_t> sample_distribution(0, sample_size - 1);
 
   centroids_.resize(static_cast<size_t>(nlist) * dim);
   for (uint32_t c = 0; c < nlist; ++c) {
@@ -840,7 +838,7 @@ void IvfIndex::KMeansTrain(const float* matrix, const size_t* sample_indices, si
         }
       } else {
         // Empty cluster: reinitialize with a random sample
-        size_t random_sample = sample_indices[rng() % sample_size];
+        size_t random_sample = sample_indices[sample_distribution(rng)];
         const float* src = matrix + random_sample * dim;
         std::copy(src, src + dim, centroid);
       }

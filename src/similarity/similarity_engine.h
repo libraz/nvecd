@@ -14,7 +14,6 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -288,17 +287,7 @@ class SimilarityEngine {
    */
   static std::vector<SimilarityResult> MergeAndSelectTopK(std::vector<SimilarityResult> results, int top_k);
 
-  /// @brief Distance function type for similarity computation
-  using DistanceFunc = std::function<float(const std::vector<float>&, const std::vector<float>&)>;
-
-  /**
-   * @brief Select distance function based on metric name
-   * @param metric Distance metric name ("cosine", "dot", "l2")
-   * @return Distance function
-   */
-  static DistanceFunc SelectDistanceFunction(const std::string& metric);
-
-  /// @brief Generate random sample indices using reservoir sampling
+  /// @brief Sample unique indices uniformly from [0, total).
   std::vector<size_t> SampleIndices(size_t total, size_t sample_size) const;
 
   /**
@@ -313,7 +302,7 @@ class SimilarityEngine {
   vectors::VectorStore* vector_store_;                ///< Vector store (not owned)
   vectors::MetadataStore* metadata_store_;            ///< Metadata store (not owned, may be null)
   config::SimilarityConfig config_;                   ///< Configuration
-  DistanceFunc distance_func_;                        ///< Distance function for similarity
+  vectors::DistanceFunc distance_func_;               ///< Raw-pointer distance function for similarity
   bool use_prenorm_ = false;                          ///< Whether to use pre-computed norm optimization (cosine only)
 
   /// Selected implementation, parsed once from config_.index_type. Dispatch on

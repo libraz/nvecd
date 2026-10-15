@@ -10,7 +10,10 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <limits>
+#include <random>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_set>
@@ -18,12 +21,75 @@
 
 #include "events/co_occurrence_index.h"
 #include "events/event_store.h"
+#include "utils/random_sampling.h"
 #include "vectors/metadata_filter.h"
 #include "vectors/metadata_store.h"
 #include "vectors/vector_store.h"
 
 namespace nvecd::similarity {
 namespace {
+
+class CountingRandomEngine {
+ public:
+  using result_type = std::mt19937::result_type;
+
+  static constexpr result_type min() { return std::mt19937::min(); }
+  static constexpr result_type max() { return std::mt19937::max(); }
+
+  result_type operator()() {
+    if (calls == kDrawLimit) {
+      throw std::runtime_error("sampling exceeded the bounded RNG draw budget");
+    }
+    ++calls;
+    return engine();
+  }
+
+  static constexpr size_t kDrawLimit = 4096;
+  std::mt19937 engine{42};
+  size_t calls = 0;
+};
+
+TEST(RandomSamplingTest, NearFullSampleRemainsUniqueForSmallPopulation) {
+  CountingRandomEngine rng;
+  const auto indices = utils::SampleIndices(4, 3, rng);
+  ASSERT_EQ(indices.size(), 3U);
+
+  std::unordered_set<size_t> unique(indices.begin(), indices.end());
+  EXPECT_EQ(unique.size(), indices.size());
+  for (size_t index : indices) {
+    EXPECT_LT(index, 4U);
+  }
+}
+
+TEST(RandomSamplingTest, WidePopulationUsesBoundedRngDrawsAndHandlesEmptyOrFullSamples) {
+  if constexpr (sizeof(size_t) <= sizeof(uint32_t)) {
+    GTEST_SKIP() << "wide index test requires 64-bit size_t";
+  }
+
+  CountingRandomEngine rng;
+
+  const auto empty = utils::SampleIndices(8, 0, rng);
+  EXPECT_TRUE(empty.empty());
+
+  const auto all = utils::SampleIndices(4, 7, rng);
+  ASSERT_EQ(all.size(), 4U);
+  EXPECT_EQ(all, (std::vector<size_t>{0, 1, 2, 3}));
+  EXPECT_EQ(rng.calls, 0U);
+
+  constexpr size_t kSampleSize = 128;
+  constexpr uint64_t wide_total = uint64_t{1} << 40;
+  const size_t total = static_cast<size_t>(wide_total);
+  std::vector<size_t> indices;
+  EXPECT_NO_THROW(indices = utils::SampleIndices(total, kSampleSize, rng));
+  ASSERT_EQ(indices.size(), kSampleSize);
+
+  std::unordered_set<size_t> unique(indices.begin(), indices.end());
+  EXPECT_EQ(unique.size(), indices.size());
+  for (size_t index : indices) {
+    EXPECT_LT(index, total);
+  }
+  EXPECT_LT(rng.calls, CountingRandomEngine::kDrawLimit);
+}
 
 // Helper to create configs
 config::EventsConfig MakeEventsConfig() {
@@ -1106,6 +1172,48 @@ TEST_F(SimilarityEngineTest, DistanceMetric_L2) {
 
   // item2: 1/(1+1.0) = 0.5
   EXPECT_NEAR((*results)[0].score, 0.5f, 1e-5f);
+}
+
+TEST_F(SimilarityEngineTest, DotAndL2RawSearchesRespectMetadataFilter) {
+  for (const std::string metric : {"dot", "l2"}) {
+    config::VectorsConfig vec_cfg;
+    vec_cfg.default_dimension = 3;
+    vec_cfg.distance_metric = metric;
+
+    config::SimilarityConfig sim_cfg = MakeSimilarityConfig();
+    sim_cfg.sample_size = 0;
+
+    auto vec_store = std::make_unique<vectors::VectorStore>(vec_cfg);
+    auto metadata_store = std::make_unique<vectors::MetadataStore>();
+    ASSERT_TRUE(vec_store->SetVector("query", {1.0f, 0.0f, 0.0f}).has_value());
+    ASSERT_TRUE(vec_store->SetVector("kept", {2.0f, 0.0f, 0.0f}).has_value());
+    ASSERT_TRUE(vec_store->SetVector("filtered", {1.5f, 0.0f, 0.0f}).has_value());
+    metadata_store->Set("kept", {{"owner", std::string("keep")}});
+    metadata_store->Set("filtered", {{"owner", std::string("drop")}});
+
+    SimilarityEngine engine(event_store_.get(), co_index_.get(), vec_store.get(), sim_cfg, vec_cfg,
+                            metadata_store.get());
+    vectors::MetadataFilter filter;
+    vectors::FilterCondition condition;
+    condition.field = "owner";
+    condition.op = vectors::FilterOp::kEq;
+    condition.value = std::string("keep");
+    filter.conditions.push_back(condition);
+
+    auto by_id = engine.SearchByIdVectors("query", 10, filter);
+    ASSERT_TRUE(by_id.has_value());
+    ASSERT_EQ(by_id->size(), 1U) << metric;
+    EXPECT_EQ((*by_id)[0].item_id, "kept") << metric;
+
+    auto by_vector = engine.SearchByVector({1.0f, 0.0f, 0.0f}, 10, filter);
+    ASSERT_TRUE(by_vector.has_value());
+    ASSERT_EQ(by_vector->size(), 1U) << metric;
+    EXPECT_EQ((*by_vector)[0].item_id, "kept") << metric;
+
+    const float expected_score = metric == "dot" ? 2.0f : 0.5f;
+    EXPECT_NEAR((*by_id)[0].score, expected_score, 1e-5f) << metric;
+    EXPECT_NEAR((*by_vector)[0].score, expected_score, 1e-5f) << metric;
+  }
 }
 
 TEST_F(SimilarityEngineTest, FusionNormalization_SingleResult) {

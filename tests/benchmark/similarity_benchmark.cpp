@@ -10,7 +10,7 @@
  * 1. VectorStore::Defragment() rebuild time
  * 2. Brute-force scan with CosineSimilarityPreNorm
  * 3. MergeAndSelectTopK (partial_sort overhead)
- * 4. Reservoir sampling (SampleIndices overhead)
+ * 4. Uniform index sampling (SampleIndices overhead)
  * 5. End-to-end SearchByIdVectors
  * 6. End-to-end SearchByVector (SIMV)
  * 7. Cache hit vs miss latency
@@ -24,7 +24,6 @@
 #include <cstdio>
 #include <iomanip>
 #include <iostream>
-#include <numeric>
 #include <random>
 #include <string>
 #include <vector>
@@ -35,6 +34,7 @@
 #include "events/co_occurrence_index.h"
 #include "events/event_store.h"
 #include "similarity/similarity_engine.h"
+#include "utils/random_sampling.h"
 #include "vectors/distance.h"
 #include "vectors/vector_store.h"
 
@@ -264,11 +264,11 @@ TEST_F(SimilarityBenchmark, DISABLED_MergeAndSelectTopK) {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Reservoir sampling (SampleIndices overhead)
+// 4. Uniform index sampling (SampleIndices overhead)
 // ---------------------------------------------------------------------------
 
-TEST_F(SimilarityBenchmark, DISABLED_ReservoirSampling) {
-  PrintHeader("Reservoir sampling (sample_size=5000)");
+TEST_F(SimilarityBenchmark, DISABLED_UniformIndexSampling) {
+  PrintHeader("Uniform index sampling (sample_size=5000)");
 
   constexpr size_t kSampleSize = 5000;
 
@@ -287,22 +287,13 @@ TEST_F(SimilarityBenchmark, DISABLED_ReservoirSampling) {
 
       auto start = std::chrono::high_resolution_clock::now();
 
-      // Reservoir sampling: select kSampleSize indices from [0, scale).
-      std::vector<size_t> reservoir(kSampleSize);
-      std::iota(reservoir.begin(), reservoir.end(), 0);
-      for (size_t i = kSampleSize; i < scale; ++i) {
-        std::uniform_int_distribution<size_t> dist(0, i);
-        size_t j = dist(rng);
-        if (j < kSampleSize) {
-          reservoir[j] = i;
-        }
-      }
+      const auto indices = utils::SampleIndices(scale, kSampleSize, rng);
 
       auto end = std::chrono::high_resolution_clock::now();
       double us = std::chrono::duration<double, std::micro>(end - start).count();
       samples.push_back(us);
 
-      ASSERT_EQ(reservoir.size(), kSampleSize);
+      ASSERT_EQ(indices.size(), kSampleSize);
     }
 
     PrintRow(scale, MedianUs(samples));

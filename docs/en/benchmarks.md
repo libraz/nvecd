@@ -6,7 +6,7 @@ This page documents the two benchmark binaries in the repository, what each of t
 
 Both live in `tests/benchmark/`, are built with the rest of the tests, and register with CTest under the `benchmark` label. Their test cases are prefixed `DISABLED_`, so an ordinary test run skips them: they take minutes, and a shared machine under load produces a timing that means nothing.
 
-`similarity_benchmark` profiles the components of the search pipeline directly, with no server and no TCP in the path. It measures eight things: the rebuild time of the vector store's defragmentation pass, a brute-force cosine scan with pre-computed norms, the top-k selection that follows it, reservoir sampling, the two end-to-end engine entry points for search by item and search by vector, query cache lookup latency for a hit and for a miss, and query cache mutation cost under the exclusive lock.
+`similarity_benchmark` profiles the components of the search pipeline directly, with no server and no TCP in the path. It measures eight things: the rebuild time of the vector store's defragmentation pass, a brute-force cosine scan with pre-computed norms, the top-k selection that follows it, uniform random sampling, the two end-to-end engine entry points for search by item and search by vector, query cache lookup latency for a hit and for a miss, and query cache mutation cost under the exclusive lock.
 
 `ann_recall_benchmark` measures the only figure that decides whether an approximate index is usable: the trade-off between recall and latency. Any ANN structure can be made arbitrarily fast by returning worse answers, so a latency for `hnsw` or `ivf` on its own says nothing. It sweeps the knob that controls the trade-off — `hnsw_ef_search` for HNSW, `ivf_nprobe` for IVF — and reports recall next to latency at every point on the curve. Ground truth is an exhaustive scan over the same vectors with the same distance function, so the result is reproducible anywhere the binary builds, with no dataset to fetch.
 
@@ -52,12 +52,12 @@ End-to-end through `SimilarityEngine`, dimension 128, `top_k` 10, cosine:
 
 | Vectors | Search by item id | Search by query vector |
 |---|---|---|
-| 1,000 | 0.010 ms | 0.010 ms |
-| 10,000 | 0.092 ms | 0.092 ms |
-| 50,000 | 0.59 ms | 0.58 ms |
-| 100,000 | 0.90 ms | 0.91 ms |
+| 1,000 | 0.011 ms | 0.010 ms |
+| 10,000 | 0.097 ms | 0.093 ms |
+| 50,000 | 0.62 ms | 0.57 ms |
+| 100,000 | 0.87 ms | 0.90 ms |
 
-These run at the default `sample_size` of 10,000, and sampling engages once the corpus exceeds twice that value. The two smallest rows are therefore exhaustive scans; the 50,000 and 100,000 rows select a sample first, and the reservoir pass that selects it walks the whole corpus, so their cost grows with corpus size even though the distance scan does not. The two entry points agree to within a percent, which is expected: they differ only in whether the query vector is looked up or supplied.
+These run at the default `sample_size` of 10,000, and sampling engages once the corpus exceeds twice that value. The two smallest rows are therefore exhaustive scans; the 50,000 and 100,000 rows score a sample of 10,000 rows instead. Drawing the sample costs work proportional to its size, but the sampled rows are scattered across the whole matrix, so the scan loses the sequential memory access the exhaustive rows get and its cost still rises with corpus size. The two entry points agree to within run-to-run noise, which is expected: they differ only in whether the query vector is looked up or supplied.
 
 Dividing through, the 100,000-vector figure is roughly 1,100 queries per second per thread.
 

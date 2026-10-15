@@ -86,8 +86,9 @@ a query never sees a matrix reallocated underneath it.
 The dot-product, L2-norm and L2-distance kernels have AVX2, NEON and scalar
 implementations. The one used is chosen on first use from runtime CPU detection,
 restricted to what the binary was compiled with: AVX2 is considered only if the
-build defined `__AVX2__`, NEON only if it defined `__ARM_NEON`, and scalar is the
-fallback that is always present.
+compiler accepted `-mavx2` for the one source file that holds the AVX2 kernels,
+NEON only if the build defined `__ARM_NEON`, and scalar is the fallback that is
+always present.
 
 The active implementation is written to the log at startup:
 
@@ -96,10 +97,11 @@ Vector SIMD: NEON
 ```
 
 No command reports it. Building with `NVECD_PORTABLE_BUILD` targets the base
-instruction set for the architecture, which on x86-64 excludes AVX2 from the
-compiled kernels: such a binary reports `Scalar` even on a CPU that supports
-AVX2. NEON is part of the AArch64 baseline and stays available in a portable
-build. See [installation.md](./installation.md) for the build options.
+instruction set for the architecture everywhere except that kernel file, so a
+portable x86-64 binary still reports `AVX2` on a CPU that supports it and
+`Scalar` on one that does not. NEON is part of the AArch64 baseline and stays
+available in a portable build. See [installation.md](./installation.md) for the
+build options.
 
 ## Index types
 
@@ -111,7 +113,7 @@ name behaves as `flat`. Setting `similarity.ivf_enabled` to true promotes a
 
 The default. No index object is built; every query scans the whole matrix. Build
 cost is zero, query cost is linear in the corpus, and the result is exact — with
-one exception. `similarity.sample_size` (default 10000) engages reservoir
+one exception. `similarity.sample_size` (default 10000) engages uniform random
 sampling once the corpus exceeds twice that value: the scan then visits a random
 sample of that many rows instead of all of them, which makes even `flat`
 approximate on a large corpus, with a different sample per query. Setting

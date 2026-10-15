@@ -58,7 +58,7 @@ similarity:
 
 Choose the knob value from the recall you need rather than the latency you want. The [recall floors in Benchmarks](./benchmarks.md#approximate-index-recall) give the shape of both curves on clustered data: recall rises steeply at first and then flattens, so the last few points of recall cost disproportionately more latency than the first. Verify the setting on your own vectors — recall depends on how clustered the corpus is, and a corpus of near-orthogonal vectors is one where no approximate index pays for itself.
 
-`sample_size` is an independent approximation that applies to the scanning path. Above twice its value, a query scores a random sample instead of the whole corpus. It bounds the distance work, but the reservoir pass that draws the sample still walks every vector, so it bounds scan cost rather than making query cost constant. Set it to 0 for exact answers.
+`sample_size` is an independent approximation that applies to the scanning path. Above twice its value, a query scores a random sample instead of the whole corpus. Floyd sampling draws the rows without walking the whole corpus, so both selection and distance work scale with the sample size. The sampled rows are scattered across the matrix, though, so query cost still rises with corpus size rather than staying constant. Set it to 0 for exact answers.
 
 ## Tuning the query cache
 

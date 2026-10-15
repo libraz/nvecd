@@ -8,12 +8,11 @@
 #include <algorithm>
 #include <limits>
 #include <map>
-#include <numeric>
 #include <queue>
 #include <random>
-#include <unordered_set>
 
 #include "utils/error.h"
+#include "utils/random_sampling.h"
 #include "utils/structured_log.h"
 #include "vectors/ann_index_factory.h"
 #include "vectors/distance.h"
@@ -48,7 +47,7 @@ SimilarityEngine::SimilarityEngine(events::EventStore* event_store, events::CoOc
       vector_store_(vector_store),
       metadata_store_(metadata_store),
       config_(config),
-      distance_func_(SelectDistanceFunction(vectors_config.distance_metric)),
+      distance_func_(vectors::GetDistanceFunc(vectors_config.distance_metric)),
       use_prenorm_(vectors_config.distance_metric.empty() || vectors_config.distance_metric == "cosine") {
   // Determine effective index type: support legacy ivf_enabled flag
   if (config_.index_type == "flat" && config_.ivf_enabled) {
@@ -194,19 +193,6 @@ void SimilarityEngine::JoinTrainThread() {
   if (thread && thread->joinable()) {
     thread->join();
   }
-}
-
-SimilarityEngine::DistanceFunc SimilarityEngine::SelectDistanceFunction(const std::string& metric) {
-  if (metric == "dot") {
-    return vectors::DotProduct;
-  }
-  if (metric == "l2") {
-    return [](const std::vector<float>& lhs, const std::vector<float>& rhs) -> float {
-      return 1.0F / (1.0F + vectors::L2Distance(lhs, rhs));
-    };
-  }
-  // Default: cosine
-  return vectors::CosineSimilarity;
 }
 
 // ============================================================================
@@ -382,12 +368,6 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
   query_ptr = snap.matrix + query_idx * snap.dim;
   query_norm = snap.norms[query_idx];
 
-  // For non-cosine metrics, build query vector once
-  std::vector<float> query_vec_data;
-  if (!use_prenorm_) {
-    query_vec_data.assign(query_ptr, query_ptr + snap.dim);
-  }
-
   // Bounded min-heap: track top-k (score, index) pairs without string allocation
   int k = validated_top_k.value();
   using ScoreIdx = std::pair<float, size_t>;
@@ -411,8 +391,7 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
                                                snap.norms[idx]);
     } else {
       const float* cand_ptr = snap.matrix + idx * snap.dim;
-      std::vector<float> cand_data(cand_ptr, cand_ptr + snap.dim);
-      score = distance_func_(query_vec_data, cand_data);
+      score = distance_func_(query_ptr, cand_ptr, static_cast<uint32_t>(snap.dim));
     }
     if (static_cast<int>(min_heap.size()) < k) {
       min_heap.push({score, idx});
@@ -768,8 +747,7 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
                                                snap.norms[idx]);
     } else {
       const float* cand_ptr = snap.matrix + idx * snap.dim;
-      std::vector<float> cand_data(cand_ptr, cand_ptr + snap.dim);
-      score = distance_func_(query_vector, cand_data);
+      score = distance_func_(query_vector.data(), cand_ptr, static_cast<uint32_t>(snap.dim));
     }
     if (static_cast<int>(min_heap.size()) < k) {
       min_heap.push({score, idx});
@@ -816,30 +794,8 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
 // ============================================================================
 
 std::vector<size_t> SimilarityEngine::SampleIndices(size_t total, size_t sample_size) const {
-  if (sample_size >= total) {
-    std::vector<size_t> all(total);
-    std::iota(all.begin(), all.end(), size_t(0));
-    return all;
-  }
-
-  // Reservoir sampling with fast modulo-based random (avoids creating
-  // uniform_int_distribution per iteration which is the main bottleneck)
   thread_local std::mt19937 rng(std::random_device{}());
-
-  std::vector<size_t> reservoir(sample_size);
-  std::iota(reservoir.begin(), reservoir.end(), size_t(0));
-
-  for (size_t i = sample_size; i < total; ++i) {
-    // Fast bounded random: rng() % (i+1) has slight bias but is much faster
-    // than creating uniform_int_distribution per iteration. The bias is
-    // negligible for large i values typical in vector search workloads.
-    size_t j = rng() % (i + 1);
-    if (j < sample_size) {
-      reservoir[j] = i;
-    }
-  }
-
-  return reservoir;
+  return utils::SampleIndices(total, sample_size, rng);
 }
 
 // ============================================================================
@@ -1132,15 +1088,12 @@ void SimilarityEngine::MaybeTrainIvfIndex() {
     if (valid_indices.size() <= kMaxCopyForTrain) {
       train_indices = valid_indices;
     } else {
-      // Reservoir sample
-      train_indices.resize(kMaxCopyForTrain);
-      std::copy(valid_indices.begin(), valid_indices.begin() + kMaxCopyForTrain, train_indices.begin());
+      // Sample positions from the live-row index list so tombstones stay excluded.
       std::mt19937 rng(42);
-      for (size_t i = kMaxCopyForTrain; i < valid_indices.size(); ++i) {
-        size_t j = rng() % (i + 1);
-        if (j < kMaxCopyForTrain) {
-          train_indices[j] = valid_indices[i];
-        }
+      const auto sample_positions = utils::SampleIndices(valid_indices.size(), kMaxCopyForTrain, rng);
+      train_indices.reserve(kMaxCopyForTrain);
+      for (size_t position : sample_positions) {
+        train_indices.push_back(valid_indices[position]);
       }
     }
 
