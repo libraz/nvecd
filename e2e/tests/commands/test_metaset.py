@@ -86,7 +86,15 @@ class TestMetaset:
 
     def test_filter_membership_and_inequality(self, nvecd):
         assert filtered_ids(nvecd, "category=in(books|toys)") == ["meta_c"]
-        assert filtered_ids(nvecd, "category!=books") == ["meta_b"]
+        # Items other tests left without a category also satisfy !=, so check only the seeded ones.
+        inequality = filtered_ids(nvecd, "category!=books")
+        assert "meta_b" in inequality
+        assert "meta_c" not in inequality
+
+    def test_inequality_matches_items_that_lack_the_field(self, nvecd):
+        """!= treats an absent field as different from the value."""
+        nvecd.vecset("meta_unlabelled", [0.95, 0.05, 0.0])
+        assert "meta_unlabelled" in filtered_ids(nvecd, "category!=books")
 
     def test_filter_conditions_are_anded(self, nvecd):
         assert filtered_ids(nvecd, "category:electronics,rank>15") == ["meta_b"]
