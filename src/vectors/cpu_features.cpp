@@ -17,18 +17,15 @@ CpuInfo DetectCpuFeatures() {
   // x86_64 architecture
   info.arch_name = "x86_64";
 
-#ifdef __AVX2__
-  // AVX2 compiled in - check runtime support
 #if defined(__GNUC__) || defined(__clang__)
-  // GCC/Clang: Use builtin runtime detection
+  // Detect at run time: this unit is built for the baseline ISA, where __AVX2__ is unset.
   if (__builtin_cpu_supports("avx2")) {
     info.has_avx2 = true;
   }
-#else
-  // MSVC or other compilers: Assume AVX2 if compiled with /arch:AVX2
+#elif defined(__AVX2__)
+  // MSVC has no equivalent builtin here; /arch:AVX2 is its availability signal.
   info.has_avx2 = true;
 #endif
-#endif  // __AVX2__
 
 #elif defined(__aarch64__) || defined(_M_ARM64)
   // ARM64 (AArch64) architecture

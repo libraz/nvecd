@@ -11,6 +11,7 @@
 #include <thread>
 #include <vector>
 
+#include "vectors/cpu_features.h"
 #include "vectors/distance.h"
 
 namespace nvecd::vectors {
@@ -35,6 +36,15 @@ TEST(VectorStoreTest, ConstructEmpty) {
   EXPECT_EQ(store.GetVectorCount(), 0);
   EXPECT_EQ(store.GetDimension(), 0);
   EXPECT_TRUE(store.GetAllIds().empty());
+}
+
+TEST(VectorStoreTest, DetectsAvx2AtRuntimeInBaselineBuilds) {
+#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
+  const bool expected = __builtin_cpu_supports("avx2") != 0;
+  EXPECT_EQ(simd::DetectCpuFeatures().has_avx2, expected);
+#else
+  GTEST_SKIP() << "GCC/Clang x86 runtime AVX2 detection is platform-specific";
+#endif
 }
 
 TEST(VectorStoreTest, SetAndGetVector) {
@@ -154,6 +164,50 @@ TEST(VectorStoreTest, SetVectorWithNormalization) {
   // Check L2 norm is 1
   float norm = L2Norm(retrieved->data);
   EXPECT_NEAR(norm, 1.0f, 1e-5);
+}
+
+TEST(VectorStoreTest, CachedNormTracksOverwriteAndTombstoneReuse) {
+  VectorStore store(MakeConfig());
+  const std::vector<float> first_input = {3.0F, 4.0F};
+  const std::vector<float> overwrite_input = {6.0F, 8.0F};
+  const std::vector<float> reused_input = {5.0F, 12.0F};
+
+  const auto expect_stored_row = [&store](const std::string& id, const std::vector<float>& expected_data,
+                                          bool expected_normalized) {
+    auto retrieved = store.GetVector(id);
+    ASSERT_TRUE(retrieved.has_value());
+    EXPECT_EQ(retrieved->data, expected_data);
+    EXPECT_EQ(retrieved->normalized, expected_normalized);
+
+    const auto snapshot = store.GetCompactSnapshot();
+    ASSERT_NE(snapshot.id_to_idx, nullptr);
+    const auto it = snapshot.id_to_idx->find(id);
+    ASSERT_NE(it, snapshot.id_to_idx->end());
+    const size_t index = it->second;
+    ASSERT_LT(index, snapshot.count);
+    EXPECT_EQ(index, 0U);
+    EXPECT_FALSE(snapshot.IsDeleted(index));
+
+    const float* row = snapshot.matrix + index * snapshot.dim;
+    const std::vector<float> stored_row(row, row + snapshot.dim);
+    EXPECT_EQ(stored_row, expected_data);
+    EXPECT_FLOAT_EQ(snapshot.norms[index], L2Norm(stored_row));
+  };
+
+  ASSERT_TRUE(store.SetVector("item", first_input, true).has_value());
+  expect_stored_row("item", {0.6F, 0.8F}, true);
+
+  ASSERT_TRUE(store.SetVector("item", overwrite_input, false).has_value());
+  expect_stored_row("item", overwrite_input, false);
+
+  ASSERT_TRUE(store.SetVector("keep1", {1.0F, 0.0F}).has_value());
+  ASSERT_TRUE(store.SetVector("keep2", {0.0F, 1.0F}).has_value());
+  ASSERT_TRUE(store.SetVector("keep3", {-1.0F, 0.0F}).has_value());
+  ASSERT_TRUE(store.DeleteVector("item"));
+  EXPECT_EQ(store.GetCompactCount(), 4U);
+  ASSERT_TRUE(store.SetVector("replacement", reused_input, true).has_value());
+  expect_stored_row("replacement", {5.0F / 13.0F, 12.0F / 13.0F}, true);
+  EXPECT_EQ(store.GetCompactCount(), 4U);
 }
 
 TEST(VectorStoreTest, NormalizeZeroVector) {

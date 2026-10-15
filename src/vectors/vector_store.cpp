@@ -20,6 +20,15 @@ VectorStore::VectorStore(config::VectorsConfig config) : config_(std::move(confi
 
 utils::Expected<void, utils::Error> VectorStore::ValidateVector(const std::string& vector_id,
                                                                 const std::vector<float>& vec) const {
+  auto validation = ValidateVectorAndGetNorm(vector_id, vec);
+  if (!validation) {
+    return utils::MakeUnexpected(validation.error());
+  }
+  return {};
+}
+
+utils::Expected<float, utils::Error> VectorStore::ValidateVectorAndGetNorm(const std::string& vector_id,
+                                                                           const std::vector<float>& vec) const {
   // Ids are written unescaped into line-framed responses, so every surface that
   // stores one shares the event layer's identifier rules.
   if (auto id_check = events::ValidateIdentifier("ID", vector_id); !id_check) {
@@ -58,26 +67,36 @@ utils::Expected<void, utils::Error> VectorStore::ValidateVector(const std::strin
     utils::LogVectorStoreError("validate_vector", vector_id, static_cast<int>(vec.size()), error.message());
     return utils::MakeUnexpected(error);
   }
-  return {};
+  return norm;
 }
 
 utils::Expected<void, utils::Error> VectorStore::SetVector(const std::string& vector_id, const std::vector<float>& vec,
                                                            bool normalize) {
-  auto validation = ValidateVector(vector_id, vec);
+  auto validation = ValidateVectorAndGetNorm(vector_id, vec);
   if (!validation) {
-    return validation;
+    return utils::MakeUnexpected(validation.error());
   }
 
-  // Prepare vector (normalize if requested)
-  std::vector<float> data = vec;
-
+  constexpr float kNormEpsilon = 1e-7F;
+  const float input_norm = validation.value();
+  std::vector<float> normalized_data;
+  const std::vector<float>* data_ptr = &vec;
+  float data_norm = input_norm;
   if (normalize) {
-    if (!Normalize(data)) {
+    if (input_norm < kNormEpsilon) {
       auto error = utils::MakeError(utils::ErrorCode::kInvalidArgument, "Cannot normalize zero vector");
       utils::LogVectorStoreError("set_vector", vector_id, static_cast<int>(vec.size()), error.message());
       return utils::MakeUnexpected(error);
     }
+
+    normalized_data.resize(vec.size());
+    for (size_t i = 0; i < vec.size(); ++i) {
+      normalized_data[i] = vec[i] / input_norm;
+    }
+    data_ptr = &normalized_data;
+    data_norm = simd::GetOptimalImpl().l2_norm(normalized_data.data(), normalized_data.size());
   }
+  const std::vector<float>& data = *data_ptr;
 
   // Store vector in compact storage
   {
@@ -104,7 +123,7 @@ utils::Expected<void, utils::Error> VectorStore::SetVector(const std::string& ve
       // Existing vector: overwrite in-place
       size_t idx = it->second;
       std::copy(data.begin(), data.end(), matrix_.begin() + static_cast<ptrdiff_t>(idx * current_dim));
-      norms_[idx] = simd::GetOptimalImpl().l2_norm(data.data(), data.size());
+      norms_[idx] = data_norm;
       normalized_[idx] = normalize;
     } else {
       // New vector: check for tombstone slot to reuse
@@ -119,7 +138,7 @@ utils::Expected<void, utils::Error> VectorStore::SetVector(const std::string& ve
         --tombstone_count_;
 
         std::copy(data.begin(), data.end(), matrix_.begin() + static_cast<ptrdiff_t>(idx * current_dim));
-        norms_[idx] = simd::GetOptimalImpl().l2_norm(data.data(), data.size());
+        norms_[idx] = data_norm;
         normalized_[idx] = normalize;
         idx_to_id_[idx] = vector_id;
         id_to_idx_[vector_id] = idx;
@@ -131,7 +150,7 @@ utils::Expected<void, utils::Error> VectorStore::SetVector(const std::string& ve
       // Append new slot
       matrix_.resize(matrix_.size() + current_dim);
       std::copy(data.begin(), data.end(), matrix_.begin() + static_cast<ptrdiff_t>(idx * current_dim));
-      norms_.push_back(simd::GetOptimalImpl().l2_norm(data.data(), data.size()));
+      norms_.push_back(data_norm);
       normalized_.push_back(normalize);
       idx_to_id_.push_back(vector_id);
       deleted_.push_back(false);

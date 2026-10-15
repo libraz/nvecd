@@ -333,6 +333,10 @@ class VectorStore {
   void Defragment();
 
  private:
+  /// Validate vector input and return its already-computed L2 norm.
+  utils::Expected<float, utils::Error> ValidateVectorAndGetNorm(const std::string& vector_id,
+                                                                const std::vector<float>& vec) const;
+
   /// @brief Internal defragment that assumes caller holds unique_lock
   void DefragmentLocked();
 
