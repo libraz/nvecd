@@ -12,6 +12,7 @@
 #include <cctype>
 #include <optional>
 #include <sstream>
+#include <vector>
 
 namespace nvecd::utils {
 
@@ -93,30 +94,22 @@ std::optional<CIDR> CIDR::Parse(const std::string& cidr_str) {
   return cidr;
 }
 
-bool IsIPAllowed(const std::string& ip_str, const std::vector<std::string>& allow_cidrs) {
-  // SECURITY: Default deny when ACL is empty (fail-closed)
-  // Users must explicitly configure allowed CIDRs
-  if (allow_cidrs.empty()) {
-    return false;  // Fail-closed: deny by default
-  }
-
-  // Parse client IP
-  auto client_ip = ParseIPv4(ip_str);
-  if (!client_ip) {
-    // Invalid IP format, deny by default
-    return false;
-  }
-
-  // Check if IP matches any CIDR
-  for (const auto& cidr_str : allow_cidrs) {
+std::vector<CIDR> ParseCidrList(const std::vector<std::string>& cidr_strs) {
+  std::vector<CIDR> parsed;
+  parsed.reserve(cidr_strs.size());
+  for (const auto& cidr_str : cidr_strs) {
     auto cidr = CIDR::Parse(cidr_str);
-    if (cidr && cidr->Contains(client_ip.value())) {
-      return true;
+    if (!cidr) {
+      spdlog::warn("Invalid CIDR entry ignored: {}", cidr_str);
+      continue;
     }
+    parsed.push_back(*cidr);
   }
+  return parsed;
+}
 
-  // IP not in any allowed CIDR range
-  return false;
+bool IsIPAllowed(const std::string& ip_str, const std::vector<std::string>& allow_cidrs) {
+  return IsIPAllowed(ip_str, ParseCidrList(allow_cidrs));
 }
 
 bool IsIPAllowed(const std::string& ip_str, const std::vector<CIDR>& parsed_allow_cidrs) {

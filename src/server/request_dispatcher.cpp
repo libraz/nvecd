@@ -23,6 +23,7 @@
 #include "config/runtime_variable_manager.h"
 #include "events/co_occurrence_index.h"
 #include "events/event_store.h"
+#include "server/argument_validation.h"
 #include "server/filter_parser.h"
 #include "server/handlers/admin_handler.h"
 #include "server/handlers/cache_handler.h"
@@ -124,7 +125,7 @@ utils::Expected<WriteOutcome, utils::Error> ApplyEvent(HandlerContext& ctx, cons
       return utils::MakeUnexpected(
           utils::MakeError(utils::ErrorCode::kInternalError, "Event dedup state changed during acceptance"));
     }
-    return WriteOutcome{CommandType::kEvent, /*deduplicated=*/true, /*dimension=*/0};
+    return WriteOutcome{CommandType::kEvent, /*dimension=*/0};
   }
 
   Command wal_cmd = cmd;
@@ -164,7 +165,7 @@ utils::Expected<WriteOutcome, utils::Error> ApplyEvent(HandlerContext& ctx, cons
     cache_ptr->InvalidateByItemId(cmd.id);
   }
 
-  return WriteOutcome{CommandType::kEvent, /*deduplicated=*/false, /*dimension=*/0};
+  return WriteOutcome{CommandType::kEvent, /*dimension=*/0};
 }
 
 utils::Expected<WriteOutcome, utils::Error> ApplyVecset(HandlerContext& ctx, const Command& cmd) {
@@ -237,7 +238,7 @@ utils::Expected<WriteOutcome, utils::Error> ApplyVecset(HandlerContext& ctx, con
     }
   }
 
-  return WriteOutcome{CommandType::kVecset, /*deduplicated=*/false, cmd.vector.size()};
+  return WriteOutcome{CommandType::kVecset, cmd.vector.size()};
 }
 
 utils::Expected<WriteOutcome, utils::Error> ApplyVecdel(HandlerContext& ctx, const Command& cmd) {
@@ -284,7 +285,7 @@ utils::Expected<WriteOutcome, utils::Error> ApplyVecdel(HandlerContext& ctx, con
     cache_ptr->InvalidateByItemId(cmd.id);
   }
 
-  return WriteOutcome{CommandType::kVecdel, /*deduplicated=*/false, /*dimension=*/0};
+  return WriteOutcome{CommandType::kVecdel, /*dimension=*/0};
 }
 
 utils::Expected<WriteOutcome, utils::Error> ApplyMetaset(HandlerContext& ctx, const Command& cmd) {
@@ -318,7 +319,7 @@ utils::Expected<WriteOutcome, utils::Error> ApplyMetaset(HandlerContext& ctx, co
     cache_ptr->Clear();
   }
 
-  return WriteOutcome{CommandType::kMetaset, /*deduplicated=*/false, /*dimension=*/0};
+  return WriteOutcome{CommandType::kMetaset, /*dimension=*/0};
 }
 
 }  // namespace
@@ -409,10 +410,10 @@ struct SearchGenerations {
 SearchGenerations CaptureGenerations(const HandlerContext& ctx, bool by_vector, const std::string& mode,
                                      bool has_metadata_filter) {
   SearchGenerations generations;
-  if (by_vector || mode != "events") {
+  if (by_vector || mode != kSearchModeEvents) {
     generations.vector = ctx.vector_generation.load(std::memory_order_acquire);
   }
-  if (!by_vector && mode != "vectors" && ctx.co_index != nullptr) {
+  if (!by_vector && mode != kSearchModeVectors && ctx.co_index != nullptr) {
     generations.cooccurrence = ctx.co_index->GetGeneration();
   }
   if (has_metadata_filter) {
@@ -466,9 +467,9 @@ utils::Expected<SearchOutcome, utils::Error> ExecuteSearch(HandlerContext& ctx, 
   utils::Expected<std::vector<similarity::SimilarityResult>, utils::Error> result;
   if (by_vector) {
     result = ctx.similarity_engine->SearchByVector(cmd.vector, cmd.top_k, cmd.filter);
-  } else if (cmd.mode == "events") {
+  } else if (cmd.mode == kSearchModeEvents) {
     result = ctx.similarity_engine->SearchByIdEvents(cmd.id, cmd.top_k, cmd.filter);
-  } else if (cmd.mode == "vectors") {
+  } else if (cmd.mode == kSearchModeVectors) {
     result = ctx.similarity_engine->SearchByIdVectors(cmd.id, cmd.top_k, cmd.filter);
   } else {  // fusion (default)
     result = ctx.similarity_engine->SearchByIdFusion(cmd.id, cmd.top_k, cmd.adaptive, cmd.filter);
@@ -856,20 +857,12 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleAuth(const C
 
 utils::Expected<void, utils::Error> RequestDispatcher::ReplayRecord(const storage::WalRecord& record) {
   if (record.op == storage::WalOpType::kCoOccurrenceMaintenance) {
-    constexpr size_t kMaintenancePayloadSize = sizeof(double) + sizeof(uint8_t);
-    if (record.payload.size() != kMaintenancePayloadSize) {
-      return utils::MakeUnexpected(
-          utils::MakeError(utils::ErrorCode::kWalCorrupted, "Invalid co-occurrence maintenance WAL payload size"));
+    auto maintenance = DecodeMaintenance(record.payload);
+    if (!maintenance) {
+      return utils::MakeUnexpected(maintenance.error());
     }
-    double alpha = 0.0;
-    std::memcpy(&alpha, record.payload.data(), sizeof(alpha));
-    const uint8_t prune = record.payload[sizeof(alpha)];
-    if (!events::IsValidDecayAlpha(alpha) || prune > 1) {
-      return utils::MakeUnexpected(
-          utils::MakeError(utils::ErrorCode::kWalCorrupted, "Invalid co-occurrence maintenance WAL payload"));
-    }
-    ctx_.co_index->ApplyDecay(alpha);
-    if (prune != 0) {
+    ctx_.co_index->ApplyDecay(maintenance->alpha);
+    if (maintenance->prune) {
       ctx_.co_index->Prune();
     }
     return {};

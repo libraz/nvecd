@@ -36,6 +36,7 @@
 #include "server/argument_validation.h"
 #include "server/command_parser.h"
 #include "server/filter_parser.h"
+#include "server/handlers/cache_handler.h"
 #include "server/handlers/dump_handler.h"
 #include "server/request_dispatcher.h"
 #include "server/score_format.h"
@@ -62,7 +63,9 @@ constexpr int kHttpUnauthorized = 401;
 constexpr int kHttpForbidden = 403;
 constexpr int kHttpTooManyRequests = 429;
 constexpr int kHttpNotFound = 404;
+constexpr int kHttpConflict = 409;
 constexpr int kHttpGone = 410;
+constexpr int kHttpUnprocessableEntity = 422;
 constexpr int kHttpInternalServerError = 500;
 constexpr int kHttpServiceUnavailable = 503;
 
@@ -206,6 +209,13 @@ int ErrorCodeToHttpStatus(utils::ErrorCode code) {
       return kHttpBadRequest;
     case utils::ErrorCode::kPermissionDenied:
       return kHttpForbidden;
+    case utils::ErrorCode::kSnapshotAlreadyInProgress:
+      return kHttpConflict;
+    // The snapshot file itself is unusable, not the request.
+    case utils::ErrorCode::kSnapshotLoadFailed:
+    case utils::ErrorCode::kSnapshotVerifyFailed:
+    case utils::ErrorCode::kSnapshotInfoFailed:
+      return kHttpUnprocessableEntity;
     // Durability could not accept the write. The state is unchanged and the
     // condition is transient from the client's point of view, so it is
     // reported as unavailable rather than as a request defect.
@@ -216,26 +226,6 @@ int ErrorCodeToHttpStatus(utils::ErrorCode code) {
     default:
       return kHttpInternalServerError;
   }
-}
-
-std::vector<utils::CIDR> ParseAllowCidrs(const std::vector<std::string>& allow_cidrs) {
-  std::vector<utils::CIDR> parsed;
-  parsed.reserve(allow_cidrs.size());
-
-  for (const auto& cidr_str : allow_cidrs) {
-    auto cidr = utils::CIDR::Parse(cidr_str);
-    if (!cidr) {
-      nvecd::utils::StructuredLog()
-          .Event("server_warning")
-          .Field("type", "invalid_cidr_entry")
-          .Field("cidr", cidr_str)
-          .Warn();
-      continue;
-    }
-    parsed.push_back(*cidr);
-  }
-
-  return parsed;
 }
 
 bool JsonNumberIsFinite(const json& value) {
@@ -445,7 +435,7 @@ HttpServer::HttpServer(HttpServerConfig config, HandlerContext* handler_context,
       tcp_stats_(tcp_stats),
       rate_limiter_(rate_limiter) {
   bound_port_.store(config_.port, std::memory_order_release);
-  parsed_allow_cidrs_ = ParseAllowCidrs(config_.allow_cidrs);
+  parsed_allow_cidrs_ = utils::ParseCidrList(config_.allow_cidrs);
 
   // Standalone HTTP users do not have NvecdServer's shared limiter. Build a
   // local one from the same config instead of silently bypassing rate limits.
@@ -1116,11 +1106,6 @@ void HttpServer::HandleEvent(const httplib::Request& req, httplib::Response& res
     SendError(res, kHttpServiceUnavailable, refusal);
     return;
   }
-  auto snapshot_write_guard = AcquireSnapshotWriteGuard(handler_context_);
-  if (WriteRefused(handler_context_, CommandType::kEvent, &refusal)) {
-    SendError(res, kHttpServiceUnavailable, refusal);
-    return;
-  }
 
   // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
@@ -1139,18 +1124,12 @@ void HttpServer::HandleEvent(const httplib::Request& req, httplib::Response& res
       }
     }
 
-    // Parse event type
-    events::EventType event_type;
-    if (*type_str == "ADD" || *type_str == "add") {
-      event_type = events::EventType::ADD;
-    } else if (*type_str == "SET" || *type_str == "set") {
-      event_type = events::EventType::SET;
-    } else if (*type_str == "DEL" || *type_str == "del") {
-      event_type = events::EventType::DEL;
-    } else {
+    const auto parsed_type = ParseEventType(*type_str);
+    if (!parsed_type) {
       SendError(res, kHttpBadRequest, "Invalid type: " + *type_str + " (must be ADD, SET, or DEL)");
       return;
     }
+    const events::EventType event_type = *parsed_type;
 
     int score = 0;
     if (event_type != events::EventType::DEL) {
@@ -1193,6 +1172,13 @@ void HttpServer::HandleEvent(const httplib::Request& req, httplib::Response& res
     command.event_type = event_type;
     command.timestamp = timestamp;
 
+    // Taken after parsing so a slow or malformed body never holds up a snapshot.
+    auto snapshot_write_guard = AcquireSnapshotWriteGuard(handler_context_);
+    if (WriteRefused(handler_context_, CommandType::kEvent, &refusal)) {
+      SendError(res, kHttpServiceUnavailable, refusal);
+      return;
+    }
+
     auto outcome = ApplyWrite(*handler_context_, command);
     if (!outcome) {
       SendError(res, ErrorCodeToHttpStatus(outcome.error().code()), outcome.error().message());
@@ -1211,11 +1197,6 @@ void HttpServer::HandleEvent(const httplib::Request& req, httplib::Response& res
 
 void HttpServer::HandleVecset(const httplib::Request& req, httplib::Response& res) {
   std::string refusal;
-  if (WriteRefused(handler_context_, CommandType::kVecset, &refusal)) {
-    SendError(res, kHttpServiceUnavailable, refusal);
-    return;
-  }
-  auto snapshot_write_guard = AcquireSnapshotWriteGuard(handler_context_);
   if (WriteRefused(handler_context_, CommandType::kVecset, &refusal)) {
     SendError(res, kHttpServiceUnavailable, refusal);
     return;
@@ -1258,6 +1239,13 @@ void HttpServer::HandleVecset(const httplib::Request& req, httplib::Response& re
       command.metadata = std::move(*metadata_result);
     }
 
+    // Taken after parsing so a slow or malformed body never holds up a snapshot.
+    auto snapshot_write_guard = AcquireSnapshotWriteGuard(handler_context_);
+    if (WriteRefused(handler_context_, CommandType::kVecset, &refusal)) {
+      SendError(res, kHttpServiceUnavailable, refusal);
+      return;
+    }
+
     auto outcome = ApplyWrite(*handler_context_, command);
     if (!outcome) {
       SendError(res, ErrorCodeToHttpStatus(outcome.error().code()), outcome.error().message());
@@ -1277,11 +1265,6 @@ void HttpServer::HandleVecset(const httplib::Request& req, httplib::Response& re
 
 void HttpServer::HandleVecdel(const httplib::Request& req, httplib::Response& res) {
   std::string refusal;
-  if (WriteRefused(handler_context_, CommandType::kVecdel, &refusal)) {
-    SendError(res, kHttpServiceUnavailable, refusal);
-    return;
-  }
-  auto snapshot_write_guard = AcquireSnapshotWriteGuard(handler_context_);
   if (WriteRefused(handler_context_, CommandType::kVecdel, &refusal)) {
     SendError(res, kHttpServiceUnavailable, refusal);
     return;
@@ -1308,6 +1291,13 @@ void HttpServer::HandleVecdel(const httplib::Request& req, httplib::Response& re
       return;
     }
 
+    // Taken after parsing so a slow or malformed body never holds up a snapshot.
+    auto snapshot_write_guard = AcquireSnapshotWriteGuard(handler_context_);
+    if (WriteRefused(handler_context_, CommandType::kVecdel, &refusal)) {
+      SendError(res, kHttpServiceUnavailable, refusal);
+      return;
+    }
+
     auto outcome = ApplyWrite(*handler_context_, command);
     if (!outcome) {
       SendError(res, ErrorCodeToHttpStatus(outcome.error().code()), outcome.error().message());
@@ -1325,11 +1315,6 @@ void HttpServer::HandleVecdel(const httplib::Request& req, httplib::Response& re
 
 void HttpServer::HandleMetaset(const httplib::Request& req, httplib::Response& res) {
   std::string refusal;
-  if (WriteRefused(handler_context_, CommandType::kMetaset, &refusal)) {
-    SendError(res, kHttpServiceUnavailable, refusal);
-    return;
-  }
-  auto snapshot_write_guard = AcquireSnapshotWriteGuard(handler_context_);
   if (WriteRefused(handler_context_, CommandType::kMetaset, &refusal)) {
     SendError(res, kHttpServiceUnavailable, refusal);
     return;
@@ -1362,6 +1347,13 @@ void HttpServer::HandleMetaset(const httplib::Request& req, httplib::Response& r
     command.type = CommandType::kMetaset;
     command.id = std::move(*id);
     command.metadata = std::move(*metadata_result);
+
+    // Taken after parsing so a slow or malformed body never holds up a snapshot.
+    auto snapshot_write_guard = AcquireSnapshotWriteGuard(handler_context_);
+    if (WriteRefused(handler_context_, CommandType::kMetaset, &refusal)) {
+      SendError(res, kHttpServiceUnavailable, refusal);
+      return;
+    }
 
     auto outcome = ApplyWrite(*handler_context_, command);
     if (!outcome) {
@@ -1435,8 +1427,8 @@ void HttpServer::HandleSim(const httplib::Request& req, httplib::Response& res) 
       SendError(res, kHttpBadRequest, mode.error().message());
       return;
     }
-    command.mode = mode->value_or("fusion");
-    if (command.mode != "events" && command.mode != "vectors" && command.mode != "fusion") {
+    command.mode = mode->value_or(std::string(kSearchModeFusion));
+    if (!IsValidSearchMode(command.mode)) {
       SendError(res, kHttpBadRequest, "Invalid mode. Must be one of: events, vectors, fusion");
       return;
     }
@@ -1576,10 +1568,10 @@ std::string ExtractDumpPath(const std::string& response, const std::string& fall
   if (verb_end == std::string::npos) {
     return fallback;
   }
-  std::string path = response.substr(verb_end + 1);
-  while (!path.empty() && (path.back() == '\r' || path.back() == '\n')) {
-    path.pop_back();
-  }
+  // DUMP INFO appends detail lines after the path; only the first line names it.
+  const size_t line_end = response.find_first_of("\r\n", verb_end + 1);
+  std::string path =
+      response.substr(verb_end + 1, line_end == std::string::npos ? std::string::npos : line_end - verb_end - 1);
   return path.empty() ? fallback : path;
 }
 }  // namespace
@@ -1724,7 +1716,7 @@ void HttpServer::HandleDumpInfo(const httplib::Request& req, httplib::Response& 
 
     json response;
     response["status"] = "ok";
-    response["filepath"] = *filepath;
+    response["filepath"] = ExtractDumpPath(*result, *filepath);
     response["info"] = info;
     SendJson(res, kHttpOk, response);
 
@@ -1881,6 +1873,7 @@ void HttpServer::HandleCacheStats(const httplib::Request& /*req*/, httplib::Resp
     response["compression_enabled"] = controller->Cache().CompressionEnabled();
     response["eviction_batch_size"] = controller->Cache().EvictionBatchSize();
     response["evictions"] = stats.evictions;
+    response["ttl_expirations"] = stats.ttl_expirations;
     response["avg_hit_latency_ms"] = stats.AverageCacheHitLatency();
     response["avg_miss_latency_ms"] = stats.AverageCacheMissLatency();
     response["time_saved_ms"] = stats.TotalTimeSaved();
@@ -1924,14 +1917,13 @@ void HttpServer::HandleCacheClear(const httplib::Request& req, httplib::Response
     uint64_t entries_before = stats_before.current_entries;
 
     // Clear cache (currently only supports clearing all)
-    if (scope == "all") {
-      auto clear_result = controller->Clear();
-      if (!clear_result) {
-        SendError(res, kHttpInternalServerError, clear_result.error().message());
-        return;
-      }
-    } else {
+    if (scope != "all") {
       SendError(res, kHttpBadRequest, "Invalid scope. Only 'all' is supported currently.");
+      return;
+    }
+    auto clear_result = handlers::HandleCacheClear(*handler_context_);
+    if (!clear_result) {
+      SendError(res, ErrorCodeToHttpStatus(clear_result.error().code()), clear_result.error().message());
       return;
     }
 
@@ -1951,15 +1943,9 @@ void HttpServer::HandleCacheClear(const httplib::Request& req, httplib::Response
 void HttpServer::HandleCacheEnable(const httplib::Request& /*req*/, httplib::Response& res) {
   // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
-    auto* manager = (handler_context_ != nullptr) ? handler_context_->variable_manager : nullptr;
-    if (manager == nullptr) {
-      SendError(res, kHttpInternalServerError, "Runtime variable manager not initialized");
-      return;
-    }
-
-    auto enable_result = manager->SetVariable("cache.enabled", "true");
+    auto enable_result = handlers::HandleCacheEnable(*handler_context_);
     if (!enable_result) {
-      SendError(res, kHttpInternalServerError, enable_result.error().message());
+      SendError(res, ErrorCodeToHttpStatus(enable_result.error().code()), enable_result.error().message());
       return;
     }
 
@@ -1977,15 +1963,9 @@ void HttpServer::HandleCacheEnable(const httplib::Request& /*req*/, httplib::Res
 void HttpServer::HandleCacheDisable(const httplib::Request& /*req*/, httplib::Response& res) {
   // Safety net at httplib library boundary - catches unexpected exceptions only
   try {
-    auto* manager = (handler_context_ != nullptr) ? handler_context_->variable_manager : nullptr;
-    if (manager == nullptr) {
-      SendError(res, kHttpInternalServerError, "Runtime variable manager not initialized");
-      return;
-    }
-
-    auto disable_result = manager->SetVariable("cache.enabled", "false");
+    auto disable_result = handlers::HandleCacheDisable(*handler_context_);
     if (!disable_result) {
-      SendError(res, kHttpInternalServerError, disable_result.error().message());
+      SendError(res, ErrorCodeToHttpStatus(disable_result.error().code()), disable_result.error().message());
       return;
     }
 

@@ -91,6 +91,15 @@ target_link_libraries(structured_log_test
 )
 gtest_discover_tests(structured_log_test)
 
+add_executable(log_level_test
+  utils/log_level_test.cpp
+)
+target_link_libraries(log_level_test
+  nvecd_utils
+  gtest_main
+)
+gtest_discover_tests(log_level_test)
+
 # Config tests
 add_executable(config_test
   config/config_test.cpp
@@ -133,6 +142,15 @@ target_link_libraries(command_parser_test
   gtest_main
 )
 gtest_discover_tests(command_parser_test)
+
+add_executable(argument_validation_test
+  server/argument_validation_test.cpp
+)
+target_link_libraries(argument_validation_test
+  nvecd_server
+  gtest_main
+)
+gtest_discover_tests(argument_validation_test)
 
 add_executable(connection_io_handler_test
   server/connection_io_handler_test.cpp
@@ -733,6 +751,22 @@ target_link_libraries(wal_test
   gtest_main
 )
 gtest_discover_tests(wal_test
+  PROPERTIES TIMEOUT 30
+)
+
+add_executable(wal_rotation_failure_test
+  storage/wal_rotation_failure_test.cpp
+)
+target_link_libraries(wal_rotation_failure_test
+  nvecd_storage
+  nvecd_events
+  nvecd_vectors
+  nvecd_config
+  nvecd_utils
+  gtest
+  gtest_main
+)
+gtest_discover_tests(wal_rotation_failure_test
   PROPERTIES TIMEOUT 30
 )
 

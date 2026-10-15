@@ -19,6 +19,7 @@
 #ifdef ADD
 #undef ADD
 #endif
+#include "server/argument_validation.h"
 #include "server/command_types.h"
 #include "utils/error.h"
 #include "utils/expected.h"
@@ -44,11 +45,11 @@ struct Command {
 
   // SIM/SIMV fields
   int top_k = 100;  // NOLINT(cppcoreguidelines-avoid-magic-numbers,readability-magic-numbers) Number of results
-  std::string mode = "fusion";        // Similarity mode: events, vectors, fusion
-  std::optional<uint64_t> timestamp;  // Optional timestamp for EVENT (epoch seconds)
-  std::optional<bool> adaptive;       // Optional adaptive flag for SIM
-  std::string filter_expr;            // SIM/SIMV filter text as sent; part of the cache key
-  vectors::MetadataFilter filter;     // filter_expr parsed by the surface that received it
+  std::string mode{kSearchModeFusion};  // Similarity mode: events, vectors, fusion
+  std::optional<uint64_t> timestamp;    // Optional timestamp for EVENT (epoch seconds)
+  std::optional<bool> adaptive;         // Optional adaptive flag for SIM
+  std::string filter_expr;              // SIM/SIMV filter text as sent; part of the cache key
+  vectors::MetadataFilter filter;       // filter_expr parsed by the surface that received it
   // METASET pairs (and HTTP VECSET metadata), already typed by the surface
   // that received them. A legacy METASET WAL record decodes to filter_expr
   // instead and is converted during replay.

@@ -97,8 +97,8 @@ void DecayScheduler::SchedulerLoop() {
       }
       if (!maintained) {
         utils::StructuredLog().Event("decay_maintenance_failed").Field("error", maintained.error().message()).Error();
-      }
-      if (prune) {
+      } else if (prune) {
+        // A refused pass leaves the counter high so the next cycle retries the prune.
         cycles_since_prune = 0;
       }
 

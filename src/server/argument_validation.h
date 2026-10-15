@@ -15,10 +15,26 @@
 #include <optional>
 #include <string_view>
 
+#include "events/event_store.h"
 #include "utils/error.h"
 #include "utils/expected.h"
 
 namespace nvecd::server {
+
+/// Search modes accepted by SIM (using=) and the HTTP /sim mode field.
+inline constexpr std::string_view kSearchModeEvents = "events";
+inline constexpr std::string_view kSearchModeVectors = "vectors";
+inline constexpr std::string_view kSearchModeFusion = "fusion";
+
+/// True for exactly the spellings above (case-sensitive).
+bool IsValidSearchMode(std::string_view mode);
+
+/**
+ * @brief Parse an EVENT type word (ADD, SET or DEL), case-insensitive
+ *
+ * @return The type, or nullopt for any other spelling
+ */
+std::optional<events::EventType> ParseEventType(std::string_view text);
 
 /**
  * @brief Parse an EVENT timestamp: unsigned decimal digits fitting uint64

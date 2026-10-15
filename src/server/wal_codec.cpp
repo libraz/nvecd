@@ -10,6 +10,8 @@
 #include <string>
 #include <type_traits>
 
+#include "events/co_occurrence_index.h"
+
 namespace nvecd::server {
 
 namespace {
@@ -401,6 +403,30 @@ utils::Expected<Command, utils::Error> DecodeWalRecord(const storage::WalRecord&
   }
 
   return cmd;
+}
+
+std::vector<uint8_t> EncodeMaintenance(double alpha, bool prune) {
+  std::vector<uint8_t> buf;
+  buf.reserve(kMaintenancePayloadSize);
+  AppendDouble(buf, alpha);
+  AppendLE<uint8_t>(buf, static_cast<uint8_t>(prune ? 1 : 0));
+  return buf;
+}
+
+utils::Expected<MaintenanceRecord, utils::Error> DecodeMaintenance(const std::vector<uint8_t>& payload) {
+  if (payload.size() != kMaintenancePayloadSize) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kWalCorrupted, "Invalid co-occurrence maintenance WAL payload size"));
+  }
+  Reader reader(payload.data(), payload.size());
+  double alpha = 0.0;
+  uint64_t prune = 0;
+  if (!reader.ReadDouble(alpha) || !reader.ReadLE(prune, sizeof(uint8_t)) || !events::IsValidDecayAlpha(alpha) ||
+      prune > 1) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kWalCorrupted, "Invalid co-occurrence maintenance WAL payload"));
+  }
+  return MaintenanceRecord{alpha, prune != 0};
 }
 
 }  // namespace nvecd::server

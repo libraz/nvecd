@@ -168,7 +168,6 @@ bool ReactorConnection::OnReadable() {
 }
 
 bool ReactorConnection::OnWritable() {
-  last_active_.store(std::chrono::steady_clock::now(), std::memory_order_relaxed);
   {
     std::lock_guard<std::mutex> lock(write_mutex_);
     while (!responses_.empty()) {
@@ -176,6 +175,8 @@ bool ReactorConnection::OnWritable() {
       const ssize_t sent =
           ::send(Fd(), response.data() + response_offset_, response.size() - response_offset_, kSendFlags);
       if (sent > 0) {
+        // A client that keeps reading is not idle, however slowly.
+        last_active_.store(std::chrono::steady_clock::now(), std::memory_order_relaxed);
         response_offset_ += static_cast<size_t>(sent);
         response_bytes_ -= static_cast<size_t>(sent);
         if (memory_budget_ != nullptr)
@@ -251,7 +252,14 @@ void ReactorConnection::DrainRequests() {
     last_active_.store(std::chrono::steady_clock::now(), std::memory_order_relaxed);
     if (!enqueued) {
       CloseAfterFlush();
-      break;
+      // The close is final: drop the backlog so the connection stops counting as busy.
+      std::lock_guard<std::mutex> lock(read_mutex_);
+      if (memory_budget_ != nullptr)
+        memory_budget_->Release(request_bytes_);
+      request_bytes_ = 0;
+      requests_.clear();
+      drain_scheduled_.store(false, std::memory_order_release);
+      return;
     }
   }
   if (read_eof_.load(std::memory_order_acquire) && !HasPendingRequests()) {
@@ -282,8 +290,8 @@ bool ReactorConnection::HasPendingOutput() const {
   return !responses_.empty();
 }
 
-bool ReactorConnection::HasWorkInFlight() const {
-  return drain_scheduled_.load(std::memory_order_acquire) || HasPendingRequests() || HasPendingOutput();
+bool ReactorConnection::HasRequestsInFlight() const {
+  return drain_scheduled_.load(std::memory_order_acquire) || HasPendingRequests();
 }
 
 bool ReactorConnection::HasPendingRequests() const {

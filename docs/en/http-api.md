@@ -89,13 +89,15 @@ with status `401`. The check runs before the handler reads any state or assemble
 | `401` | credentials missing or wrong on a gated route |
 | `403` | source address outside `network.allow_cidrs`, or a permission-denied error from a handler |
 | `404` | unknown route or method; unknown item ID; snapshot or configuration file not found |
+| `409` | a snapshot save or load while another snapshot operation is running |
 | `410` | `/debug/on` and `/debug/off` |
 | `413` | request body larger than `performance.max_query_length` |
+| `422` | a snapshot file that exists but cannot be loaded, verified or inspected (unreadable, corrupt or an unsupported version) |
 | `429` | rate limit exceeded |
-| `500` | any other handler error, including snapshot read and integrity failures |
+| `500` | any other handler error |
 | `503` | server is loading; a write route while a lock-mode snapshot holds the stores or after the persistence fail-stop latched (the `error` text is the TCP `READONLY` message); a write the WAL could not accept |
 
-Handler errors are mapped from the typed error code rather than sniffed from a message, so the same failure produces the same status on every route. Domain errors map as follows: item and file not-found conditions to `404`; argument, parsing, dimension, `top_k` and event-score errors to `400`; permission-denied to `403`; WAL write, rotation and not-open errors to `503`; everything else to `500`.
+Handler errors are mapped from the typed error code rather than sniffed from a message, so the same failure produces the same status on every route. Domain errors map as follows: item and file not-found conditions to `404`; argument, parsing, dimension, `top_k` and event-score errors to `400`; permission-denied to `403`; a concurrent snapshot operation to `409`; an unusable snapshot file to `422`; WAL write, rotation and not-open errors to `503`; everything else to `500`.
 
 Every error body is a single-field object:
 
@@ -117,7 +119,7 @@ Every error body is a single-field object:
 |---|---|---|---|
 | `ctx` | string | yes | context ID |
 | `id` | string | yes | item ID |
-| `type` | string | yes | `ADD`, `SET` or `DEL`, upper or lower case |
+| `type` | string | yes | `ADD`, `SET` or `DEL`, case-insensitive |
 | `score` | integer | for `ADD` and `SET` | must be an integer, not a float; range 0–100 |
 | `timestamp` | unsigned integer | no | epoch seconds; the server's clock is used when omitted |
 
@@ -306,13 +308,14 @@ This is a deliberately narrow summary: bind addresses, ports, the password and t
   "evictions": 0,
   "avg_hit_latency_ms": 0.0,
   "avg_miss_latency_ms": 8.329999999999999e-05,
-  "time_saved_ms": 0.0
+  "time_saved_ms": 0.0,
+  "ttl_expirations": 0
 }
 ```
 
 `ttl_seconds` and `min_query_cost_ms` reflect the live values, which the `cache.ttl_seconds` and `cache.min_query_cost_ms` runtime variables can change. When no cache controller is wired the route answers `500`.
 
-The field set is close to TCP `CACHE STATS` but not identical: the TCP block additionally reports `ttl_expirations`, and it names two fields differently (`cache_enabled` and `cache_entries` here are `enabled` and `current_entries`).
+The field set is close to TCP `CACHE STATS` but not identical: it names two fields differently (`cache_enabled` and `cache_entries` here are `enabled` and `current_entries`).
 
 ## Cache management
 
@@ -401,7 +404,7 @@ A failed verification does not collapse to a bare `error` object; it reports the
 }
 ```
 
-The status is the mapped error status: `404` for a missing file, `500` for an unreadable or corrupt one.
+The status is the mapped error status: `404` for a missing file, `422` for an unreadable or corrupt one.
 
 ### `POST /dump/info`
 
@@ -412,7 +415,7 @@ The status is the mapped error status: `404` for a missing file, `500` for an un
 ```json
 {
   "status": "ok",
-  "filepath": "nvecd.nvec",
+  "filepath": "/var/lib/nvecd/snapshots/nvecd.nvec",
   "info": {
     "version": "1",
     "stores": "4",

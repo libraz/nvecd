@@ -23,10 +23,11 @@
 #include "server/handlers/dump_handler.h"
 #include "server/http_server.h"
 #include "server/request_dispatcher.h"
+#include "server/wal_codec.h"
 #include "storage/snapshot_format.h"
-#include "storage/snapshot_format_v1.h"
 #include "storage/wal_checkpoint.h"
 #include "utils/error.h"
+#include "utils/network_utils.h"
 #include "utils/structured_log.h"
 
 namespace nvecd::server {
@@ -202,14 +203,7 @@ utils::Expected<void, utils::Error> NvecdServer::Start() {
 
   // Parse allowed CIDRs
   server_config.allow_cidrs = config_.network.allow_cidrs;
-  for (const auto& cidr_str : config_.network.allow_cidrs) {
-    auto cidr = utils::CIDR::Parse(cidr_str);
-    if (cidr) {
-      server_config.parsed_allow_cidrs.push_back(*cidr);
-    } else {
-      spdlog::warn("Invalid CIDR in configuration: {}", cidr_str);
-    }
-  }
+  server_config.parsed_allow_cidrs = utils::ParseCidrList(config_.network.allow_cidrs);
 
   // Create connection acceptor
   acceptor_ = std::make_unique<ConnectionAcceptor>(server_config, thread_pool_.get());
@@ -423,10 +417,7 @@ utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
   // Create CoOccurrenceIndex with the pruning policy configured alongside
   // the event store. Keeping this wiring here makes the YAML settings apply
   // to both TCP and HTTP ingestion paths through the shared index.
-  events::CoOccurrenceIndex::Config co_index_config;
-  co_index_config.max_neighbors_per_item = config_.events.max_neighbors_per_item;
-  co_index_config.min_support = static_cast<float>(config_.events.min_support);
-  co_index_ = std::make_unique<events::CoOccurrenceIndex>(co_index_config);
+  co_index_ = std::make_unique<events::CoOccurrenceIndex>(handlers::MakeCoOccurrenceConfig(config_.events));
   spdlog::info("CoOccurrenceIndex initialized");
 
   // Create VectorStore
@@ -521,36 +512,13 @@ utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
   // The fork-snapshot writer is also given the WAL pointer so it can write the
   // checkpoint sidecar and truncate the WAL once a background snapshot lands.
   auto load_snapshot = [this](const std::string& snapshot_path) -> utils::Expected<void, utils::Error> {
-    events::CoOccurrenceIndex::Config co_config;
-    co_config.max_neighbors_per_item = config_.events.max_neighbors_per_item;
-    co_config.min_support = static_cast<float>(config_.events.min_support);
-    events::EventStore staged_event_store(config_.events);
-    events::CoOccurrenceIndex staged_co_index(co_config);
-    vectors::VectorStore staged_vector_store(config_.vectors);
-    vectors::MetadataStore staged_metadata_store;
-    config::Config loaded_config;
-    storage::snapshot_format::IntegrityError integrity_error;
-    auto load = storage::snapshot_v1::ReadSnapshotV1(snapshot_path, loaded_config, staged_event_store, staged_co_index,
-                                                     staged_vector_store, nullptr, nullptr, &integrity_error,
-                                                     &staged_metadata_store);
+    handlers::StagedStores staged(config_, handler_ctx_.metadata_store != nullptr);
+    auto load = staged.Read(snapshot_path);
     if (!load) {
-      std::string msg = load.error().message();
-      if (!integrity_error.message.empty()) {
-        msg += " (" + integrity_error.message + ")";
-      }
-      spdlog::warn("Skipping invalid snapshot {} during recovery: {}", snapshot_path, msg);
+      spdlog::warn("Skipping invalid snapshot {} during recovery: {}", snapshot_path, staged.Describe(load.error()));
       return utils::MakeUnexpected(load.error());
     }
-    event_store_->SwapState(staged_event_store);
-    co_index_->SwapState(staged_co_index);
-    vector_store_->SwapState(staged_vector_store);
-    metadata_store_->SwapState(staged_metadata_store);
-    handler_ctx_.vector_generation.fetch_add(1, std::memory_order_acq_rel);
-    handler_ctx_.metadata_generation.fetch_add(1, std::memory_order_acq_rel);
-    handler_ctx_.dataset_generation.fetch_add(1, std::memory_order_acq_rel);
-    if (cache_controller_ != nullptr) {
-      (void)cache_controller_->Clear();
-    }
+    staged.Publish(handler_ctx_, /*rebuild_ann=*/false);
     spdlog::info("Recovery loaded snapshot: {}", snapshot_path);
     return {};
   };
@@ -671,9 +639,7 @@ utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
           }
 
           if (handler_ctx_.wal != nullptr) {
-            std::vector<uint8_t> payload(sizeof(alpha) + sizeof(uint8_t));
-            std::memcpy(payload.data(), &alpha, sizeof(alpha));
-            payload[sizeof(alpha)] = prune ? 1 : 0;
+            const auto payload = EncodeMaintenance(alpha, prune);
             auto appended =
                 handler_ctx_.wal->Append(storage::WalOpType::kCoOccurrenceMaintenance, payload.data(), payload.size());
             if (!appended) {

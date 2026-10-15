@@ -22,9 +22,11 @@
 #include <array>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <future>
 #include <mutex>
 #include <nlohmann/json.hpp>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <utility>
@@ -1897,6 +1899,120 @@ TEST_F(HttpServerCorsTest, PreflightAllowsAuthenticatedDeleteRoutes) {
   EXPECT_EQ(res->status, 204);
   EXPECT_NE(res->get_header_value("Access-Control-Allow-Methods").find("DELETE"), std::string::npos);
   EXPECT_NE(res->get_header_value("Access-Control-Allow-Headers").find("Authorization"), std::string::npos);
+}
+
+namespace fs = std::filesystem;
+
+fs::path MakeHttpDumpDir(const char* tag) {
+  const fs::path dir =
+      fs::temp_directory_path() / (std::string("nvecd_http_") + tag + "_" + std::to_string(::getpid()));
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+  fs::permissions(dir, fs::perms::owner_all, fs::perm_options::replace);
+  return dir;
+}
+
+TEST_F(HttpServerTest, UnusableSnapshotFileReturns422) {
+  const fs::path dir = MakeHttpDumpDir("corrupt");
+  handler_ctx_.dump_dir = dir.string();
+  {
+    std::ofstream bad(dir / "bad.nvec", std::ios::binary);
+    bad << "this is not a snapshot";
+  }
+
+  json body = {{"filepath", "bad.nvec"}};
+  auto load = client_->Post("/dump/load", body.dump(), "application/json");
+  ASSERT_TRUE(load);
+  EXPECT_EQ(load->status, 422) << load->body;
+  auto verify = client_->Post("/dump/verify", body.dump(), "application/json");
+  ASSERT_TRUE(verify);
+  EXPECT_EQ(verify->status, 422) << verify->body;
+
+  handler_ctx_.dump_dir = "";
+  fs::remove_all(dir);
+}
+
+TEST_F(HttpServerTest, SnapshotLoadWhileAnotherIsRunningReturns409) {
+  const fs::path dir = MakeHttpDumpDir("busy");
+  handler_ctx_.dump_dir = dir.string();
+  std::ofstream(dir / "any.nvec", std::ios::binary) << "placeholder";
+  loading_.store(true);
+
+  json body = {{"filepath", "any.nvec"}};
+  auto load = client_->Post("/dump/load", body.dump(), "application/json");
+  ASSERT_TRUE(load);
+  EXPECT_EQ(load->status, 409) << load->body;
+
+  loading_.store(false);
+  handler_ctx_.dump_dir = "";
+  fs::remove_all(dir);
+}
+
+TEST_F(HttpServerTest, DumpInfoReportsTheResolvedPath) {
+  const fs::path dir = MakeHttpDumpDir("info");
+  handler_ctx_.dump_dir = dir.string();
+  config_->snapshot.mode = "lock";
+  vector_store_->SetVector("item", {1.0F, 0.0F, 0.0F, 0.0F});
+
+  json body = {{"filepath", "info.nvec"}};
+  ASSERT_EQ(client_->Post("/dump/save", body.dump(), "application/json")->status, 200);
+  auto info = client_->Post("/dump/info", body.dump(), "application/json");
+  ASSERT_TRUE(info);
+  ASSERT_EQ(info->status, 200) << info->body;
+  EXPECT_EQ(json::parse(info->body)["filepath"], fs::weakly_canonical(dir / "info.nvec").string());
+
+  handler_ctx_.dump_dir = "";
+  fs::remove_all(dir);
+}
+
+TEST_F(HttpServerTest, EventTypeIsCaseInsensitive) {
+  for (const char* type : {"add", "Add", "SET", "set"}) {
+    json evt = {{"ctx", "ctx1"}, {"type", type}, {"id", "item"}, {"score", 10}};
+    auto res = client_->Post("/event", evt.dump(), "application/json");
+    ASSERT_TRUE(res) << type;
+    EXPECT_EQ(res->status, 200) << type << " -> " << res->body;
+  }
+  json del = {{"ctx", "ctx1"}, {"type", "dEl"}, {"id", "item"}};
+  auto res = client_->Post("/event", del.dump(), "application/json");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(res->status, 200) << res->body;
+}
+
+TEST_F(HttpServerTest, CacheStatsReportsTtlExpirations) {
+  auto res = client_->Get("/cache/stats");
+  ASSERT_TRUE(res);
+  ASSERT_EQ(res->status, 200);
+  EXPECT_TRUE(json::parse(res->body).contains("ttl_expirations"));
+}
+
+TEST_F(HttpServerTest, CacheToggleFailureUsesTheSharedErrorMapping) {
+  handler_ctx_.variable_manager = nullptr;
+  auto res = client_->Post("/cache/enable", "{}", "application/json");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(res->status, 500) << res->body;
+  EXPECT_TRUE(json::parse(res->body).contains("error"));
+
+  handler_ctx_.variable_manager = variable_manager_.get();
+  auto ok = client_->Post("/cache/disable", "{}", "application/json");
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(ok->status, 200) << ok->body;
+}
+
+TEST_F(HttpServerTest, MalformedWriteBodyDoesNotWaitForTheSnapshotGate) {
+  std::shared_mutex snapshot_gate;
+  handler_ctx_.snapshot_write_gate = &snapshot_gate;
+  std::unique_lock snapshot_guard(snapshot_gate);
+
+  auto request = std::async(std::launch::async, [url = BaseUrl()] {
+    httplib::Client client(url);
+    auto response = client.Post("/vecset", "not json", "application/json");
+    return response ? response->status : -1;
+  });
+  const bool answered = request.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+  snapshot_guard.unlock();
+  EXPECT_TRUE(answered) << "a request that fails to parse must be rejected before it takes the snapshot gate";
+  EXPECT_EQ(request.get(), 400);
+  handler_ctx_.snapshot_write_gate = nullptr;
 }
 
 }  // namespace

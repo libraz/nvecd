@@ -26,10 +26,6 @@ namespace nvecd::server {
 struct WriteOutcome {
   CommandType type = CommandType::kUnknown;
 
-  /// EVENT only: the event was a duplicate of one already in the dedup window,
-  /// so no WAL record was written and no co-occurrence edge was ingested.
-  bool deduplicated = false;
-
   /// VECSET only: dimension of the stored vector.
   size_t dimension = 0;
 };

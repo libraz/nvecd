@@ -27,6 +27,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -71,6 +72,27 @@ std::vector<uint8_t> EncodeCommand(const Command& cmd);
  * @return Decoded Command, or a kStorage* error on a truncated/invalid payload
  */
 utils::Expected<Command, utils::Error> DecodeWalRecord(const storage::WalRecord& record);
+
+/// Payload size of a co-occurrence maintenance record: f64 alpha, u8 prune.
+inline constexpr size_t kMaintenancePayloadSize = sizeof(double) + sizeof(uint8_t);
+
+/// Decoded co-occurrence maintenance record (decay, optionally followed by a prune).
+struct MaintenanceRecord {
+  double alpha;
+  bool prune;
+};
+
+/**
+ * @brief Encode a co-occurrence maintenance record: f64 alpha, u8 prune (little-endian)
+ */
+std::vector<uint8_t> EncodeMaintenance(double alpha, bool prune);
+
+/**
+ * @brief Decode a co-occurrence maintenance record payload
+ *
+ * @return The record, or kWalCorrupted for a wrong size, an invalid alpha or a prune flag above 1
+ */
+utils::Expected<MaintenanceRecord, utils::Error> DecodeMaintenance(const std::vector<uint8_t>& payload);
 
 /**
  * @brief Whether a replay failure is an intended recovery gap, not corruption

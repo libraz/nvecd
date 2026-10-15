@@ -8,13 +8,62 @@
 
 #pragma once
 
+#include <memory>
 #include <string>
 
+#include "config/config.h"
+#include "events/co_occurrence_index.h"
+#include "events/event_store.h"
 #include "server/server_types.h"
 #include "utils/error.h"
 #include "utils/expected.h"
+#include "vectors/metadata_store.h"
+#include "vectors/vector_store.h"
 
 namespace nvecd::server::handlers {
+
+/**
+ * @brief Co-occurrence index settings derived from the events configuration
+ */
+events::CoOccurrenceIndex::Config MakeCoOccurrenceConfig(const config::EventsConfig& events);
+
+/**
+ * @brief Stores a snapshot is deserialized into before it replaces live state
+ *
+ * A corrupt or semantically invalid file can only touch these instances. Startup
+ * recovery and DUMP LOAD both stage, read, then Publish().
+ */
+class StagedStores {
+ public:
+  /**
+   * @param config Server configuration the stores are sized from
+   * @param with_metadata Whether to stage a metadata store
+   */
+  StagedStores(const config::Config& config, bool with_metadata);
+
+  /// Deserialize the snapshot at @p path into the staged stores.
+  utils::Expected<void, utils::Error> Read(const std::string& path);
+
+  /// @p error's message, followed by the integrity detail the last Read() reported.
+  std::string Describe(const utils::Error& error) const;
+
+  /**
+   * @brief Swap the staged state into the live stores of @p ctx
+   *
+   * Optionally rebuilds the ANN index, then bumps the vector, metadata and dataset
+   * generations and clears the similarity cache, so no search cached against the
+   * old index outlives the swap. Startup passes false and rebuilds after WAL replay.
+   * Callers hold whatever gates keep writers out.
+   */
+  void Publish(HandlerContext& ctx, bool rebuild_ann);
+
+ private:
+  events::EventStore event_store_;
+  events::CoOccurrenceIndex co_index_;
+  vectors::VectorStore vector_store_;
+  std::unique_ptr<vectors::MetadataStore> metadata_store_;
+  std::string integrity_message_;
+};
 
 /**
  * @brief Start a background fork snapshot of the live stores

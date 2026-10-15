@@ -407,5 +407,36 @@ TEST(WalCodecTest, DamageIsNeverAnIntendedReplayGap) {
   }
 }
 
+TEST(WalCodecTest, MaintenanceRecordRoundTripsAndIsLittleEndian) {
+  const auto payload = EncodeMaintenance(0.5, true);
+  ASSERT_EQ(payload.size(), kMaintenancePayloadSize);
+  // 0.5 is 0x3FE0000000000000: the high bytes sit at the end of the f64.
+  EXPECT_EQ(payload[6], 0xE0);
+  EXPECT_EQ(payload[7], 0x3F);
+  EXPECT_EQ(payload[8], 1);
+
+  auto decoded = DecodeMaintenance(payload);
+  ASSERT_TRUE(decoded.has_value());
+  EXPECT_DOUBLE_EQ(decoded->alpha, 0.5);
+  EXPECT_TRUE(decoded->prune);
+
+  auto no_prune = DecodeMaintenance(EncodeMaintenance(0.9, false));
+  ASSERT_TRUE(no_prune.has_value());
+  EXPECT_FALSE(no_prune->prune);
+}
+
+TEST(WalCodecTest, MaintenanceRecordRejectsMalformedPayloads) {
+  auto payload = EncodeMaintenance(0.5, false);
+  auto bad_flag = payload;
+  bad_flag.back() = 2;
+  EXPECT_EQ(DecodeMaintenance(bad_flag).error().code(), utils::ErrorCode::kWalCorrupted);
+
+  auto truncated = payload;
+  truncated.pop_back();
+  EXPECT_EQ(DecodeMaintenance(truncated).error().code(), utils::ErrorCode::kWalCorrupted);
+
+  EXPECT_EQ(DecodeMaintenance(EncodeMaintenance(2.0, false)).error().code(), utils::ErrorCode::kWalCorrupted);
+}
+
 }  // namespace
 }  // namespace nvecd::server

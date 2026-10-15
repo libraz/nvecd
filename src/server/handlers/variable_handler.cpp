@@ -9,8 +9,14 @@
 #include "server/handlers/variable_handler.h"
 
 #include <sstream>
+#include <string_view>
 
 namespace nvecd::server::handlers {
+
+namespace {
+constexpr std::string_view kMutableSuffix = " (mutable)";
+constexpr std::string_view kImmutableSuffix = " (immutable)";
+}  // namespace
 
 utils::Expected<std::string, utils::Error> HandleSet(config::RuntimeVariableManager* manager,
                                                      const std::string& variable_name, const std::string& value) {
@@ -56,8 +62,9 @@ utils::Expected<std::string, utils::Error> HandleShowVariables(config::RuntimeVa
   oss << "*" << variables.size() << "\r\n";
 
   for (const auto& [name, info] : variables) {
-    oss << "$" << (name.size() + 1 + info.value.size() + (info.mutable_ ? 10 : 12)) << "\r\n";
-    oss << name << "=" << info.value << (info.mutable_ ? " (mutable)" : " (immutable)") << "\r\n";
+    const std::string_view suffix = info.mutable_ ? kMutableSuffix : kImmutableSuffix;
+    oss << "$" << (name.size() + 1 + info.value.size() + suffix.size()) << "\r\n";
+    oss << name << "=" << info.value << suffix << "\r\n";
   }
 
   return oss.str();

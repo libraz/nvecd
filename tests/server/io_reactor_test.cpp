@@ -357,6 +357,46 @@ TEST(IoReactorTest, ExecutingRequestIsNotReapedAsIdle) {
   ::close(sockets[1]);
 }
 
+TEST(IoReactorTest, ClientThatNeverReadsItsRepliesIsReapedAsIdle) {
+  ThreadPool pool(1);
+  ReactorConfig config;
+  config.poll_timeout_ms = 10;
+  config.idle_timeout_sec = 1;
+  config.reaper_interval_sec = 1;
+  IoReactor reactor(config);
+  ASSERT_TRUE(reactor.Start());
+
+  int sockets[2];
+  ASSERT_EQ(MakeSocketPair(sockets), 0);
+  const std::string big_reply(1024 * 1024, 'x');
+  ASSERT_TRUE(reactor.Register(sockets[0], &pool, TestIoConfig(),
+                               [&big_reply](const std::string&, ConnectionContext&) { return big_reply; }));
+
+  // More reply bytes than the socket buffers hold, so output stays queued.
+  ASSERT_EQ(::write(sockets[1], "A\nB\nC\nD\nE\nF\n", 12), 12);
+  std::this_thread::sleep_for(std::chrono::milliseconds(3500));
+
+  // Reading now only drains what was flushed before the close; EOF must follow.
+  bool closed = false;
+  char buffer[65536];
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (std::chrono::steady_clock::now() < deadline) {
+    pollfd poll_fd{sockets[1], POLLIN, 0};
+    if (::poll(&poll_fd, 1, 200) <= 0)
+      continue;
+    const ssize_t count = ::read(sockets[1], buffer, sizeof(buffer));
+    if (count <= 0) {
+      closed = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(closed) << "a client that never reads must not pin its queued output past the idle timeout";
+
+  reactor.Stop();
+  pool.Shutdown();
+  ::close(sockets[1]);
+}
+
 TEST(IoReactorTest, FailedRegistrationLeavesTheDescriptorWithTheCaller) {
   ThreadPool pool(1);
   IoReactor reactor({10, 0});

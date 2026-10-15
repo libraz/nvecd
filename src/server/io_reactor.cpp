@@ -260,7 +260,7 @@ void IoReactor::ReapIdleConnections() {
     }
   }
   for (const auto& [fd, connection] : stale) {
-    if (connection->HasWorkInFlight())
+    if (connection->HasRequestsInFlight())
       continue;
     Unregister(fd, connection.get());
   }

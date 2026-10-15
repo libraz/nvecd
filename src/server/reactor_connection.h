@@ -51,9 +51,9 @@ class ReactorConnection : public std::enable_shared_from_this<ReactorConnection>
   std::chrono::steady_clock::time_point LastActive() const;
   std::chrono::steady_clock::time_point CreatedAt() const;
   bool HasReceivedFrame() const { return received_frame_.load(std::memory_order_acquire); }
-  /// A request queued or executing, or a response not yet flushed. Such a
-  /// connection is busy, not idle, whatever its last socket activity.
-  bool HasWorkInFlight() const;
+  /// A request queued or executing. Such a connection is busy, not idle,
+  /// whatever its last socket activity; unflushed output alone does not count.
+  bool HasRequestsInFlight() const;
 
  private:
   ReactorConnection(utils::FDGuard fd, IoReactor* reactor, ThreadPool* thread_pool, IOConfig config,

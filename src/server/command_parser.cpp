@@ -209,8 +209,8 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request, 
     cmd.ctx = tokens[1];
 
     // Parse event type
-    std::string type_str = ToUpper(tokens[2]);
-    if (type_str == "ADD") {
+    const auto event_type = ParseEventType(tokens[2]);
+    if (event_type == events::EventType::ADD) {
       cmd.event_type = events::EventType::ADD;
       if (tokens.size() < 5 || tokens.size() > 6) {
         return utils::MakeUnexpected(
@@ -231,7 +231,7 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request, 
         cmd.timestamp = *ts_result;
       }
 
-    } else if (type_str == "SET") {
+    } else if (event_type == events::EventType::SET) {
       cmd.event_type = events::EventType::SET;
       if (tokens.size() < 5 || tokens.size() > 6) {
         return utils::MakeUnexpected(
@@ -252,7 +252,7 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request, 
         cmd.timestamp = *ts_result;
       }
 
-    } else if (type_str == "DEL") {
+    } else if (event_type == events::EventType::DEL) {
       cmd.event_type = events::EventType::DEL;
       if (tokens.size() < 4 || tokens.size() > 5) {
         return utils::MakeUnexpected(
@@ -270,8 +270,9 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request, 
       }
 
     } else {
-      return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandSyntaxError,
-                                                    "Invalid EVENT type: " + type_str + " (must be ADD, SET, or DEL)"));
+      return utils::MakeUnexpected(
+          utils::MakeError(utils::ErrorCode::kCommandSyntaxError,
+                           "Invalid EVENT type: " + ToUpper(tokens[2]) + " (must be ADD, SET, or DEL)"));
     }
 
   } else if (cmd_name == "VECSET") {
@@ -340,7 +341,7 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request, 
     for (size_t i = 3; i < tokens.size(); ++i) {
       if (tokens[i].rfind("using=", 0) == 0) {
         cmd.mode = tokens[i].substr(kUsingPrefixLength);
-        if (cmd.mode != "events" && cmd.mode != "vectors" && cmd.mode != "fusion") {
+        if (!IsValidSearchMode(cmd.mode)) {
           return utils::MakeUnexpected(
               utils::MakeError(utils::ErrorCode::kCommandSyntaxError,
                                "Invalid using value: " + cmd.mode + " (must be events, vectors, or fusion)"));

@@ -63,6 +63,11 @@ bool IsNonFiniteSpelling(std::string_view text) {
   return lowered == "nan" || lowered == "inf" || lowered == "infinity";
 }
 
+/// True for "+-5" and "++5": a leading '+' is followed by at most the digits.
+bool HasSecondSign(std::string_view text) {
+  return text.size() >= 2 && text[0] == '+' && (text[1] == '+' || text[1] == '-');
+}
+
 /// Parse an integer token, saturating values beyond the int64 range.
 utils::Expected<int64_t, utils::Error> ParseSaturatedInteger(std::string_view text) {
   const size_t start = (!text.empty() && text[0] == '+') ? 1 : 0;
@@ -70,7 +75,7 @@ utils::Expected<int64_t, utils::Error> ParseSaturatedInteger(std::string_view te
   const char* last = text.data() + text.size();
   int64_t value = 0;
   const auto [ptr, ec] = std::from_chars(first, last, value);
-  if (ptr == first) {
+  if (ptr == first || HasSecondSign(text)) {
     return utils::MakeUnexpected(
         utils::MakeError(utils::ErrorCode::kCommandInvalidArgument, "Failed to parse integer: " + std::string(text)));
   }
@@ -99,6 +104,28 @@ utils::Expected<int, utils::Error> CheckTopK(int64_t value, uint32_t max_top_k, 
 }
 
 }  // namespace
+
+bool IsValidSearchMode(std::string_view mode) {
+  return mode == kSearchModeEvents || mode == kSearchModeVectors || mode == kSearchModeFusion;
+}
+
+std::optional<events::EventType> ParseEventType(std::string_view text) {
+  std::string upper;
+  upper.reserve(text.size());
+  for (const char c : text) {
+    upper.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+  }
+  if (upper == "ADD") {
+    return events::EventType::ADD;
+  }
+  if (upper == "SET") {
+    return events::EventType::SET;
+  }
+  if (upper == "DEL") {
+    return events::EventType::DEL;
+  }
+  return std::nullopt;
+}
 
 utils::Expected<uint64_t, utils::Error> ParseTimestamp(std::string_view text) {
   uint64_t value = 0;
@@ -135,7 +162,7 @@ std::optional<int64_t> ParseDecimalInteger(std::string_view text) {
   const char* last = text.data() + text.size();
   int64_t value = 0;
   const auto [ptr, ec] = std::from_chars(first, last, value);
-  if (ptr == first || ptr != last || ec != std::errc()) {
+  if (ptr == first || ptr != last || ec != std::errc() || HasSecondSign(text)) {
     return std::nullopt;
   }
   return value;

@@ -923,12 +923,10 @@ TEST_F(RequestDispatcherTest, GateWaitIsNotCountedAsQueryCost) {
 // ============================================================================
 
 namespace {
-nvecd::storage::WalRecord MaintenanceRecord(double alpha) {
+nvecd::storage::WalRecord MaintenanceWalRecord(double alpha) {
   nvecd::storage::WalRecord record;
   record.op = nvecd::storage::WalOpType::kCoOccurrenceMaintenance;
-  record.payload.resize(sizeof(alpha) + sizeof(uint8_t));
-  std::memcpy(record.payload.data(), &alpha, sizeof(alpha));
-  record.payload[sizeof(alpha)] = 0;
+  record.payload = EncodeMaintenance(alpha, /*prune=*/false);
   return record;
 }
 
@@ -943,16 +941,16 @@ nvecd::storage::WalRecord CommandRecord(const Command& cmd) {
 TEST_F(RequestDispatcherTest, ReplayAppliesEveryConfigValidDecayAlpha) {
   // 0 is a config-valid alpha that clears the index; the live path logs it.
   co_index_->SetScore("item1", "item2", 100.0F);
-  auto cleared = dispatcher_->ReplayRecord(MaintenanceRecord(0.0));
+  auto cleared = dispatcher_->ReplayRecord(MaintenanceWalRecord(0.0));
   ASSERT_TRUE(cleared.has_value()) << cleared.error().message();
   EXPECT_FLOAT_EQ(co_index_->GetScore("item1", "item2"), 0.0F);
 
   co_index_->SetScore("item1", "item2", 100.0F);
-  ASSERT_TRUE(dispatcher_->ReplayRecord(MaintenanceRecord(1.0)).has_value());
+  ASSERT_TRUE(dispatcher_->ReplayRecord(MaintenanceWalRecord(1.0)).has_value());
   EXPECT_FLOAT_EQ(co_index_->GetScore("item1", "item2"), 100.0F);
 
   for (const double invalid : {-0.1, 1.5, std::numeric_limits<double>::quiet_NaN()}) {
-    auto rejected = dispatcher_->ReplayRecord(MaintenanceRecord(invalid));
+    auto rejected = dispatcher_->ReplayRecord(MaintenanceWalRecord(invalid));
     ASSERT_FALSE(rejected.has_value()) << invalid;
     EXPECT_EQ(rejected.error().code(), nvecd::utils::ErrorCode::kWalCorrupted);
   }

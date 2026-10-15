@@ -17,6 +17,7 @@
 #include <utility>
 
 #include "cache/similarity_cache.h"
+#include "cache/similarity_cache_controller.h"
 #include "config/config.h"
 #include "events/co_occurrence_index.h"
 #include "events/event_store.h"
@@ -41,6 +42,57 @@ utils::ErrorCode SnapshotFailureCode(const utils::Error& cause, utils::ErrorCode
   return cause.code() == utils::ErrorCode::kStorageFileNotFound ? cause.code() : fallback;
 }
 }  // namespace
+
+events::CoOccurrenceIndex::Config MakeCoOccurrenceConfig(const config::EventsConfig& events) {
+  events::CoOccurrenceIndex::Config config;
+  config.max_neighbors_per_item = events.max_neighbors_per_item;
+  config.min_support = static_cast<float>(events.min_support);
+  return config;
+}
+
+StagedStores::StagedStores(const config::Config& config, bool with_metadata)
+    : event_store_(config.events),
+      co_index_(MakeCoOccurrenceConfig(config.events)),
+      vector_store_(config.vectors),
+      metadata_store_(with_metadata ? std::make_unique<vectors::MetadataStore>() : nullptr) {}
+
+utils::Expected<void, utils::Error> StagedStores::Read(const std::string& path) {
+  config::Config loaded_config;
+  storage::snapshot_format::IntegrityError integrity_error;
+  auto result = storage::snapshot_v1::ReadSnapshotV1(path, loaded_config, event_store_, co_index_, vector_store_,
+                                                     nullptr, nullptr, &integrity_error, metadata_store_.get());
+  integrity_message_ = integrity_error.message;
+  return result;
+}
+
+std::string StagedStores::Describe(const utils::Error& error) const {
+  std::string message = error.message();
+  if (!integrity_message_.empty()) {
+    message += " (" + integrity_message_ + ")";
+  }
+  return message;
+}
+
+void StagedStores::Publish(HandlerContext& ctx, bool rebuild_ann) {
+  ctx.event_store->SwapState(event_store_);
+  ctx.co_index->SwapState(co_index_);
+  ctx.vector_store->SwapState(vector_store_);
+  if (ctx.metadata_store != nullptr && metadata_store_ != nullptr) {
+    ctx.metadata_store->SwapState(*metadata_store_);
+  }
+  if (rebuild_ann && ctx.similarity_engine != nullptr) {
+    ctx.similarity_engine->RebuildAnnFromStore();
+  }
+  ctx.vector_generation.fetch_add(1, std::memory_order_acq_rel);
+  ctx.metadata_generation.fetch_add(1, std::memory_order_acq_rel);
+  ctx.dataset_generation.fetch_add(1, std::memory_order_acq_rel);
+  // The controller also owns a cache that is currently disabled (unpublished).
+  if (ctx.cache_controller != nullptr) {
+    (void)ctx.cache_controller->Clear();
+  } else if (auto* cache = ctx.cache.load(std::memory_order_acquire)) {
+    cache->Clear();
+  }
+}
 
 utils::Expected<void, utils::Error> StartForkSnapshot(HandlerContext& ctx, const std::string& resolved_path) {
   if (ctx.fork_snapshot_writer == nullptr || ctx.config == nullptr || ctx.event_store == nullptr ||
@@ -206,24 +258,10 @@ utils::Expected<std::string, utils::Error> HandleDumpLoad(HandlerContext& ctx, c
 
   // Deserialize into isolated stores first. A corrupt or semantically invalid
   // snapshot can mutate only these staged instances, never the live state.
-  events::CoOccurrenceIndex::Config co_index_config;
-  co_index_config.max_neighbors_per_item = ctx.config->events.max_neighbors_per_item;
-  co_index_config.min_support = static_cast<float>(ctx.config->events.min_support);
-  events::EventStore staged_event_store(ctx.config->events);
-  events::CoOccurrenceIndex staged_co_index(co_index_config);
-  vectors::VectorStore staged_vector_store(ctx.config->vectors);
-  auto staged_metadata_store = ctx.metadata_store != nullptr ? std::make_unique<vectors::MetadataStore>() : nullptr;
-  config::Config loaded_config;
-  storage::snapshot_format::IntegrityError integrity_error;
-  auto result = storage::snapshot_v1::ReadSnapshotV1(resolved_path, loaded_config, staged_event_store, staged_co_index,
-                                                     staged_vector_store, nullptr, nullptr, &integrity_error,
-                                                     staged_metadata_store.get());
-
+  StagedStores staged(*ctx.config, ctx.metadata_store != nullptr);
+  auto result = staged.Read(resolved_path);
   if (!result) {
-    std::string error_msg = "Failed to load snapshot from " + resolved_path + ": " + result.error().message();
-    if (!integrity_error.message.empty()) {
-      error_msg += " (" + integrity_error.message + ")";
-    }
+    std::string error_msg = "Failed to load snapshot from " + resolved_path + ": " + staged.Describe(result.error());
     utils::LogStorageError("dump_load", resolved_path, error_msg);
     return utils::MakeUnexpected(
         utils::MakeError(SnapshotFailureCode(result.error(), utils::ErrorCode::kSnapshotLoadFailed), error_msg));
@@ -252,23 +290,7 @@ utils::Expected<std::string, utils::Error> HandleDumpLoad(HandlerContext& ctx, c
     }
   }
 
-  ctx.event_store->SwapState(staged_event_store);
-  ctx.co_index->SwapState(staged_co_index);
-  ctx.vector_store->SwapState(staged_vector_store);
-  if (ctx.metadata_store != nullptr) {
-    ctx.metadata_store->SwapState(*staged_metadata_store);
-  }
-
-  if (ctx.similarity_engine != nullptr) {
-    ctx.similarity_engine->RebuildAnnFromStore();
-  }
-  ctx.vector_generation.fetch_add(1, std::memory_order_acq_rel);
-  ctx.metadata_generation.fetch_add(1, std::memory_order_acq_rel);
-  ctx.dataset_generation.fetch_add(1, std::memory_order_acq_rel);
-  auto* cache_ptr = ctx.cache.load(std::memory_order_acquire);
-  if (cache_ptr != nullptr) {
-    cache_ptr->Clear();
-  }
+  staged.Publish(ctx, /*rebuild_ann=*/true);
 
   auto fail_stop = [&](const utils::Error& error) -> utils::Expected<std::string, utils::Error> {
     // Publication has already occurred. If any durability step fails, do not

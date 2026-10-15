@@ -215,5 +215,24 @@ TEST(NetworkUtilsTest, IsIPAllowed_InvalidCIDR) {
   EXPECT_FALSE(IsIPAllowed("172.16.0.1", allow_cidrs));
 }
 
+TEST(NetworkUtilsTest, ParseCidrList_SkipsInvalidEntriesKeepingOrder) {
+  auto parsed = ParseCidrList({"10.0.0.0/8", "bogus", "192.168.1.0/33", "127.0.0.0/8"});
+  ASSERT_EQ(parsed.size(), 2U);
+  EXPECT_EQ(parsed[0].prefix_length, 8);
+  EXPECT_EQ(parsed[0].network, 0x0A000000U);
+  EXPECT_EQ(parsed[1].network, 0x7F000000U);
+  EXPECT_TRUE(ParseCidrList({}).empty());
+}
+
+TEST(NetworkUtilsTest, IsIPAllowed_StringOverloadMatchesParsedOverload) {
+  const std::vector<std::string> cidrs = {"10.0.0.0/8", "bogus"};
+  const auto parsed = ParseCidrList(cidrs);
+  for (const char* ip : {"10.1.2.3", "11.0.0.1", "not-an-ip"}) {
+    EXPECT_EQ(IsIPAllowed(ip, cidrs), IsIPAllowed(ip, parsed)) << ip;
+  }
+  EXPECT_FALSE(IsIPAllowed("10.1.2.3", std::vector<std::string>{}));
+  EXPECT_FALSE(IsIPAllowed("10.1.2.3", std::vector<std::string>{"bogus"}));
+}
+
 }  // namespace utils
 }  // namespace nvecd

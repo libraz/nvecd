@@ -43,6 +43,13 @@ struct CIDR {
 std::optional<uint32_t> ParseIPv4(const std::string& ip_str);
 
 /**
+ * @brief Parse a list of CIDR strings, skipping (and logging) invalid entries
+ * @param cidr_strs CIDR strings (e.g., "192.168.1.0/24")
+ * @return The valid entries, in order
+ */
+std::vector<CIDR> ParseCidrList(const std::vector<std::string>& cidr_strs);
+
+/**
  * @brief Check if an IP address is allowed by CIDR list
  * @param ip_str IP address string (e.g., "192.168.1.1")
  * @param allow_cidrs List of allowed CIDR ranges
