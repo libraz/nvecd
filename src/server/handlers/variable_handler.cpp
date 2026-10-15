@@ -8,7 +8,6 @@
 
 #include "server/handlers/variable_handler.h"
 
-#include <algorithm>
 #include <sstream>
 
 namespace nvecd::server::handlers {
@@ -54,21 +53,11 @@ utils::Expected<std::string, utils::Error> HandleShowVariables(config::RuntimeVa
   // Format output
   std::ostringstream oss;
 
-  // Count lines for array response
-  size_t count = 0;
-  for (const auto& [name, info] : variables) {
-    if (pattern.empty() || name.find(prefix) == 0) {
-      count++;
-    }
-  }
-
-  oss << "*" << count << "\r\n";
+  oss << "*" << variables.size() << "\r\n";
 
   for (const auto& [name, info] : variables) {
-    if (pattern.empty() || name.find(prefix) == 0) {
-      oss << "$" << (name.size() + 1 + info.value.size() + (info.mutable_ ? 10 : 12)) << "\r\n";
-      oss << name << "=" << info.value << (info.mutable_ ? " (mutable)" : " (immutable)") << "\r\n";
-    }
+    oss << "$" << (name.size() + 1 + info.value.size() + (info.mutable_ ? 10 : 12)) << "\r\n";
+    oss << name << "=" << info.value << (info.mutable_ ? " (mutable)" : " (immutable)") << "\r\n";
   }
 
   return oss.str();

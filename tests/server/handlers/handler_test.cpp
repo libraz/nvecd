@@ -937,7 +937,16 @@ TEST_F(HandlerTest, HandleShowVariables_WithManager_ReturnsList) {
 TEST_F(HandlerTest, HandleShowVariables_WithPattern_FiltersResults) {
   auto result = HandleShowVariables(variable_manager_.get(), "logging.%");
   ASSERT_TRUE(result.has_value());
-  EXPECT_THAT(*result, HasSubstr("logging."));
+  const auto expected_variables = variable_manager_->GetAllVariables("logging.");
+  ASSERT_FALSE(expected_variables.empty());
+  const size_t header_end = result->find("\r\n");
+  ASSERT_NE(header_end, std::string::npos);
+  EXPECT_EQ(result->substr(0, header_end), "*" + std::to_string(expected_variables.size()));
+  for (const auto& [name, info] : expected_variables) {
+    (void)info;
+    EXPECT_THAT(*result, HasSubstr(name + "="));
+  }
+  EXPECT_EQ(result->find("cache."), std::string::npos);
 }
 
 TEST_F(HandlerTest, HandleSet_ImmutableVariable_ReturnsError) {
