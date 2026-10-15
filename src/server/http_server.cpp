@@ -996,7 +996,7 @@ void HttpServer::HandleInfo(const httplib::Request& /*req*/, httplib::Response& 
     }
 
     // Memory health status
-    auto health = utils::GetMemoryHealthStatus();
+    auto health = sys_info ? utils::GetMemoryHealthStatus(*sys_info) : utils::MemoryHealthStatus::UNKNOWN;
     memory_obj["memory_health"] = utils::MemoryHealthStatusToString(health);
 
     response["memory"] = memory_obj;

@@ -7,15 +7,10 @@
 
 #include <spdlog/spdlog.h>
 
-#include <array>
-#include <cmath>
-#include <cstdio>
+#include <algorithm>
 #include <fstream>
-#include <iomanip>
 #include <limits>
 #include <sstream>
-
-#include "utils/string_utils.h"
 
 #ifdef __APPLE__
 #include <mach/mach.h>
@@ -86,7 +81,10 @@ std::optional<SystemMemoryInfo> GetSystemMemoryInfo() {
   // Get VM statistics for available memory
   mach_port_t host_port = mach_host_self();
   vm_size_t page_size = 0;
-  host_page_size(host_port, &page_size);
+  if (host_page_size(host_port, &page_size) != KERN_SUCCESS) {
+    mach_port_deallocate(mach_task_self(), host_port);
+    return std::nullopt;
+  }
 
   vm_statistics64_data_t vm_stats{};
   mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
@@ -95,6 +93,8 @@ std::optional<SystemMemoryInfo> GetSystemMemoryInfo() {
   kern_return_t kern_ret = host_statistics64(host_port, HOST_VM_INFO64,
                                              // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
                                              reinterpret_cast<host_info64_t>(&vm_stats), &count);
+
+  mach_port_deallocate(mach_task_self(), host_port);
 
   if (kern_ret != KERN_SUCCESS) {
     spdlog::error("Failed to get VM statistics");
@@ -252,35 +252,21 @@ std::optional<ProcessMemoryInfo> GetProcessMemoryInfo() {
   return info;
 }
 
-bool CheckMemoryAvailability(uint64_t required_bytes, double safety_margin_ratio) {
-  auto system_info = GetSystemMemoryInfo();
-  if (!system_info) {
-    spdlog::warn("Unable to check memory availability, allowing operation");
-    return true;  // Fail-open: allow operation if we can't check
-  }
-
-  // Calculate required bytes with safety margin
-  auto required_with_margin = static_cast<uint64_t>(static_cast<double>(required_bytes) * (1.0 + safety_margin_ratio));
-
-  // Check if available physical memory is sufficient
-  if (system_info->available_physical_bytes < required_with_margin) {
-    spdlog::warn("Insufficient memory: required={} ({} with margin), available={}", FormatBytes(required_bytes),
-                 FormatBytes(required_with_margin), FormatBytes(system_info->available_physical_bytes));
-    return false;
-  }
-
-  return true;
-}
-
 MemoryHealthStatus GetMemoryHealthStatus() {
   auto system_info = GetSystemMemoryInfo();
   if (!system_info) {
     return MemoryHealthStatus::UNKNOWN;
   }
 
-  // Calculate available memory ratio
-  double available_ratio = static_cast<double>(system_info->available_physical_bytes) /
-                           static_cast<double>(system_info->total_physical_bytes);
+  return GetMemoryHealthStatus(*system_info);
+}
+
+MemoryHealthStatus GetMemoryHealthStatus(const SystemMemoryInfo& info) {
+  if (info.total_physical_bytes == 0) {
+    return MemoryHealthStatus::UNKNOWN;
+  }
+  const double available_ratio =
+      static_cast<double>(info.available_physical_bytes) / static_cast<double>(info.total_physical_bytes);
 
   if (available_ratio >= kHealthyThreshold) {
     return MemoryHealthStatus::HEALTHY;
@@ -303,37 +289,6 @@ std::string MemoryHealthStatusToString(MemoryHealthStatus status) {
       return "UNKNOWN";
   }
   return "UNKNOWN";
-}
-
-uint64_t EstimateOptimizationMemory(uint64_t index_memory_usage, size_t batch_size) {
-  // Optimization creates clones of posting lists in batches
-  // Peak memory usage occurs when:
-  // 1. Original index is fully loaded
-  // 2. One batch worth of cloned posting lists is being created
-  // 3. Temporary data structures for batch processing
-  //
-  // Memory breakdown:
-  // - Original index: index_memory_usage
-  // - Cloned batch (worst case): (batch_size / total_terms) * index_memory_usage
-  // - Temporary overhead: ~10% of batch memory
-  //
-  // Conservative estimate: assume average term size
-  // Typical batch represents ~1-5% of total index for default batch size (1000)
-
-  if (batch_size == 0 || index_memory_usage == 0) {
-    return 0;
-  }
-
-  // Estimate batch represents 5% of index (conservative)
-  constexpr double kBatchRatio = 0.05;
-  auto batch_memory = static_cast<uint64_t>(static_cast<double>(index_memory_usage) * kBatchRatio);
-
-  // Add 10% overhead for temporary structures
-  constexpr double kOverheadRatio = 0.10;
-  auto overhead = static_cast<uint64_t>(static_cast<double>(batch_memory) * kOverheadRatio);
-
-  // Total peak = original + batch + overhead
-  return index_memory_usage + batch_memory + overhead;
 }
 
 }  // namespace nvecd::utils
