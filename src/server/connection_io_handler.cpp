@@ -12,6 +12,7 @@
 #include <cerrno>
 #include <cstring>
 
+#include "server/protocol_framing.h"
 #include "server/server_types.h"
 #include "utils/structured_log.h"
 
@@ -86,18 +87,11 @@ void ConnectionIOHandler::HandleConnection(int client_fd, ConnectionContext& ctx
 
 bool ConnectionIOHandler::ProcessBuffer(std::string& accumulated, int client_fd, ConnectionContext& ctx) {
   while (true) {
-    // Support both \r\n and \n line endings (protocol spec line 19)
-    size_t pos = accumulated.find("\r\n");
-    size_t delimiter_len = 2;
-
-    if (pos == std::string::npos) {
-      pos = accumulated.find('\n');
-      delimiter_len = 1;
-    }
-
-    if (pos == std::string::npos) {
+    const auto frame = FindRequestFrame(accumulated);
+    if (!frame.has_value()) {
       break;  // No complete line found
     }
+    const size_t pos = frame->request_size;
 
     if (pos > config_.max_query_length) {
       nvecd::utils::StructuredLog()
@@ -112,7 +106,7 @@ bool ConnectionIOHandler::ProcessBuffer(std::string& accumulated, int client_fd,
     }
 
     std::string request = accumulated.substr(0, pos);
-    accumulated = accumulated.substr(pos + delimiter_len);
+    accumulated.erase(0, pos + frame->delimiter_size);
 
     if (request.empty()) {
       continue;
@@ -130,45 +124,11 @@ bool ConnectionIOHandler::ProcessBuffer(std::string& accumulated, int client_fd,
   return true;
 }
 
-std::string ConnectionIOHandler::NormalizeResponse(const std::string& response) {
-  // Canonical framing policy: every line is terminated with CRLF and the
-  // response carries exactly one trailing CRLF. Handler bodies historically
-  // mixed bare "\n" (between lines and as a trailing terminator) with the CRLF
-  // that SendResponse used to append unconditionally. That produced an extra
-  // blank line on single-line responses and mis-framed multi-line responses for
-  // clients that split on CRLF. Normalizing here keeps the policy in one place,
-  // independent of how each handler builds its body.
-  //
-  // Strip any trailing newline characters first so we do not emit a blank
-  // terminating line, then rewrite every interior bare "\n" to "\r\n".
-  size_t end = response.size();
-  while (end > 0 && (response[end - 1] == '\n' || response[end - 1] == '\r')) {
-    --end;
-  }
-
-  std::string normalized;
-  normalized.reserve(end + 2);
-  for (size_t i = 0; i < end; ++i) {
-    char ch = response[i];
-    if (ch == '\r') {
-      // Skip a CR; the following LF (or this position) becomes a CRLF below.
-      continue;
-    }
-    if (ch == '\n') {
-      normalized += "\r\n";
-      continue;
-    }
-    normalized += ch;
-  }
-  normalized += "\r\n";
-  return normalized;
-}
-
 // Kept as member function for consistency and potential future extensions
 // NOLINTNEXTLINE(readability-convert-member-functions-to-static)
 bool ConnectionIOHandler::SendResponse(int client_fd, const std::string& response) {
   // Normalize line endings once, then send the framed buffer.
-  const std::string framed = NormalizeResponse(response);
+  const std::string framed = nvecd::server::NormalizeResponse(response);
 
   size_t total_sent = 0;
   while (total_sent < framed.size()) {

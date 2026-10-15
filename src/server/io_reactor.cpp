@@ -225,12 +225,11 @@ void IoReactor::EventLoop() {
       if (!connection)
         continue;
       bool keep = true;
-      if ((event.events & reactor::event::kReadable) != 0U)
+      if ((event.events & (reactor::event::kReadable | reactor::event::kHangup)) != 0U)
         keep = connection->OnReadable();
       if (keep && (event.events & reactor::event::kWritable) != 0U)
         keep = connection->OnWritable();
-      if (keep && (event.events & (reactor::event::kError | reactor::event::kHangup)) != 0U &&
-          (event.events & reactor::event::kReadable) == 0U) {
+      if (keep && (event.events & reactor::event::kError) != 0U) {
         keep = connection->OnError();
       }
       if (!keep)

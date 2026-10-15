@@ -64,7 +64,6 @@ class ReactorConnection : public std::enable_shared_from_this<ReactorConnection>
   bool HasPendingOutput() const;
   bool HasPendingRequests() const;
   void CloseAfterFlush();
-  static std::string NormalizeResponse(const std::string& response);
 
   static constexpr size_t kMaxPendingFrames = 1024;
   static constexpr size_t kPendingFramesHighWatermark = 768;

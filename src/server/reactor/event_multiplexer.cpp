@@ -95,7 +95,8 @@ class EpollMultiplexer final : public EventMultiplexer {
         flags |= event::kReadable;
       if ((item.events & EPOLLOUT) != 0U)
         flags |= event::kWritable;
-      if ((item.events & EPOLLERR) != 0U)
+      // EPOLLHUP cannot be masked and means both directions are gone, so it closes like an error.
+      if ((item.events & (EPOLLERR | EPOLLHUP)) != 0U)
         flags |= event::kError;
       if ((item.events & (EPOLLHUP | EPOLLRDHUP)) != 0U)
         flags |= event::kHangup;
@@ -119,9 +120,9 @@ class EpollMultiplexer final : public EventMultiplexer {
  private:
   utils::Expected<void, utils::Error> Control(int operation, int client_fd, uint8_t interest, RegistrationToken token) {
     epoll_event event{};
-    event.events = EPOLLRDHUP | EPOLLHUP | EPOLLERR;
+    event.events = EPOLLHUP | EPOLLERR;
     if ((interest & event::kReadable) != 0U)
-      event.events |= EPOLLIN;
+      event.events |= EPOLLIN | EPOLLRDHUP;
     if ((interest & event::kWritable) != 0U)
       event.events |= EPOLLOUT;
     event.data.u64 = token;

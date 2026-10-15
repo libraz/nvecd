@@ -6,10 +6,13 @@
 #include "server/connection_io_handler.h"
 
 #include <gtest/gtest.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
+#include <string>
 #include <thread>
 
 #include "server/server_types.h"
@@ -72,6 +75,46 @@ TEST(ConnectionIOHandlerTest, NormalizesAlreadyTerminatedAuthResponseExactlyOnce
   const ssize_t received = ::read(sockets[1], response, sizeof(response));
   ASSERT_GT(received, 0);
   EXPECT_EQ(std::string(response, static_cast<size_t>(received)), "+OK\r\n");
+
+  ::close(sockets[1]);
+  server_thread.join();
+  ::close(sockets[0]);
+}
+
+TEST(ConnectionIOHandlerTest, MixedLineEndingsUseTheFirstLfAsTheRequestBoundary) {
+  int sockets[2] = {-1, -1};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets), 0);
+
+  std::atomic<bool> shutdown{false};
+  IOConfig config;
+  config.recv_buffer_size = 32;
+  config.max_query_length = 32;
+  config.max_accumulated_bytes = 64;
+  config.recv_timeout_sec = 0;
+  ConnectionIOHandler handler(
+      config, [](const std::string& request, ConnectionContext&) { return "OK " + request; }, shutdown);
+
+  ConnectionContext context;
+  std::thread server_thread([&] { handler.HandleConnection(sockets[0], context); });
+
+  const std::string requests = "PING\nINFO\r\n";
+  ASSERT_EQ(::write(sockets[1], requests.data(), requests.size()), static_cast<ssize_t>(requests.size()));
+  ASSERT_EQ(::shutdown(sockets[1], SHUT_WR), 0);
+
+  const std::string expected = "OK PING\r\nOK INFO\r\n";
+  std::string received;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (received.size() < expected.size() && std::chrono::steady_clock::now() < deadline) {
+    pollfd poll_fd{sockets[1], POLLIN, 0};
+    if (::poll(&poll_fd, 1, 50) <= 0)
+      continue;
+    char buffer[64]{};
+    const ssize_t count = ::read(sockets[1], buffer, sizeof(buffer));
+    if (count <= 0)
+      break;
+    received.append(buffer, static_cast<size_t>(count));
+  }
+  EXPECT_EQ(received, expected);
 
   ::close(sockets[1]);
   server_thread.join();

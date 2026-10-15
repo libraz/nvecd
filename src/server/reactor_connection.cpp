@@ -10,9 +10,11 @@
 #include <array>
 #include <cerrno>
 #include <cstring>
+#include <exception>
 #include <utility>
 
 #include "server/io_reactor.h"
+#include "server/protocol_framing.h"
 #include "server/thread_pool.h"
 
 namespace nvecd::server {
@@ -97,14 +99,11 @@ bool ReactorConnection::OnReadable() {
         } else {
           accumulated_.append(chunk.data(), static_cast<size_t>(read));
           while (true) {
-            // A request ends at the first LF; a CR directly before it belongs
-            // to the terminator, so mixed endings frame one request per line.
-            const size_t newline = accumulated_.find('\n');
-            if (newline == std::string::npos)
+            const auto frame = FindRequestFrame(accumulated_);
+            if (!frame.has_value())
               break;
-            const bool has_cr = newline > 0 && accumulated_[newline - 1] == '\r';
-            const size_t end = has_cr ? newline - 1 : newline;
-            const size_t delimiter = has_cr ? 2 : 1;
+            const size_t end = frame->request_size;
+            const size_t delimiter = frame->delimiter_size;
             if (end > config_.max_query_length || requests_.size() >= kMaxPendingFrames ||
                 request_bytes_ + end > config_.max_accumulated_bytes) {
               overflow = true;
@@ -126,6 +125,8 @@ bool ReactorConnection::OnReadable() {
           if (requests_.size() >= kPendingFramesHighWatermark) {
             read_paused_ = true;
             pause_read = true;
+            // Under read_mutex_, or DrainRequests could re-enable reads before this disable lands.
+            reactor_->SetReadEnabled(Fd(), false);
           }
         }
       }
@@ -135,10 +136,8 @@ bool ReactorConnection::OnReadable() {
         CloseAfterFlush();
         return true;
       }
-      if (pause_read) {
-        reactor_->SetReadEnabled(Fd(), false);
+      if (pause_read)
         break;
-      }
       // Level-triggered readiness will report this fd again while the peer
       // still has data. Yield after a bounded turn so one streaming client
       // cannot monopolize the reactor thread.
@@ -170,7 +169,6 @@ bool ReactorConnection::OnReadable() {
 
 bool ReactorConnection::OnWritable() {
   last_active_.store(std::chrono::steady_clock::now(), std::memory_order_relaxed);
-  bool drained = false;
   {
     std::lock_guard<std::mutex> lock(write_mutex_);
     while (!responses_.empty()) {
@@ -194,10 +192,9 @@ bool ReactorConnection::OnWritable() {
         return true;
       return false;
     }
-    drained = true;
-  }
-  if (drained)
+    // Under the publication lock, or a response armed after the empty check would be disarmed.
     reactor_->DisarmWrite(Fd());
+  }
   return !close_after_flush_.load(std::memory_order_acquire);
 }
 
@@ -222,7 +219,6 @@ bool ReactorConnection::ScheduleDrain() {
 void ReactorConnection::DrainRequests() {
   while (true) {
     std::string request;
-    bool resume_read = false;
     {
       std::lock_guard<std::mutex> lock(read_mutex_);
       if (requests_.empty()) {
@@ -236,12 +232,21 @@ void ReactorConnection::DrainRequests() {
       requests_.pop_front();
       if (read_paused_ && requests_.size() <= kPendingFramesLowWatermark) {
         read_paused_ = false;
-        resume_read = true;
+        // Ordered against the high-watermark disable in OnReadable().
+        reactor_->SetReadEnabled(Fd(), true);
       }
     }
-    if (resume_read)
-      reactor_->SetReadEnabled(Fd(), true);
-    const bool enqueued = EnqueueResponse(processor_(request, context_));
+    std::string response;
+    try {
+      response = processor_(request, context_);
+    } catch (const std::exception& error) {
+      spdlog::error("Request processor failed on fd {}: {}", Fd(), error.what());
+      response = "ERROR Internal server error";
+    } catch (...) {
+      spdlog::error("Request processor failed on fd {} with an unknown exception", Fd());
+      response = "ERROR Internal server error";
+    }
+    const bool enqueued = EnqueueResponse(response);
     // Idle time starts when a request completes, not when it was read.
     last_active_.store(std::chrono::steady_clock::now(), std::memory_order_relaxed);
     if (!enqueued) {
@@ -257,7 +262,7 @@ void ReactorConnection::DrainRequests() {
 }
 
 bool ReactorConnection::EnqueueResponse(const std::string& response) {
-  std::string framed = NormalizeResponse(response);
+  std::string framed = nvecd::server::NormalizeResponse(response);
   {
     std::lock_guard<std::mutex> lock(write_mutex_);
     if (response_bytes_ + framed.size() > kMaxWriteQueueBytes ||
@@ -290,24 +295,6 @@ void ReactorConnection::CloseAfterFlush() {
   close_after_flush_.store(true, std::memory_order_release);
   reactor_->DisarmRead(Fd());
   reactor_->ArmWrite(Fd());
-}
-
-std::string ReactorConnection::NormalizeResponse(const std::string& response) {
-  size_t end = response.size();
-  while (end > 0 && (response[end - 1] == '\r' || response[end - 1] == '\n'))
-    --end;
-  std::string normalized;
-  normalized.reserve(end + 2);
-  for (size_t i = 0; i < end; ++i) {
-    if (response[i] == '\r')
-      continue;
-    if (response[i] == '\n')
-      normalized += "\r\n";
-    else
-      normalized += response[i];
-  }
-  normalized += "\r\n";
-  return normalized;
 }
 
 }  // namespace nvecd::server

@@ -6,7 +6,7 @@ nvecd は単一のプロセスで、すべてのデータをメモリに保持�
 
 ![ネットワーク層、ディスパッチ層、ドメインのストア群、ストレージ層と、それらすべてを所有する NvecdServer](../images/architecture-ja.svg)
 
-**ネットワーク**。`ConnectionAcceptor` はリスナーごとに accept ループを走らせます。TCP に 1 つ、必要なら Unix ドメインソケットに 1 つです。`IoReactor` は受理したディスクリプタすべてを所有する単一のレベルトリガのイベントループで、その背後にある可搬な readiness バックエンドが `reactor/event_multiplexer`、クライアントごとのバッファと書き込みキューを持つのが `ReactorConnection` です。フレーミングは `ConnectionIOHandler` が行います。`ThreadPool` はコマンドの実行をイベントループから切り離して走らせます。`HttpServer` は独自のワーカースレッドを持つ別のリスナーで、同じコマンドを JSON のルートとして公開します。`RateLimiter` は両者の手前に置く任意のクライアント単位のトークンバケットです。
+**ネットワーク**。`ConnectionAcceptor` はリスナーごとに accept ループを走らせます。TCP に 1 つ、必要なら Unix ドメインソケットに 1 つです。`IoReactor` は受理したディスクリプタすべてを所有する単一のレベルトリガのイベントループで、その背後にある可搬な readiness バックエンドが `reactor/event_multiplexer`、クライアントごとのバッファと書き込みキューを持つのが `ReactorConnection` です。リクエストとレスポンスのフレーミングは、`ReactorConnection` が `protocol_framing.h` の関数を使って行います。`ThreadPool` はコマンドの実行をイベントループから切り離して走らせます。`HttpServer` は独自のワーカースレッドを持つ別のリスナーで、同じコマンドを JSON のルートとして公開します。`RateLimiter` は両者の手前に置く任意のクライアント単位のトークンバケットです。
 
 **ディスパッチ**。`command_parser` がリクエスト行を `Command` に変換します。`RequestDispatcher` が認証し、ライフサイクルのゲートを確認し、振り分けます。クエリ以外のコマンドは `src/server/handlers/` の下のハンドラが担当します（`info_handler`、`admin_handler`、`debug_handler`、`dump_handler`、`cache_handler`、`variable_handler`）。`filter_parser` は `filter=` の式を `MetadataFilter` に変換します。
 
