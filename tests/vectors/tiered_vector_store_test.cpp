@@ -13,6 +13,7 @@
 #include <string>
 #include <thread>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "vectors/merge_scheduler.h"
@@ -182,6 +183,66 @@ TEST_F(TieredVectorStoreTest, SearchMergesMainAndDelta) {
   ASSERT_GE(results.size(), 1U);
   EXPECT_EQ(results[0].id, "v2");
   EXPECT_NEAR(results[0].score, 1.0F, 0.01F);
+}
+
+TEST_F(TieredVectorStoreTest, MergeHandlesExtremeNegativeScoresAcrossBothTiers) {
+  auto cfg = DefaultConfig();
+  cfg.distance_metric = "dot";
+  TieredVectorStore store(cfg);
+
+  std::vector<float> query(kDim, 0.0F);
+  query[0] = 1.0e15F;
+  std::vector<float> main_vector(kDim, 0.0F);
+  main_vector[0] = -2.0e15F;
+  std::vector<float> delta_vector(kDim, 0.0F);
+  delta_vector[0] = -3.0e15F;
+
+  ASSERT_TRUE(store.Add("main", std::move(main_vector)).has_value());
+  auto results = store.Search(query.data(), 1);
+  ASSERT_EQ(results.size(), 1U);
+  EXPECT_EQ(results[0].id, "main");
+  EXPECT_LT(results[0].score, -1.0e30F);
+
+  ASSERT_TRUE(store.MergeDeltaToMain().has_value());
+  results = store.Search(query.data(), 1);
+  ASSERT_EQ(results.size(), 1U);
+  EXPECT_EQ(results[0].id, "main");
+  EXPECT_LT(results[0].score, -1.0e30F);
+
+  ASSERT_TRUE(store.Add("delta", std::move(delta_vector)).has_value());
+
+  results = store.Search(query.data(), 2);
+  ASSERT_EQ(results.size(), 2U);
+  EXPECT_EQ(results[0].id, "main");
+  EXPECT_EQ(results[1].id, "delta");
+  EXPECT_GT(results[0].score, results[1].score);
+  EXPECT_LT(results[1].score, -1.0e30F);
+}
+
+TEST_F(TieredVectorStoreTest, CosineCachedNormsPreserveZeroScoresAcrossTierTransitions) {
+  std::vector<float> zero_vector(kDim, 0.0F);
+  const auto query = MakeAxisVector(kDim, 0);
+  ASSERT_TRUE(store_->Add("v0", zero_vector).has_value());
+
+  auto results = store_->Search(query.data(), 1);
+  ASSERT_EQ(results.size(), 1U);
+  EXPECT_EQ(results[0].id, "v0");
+  EXPECT_FLOAT_EQ(results[0].score, 0.0F);
+
+  ASSERT_TRUE(store_->MergeDeltaToMain().has_value());
+  results = store_->Search(query.data(), 1);
+  ASSERT_EQ(results.size(), 1U);
+  EXPECT_EQ(results[0].id, "v0");
+  EXPECT_FLOAT_EQ(results[0].score, 0.0F);
+
+  ASSERT_TRUE(store_->Update("v0", MakeAxisVector(kDim, 1)).has_value());
+  results = store_->Search(query.data(), 1);
+  ASSERT_EQ(results.size(), 1U);
+  EXPECT_EQ(results[0].id, "v0");
+  EXPECT_FLOAT_EQ(results[0].score, 0.0F);
+
+  ASSERT_TRUE(store_->Delete("v0").has_value());
+  EXPECT_TRUE(store_->Search(query.data(), 1).empty());
 }
 
 TEST_F(TieredVectorStoreTest, SearchExcludesDeletedFromMain) {

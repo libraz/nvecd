@@ -277,13 +277,17 @@ std::vector<TieredSearchResult> TieredVectorStore::SearchMain(const float* query
     // Min-heap: (score, index) — keeps worst score on top for eviction
     using ScorePair = std::pair<float, uint32_t>;
     std::priority_queue<ScorePair, std::vector<ScorePair>, std::greater<ScorePair>> heap;
+    const bool use_cosine_prenorm = distance_func_ == CosineDistanceRaw;
+    const float query_norm = use_cosine_prenorm ? ComputeNorm(query, dimension_) : 0.0F;
 
     for (uint32_t i = 0; i < main_.TotalSlots(); ++i) {
       if (main_.deleted.count(i) > 0) {
         continue;
       }
       const float* vec = &main_.matrix[static_cast<size_t>(i) * dimension_];
-      float score = distance_func_(query, vec, dimension_);
+      const float score = use_cosine_prenorm
+                              ? CosineSimilarityPreNorm(query, vec, dimension_, query_norm, main_.norms[i])
+                              : distance_func_(query, vec, dimension_);
 
       if (heap.size() < top_k) {
         heap.push({score, i});
@@ -313,10 +317,14 @@ std::vector<TieredSearchResult> TieredVectorStore::SearchDelta(const float* quer
 
   using ScorePair = std::pair<float, uint32_t>;
   std::priority_queue<ScorePair, std::vector<ScorePair>, std::greater<ScorePair>> heap;
+  const bool use_cosine_prenorm = distance_func_ == CosineDistanceRaw;
+  const float query_norm = use_cosine_prenorm ? ComputeNorm(query, dimension_) : 0.0F;
 
   for (uint32_t i = 0; i < static_cast<uint32_t>(delta_.ids.size()); ++i) {
     const float* vec = &delta_.matrix[static_cast<size_t>(i) * dimension_];
-    float score = distance_func_(query, vec, dimension_);
+    const float score = use_cosine_prenorm
+                            ? CosineSimilarityPreNorm(query, vec, dimension_, query_norm, delta_.norms[i])
+                            : distance_func_(query, vec, dimension_);
 
     if (heap.size() < top_k) {
       heap.push({score, i});
@@ -348,10 +356,7 @@ std::vector<TieredSearchResult> TieredVectorStore::MergeResults(std::vector<Tier
   size_t di = 0;
 
   while (merged.size() < top_k && (mi < main_results.size() || di < delta_results.size())) {
-    float main_score = (mi < main_results.size()) ? main_results[mi].score : -1e30F;
-    float delta_score = (di < delta_results.size()) ? delta_results[di].score : -1e30F;
-
-    if (main_score >= delta_score) {
+    if (di >= delta_results.size() || (mi < main_results.size() && main_results[mi].score >= delta_results[di].score)) {
       merged.push_back(std::move(main_results[mi]));
       ++mi;
     } else {
