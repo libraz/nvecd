@@ -7,6 +7,8 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
+#include <cmath>
 #include <limits>
 
 namespace nvecd::vectors {
@@ -69,6 +71,74 @@ TEST(FilterConditionTest, NanNeverComparesEqualOrOrdered) {
     FilterCondition by_int = by_double;
     by_int.value = int64_t{10};
     EXPECT_FALSE(by_int.Match(stored)) << static_cast<int>(op);
+
+    FilterCondition stored_int = by_double;
+    stored_int.value = std::numeric_limits<double>::quiet_NaN();
+    EXPECT_FALSE(stored_int.Match(MetadataValue(int64_t{10}))) << static_cast<int>(op);
+  }
+}
+
+TEST(FilterConditionTest, MixedInt64AndDoubleComparisonsCoverIntegerBoundaries) {
+  struct ComparisonCase {
+    int64_t integer;
+    double real;
+    int comparison;
+    const char* description;
+  };
+
+  constexpr double kInt64MinAsDouble = -0x1p63;
+  constexpr double kInt64UpperBoundAsDouble = 0x1p63;
+  const std::array cases{
+      ComparisonCase{std::numeric_limits<int64_t>::min(), kInt64MinAsDouble, 0, "exact INT64_MIN"},
+      ComparisonCase{std::numeric_limits<int64_t>::max(), kInt64UpperBoundAsDouble, -1, "2^63 above INT64_MAX"},
+      ComparisonCase{std::numeric_limits<int64_t>::max(), std::nextafter(kInt64UpperBoundAsDouble, 0.0), 1,
+                     "largest representable double below 2^63"},
+      ComparisonCase{std::numeric_limits<int64_t>::min(),
+                     std::nextafter(kInt64MinAsDouble, -std::numeric_limits<double>::infinity()), 1,
+                     "double below INT64_MIN"},
+      ComparisonCase{int64_t{9'007'199'254'740'993LL}, 0x1p53, 1, "2^53 + 1 remains above 2^53"},
+      ComparisonCase{42, 42.5, -1, "positive fractional double"},
+      ComparisonCase{-42, -42.5, 1, "negative fractional double"},
+      ComparisonCase{0, std::numeric_limits<double>::infinity(), -1, "positive infinity"},
+      ComparisonCase{0, -std::numeric_limits<double>::infinity(), 1, "negative infinity"},
+  };
+  constexpr std::array operators{FilterOp::kEq, FilterOp::kNe, FilterOp::kGt,
+                                 FilterOp::kGe, FilterOp::kLt, FilterOp::kLe};
+
+  const auto matches = [](FilterOp op, int comparison) {
+    switch (op) {
+      case FilterOp::kEq:
+        return comparison == 0;
+      case FilterOp::kNe:
+        return comparison != 0;
+      case FilterOp::kGt:
+        return comparison > 0;
+      case FilterOp::kGe:
+        return comparison >= 0;
+      case FilterOp::kLt:
+        return comparison < 0;
+      case FilterOp::kLe:
+        return comparison <= 0;
+      case FilterOp::kIn:
+        return false;
+    }
+    return false;
+  };
+
+  for (const auto& test_case : cases) {
+    for (const FilterOp op : operators) {
+      FilterCondition int_to_double;
+      int_to_double.op = op;
+      int_to_double.value = test_case.real;
+      EXPECT_EQ(int_to_double.Match(MetadataValue(test_case.integer)), matches(op, test_case.comparison))
+          << test_case.description << " int64 -> double, op=" << static_cast<int>(op);
+
+      FilterCondition double_to_int;
+      double_to_int.op = op;
+      double_to_int.value = test_case.integer;
+      EXPECT_EQ(double_to_int.Match(MetadataValue(test_case.real)), matches(op, -test_case.comparison))
+          << test_case.description << " double -> int64, op=" << static_cast<int>(op);
+    }
   }
 }
 

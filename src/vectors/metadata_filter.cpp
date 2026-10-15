@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <type_traits>
 
 namespace nvecd::vectors {
 
@@ -24,6 +25,46 @@ int CompareDoubles(double lhs, double rhs) {
   return 0;
 }
 
+/// Compare an int64 value to a double without first rounding the integer to
+/// double or converting an out-of-range double to int64.
+int CompareInt64ToDouble(int64_t lhs, double rhs) {
+  if (std::isnan(rhs)) {
+    return -2;  // Sentinel for "not comparable"
+  }
+
+  constexpr double kInt64Min = -0x1p63;
+  constexpr double kInt64UpperBound = 0x1p63;
+  if (rhs < kInt64Min) {
+    return 1;
+  }
+  if (rhs >= kInt64UpperBound) {
+    return -1;
+  }
+
+  // The guards above make this exact: -2^63 is included, +2^63 (INT64_MAX + 1) is not.
+  const int64_t rhs_integer = static_cast<int64_t>(rhs);
+  if (lhs < rhs_integer) {
+    return -1;
+  }
+  if (lhs > rhs_integer) {
+    return 1;
+  }
+
+  const double fraction = rhs - std::trunc(rhs);
+  if (fraction > 0.0) {
+    return -1;
+  }
+  if (fraction < 0.0) {
+    return 1;
+  }
+  return 0;
+}
+
+int CompareDoubleToInt64(double lhs, int64_t rhs) {
+  const int comparison = CompareInt64ToDouble(rhs, lhs);
+  return comparison == -2 ? -2 : -comparison;
+}
+
 /// Compare two MetadataValue instances using < ordering.
 /// Returns -1, 0, or 1 (like strcmp).
 /// Only meaningful when both are the same type and numeric/string.
@@ -32,10 +73,10 @@ int CompareValues(const MetadataValue& lhs, const MetadataValue& rhs) {
   if (lhs.index() != rhs.index()) {
     // int64 vs double
     if (std::holds_alternative<int64_t>(lhs) && std::holds_alternative<double>(rhs)) {
-      return CompareDoubles(static_cast<double>(std::get<int64_t>(lhs)), std::get<double>(rhs));
+      return CompareInt64ToDouble(std::get<int64_t>(lhs), std::get<double>(rhs));
     }
     if (std::holds_alternative<double>(lhs) && std::holds_alternative<int64_t>(rhs)) {
-      return CompareDoubles(std::get<double>(lhs), static_cast<double>(std::get<int64_t>(rhs)));
+      return CompareDoubleToInt64(std::get<double>(lhs), std::get<int64_t>(rhs));
     }
     // Other type mismatches: not comparable
     return -2;  // Sentinel for "not comparable"
