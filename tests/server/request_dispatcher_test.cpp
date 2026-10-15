@@ -674,6 +674,66 @@ TEST_F(RequestDispatcherTest, VecsetInvalidatesCachedSimResultsForNewVector) {
   EXPECT_NE(again.find("item2"), std::string::npos);
 }
 
+TEST_F(RequestDispatcherTest, VectorsSimCacheSurvivesUnrelatedEventMutation) {
+  nvecd::cache::CachePolicy item_policy;
+  item_policy.enabled = true;
+  cache_->SetSearchTypePolicy(nvecd::cache::SearchType::kItemSearch, item_policy);
+
+  ASSERT_NE(Dispatch("VECSET query 1 0\r\n").find("OK"), std::string::npos);
+  ASSERT_NE(Dispatch("VECSET neighbor 0.9 0.1\r\n").find("OK"), std::string::npos);
+  ASSERT_NE(Dispatch("SIM query 5 using=vectors\r\n").find("OK RESULTS 1"), std::string::npos);
+
+  ASSERT_NE(Dispatch("EVENT unrelated ADD event_a 10\r\n").find("OK"), std::string::npos);
+  ASSERT_NE(Dispatch("EVENT unrelated ADD event_b 10\r\n").find("OK"), std::string::npos);
+
+  const auto hits_before = cache_->GetStatistics().cache_hits;
+  EXPECT_NE(Dispatch("SIM query 5 using=vectors\r\n").find("OK RESULTS 1"), std::string::npos);
+  EXPECT_EQ(cache_->GetStatistics().cache_hits, hits_before + 1);
+}
+
+TEST_F(RequestDispatcherTest, EventsSimCacheSurvivesUnrelatedVectorMutation) {
+  nvecd::cache::CachePolicy item_policy;
+  item_policy.enabled = true;
+  cache_->SetSearchTypePolicy(nvecd::cache::SearchType::kItemSearch, item_policy);
+  co_index_->SetScore("query", "neighbor", 1.0F);
+
+  ASSERT_NE(Dispatch("SIM query 5 using=events\r\n").find("OK RESULTS 1"), std::string::npos);
+  ASSERT_NE(Dispatch("VECSET unrelated 0 1\r\n").find("OK"), std::string::npos);
+
+  const auto hits_before = cache_->GetStatistics().cache_hits;
+  EXPECT_NE(Dispatch("SIM query 5 using=events\r\n").find("OK RESULTS 1"), std::string::npos);
+  EXPECT_EQ(cache_->GetStatistics().cache_hits, hits_before + 1);
+}
+
+TEST_F(RequestDispatcherTest, FilteredSimCacheInvalidatesAfterMetadataGenerationChanges) {
+  nvecd::cache::CachePolicy filtered_policy;
+  filtered_policy.enabled = true;
+  cache_->SetSearchTypePolicy(nvecd::cache::SearchType::kFilteredSearch, filtered_policy);
+
+  ASSERT_NE(Dispatch("VECSET item 1 0\r\n").find("OK"), std::string::npos);
+  metadata_store_->Set("item", {{"status", std::string("active")}});
+  ASSERT_NE(Dispatch("SIMV 5 filter=status:active 1 0\r\n").find("OK RESULTS 1"), std::string::npos);
+
+  metadata_store_->Set("item", {{"status", std::string("draft")}});
+  ctx_->metadata_generation.fetch_add(1, std::memory_order_acq_rel);
+  const auto hits_before = cache_->GetStatistics().cache_hits;
+  EXPECT_EQ(Dispatch("SIMV 5 filter=status:active 1 0\r\n"), "OK RESULTS 0\r\n");
+  EXPECT_EQ(cache_->GetStatistics().cache_hits, hits_before);
+}
+
+TEST_F(RequestDispatcherTest, DatasetReplacementGenerationInvalidatesWarmCacheKey) {
+  nvecd::cache::CachePolicy item_policy;
+  item_policy.enabled = true;
+  cache_->SetSearchTypePolicy(nvecd::cache::SearchType::kItemSearch, item_policy);
+  co_index_->SetScore("query", "neighbor", 1.0F);
+  ASSERT_NE(Dispatch("SIM query 5 using=events\r\n").find("OK RESULTS 1"), std::string::npos);
+
+  ctx_->dataset_generation.fetch_add(1, std::memory_order_acq_rel);
+  const auto hits_before = cache_->GetStatistics().cache_hits;
+  EXPECT_NE(Dispatch("SIM query 5 using=events\r\n").find("OK RESULTS 1"), std::string::npos);
+  EXPECT_EQ(cache_->GetStatistics().cache_hits, hits_before);
+}
+
 // ============================================================================
 // Score formatting (fixed 4-decimal precision on the TCP surface)
 // ============================================================================

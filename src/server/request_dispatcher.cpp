@@ -390,7 +390,8 @@ bool IsBlockedByReadOnly(const HandlerContext& ctx, CommandType type, std::strin
 
 namespace {
 
-/// Store generations a cached search result depends on.
+/// Store generations a cached search result depends on. Dataset replacement is
+/// always included because a staged LOAD can replace the underlying counters.
 struct SearchGenerations {
   uint64_t cooccurrence = 0;
   uint64_t vector = 0;
@@ -403,14 +404,20 @@ struct SearchGenerations {
   }
 };
 
-/// SIMV results do not depend on co-occurrence, so it stays out of their key.
-SearchGenerations CaptureGenerations(const HandlerContext& ctx, bool by_vector) {
+/// Capture only the stores used by the selected search mode. Metadata affects
+/// results only when the query carries a metadata filter.
+SearchGenerations CaptureGenerations(const HandlerContext& ctx, bool by_vector, const std::string& mode,
+                                     bool has_metadata_filter) {
   SearchGenerations generations;
-  if (!by_vector && ctx.co_index != nullptr) {
+  if (by_vector || mode != "events") {
+    generations.vector = ctx.vector_generation.load(std::memory_order_acquire);
+  }
+  if (!by_vector && mode != "vectors" && ctx.co_index != nullptr) {
     generations.cooccurrence = ctx.co_index->GetGeneration();
   }
-  generations.vector = ctx.vector_generation.load(std::memory_order_acquire);
-  generations.metadata = ctx.metadata_generation.load(std::memory_order_acquire);
+  if (has_metadata_filter) {
+    generations.metadata = ctx.metadata_generation.load(std::memory_order_acquire);
+  }
   generations.dataset = ctx.dataset_generation.load(std::memory_order_acquire);
   return generations;
 }
@@ -438,7 +445,8 @@ utils::Expected<SearchOutcome, utils::Error> ExecuteSearch(HandlerContext& ctx, 
   SearchGenerations captured;
 
   if (cache_enabled) {
-    captured = CaptureGenerations(ctx, by_vector);
+    const bool has_metadata_filter = !cmd.filter_expr.empty();
+    captured = CaptureGenerations(ctx, by_vector, cmd.mode, has_metadata_filter);
     cache_key =
         by_vector ? cache::GenerateSimvCacheKey(
                         {cmd.vector, cmd.top_k, captured.vector, cmd.filter_expr, captured.metadata, captured.dataset})
@@ -468,14 +476,7 @@ utils::Expected<SearchOutcome, utils::Error> ExecuteSearch(HandlerContext& ctx, 
   if (!result) {
     return utils::MakeUnexpected(result.error());
   }
-  if (by_vector || cmd.mode != "events") {
-    // Non-events modes already apply the filter inside the engine; this second
-    // pass enforces it consistently for results that bypassed engine filtering.
-    *result = ApplyMetadataFilter(*result, ctx.metadata_store, cmd.filter);
-  }
-
-  // The stored cost covers the engine call and post-filter only, measured
-  // before the gate below so lock waits never count as query cost.
+  // Measured before the gate below, so lock waits never count as query cost.
   const double elapsed_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 
   if (cache_enabled) {
@@ -484,7 +485,7 @@ utils::Expected<SearchOutcome, utils::Error> ExecuteSearch(HandlerContext& ctx, 
       generation_guard = std::unique_lock(*ctx.write_serialization_gate);
     }
     if (cache_ptr == ctx.cache.load(std::memory_order_acquire) && cache_ptr->IsEnabled() &&
-        captured == CaptureGenerations(ctx, by_vector)) {
+        captured == CaptureGenerations(ctx, by_vector, cmd.mode, !cmd.filter_expr.empty())) {
       std::vector<std::string> item_ids;
       item_ids.reserve(result->size() + 1);
       if (!by_vector) {
