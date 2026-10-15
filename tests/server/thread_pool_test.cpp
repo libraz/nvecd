@@ -59,6 +59,35 @@ TEST_F(ThreadPoolTest, SubmitAndExecute) {
   EXPECT_EQ(counter, 1);
 }
 
+TEST_F(ThreadPoolTest, RejectsEmptyTasksWithoutChangingActiveWorkerAccounting) {
+  ThreadPool pool(1);
+  EXPECT_FALSE(pool.Submit({}));
+  EXPECT_EQ(pool.GetQueueSize(), 0U);
+  EXPECT_EQ(pool.GetActiveWorkerCount(), 0U);
+
+  std::atomic<bool> started{false};
+  std::atomic<bool> release{false};
+  ASSERT_TRUE(pool.Submit([&started, &release]() {
+    started.store(true, std::memory_order_release);
+    while (!release.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+  }));
+  while (!started.load(std::memory_order_acquire)) {
+    std::this_thread::yield();
+  }
+  EXPECT_EQ(pool.GetActiveWorkerCount(), 1U);
+
+  release.store(true, std::memory_order_release);
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (pool.GetActiveWorkerCount() != 0U && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+  EXPECT_EQ(pool.GetActiveWorkerCount(), 0U);
+  pool.Shutdown(500);
+  EXPECT_EQ(pool.GetActiveWorkerCount(), 0U);
+}
+
 TEST_F(ThreadPoolTest, MultipleTasks) {
   ThreadPool pool(4);
   std::atomic<int> counter{0};

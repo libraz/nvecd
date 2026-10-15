@@ -65,6 +65,11 @@ class ThreadPool {
   size_t GetQueueSize() const;
 
   /**
+   * @brief Get number of tasks currently executing
+   */
+  size_t GetActiveWorkerCount() const { return state_->active_workers.load(std::memory_order_acquire); }
+
+  /**
    * @brief Check if pool is shutting down
    */
   bool IsShutdown() const;

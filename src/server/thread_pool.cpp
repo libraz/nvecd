@@ -38,6 +38,10 @@ ThreadPool::~ThreadPool() {
 }
 
 bool ThreadPool::Submit(Task task) {
+  if (!task) {
+    return false;
+  }
+
   {
     std::unique_lock<std::mutex> lock(state_->queue_mutex);
 

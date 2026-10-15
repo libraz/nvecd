@@ -8,10 +8,7 @@
 
 #include "server/nvecd_server.h"
 
-#include <arpa/inet.h>
 #include <spdlog/spdlog.h>
-#include <sys/socket.h>
-#include <sys/un.h>
 
 #include <algorithm>
 #include <chrono>
@@ -23,10 +20,8 @@
 #include <vector>
 
 #include "cache/similarity_cache.h"
-#include "server/connection_io_handler.h"
 #include "server/handlers/dump_handler.h"
 #include "server/http_server.h"
-#include "server/reactor_connection.h"
 #include "server/request_dispatcher.h"
 #include "storage/snapshot_format.h"
 #include "storage/snapshot_format_v1.h"
@@ -329,7 +324,8 @@ void NvecdServer::Stop() {
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::milliseconds(config_.perf.shutdown_timeout_ms);
     const auto drained = [this] {
-      return in_flight_requests_.load() == 0 && (!thread_pool_ || thread_pool_->GetQueueSize() == 0) &&
+      return in_flight_requests_.load() == 0 &&
+             (!thread_pool_ || (thread_pool_->GetQueueSize() == 0 && thread_pool_->GetActiveWorkerCount() == 0)) &&
              reactor_->MemoryBudget()->UsedBytes() == 0;
     };
     while (!drained()) {
@@ -724,61 +720,21 @@ utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
   return {};
 }
 
-void NvecdServer::HandleConnection(int client_fd) {
-  stats_.total_connections++;
-  stats_.active_connections++;
-
-  spdlog::debug("New connection: fd={}", client_fd);
-
-  // This runs synchronously on the thread-pool worker that ConnectionAcceptor
-  // already submitted us on. Do NOT submit a second task here: a nested Submit
-  // would return immediately, causing the acceptor's outer task to call
-  // RemoveConnection() before any I/O ran (undercounting active_fds_ and
-  // defeating the connection limits) and would leave the fd unclosed forever
-  // (fd leak -> EMFILE -> full-service DoS). Blocking here keeps connection
-  // accounting and fd close ownership on the acceptor's task.
-  ConnectionContext conn_ctx;
-  conn_ctx.client_fd = client_fd;
-
-  // Extract a stable peer identity for rate limiting.  A UNIX-domain peer is
-  // not an IPv4 address; interpreting it as one produces a bogus shared key.
-  sockaddr_storage peer_addr{};
-  socklen_t peer_len = sizeof(peer_addr);
-  if (getpeername(client_fd, reinterpret_cast<sockaddr*>(&peer_addr), &peer_len) == 0 &&
-      peer_addr.ss_family == AF_INET) {
-    const auto* ipv4_peer = reinterpret_cast<const sockaddr_in*>(&peer_addr);
-    char ip_buf[INET_ADDRSTRLEN];
-    if (inet_ntop(AF_INET, &ipv4_peer->sin_addr, ip_buf, sizeof(ip_buf)) != nullptr) {
-      conn_ctx.client_ip = ip_buf;
-    }
-  } else if (peer_addr.ss_family == AF_UNIX) {
-    // Local socket access is authorized by the socket filesystem permissions.
-    // Keep it distinct so ProcessRequest can deliberately exempt it from the
-    // per-IP limiter instead of accidentally treating it as an arbitrary IP.
-    conn_ctx.client_ip = "unix";
-  }
-
-  // Create I/O configuration
-  IOConfig io_config;
-  io_config.recv_buffer_size = static_cast<size_t>(config_.perf.recv_buffer_size);
-  io_config.max_query_length = static_cast<size_t>(config_.perf.max_query_length);
-  io_config.max_accumulated_bytes = static_cast<size_t>(config_.perf.max_query_length) * 2;
-  io_config.recv_timeout_sec = config_.perf.connection_timeout_sec;
-
-  // Create request processor
-  RequestProcessor processor = [this](const std::string& request, ConnectionContext& ctx) {
-    return this->ProcessRequest(request, ctx);
-  };
-
-  // Create I/O handler and handle connection
-  ConnectionIOHandler io_handler(io_config, processor, shutdown_);
-  io_handler.HandleConnection(client_fd, conn_ctx);
-
-  stats_.active_connections--;
-  spdlog::debug("Connection closed: fd={}", client_fd);
-}
-
 std::string NvecdServer::ProcessRequest(const std::string& request, ConnectionContext& conn_ctx) {
+  class InFlightRequestGuard {
+   public:
+    explicit InFlightRequestGuard(std::atomic<size_t>& count) : count_(count) {
+      count_.fetch_add(1, std::memory_order_relaxed);
+    }
+    ~InFlightRequestGuard() { count_.fetch_sub(1, std::memory_order_relaxed); }
+
+    InFlightRequestGuard(const InFlightRequestGuard&) = delete;
+    InFlightRequestGuard& operator=(const InFlightRequestGuard&) = delete;
+
+   private:
+    std::atomic<size_t>& count_;
+  } in_flight(in_flight_requests_);
+
   if (!dispatcher_) {
     return "ERROR Server not initialized\r\n";
   }
@@ -790,10 +746,7 @@ std::string NvecdServer::ProcessRequest(const std::string& request, ConnectionCo
     }
   }
 
-  in_flight_requests_.fetch_add(1);
-  std::string response = dispatcher_->Dispatch(request, conn_ctx);
-  in_flight_requests_.fetch_sub(1);
-  return response;
+  return dispatcher_->Dispatch(request, conn_ctx);
 }
 
 }  // namespace nvecd::server

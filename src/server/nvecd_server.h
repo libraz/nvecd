@@ -148,12 +148,6 @@ class NvecdServer {
   void AbortStart();
 
   /**
-   * @brief Handle client connection
-   * @param client_fd Client socket file descriptor
-   */
-  void HandleConnection(int client_fd);
-
-  /**
    * @brief Process single request
    * @param request Request string
    * @param conn_ctx Connection context
