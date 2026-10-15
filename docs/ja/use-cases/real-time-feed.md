@@ -92,7 +92,7 @@ nvecd-cli -p 11017 SIM clip_sunset 5 using=events
 ```
 
 ```text
-(1 results, showing 1)
+(1 results)
 1) clip_reef (score: 8550)
 ```
 
@@ -107,7 +107,7 @@ nvecd-cli -p 11017 SIM clip_sunset 5 using=events
 ```
 
 ```text
-(2 results, showing 2)
+(2 results)
 1) clip_reef (score: 8550)
 2) clip_forest (score: 4275)
 ```
@@ -122,7 +122,7 @@ nvecd-cli -p 11017 SIM clip_sunset 5 using=events
 ```
 
 ```text
-(2 results, showing 2)
+(2 results)
 1) clip_reef (score: 8505)
 2) clip_forest (score: 4275)
 ```

@@ -221,7 +221,7 @@ Three error sources are distinguishable by code:
 | `kClientServerError` (7010) | the server answered `ERROR`; the message is the server's text |
 | `kClientProtocolError` (7011) | the response did not have the expected shape |
 
-A server-side error keeps the connection usable; a transport error does not, and the client disconnects itself.
+A server-side error keeps the connection usable; a transport error does not, and the client disconnects itself. A protocol error found while a reply is still arriving — the server closing before the reply is complete, or a reply over the 64 MiB limit — also disconnects, because the stream position of the next reply is lost.
 
 ### A complete example
 

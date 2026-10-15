@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <utility>
@@ -32,7 +33,8 @@ namespace nvecd::testing {
  */
 class CannedResponseServer {
  public:
-  explicit CannedResponseServer(std::vector<std::string> replies) : replies_(std::move(replies)) {
+  explicit CannedResponseServer(std::vector<std::string> replies, bool close_after_script = false)
+      : replies_(std::move(replies)), close_after_script_(close_after_script) {
     listener_ = ::socket(AF_INET, SOCK_STREAM, 0);
     if (listener_ < 0) {
       return;
@@ -70,6 +72,11 @@ class CannedResponseServer {
 
   [[nodiscard]] uint16_t Port() const { return port_; }
 
+  [[nodiscard]] std::vector<std::string> Commands() const {
+    std::lock_guard lock(commands_mutex_);
+    return commands_;
+  }
+
  private:
   void Serve() {
     if (replies_.empty()) {
@@ -90,10 +97,18 @@ class CannedResponseServer {
       pending.append(buffer, static_cast<size_t>(received));
       size_t line_end = pending.find('\n');
       while (line_end != std::string::npos) {
+        {
+          std::lock_guard lock(commands_mutex_);
+          commands_.emplace_back(pending.data(), line_end + 1);
+        }
         pending.erase(0, line_end + 1);
         const std::string& reply = replies_[reply_index < replies_.size() ? reply_index : replies_.size() - 1];
         ++reply_index;
         if (::send(connection, reply.data(), reply.size(), 0) < 0) {
+          ::close(connection);
+          return;
+        }
+        if (close_after_script_ && reply_index >= replies_.size()) {
           ::close(connection);
           return;
         }
@@ -104,8 +119,11 @@ class CannedResponseServer {
   }
 
   std::vector<std::string> replies_;
+  mutable std::mutex commands_mutex_;
+  std::vector<std::string> commands_;
   int listener_ = -1;
   uint16_t port_ = 0;
+  bool close_after_script_ = false;
   std::thread worker_;
 };
 

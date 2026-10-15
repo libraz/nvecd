@@ -85,7 +85,7 @@ nvecd-cli -p 11017 SIM widget 10 using=events
 ```
 
 ```text
-(2 results, showing 2)
+(2 results)
 1) flange (score: 9500)
 2) gasket (score: 8000)
 ```
@@ -111,7 +111,7 @@ nvecd-cli -p 11017 SIM widget 10
 ```
 
 ```text
-(2 results, showing 2)
+(2 results)
 1) flange (score: 1)
 2) gasket (score: 0)
 ```

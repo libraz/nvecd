@@ -505,6 +505,7 @@ class NvecdClient {
     char buffer[kReceiveBufferSize];
 
     const auto frame = nvecd::client::transport::FrameForCommand(command, debug_mode_);
+    nvecd::client::transport::ResponseScanner scanner(frame);
     // Snapshot save/load/verify can legitimately outlast the interactive deadline.
     if (frame.long_running) {
       SetReceiveTimeout(sock_.Get(), kAdminTimeoutSeconds);
@@ -515,7 +516,7 @@ class NvecdClient {
       }
     });
     while (true) {
-      if (const auto response_length = nvecd::client::transport::CompleteResponseLength(response_buffer_, frame)) {
+      if (const auto response_length = nvecd::client::transport::ScanResponseLength(response_buffer_, scanner)) {
         response.assign(response_buffer_.data(), *response_length);
         response_buffer_.erase(0, *response_length);
         break;
@@ -524,8 +525,12 @@ class NvecdClient {
       const ssize_t received =
           nvecd::client::transport::ReceiveRetryingEintr(sock_.Get(), buffer, sizeof(buffer), &io_error);
       if (received <= 0) {
+        const bool has_incomplete_response = !response_buffer_.empty();
         Disconnect();
         if (received == 0) {
+          if (has_incomplete_response) {
+            return "(error) Protocol response ended before its frame was complete";
+          }
           return "(error) SERVER_DISCONNECTED: Server closed the connection. This usually means:\n"
                  "  1. Server was shut down gracefully\n"
                  "  2. Server crashed or encountered a fatal error\n"
@@ -555,16 +560,7 @@ class NvecdClient {
       response.pop_back();
     }
 
-    // A refused DEBUG command must not latch the mode: framing a later SIM
-    // response as a debug block the server never sends stalls the read loop.
-    if (!nvecd::client::transport::IsErrorResponse(response)) {
-      const std::string upper = nvecd::client::transport::UpperCommand(command);
-      if (upper == "DEBUG ON") {
-        debug_mode_ = true;
-      } else if (upper == "DEBUG OFF") {
-        debug_mode_ = false;
-      }
-    }
+    nvecd::client::transport::UpdateDebugMode(response, debug_mode_);
 
     return response;
   }
@@ -654,15 +650,14 @@ class NvecdClient {
       // Send command and print response
       std::string response = SendCommand(line);
 
-      // Check if server disconnected
-      if (response.find("SERVER_DISCONNECTED") != std::string::npos ||
-          response.find("SERVER_TIMEOUT") != std::string::npos) {
-        PrintResponse(response);
+      // Every failure that drops the socket ends the session; no later command could succeed.
+      if (!IsConnected()) {
+        PrintResponse(response, false);
         std::cout << "\nConnection to server lost. Exiting...\n";
         break;
       }
 
-      PrintResponse(response);
+      PrintResponse(response, nvecd::client::transport::FrameForCommand(line, false).similarity_search);
     }
   }
 
@@ -678,14 +673,15 @@ class NvecdClient {
    */
   [[nodiscard]] int RunSingleCommand(const std::string& command) const {
     std::string response = SendCommand(command);
-    PrintResponse(response);
-    return nvecd::client::transport::IsErrorResponse(response) ? 1 : 0;
+    const bool valid_response =
+        PrintResponse(response, nvecd::client::transport::FrameForCommand(command, false).similarity_search);
+    return !valid_response || nvecd::client::transport::IsErrorResponse(response) ? 1 : 0;
   }
 
   [[nodiscard]] bool Authenticate(const std::string& password) const {
     const std::string response = SendCommand("AUTH " + password);
     if (nvecd::client::transport::IsErrorResponse(response)) {
-      PrintResponse(response);
+      PrintResponse(response, false);
       return false;
     }
     return true;
@@ -731,48 +727,34 @@ class NvecdClient {
     std::cout << "  help      - Show this help" << '\n';
   }
 
-  static void PrintResponse(const std::string& response) {
+  static bool PrintResponse(const std::string& response, bool search_response) {
     // Parse response type
-    if (response.find("OK RESULTS") == 0) {
+    if (search_response && !nvecd::client::transport::IsErrorResponse(response)) {
       // SIM/SIMV response: OK RESULTS <count>, then <count> "<id> <score>" lines.
-      // Whatever follows them (the DEBUG block) is echoed verbatim.
-      std::istringstream iss(response);
-      std::string header;
-      std::getline(iss, header);
-      std::istringstream header_stream(header);
-      std::string status;
-      std::string results_str;
-      size_t count = 0;
-      header_stream >> status >> results_str >> count;
+      // A well-formed DEBUG block after them is printed line by line.
+      const auto parsed = nvecd::client::transport::ParseSearchResponse(response);
+      if (!parsed) {
+        std::cout << "(error) Invalid SIM/SIMV response" << '\n' << std::flush;
+        return false;
+      }
 
-      std::vector<std::pair<std::string, float>> items;
-      std::string line;
-      while (items.size() < count && std::getline(iss, line)) {
-        std::istringstream item_stream(line);
-        std::string id;
-        float score = 0.0f;
-        if (item_stream >> id >> score) {
-          items.emplace_back(id, score);
+      std::cout << "(" << parsed->results.size() << " results)" << '\n';
+
+      for (size_t i = 0; i < parsed->results.size(); ++i) {
+        std::cout << (i + 1) << ") " << parsed->results[i].id << " (score: " << parsed->results[i].score << ")\n";
+      }
+
+      std::istringstream debug_stream(std::string(parsed->debug_block));
+      std::string debug_line;
+      while (std::getline(debug_stream, debug_line)) {
+        if (!debug_line.empty() && debug_line.back() == '\r') {
+          debug_line.pop_back();
         }
+        std::cout << debug_line << '\n';
       }
-
-      std::cout << "(" << count << " results";
-      if (!items.empty()) {
-        std::cout << ", showing " << items.size() << ")";
-      } else {
-        std::cout << ")";
-      }
-      std::cout << '\n';
-
-      for (size_t i = 0; i < items.size(); ++i) {
-        std::cout << (i + 1) << ") " << items[i].first << " (score: " << items[i].second << ")\n";
-      }
-      while (std::getline(iss, line)) {
-        std::cout << line << '\n';
-      }
-    } else if (response.find("OK DEBUG_ON") == 0) {
+    } else if (response == "OK DEBUG_ON") {
       std::cout << "Debug mode enabled" << '\n';
-    } else if (response.find("OK DEBUG_OFF") == 0) {
+    } else if (response == "OK DEBUG_OFF") {
       std::cout << "Debug mode disabled" << '\n';
     } else if (response.find("OK") == 0) {
       // Generic OK response - print everything after "OK "
@@ -792,6 +774,7 @@ class NvecdClient {
     // CRITICAL: Explicit flush required for popen() to capture output
     // Short responses like "OK\n" may not trigger automatic flush before process exit
     std::cout << std::flush;
+    return true;
   }
 
   Config config_;

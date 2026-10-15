@@ -14,9 +14,11 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <future>
+#include <locale>
 #include <memory>
 #include <string>
 #include <thread>
@@ -36,6 +38,26 @@ namespace {
 
 // Test server port (random high port to avoid conflicts)
 constexpr uint16_t kTestPort = 0;  // Let OS assign random port
+
+class CommaDecimalPunct final : public std::numpunct<char> {
+ protected:
+  char do_decimal_point() const override { return ','; }
+};
+
+class GlobalLocaleGuard {
+ public:
+  explicit GlobalLocaleGuard(const std::locale& replacement) : previous_(std::locale()) {
+    std::locale::global(replacement);
+  }
+
+  ~GlobalLocaleGuard() { std::locale::global(previous_); }
+
+  GlobalLocaleGuard(const GlobalLocaleGuard&) = delete;
+  GlobalLocaleGuard& operator=(const GlobalLocaleGuard&) = delete;
+
+ private:
+  std::locale previous_;
+};
 
 /**
  * @brief Test fixture with embedded server
@@ -149,6 +171,40 @@ TEST(NvecdClientFramingTest, CompleteResponseLengthPreservesCoalescedNextRespons
   const auto length = detail::CompleteResponseLength(first + second);
   ASSERT_TRUE(length.has_value());
   EXPECT_EQ(*length, first.size());
+}
+
+TEST(NvecdClientFramingTest, IncrementalScannerFindsTheSameFrameAtEverySplit) {
+  const std::vector<std::pair<std::string, transport::ResponseFrame>> cases = {
+      {"OK RESULTS 2\r\nitem1 0.9\r\nitem2 0.8\r\n", {}},
+      {"OK RESULTS 1\r\nitem1 0.9\r\n# DEBUG 2\r\nmode: vectors\r\nquery_time_us: 4\r\n",
+       transport::FrameForCommand("SIM item1 1", true)},
+      {"OK INFO\r\nversion: 1\r\nEND\r\n", transport::FrameForCommand("INFO", false)},
+      {"*2\r\n$3\r\none\r\n$3\r\ntwo\r\n", {}},
+  };
+
+  for (const auto& [response, frame] : cases) {
+    for (size_t split = 1; split < response.size(); ++split) {
+      transport::ResponseScanner scanner(frame);
+      std::string accumulated = response.substr(0, split);
+      EXPECT_FALSE(transport::ScanResponseLength(accumulated, scanner).has_value())
+          << "reported complete at split " << split;
+      accumulated.append(response.substr(split));
+      EXPECT_EQ(transport::ScanResponseLength(accumulated, scanner), response.size()) << "failed at split " << split;
+    }
+
+    transport::ResponseScanner scanner(frame);
+    std::string accumulated;
+    for (size_t index = 0; index < response.size(); ++index) {
+      accumulated.push_back(response[index]);
+      const auto length = transport::ScanResponseLength(accumulated, scanner);
+      if (index + 1 < response.size()) {
+        EXPECT_FALSE(length.has_value()) << "reported complete after byte " << index;
+      } else {
+        EXPECT_EQ(length, response.size());
+      }
+    }
+    EXPECT_EQ(std::max(scanner.scan_offset, scanner.value_scan_offset), response.size());
+  }
 }
 
 TEST(NvecdClientFramingTest, BulkAndArrayFramesWaitForTheDeclaredPayload) {
@@ -630,6 +686,145 @@ TEST(NvecdClientDebugModeTest, ARefusedDebugCommandDoesNotLatchDebugFraming) {
   client.Disconnect();
 }
 
+TEST(NvecdClientDebugModeTest, DebugStateFollowsExactRepliesAcrossWhitespaceVariants) {
+  nvecd::testing::CannedResponseServer server({
+      "OK DEBUG_ON\r\n",
+      "OK RESULTS 1\r\nitem 0.9000\r\n# DEBUG 1\r\nmode: vectors\r\n",
+      "OK DEBUG_OFF\r\n",
+      "OK RESULTS 1\r\nitem 0.9000\r\n",
+  });
+  ASSERT_GT(server.Port(), 0);
+
+  ClientConfig config;
+  config.host = "127.0.0.1";
+  config.port = server.Port();
+  config.timeout_ms = 500;
+  NvecdClient client(config);
+  ASSERT_TRUE(client.Connect());
+
+  auto enabled = client.SendCommand("dEbUg\tON");
+  ASSERT_TRUE(enabled) << enabled.error().message();
+  EXPECT_EQ(*enabled, "OK DEBUG_ON");
+  auto debug_search = client.Simv({1.0F}, 1, "vectors");
+  ASSERT_TRUE(debug_search) << debug_search.error().message();
+  ASSERT_EQ(debug_search->results.size(), 1U);
+
+  auto disabled = client.SendCommand("DEBUG  OFF");
+  ASSERT_TRUE(disabled) << disabled.error().message();
+  EXPECT_EQ(*disabled, "OK DEBUG_OFF");
+  auto plain_search = client.Simv({1.0F}, 1, "vectors");
+  ASSERT_TRUE(plain_search) << plain_search.error().message();
+  ASSERT_EQ(plain_search->results.size(), 1U);
+
+  client.Disconnect();
+}
+
+TEST(NvecdClientDebugModeTest, SuccessfulLookingButNonExactDebugReplyDoesNotLatch) {
+  nvecd::testing::CannedResponseServer server({"OK DEBUG_ON extra\r\n", "OK RESULTS 1\r\nitem 0.9000\r\n"});
+  ASSERT_GT(server.Port(), 0);
+
+  ClientConfig config;
+  config.host = "127.0.0.1";
+  config.port = server.Port();
+  config.timeout_ms = 500;
+  NvecdClient client(config);
+  ASSERT_TRUE(client.Connect());
+
+  EXPECT_EQ(client.SendCommand("DEBUG ON").value(), "OK DEBUG_ON extra");
+  auto search = client.Simv({1.0F}, 1, "vectors");
+  ASSERT_TRUE(search) << search.error().message();
+  ASSERT_EQ(search->results.size(), 1U);
+
+  client.Disconnect();
+}
+
+TEST(NvecdClientDebugModeTest, DebugTogglesFailUnlessTheReplyConfirmsTheNewState) {
+  nvecd::testing::CannedResponseServer server(
+      {"OK DEBUG_ON extra\r\n", "OK\r\n", "OK DEBUG_ON\r\n", "OK DEBUG_OFF\r\n"});
+  ASSERT_GT(server.Port(), 0);
+
+  ClientConfig config;
+  config.host = "127.0.0.1";
+  config.port = server.Port();
+  config.timeout_ms = 500;
+  NvecdClient client(config);
+  ASSERT_TRUE(client.Connect());
+
+  auto unconfirmed_on = client.EnableDebug();
+  ASSERT_FALSE(unconfirmed_on);
+  EXPECT_EQ(unconfirmed_on.error().code(), ErrorCode::kClientProtocolError);
+  auto unconfirmed_off = client.DisableDebug();
+  ASSERT_FALSE(unconfirmed_off);
+  EXPECT_EQ(unconfirmed_off.error().code(), ErrorCode::kClientProtocolError);
+  EXPECT_TRUE(client.EnableDebug());
+  EXPECT_TRUE(client.DisableDebug());
+
+  client.Disconnect();
+}
+
+TEST(NvecdClientSimProtocolTest, RejectsMalformedCountsRowsAndNonFiniteScores) {
+  const std::vector<std::pair<std::string, bool>> replies = {
+      {"OK RESULTS nope\r\n", false},          {"OK RESULTS 1 extra\r\nitem 0.9\r\n", false},
+      {"OK RESULTS 2\r\nitem 0.9\r\n", true},  {"OK RESULTS 1\r\nitem 0.9 extra\r\n", false},
+      {"OK RESULTS 1\r\nitem nan\r\n", false}, {"OK RESULTS 1\r\nitem inf\r\n", false},
+  };
+
+  for (const auto& [reply, close_after_script] : replies) {
+    nvecd::testing::CannedResponseServer server({reply}, close_after_script);
+    ASSERT_GT(server.Port(), 0);
+
+    ClientConfig config;
+    config.host = "127.0.0.1";
+    config.port = server.Port();
+    config.timeout_ms = 1000;
+    NvecdClient client(config);
+    ASSERT_TRUE(client.Connect());
+
+    auto result = client.Simv({1.0F}, 1, "vectors");
+    ASSERT_FALSE(result) << reply;
+    EXPECT_EQ(result.error().code(), ErrorCode::kClientProtocolError) << reply;
+    client.Disconnect();
+  }
+}
+
+TEST(NvecdClientSimProtocolTest, SharedParserRejectsExtraResultRowsAndMalformedDebugBlocks) {
+  for (const std::string_view response : {
+           "OK RESULTS 0\r\nextra 0.9",
+           "OK RESULTS 1\r\nitem 0.9\r\nextra 0.8",
+           "OK RESULTS 1\r\nitem 0.9\r\n# DEBUG 1\r\nfield: 1\r\nextra: 2",
+           "OK RESULTS 1\r\nitem 0.9\r\n# DEBUG bad\r\n",
+       }) {
+    EXPECT_FALSE(transport::ParseSearchResponse(response)) << response;
+  }
+}
+
+TEST(NvecdClientConfigTest, NumericWireAndResponseParsingIgnoreGlobalDecimalLocale) {
+  const std::locale comma_locale(std::locale::classic(), new CommaDecimalPunct());
+  GlobalLocaleGuard restore_locale(comma_locale);
+  nvecd::testing::CannedResponseServer server({"OK VECSET\r\n", "OK RESULTS 1\r\nitem 0.75\r\n"});
+  ASSERT_GT(server.Port(), 0);
+
+  ClientConfig config;
+  config.host = "127.0.0.1";
+  config.port = server.Port();
+  NvecdClient client(config);
+  ASSERT_TRUE(client.Connect());
+
+  ASSERT_TRUE(client.Vecset("item", {0.25F}));
+  SearchOptions options;
+  options.min_score = 0.375F;
+  const auto result = client.Simv({0.5F}, 1, "vectors", options);
+  ASSERT_TRUE(result) << result.error().message();
+  ASSERT_EQ(result->results.size(), 1U);
+  EXPECT_FLOAT_EQ(result->results[0].score, 0.75F);
+
+  const auto commands = server.Commands();
+  ASSERT_EQ(commands.size(), 2U);
+  EXPECT_EQ(commands[0], "VECSET item 0.25\r\n");
+  EXPECT_EQ(commands[1], "SIMV 1 min_score=0.375 0.5\r\n");
+  client.Disconnect();
+}
+
 TEST(NvecdClientSaveTest, KeepsStartedSaveDistinctFromCompletedSave) {
   // A started save names a file that does not exist yet; a completed save
   // names one that is ready to load. Backup automation cannot tell the
@@ -1061,6 +1256,24 @@ TEST_F(NvecdClientTest, CacheCommands) {
   EXPECT_TRUE(client.CacheClear()) << "CacheClear failed";
   EXPECT_TRUE(client.CacheEnable()) << "CacheEnable failed";
   EXPECT_TRUE(client.CacheDisable()) << "CacheDisable failed";
+}
+
+TEST(NvecdClientSimpleResponseTest, SuccessStatusRequiresATokenBoundary) {
+  for (const std::string& reply : {"OKAY\r\n", "OKsuffix\r\n", "+OKAY\r\n"}) {
+    nvecd::testing::CannedResponseServer server({reply});
+    ASSERT_GT(server.Port(), 0);
+
+    ClientConfig config;
+    config.host = "127.0.0.1";
+    config.port = server.Port();
+    NvecdClient client(config);
+    ASSERT_TRUE(client.Connect());
+
+    const auto result = client.Vecdel("item");
+    ASSERT_FALSE(result) << reply;
+    EXPECT_EQ(result.error().code(), ErrorCode::kClientProtocolError) << reply;
+    client.Disconnect();
+  }
 }
 
 //

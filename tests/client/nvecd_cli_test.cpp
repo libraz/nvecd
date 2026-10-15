@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -169,6 +170,46 @@ TEST(NvecdCliTest, DebugBlockAfterSearchResultsIsPrintedVerbatim) {
   EXPECT_NE(run.output.find("# DEBUG 2"), std::string::npos) << run.output;
   EXPECT_NE(run.output.find("vector_score: 0.5"), std::string::npos) << run.output;
   EXPECT_NE(run.output.find("event_score: 0.25"), std::string::npos) << run.output;
+}
+
+TEST(NvecdCliTest, DebugStateTracksRepliesAcrossWhitespaceVariantsAndCommands) {
+  nvecd::testing::CannedResponseServer server({
+      "OK DEBUG_ON\r\n",
+      "OK RESULTS 1\r\nitem 0.9000\r\n# DEBUG 1\r\nmode: vectors\r\n",
+      "OK DEBUG_OFF\r\n",
+      "OK RESULTS 1\r\nitem 0.9000\r\n",
+  });
+  ASSERT_GT(server.Port(), 0);
+
+  const CliRun run = RunCliArgs({"-h", "127.0.0.1", "-p", std::to_string(server.Port())},
+                                "DEBUG\tON\nSIM item 1 using=vectors\nDEBUG  OFF\nSIM item 1 using=vectors\n");
+
+  EXPECT_EQ(run.output.find("SERVER_TIMEOUT"), std::string::npos) << run.output;
+  EXPECT_NE(run.output.find("mode: vectors"), std::string::npos) << run.output;
+  constexpr std::string_view kResultLine = "item (score: 0.9)";
+  const size_t first_result = run.output.find(kResultLine);
+  ASSERT_NE(first_result, std::string::npos) << run.output;
+  EXPECT_NE(run.output.find(kResultLine, first_result + kResultLine.size()), std::string::npos) << run.output;
+}
+
+TEST(NvecdCliTest, MalformedSearchResultHasNonzeroExitStatus) {
+  nvecd::testing::CannedResponseServer server({"OK RESULTS 1\r\nitem not-a-score\r\n"});
+  ASSERT_GT(server.Port(), 0);
+
+  const CliRun run = RunCliArgs({"-h", "127.0.0.1", "-p", std::to_string(server.Port()), "SIMV", "1", "0.5"});
+  EXPECT_EQ(run.exit_code, 1) << run.output;
+  EXPECT_NE(run.output.find("Invalid SIM/SIMV response"), std::string::npos) << run.output;
+}
+
+TEST(NvecdCliTest, InteractiveSessionExitsWhenTheServerClosesMidResponse) {
+  nvecd::testing::CannedResponseServer server({"OK RESULTS 2\r\nitem 0.9000\r\n"}, /*close_after_script=*/true);
+  ASSERT_GT(server.Port(), 0);
+
+  const CliRun run =
+      RunCliArgs({"-h", "127.0.0.1", "-p", std::to_string(server.Port())}, "SIM item 2 using=vectors\nINFO\n");
+
+  EXPECT_NE(run.output.find("Connection to server lost"), std::string::npos) << run.output;
+  EXPECT_EQ(run.output.find("Not connected"), std::string::npos) << run.output;
 }
 
 TEST(NvecdCliTest, DumpInfoPrintsTheWholeBlockAndTheNextReplyStaysAligned) {

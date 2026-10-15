@@ -46,7 +46,7 @@ sed 's|/var/lib/nvecd/snapshots|/tmp/nvecd-data|' examples/config.yaml > /tmp/nv
 ```
 
 ```text
-(2 results, showing 2)
+(2 results)
 1) flange (score: 9500)
 2) gasket (score: 8000)
 ```
@@ -93,7 +93,7 @@ gasket 8000.0000\r\n
 ```
 
 ```text
-(3 results, showing 3)
+(3 results)
 1) bolt (score: 0.9994)
 2) gasket (score: 0.9954)
 3) flange (score: 0.2677)
@@ -108,7 +108,7 @@ gasket 8000.0000\r\n
 ```
 
 ```text
-(3 results, showing 3)
+(3 results)
 1) bolt (score: 0.6)
 2) gasket (score: 0.5967)
 3) flange (score: 0.4)
@@ -125,7 +125,7 @@ gasket 8000.0000\r\n
 ```
 
 ```text
-(3 results, showing 3)
+(3 results)
 1) widget (score: 1)
 2) gasket (score: 0.9942)
 3) flange (score: 0)
@@ -140,7 +140,7 @@ gasket 8000.0000\r\n
 ```
 
 ```text
-(3 results, showing 3)
+(3 results)
 1) bolt (score: 0.872)
 2) gasket (score: 0.8672)
 3) flange (score: 0.128)
@@ -157,7 +157,7 @@ gasket 8000.0000\r\n
 ```
 
 ```text
-(3 results, showing 3)
+(3 results)
 1) flange (score: 0.8685)
 2) gasket (score: 0.6569)
 3) bolt (score: 0.6367)
@@ -183,7 +183,7 @@ gasket 8000.0000\r\n
 ```
 
 ```text
-(2 results, showing 2)
+(2 results)
 1) bolt (score: 0.9994)
 2) flange (score: 0.2677)
 ```
@@ -195,7 +195,7 @@ gasket 8000.0000\r\n
 ```
 
 ```text
-(2 results, showing 2)
+(2 results)
 1) bolt (score: 0.9994)
 2) gasket (score: 0.9954)
 ```

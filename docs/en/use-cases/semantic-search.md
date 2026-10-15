@@ -61,7 +61,7 @@ nvecd-cli -p 11017 SIMV 3 0.90 0.25 0.12 0.05
 ```
 
 ```text
-(3 results, showing 3)
+(3 results)
 1) doc_sorting (score: 0.9992)
 2) doc_indexing (score: 0.9964)
 3) doc_billing (score: 0.2613)
@@ -87,7 +87,7 @@ nvecd-cli -p 11017 SIMV 3 min_score=0.8 0.90 0.25 0.12 0.05
 ```
 
 ```text
-(2 results, showing 2)
+(2 results)
 1) doc_sorting (score: 0.9992)
 2) doc_indexing (score: 0.9964)
 ```
@@ -101,7 +101,7 @@ nvecd-cli -p 11017 SIMV 3 filter=lang=en,year>=2022 0.90 0.25 0.12 0.05
 ```
 
 ```text
-(1 results, showing 1)
+(1 results)
 1) doc_sorting (score: 0.9992)
 ```
 

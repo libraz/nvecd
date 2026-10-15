@@ -20,11 +20,13 @@
 #include <charconv>
 #include <cstring>
 #include <iomanip>
+#include <locale>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include "client/protocol_transport.h"
 #include "events/id_validation.h"
@@ -82,12 +84,13 @@ struct timeval MakeSocketTimeout(uint32_t timeout_ms) {
 }
 
 /**
- * @brief Serialize a float with full round-trippable precision.
+ * @brief Create a command stream that emits ASCII numbers at round-trip float precision.
  */
-std::string FormatFloat(float value) {
+std::ostringstream MakeCommandStream() {
   std::ostringstream oss;
-  oss << std::setprecision(kFloatRoundTripPrecision) << value;
-  return oss.str();
+  oss.imbue(std::locale::classic());
+  oss << std::setprecision(kFloatRoundTripPrecision);
+  return oss;
 }
 
 /**
@@ -101,7 +104,7 @@ void AppendSearchOptions(std::ostringstream& cmd, const SearchOptions& options) 
     cmd << " filter=" << options.filter;
   }
   if (options.min_score.has_value()) {
-    cmd << " min_score=" << FormatFloat(*options.min_score);
+    cmd << " min_score=" << *options.min_score;
   }
 }
 
@@ -153,6 +156,21 @@ ClientConfig WithDefaults(ClientConfig config) {
   return config;
 }
 
+Expected<SimResponse, Error> ParseSimResponse(std::string_view response, std::string mode) {
+  auto parsed = transport::ParseSearchResponse(response);
+  if (!parsed) {
+    return MakeUnexpected(MakeError(ErrorCode::kClientProtocolError, "Unexpected SIM/SIMV response format"));
+  }
+
+  SimResponse result;
+  result.mode = std::move(mode);
+  result.results.reserve(parsed->results.size());
+  for (auto& item : parsed->results) {
+    result.results.emplace_back(std::move(item.id), item.score);
+  }
+  return result;
+}
+
 }  // namespace
 
 namespace detail {
@@ -173,7 +191,8 @@ bool IsResponseComplete(const std::string& buffer) {
  */
 class NvecdClient::Impl {
  public:
-  explicit Impl(ClientConfig config) : config_(WithDefaults(std::move(config))) {}
+  explicit Impl(ClientConfig config)
+      : config_(WithDefaults(std::move(config))), receive_buffer_(config_.recv_buffer_size) {}
 
   ~Impl() { Disconnect(); }
 
@@ -303,19 +322,23 @@ class NvecdClient::Impl {
     // SIM/SIMV response (or coalesce several responses), so loop until length-
     // aware framing reports a complete response. See detail::IsResponseComplete.
     std::string response;
-    std::vector<char> buffer(config_.recv_buffer_size);
-
-    const auto frame = transport::FrameForCommand(command, debug_mode_);
+    transport::ResponseScanner scanner(transport::FrameForCommand(command, debug_mode_));
     while (true) {
-      if (const auto response_length = transport::CompleteResponseLength(response_buffer_, frame)) {
+      if (const auto response_length = transport::ScanResponseLength(response_buffer_, scanner)) {
         response.assign(response_buffer_.data(), *response_length);
         response_buffer_.erase(0, *response_length);
         break;
       }
-      const ssize_t received = transport::ReceiveRetryingEintr(sock_, buffer.data(), buffer.size(), &io_error);
+      const ssize_t received =
+          transport::ReceiveRetryingEintr(sock_, receive_buffer_.data(), receive_buffer_.size(), &io_error);
       if (received <= 0) {
+        const bool has_incomplete_response = !response_buffer_.empty();
         DisconnectUnlocked();
         if (received == 0) {
+          if (has_incomplete_response) {
+            return MakeUnexpected(
+                MakeError(ErrorCode::kClientProtocolError, "Server closed during an incomplete response"));
+          }
           return MakeUnexpected(MakeError(ErrorCode::kClientConnectionClosed, "Connection closed by server"));
         }
         // A caller that retries on a timeout but not on a protocol failure needs
@@ -329,7 +352,7 @@ class NvecdClient::Impl {
                                         std::string("Failed to receive response: ") + strerror(io_error)));
       }
 
-      response_buffer_.append(buffer.data(), static_cast<size_t>(received));
+      response_buffer_.append(receive_buffer_.data(), static_cast<size_t>(received));
       if (response_buffer_.size() > transport::kMaxBufferedResponseBytes) {
         DisconnectUnlocked();
         return MakeUnexpected(MakeError(ErrorCode::kClientProtocolError, "Response exceeds 64 MiB limit"));
@@ -341,16 +364,7 @@ class NvecdClient::Impl {
       response.pop_back();
     }
 
-    // A refused DEBUG command must not latch the mode: framing a later SIM
-    // response as a debug block the server never sends stalls the read loop.
-    if (!transport::IsErrorResponse(response)) {
-      const std::string upper = transport::UpperCommand(command);
-      if (upper == "DEBUG ON") {
-        debug_mode_ = true;
-      } else if (upper == "DEBUG OFF") {
-        debug_mode_ = false;
-      }
-    }
+    transport::UpdateDebugMode(response, debug_mode_);
 
     return response;
   }
@@ -380,7 +394,7 @@ class NvecdClient::Impl {
       return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, "Score must be between 0 and 100"));
     }
 
-    std::ostringstream cmd;
+    std::ostringstream cmd = MakeCommandStream();
     cmd << "EVENT " << ctx << " " << type << " " << id;
     if (type != "DEL") {
       cmd << " " << score;
@@ -391,15 +405,7 @@ class NvecdClient::Impl {
       return MakeUnexpected(result.error());
     }
 
-    if (transport::IsErrorResponse(*result)) {
-      return MakeUnexpected(MakeError(ErrorCode::kClientServerError, ErrorBody(*result)));
-    }
-
-    if (result->find("OK") != 0) {
-      return MakeUnexpected(MakeError(ErrorCode::kClientProtocolError, "Unexpected response: " + *result));
-    }
-
-    return {};
+    return CheckOkResponse(*result);
   }
 
   Expected<void, Error> Vecset(const std::string& id, const std::vector<float>& vector) const {
@@ -410,10 +416,10 @@ class NvecdClient::Impl {
       return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, "Vector cannot be empty"));
     }
 
-    std::ostringstream cmd;
+    std::ostringstream cmd = MakeCommandStream();
     cmd << "VECSET " << id;
     for (float val : vector) {
-      cmd << " " << FormatFloat(val);
+      cmd << " " << val;
     }
 
     auto result = SendCommand(cmd.str());
@@ -421,15 +427,7 @@ class NvecdClient::Impl {
       return MakeUnexpected(result.error());
     }
 
-    if (transport::IsErrorResponse(*result)) {
-      return MakeUnexpected(MakeError(ErrorCode::kClientServerError, ErrorBody(*result)));
-    }
-
-    if (result->find("OK") != 0) {
-      return MakeUnexpected(MakeError(ErrorCode::kClientProtocolError, "Unexpected response: " + *result));
-    }
-
-    return {};
+    return CheckOkResponse(*result);
   }
 
   Expected<void, Error> Vecdel(const std::string& id) const {
@@ -441,13 +439,7 @@ class NvecdClient::Impl {
     if (!result) {
       return MakeUnexpected(result.error());
     }
-    if (transport::IsErrorResponse(*result)) {
-      return MakeUnexpected(MakeError(ErrorCode::kClientServerError, ErrorBody(*result)));
-    }
-    if (result->find("OK") != 0) {
-      return MakeUnexpected(MakeError(ErrorCode::kClientProtocolError, "Unexpected response: " + *result));
-    }
-    return {};
+    return CheckOkResponse(*result);
   }
 
   Expected<void, Error> Metaset(const std::string& id, const std::string& metadata) const {
@@ -461,7 +453,7 @@ class NvecdClient::Impl {
       return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, "Metadata cannot be empty"));
     }
 
-    std::ostringstream cmd;
+    std::ostringstream cmd = MakeCommandStream();
     cmd << "METASET " << id << " " << metadata;
 
     auto result = SendCommand(cmd.str());
@@ -469,15 +461,7 @@ class NvecdClient::Impl {
       return MakeUnexpected(result.error());
     }
 
-    if (transport::IsErrorResponse(*result)) {
-      return MakeUnexpected(MakeError(ErrorCode::kClientServerError, ErrorBody(*result)));
-    }
-
-    if (result->find("OK") != 0) {
-      return MakeUnexpected(MakeError(ErrorCode::kClientProtocolError, "Unexpected response: " + *result));
-    }
-
-    return {};
+    return CheckOkResponse(*result);
   }
 
   Expected<SimResponse, Error> Sim(const std::string& id, uint32_t top_k, const std::string& mode,
@@ -492,7 +476,7 @@ class NvecdClient::Impl {
       return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, *err));
     }
 
-    std::ostringstream cmd;
+    std::ostringstream cmd = MakeCommandStream();
     cmd << "SIM " << id << " " << top_k;
     if (!mode.empty()) {
       cmd << " using=" << mode;
@@ -511,28 +495,7 @@ class NvecdClient::Impl {
       return MakeUnexpected(MakeError(ErrorCode::kClientServerError, ErrorBody(*result)));
     }
 
-    // Parse response: OK RESULTS <count> <id1> <score1> <id2> <score2> ...
-    if (result->find("OK RESULTS") != 0) {
-      return MakeUnexpected(MakeError(ErrorCode::kClientProtocolError, "Unexpected response format"));
-    }
-
-    std::istringstream iss(*result);
-    std::string status;
-    std::string results_str;
-    int count = 0;
-    iss >> status >> results_str >> count;
-
-    SimResponse resp;
-    resp.mode = mode.empty() ? "fusion" : mode;
-
-    // Parse result pairs (id score id score ...)
-    std::string result_id;
-    float score = 0.0F;
-    while (iss >> result_id >> score) {
-      resp.results.emplace_back(result_id, score);
-    }
-
-    return resp;
+    return ParseSimResponse(*result, mode.empty() ? "fusion" : mode);
   }
 
   Expected<SimResponse, Error> Simv(const std::vector<float>& vector, uint32_t top_k, const std::string& mode,
@@ -548,11 +511,11 @@ class NvecdClient::Impl {
     }
 
     // SIMV wire syntax places filter=/min_score= before the vector components.
-    std::ostringstream cmd;
+    std::ostringstream cmd = MakeCommandStream();
     cmd << "SIMV " << top_k;
     AppendSearchOptions(cmd, options);
     for (float val : vector) {
-      cmd << " " << FormatFloat(val);
+      cmd << " " << val;
     }
 
     auto result = SendCommand(cmd.str());
@@ -564,28 +527,7 @@ class NvecdClient::Impl {
       return MakeUnexpected(MakeError(ErrorCode::kClientServerError, ErrorBody(*result)));
     }
 
-    // Parse response: OK RESULTS <count> <id1> <score1> <id2> <score2> ...
-    if (result->find("OK RESULTS") != 0) {
-      return MakeUnexpected(MakeError(ErrorCode::kClientProtocolError, "Unexpected response format"));
-    }
-
-    std::istringstream iss(*result);
-    std::string status;
-    std::string results_str;
-    int count = 0;
-    iss >> status >> results_str >> count;
-
-    SimResponse resp;
-    resp.mode = mode.empty() ? "vectors" : mode;
-
-    // Parse result pairs (id score id score ...)
-    std::string result_id;
-    float score = 0.0F;
-    while (iss >> result_id >> score) {
-      resp.results.emplace_back(result_id, score);
-    }
-
-    return resp;
+    return ParseSimResponse(*result, mode.empty() ? "vectors" : mode);
   }
 
   //
@@ -666,7 +608,7 @@ class NvecdClient::Impl {
   }
 
   Expected<SaveResult, Error> Save(const std::string& filepath) const {
-    std::ostringstream cmd;
+    std::ostringstream cmd = MakeCommandStream();
     if (filepath.empty()) {
       cmd << "DUMP SAVE";
     } else {
@@ -710,7 +652,7 @@ class NvecdClient::Impl {
     if (auto err = ValidateProtocolToken(filepath, "snapshot filepath")) {
       return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, *err));
     }
-    std::ostringstream cmd;
+    std::ostringstream cmd = MakeCommandStream();
     cmd << "DUMP LOAD " << filepath;
 
     auto result = SendCommand(cmd.str());
@@ -740,7 +682,7 @@ class NvecdClient::Impl {
     if (auto err = ValidateProtocolToken(filepath, "snapshot filepath")) {
       return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, *err));
     }
-    std::ostringstream cmd;
+    std::ostringstream cmd = MakeCommandStream();
     cmd << "DUMP VERIFY " << filepath;
 
     auto result = SendCommand(cmd.str());
@@ -763,7 +705,7 @@ class NvecdClient::Impl {
     if (auto err = ValidateProtocolToken(filepath, "snapshot filepath")) {
       return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, *err));
     }
-    std::ostringstream cmd;
+    std::ostringstream cmd = MakeCommandStream();
     cmd << "DUMP INFO " << filepath;
 
     auto result = SendCommand(cmd.str());
@@ -784,15 +726,7 @@ class NvecdClient::Impl {
       return MakeUnexpected(result.error());
     }
 
-    if (transport::IsErrorResponse(*result)) {
-      return MakeUnexpected(MakeError(ErrorCode::kClientServerError, ErrorBody(*result)));
-    }
-
-    if (result->find("OK") != 0) {
-      return MakeUnexpected(MakeError(ErrorCode::kClientProtocolError, "Unexpected response: " + *result));
-    }
-
-    return {};
+    return CheckDebugToggleResponse(*result, "OK DEBUG_ON");
   }
 
   Expected<void, Error> DisableDebug() const {
@@ -801,15 +735,7 @@ class NvecdClient::Impl {
       return MakeUnexpected(result.error());
     }
 
-    if (transport::IsErrorResponse(*result)) {
-      return MakeUnexpected(MakeError(ErrorCode::kClientServerError, ErrorBody(*result)));
-    }
-
-    if (result->find("OK") != 0) {
-      return MakeUnexpected(MakeError(ErrorCode::kClientProtocolError, "Unexpected response: " + *result));
-    }
-
-    return {};
+    return CheckDebugToggleResponse(*result, "OK DEBUG_OFF");
   }
 
   Expected<void, Error> Auth(const std::string& password) const {
@@ -820,7 +746,7 @@ class NvecdClient::Impl {
       return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, *err));
     }
 
-    std::ostringstream cmd;
+    std::ostringstream cmd = MakeCommandStream();
     // AUTH is the sole command whose argument is an opaque suffix rather than
     // a token. The server preserves all bytes after this delimiter, including
     // leading, trailing, and repeated spaces; quoting here would turn those
@@ -892,7 +818,18 @@ class NvecdClient::Impl {
     if (transport::IsErrorResponse(response)) {
       return MakeUnexpected(MakeError(ErrorCode::kClientServerError, ErrorBody(response)));
     }
-    if (response.find("OK") != 0 && response.find("+OK") != 0) {
+    if (!transport::HasResponsePrefixToken(response, "OK") && !transport::HasResponsePrefixToken(response, "+OK")) {
+      return MakeUnexpected(MakeError(ErrorCode::kClientProtocolError, "Unexpected response: " + response));
+    }
+    return {};
+  }
+
+  // Success only when the reply is the one UpdateDebugMode latches on, so the result matches the framing state.
+  static Expected<void, Error> CheckDebugToggleResponse(const std::string& response, std::string_view confirmed) {
+    if (auto ok = CheckOkResponse(response); !ok) {
+      return ok;
+    }
+    if (response != confirmed) {
       return MakeUnexpected(MakeError(ErrorCode::kClientProtocolError, "Unexpected response: " + response));
     }
     return {};
@@ -910,6 +847,7 @@ class NvecdClient::Impl {
   ClientConfig config_;
   mutable std::mutex round_trip_mutex_;
   mutable int sock_ = -1;
+  mutable std::vector<char> receive_buffer_;
   mutable std::string response_buffer_;
   mutable bool debug_mode_ = false;
 };

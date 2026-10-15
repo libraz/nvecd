@@ -118,7 +118,7 @@ nvecd-cli -p 11017 SIM lamp 5 using=events
 ```
 
 ```text
-(2 results, showing 2)
+(2 results)
 1) bulb (score: 14500)
 2) desk (score: 6000)
 ```
@@ -130,7 +130,7 @@ nvecd-cli -p 11017 SIM lamp 5 using=vectors
 ```
 
 ```text
-(3 results, showing 3)
+(3 results)
 1) bulb (score: 0.9978)
 2) shade (score: 0.975)
 3) desk (score: 0.315)
@@ -143,7 +143,7 @@ nvecd-cli -p 11017 SIM lamp 5 using=fusion
 ```
 
 ```text
-(3 results, showing 3)
+(3 results)
 1) bulb (score: 1)
 2) shade (score: 0.8429)
 3) desk (score: 0)
@@ -156,7 +156,7 @@ nvecd-cli -p 11017 SIM lamp 5 using=fusion adaptive=off
 ```
 
 ```text
-(3 results, showing 3)
+(3 results)
 1) bulb (score: 1)
 2) shade (score: 0.58)
 3) desk (score: 0)
@@ -171,7 +171,7 @@ nvecd-cli -p 11017 SIM shade 5 using=fusion
 ```
 
 ```text
-(3 results, showing 3)
+(3 results)
 1) bulb (score: 1)
 2) lamp (score: 0.9786)
 3) desk (score: 0)
@@ -188,7 +188,7 @@ nvecd-cli -p 11017 SIM lamp 5 using=fusion filter=category=lighting,in_stock=tru
 ```
 
 ```text
-(1 results, showing 1)
+(1 results)
 1) bulb (score: 0.9981)
 ```
 

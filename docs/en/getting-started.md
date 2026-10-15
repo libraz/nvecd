@@ -46,7 +46,7 @@ Each one answers `EVENT`. The score is an integer weight in the range 0 to 100; 
 ```
 
 ```text
-(2 results, showing 2)
+(2 results)
 1) flange (score: 9500)
 2) gasket (score: 8000)
 ```
@@ -93,7 +93,7 @@ Each answers `VECSET`. The first vector stored fixes the dimension for the whole
 ```
 
 ```text
-(3 results, showing 3)
+(3 results)
 1) bolt (score: 0.9994)
 2) gasket (score: 0.9954)
 3) flange (score: 0.2677)
@@ -108,7 +108,7 @@ The metric is `vectors.distance_metric`, cosine by default, so the score is a co
 ```
 
 ```text
-(3 results, showing 3)
+(3 results)
 1) bolt (score: 0.6)
 2) gasket (score: 0.5967)
 3) flange (score: 0.4)
@@ -125,7 +125,7 @@ An item with no events at all shows the other half of the behaviour:
 ```
 
 ```text
-(3 results, showing 3)
+(3 results)
 1) widget (score: 1)
 2) gasket (score: 0.9942)
 3) flange (score: 0)
@@ -140,7 +140,7 @@ Adding `adaptive=on` makes the weight follow the query item's own data density i
 ```
 
 ```text
-(3 results, showing 3)
+(3 results)
 1) bolt (score: 0.872)
 2) gasket (score: 0.8672)
 3) flange (score: 0.128)
@@ -157,7 +157,7 @@ Adding `adaptive=on` makes the weight follow the query item's own data density i
 ```
 
 ```text
-(3 results, showing 3)
+(3 results)
 1) flange (score: 0.8685)
 2) gasket (score: 0.6569)
 3) bolt (score: 0.6367)
@@ -183,7 +183,7 @@ Metadata is attached per item and is only accepted for an item that already has 
 ```
 
 ```text
-(2 results, showing 2)
+(2 results)
 1) bolt (score: 0.9994)
 2) flange (score: 0.2677)
 ```
@@ -195,7 +195,7 @@ Metadata is attached per item and is only accepted for an item that already has 
 ```
 
 ```text
-(2 results, showing 2)
+(2 results)
 1) bolt (score: 0.9994)
 2) gasket (score: 0.9954)
 ```

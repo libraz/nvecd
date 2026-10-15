@@ -27,7 +27,7 @@ nvecd-cli -p 11017 EVENT bob   ADD widget 100
 nvecd-cli -p 11017 EVENT bob   ADD flange 95
 
 nvecd-cli -p 11017 SIM widget 10 using=events
-# (2 results, showing 2)
+# (2 results)
 # 1) flange (score: 9500)
 # 2) gasket (score: 8000)
 
@@ -36,12 +36,12 @@ nvecd-cli -p 11017 VECSET widget 0.10 0.20 0.30 0.40
 nvecd-cli -p 11017 VECSET gasket 0.15 0.18 0.32 0.41
 
 nvecd-cli -p 11017 SIM widget 10 using=fusion
-# (2 results, showing 2)
+# (2 results)
 # 1) gasket (score: 0.5972)
 # 2) flange (score: 0.4)
 
 nvecd-cli -p 11017 SIMV 10 0.5 0.3 0.2 0.1          # クエリベクトルに近いもの
-# (2 results, showing 2)
+# (2 results)
 # 1) gasket (score: 0.6569)
 # 2) widget (score: 0.6139)
 ```
