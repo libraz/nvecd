@@ -41,9 +41,6 @@ namespace nvecd::client {
 namespace {
 
 // Protocol constants
-constexpr size_t kErrorPrefixLen = 6;  // Length of "ERROR "
-constexpr int kMillisecondsPerSecond = 1000;
-constexpr int kMicrosecondsPerMillisecond = 1000;
 
 // Round-trippable precision for IEEE-754 single precision floats: a 9-digit
 // decimal mantissa uniquely identifies any float, so serialized vectors parse
@@ -70,17 +67,6 @@ uint64_t ParseUint64(const std::string& value, uint64_t fallback = 0) {
     return fallback;
   }
   return parsed;
-}
-
-/**
- * @brief Build the timeval that SO_RCVTIMEO/SO_SNDTIMEO expect.
- */
-struct timeval MakeSocketTimeout(uint32_t timeout_ms) {
-  struct timeval value = {};
-  value.tv_sec = static_cast<decltype(value.tv_sec)>(timeout_ms / kMillisecondsPerSecond);
-  value.tv_usec =
-      static_cast<decltype(value.tv_usec)>((timeout_ms % kMillisecondsPerSecond) * kMicrosecondsPerMillisecond);
-  return value;
 }
 
 /**
@@ -175,9 +161,8 @@ Expected<SimResponse, Error> ParseSimResponse(std::string_view response, std::st
 
 namespace detail {
 
-std::optional<size_t> CompleteResponseLength(const std::string& buffer, bool requires_end_terminator) {
-  const transport::ResponseFrame frame{requires_end_terminator};
-  return transport::CompleteResponseLength(buffer, frame);
+std::optional<size_t> CompleteResponseLength(const std::string& buffer) {
+  return transport::CompleteResponseLength(buffer);
 }
 
 bool IsResponseComplete(const std::string& buffer) {
@@ -218,10 +203,7 @@ class NvecdClient::Impl {
       }
       (void)transport::ConfigureNoSigpipe(sock_);
 
-      // Set timeouts
-      const struct timeval timeout_val = MakeSocketTimeout(config_.timeout_ms);
-      (void)setsockopt(sock_, SOL_SOCKET, SO_RCVTIMEO, &timeout_val, sizeof(timeout_val));
-      (void)setsockopt(sock_, SOL_SOCKET, SO_SNDTIMEO, &timeout_val, sizeof(timeout_val));
+      transport::ApplySocketTimeouts(sock_, config_.timeout_ms);
 
       struct sockaddr_un server_addr = {};
       server_addr.sun_family = AF_UNIX;
@@ -260,10 +242,7 @@ class NvecdClient::Impl {
       }
       (void)transport::ConfigureNoSigpipe(candidate_sock);
 
-      // Non-critical: timeout setting failure is acceptable (connection still works, just without timeout)
-      const struct timeval timeout_val = MakeSocketTimeout(config_.timeout_ms);
-      (void)setsockopt(candidate_sock, SOL_SOCKET, SO_RCVTIMEO, &timeout_val, sizeof(timeout_val));
-      (void)setsockopt(candidate_sock, SOL_SOCKET, SO_SNDTIMEO, &timeout_val, sizeof(timeout_val));
+      transport::ApplySocketTimeouts(candidate_sock, config_.timeout_ms);
 
       if (connect(candidate_sock, candidate->ai_addr, candidate->ai_addrlen) == 0) {
         sock_ = candidate_sock;
@@ -322,7 +301,17 @@ class NvecdClient::Impl {
     // SIM/SIMV response (or coalesce several responses), so loop until length-
     // aware framing reports a complete response. See detail::IsResponseComplete.
     std::string response;
-    transport::ResponseScanner scanner(transport::FrameForCommand(command, debug_mode_));
+    const transport::ResponseFrame frame = transport::FrameForCommand(command, debug_mode_);
+    transport::ResponseScanner scanner(frame);
+    // Snapshot save/load/verify can legitimately outlast the configured deadline.
+    if (frame.long_running) {
+      transport::SetReceiveTimeout(sock_, transport::kAdminTimeoutMs);
+    }
+    const ScopeGuard restore_timeout([this, &frame]() {
+      if (frame.long_running && sock_ >= 0) {
+        transport::SetReceiveTimeout(sock_, config_.timeout_ms);
+      }
+    });
     while (true) {
       if (const auto response_length = transport::ScanResponseLength(response_buffer_, scanner)) {
         response.assign(response_buffer_.data(), *response_length);
@@ -506,6 +495,10 @@ class NvecdClient::Impl {
     if (auto err = ValidateProtocolToken(mode, "search mode")) {
       return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, *err));
     }
+    // SIMV has no mode token on the wire; any other mode would be echoed back as a label it never ran.
+    if (!mode.empty() && mode != "vectors") {
+      return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, "SIMV supports only the vectors search mode"));
+    }
     if (auto err = ValidateProtocolToken(options.filter, "metadata filter")) {
       return MakeUnexpected(MakeError(ErrorCode::kClientInvalidArgument, *err));
     }
@@ -527,7 +520,7 @@ class NvecdClient::Impl {
       return MakeUnexpected(MakeError(ErrorCode::kClientServerError, ErrorBody(*result)));
     }
 
-    return ParseSimResponse(*result, mode.empty() ? "vectors" : mode);
+    return ParseSimResponse(*result, "vectors");
   }
 
   //
@@ -594,18 +587,7 @@ class NvecdClient::Impl {
     return info;
   }
 
-  Expected<std::string, Error> GetConfig() const {
-    auto result = SendCommand("CONFIG SHOW");
-    if (!result) {
-      return MakeUnexpected(result.error());
-    }
-
-    if (transport::IsErrorResponse(*result)) {
-      return MakeUnexpected(MakeError(ErrorCode::kClientServerError, ErrorBody(*result)));
-    }
-
-    return *result;
-  }
+  Expected<std::string, Error> GetConfig() const { return SendExpectingBody("CONFIG SHOW"); }
 
   Expected<SaveResult, Error> Save(const std::string& filepath) const {
     std::ostringstream cmd = MakeCommandStream();
@@ -685,16 +667,7 @@ class NvecdClient::Impl {
     std::ostringstream cmd = MakeCommandStream();
     cmd << "DUMP VERIFY " << filepath;
 
-    auto result = SendCommand(cmd.str());
-    if (!result) {
-      return MakeUnexpected(result.error());
-    }
-
-    if (transport::IsErrorResponse(*result)) {
-      return MakeUnexpected(MakeError(ErrorCode::kClientServerError, ErrorBody(*result)));
-    }
-
-    return *result;
+    return SendExpectingBody(cmd.str());
   }
 
   Expected<std::string, Error> DumpInfo(const std::string& filepath) const {
@@ -708,16 +681,7 @@ class NvecdClient::Impl {
     std::ostringstream cmd = MakeCommandStream();
     cmd << "DUMP INFO " << filepath;
 
-    auto result = SendCommand(cmd.str());
-    if (!result) {
-      return MakeUnexpected(result.error());
-    }
-
-    if (transport::IsErrorResponse(*result)) {
-      return MakeUnexpected(MakeError(ErrorCode::kClientServerError, ErrorBody(*result)));
-    }
-
-    return *result;
+    return SendExpectingBody(cmd.str());
   }
 
   Expected<void, Error> EnableDebug() const {
@@ -761,31 +725,9 @@ class NvecdClient::Impl {
     return CheckOkResponse(*result);
   }
 
-  Expected<std::string, Error> DumpStatus() const {
-    auto result = SendCommand("DUMP STATUS");
-    if (!result) {
-      return MakeUnexpected(result.error());
-    }
+  Expected<std::string, Error> DumpStatus() const { return SendExpectingBody("DUMP STATUS"); }
 
-    if (transport::IsErrorResponse(*result)) {
-      return MakeUnexpected(MakeError(ErrorCode::kClientServerError, ErrorBody(*result)));
-    }
-
-    return *result;
-  }
-
-  Expected<std::string, Error> CacheStats() const {
-    auto result = SendCommand("CACHE STATS");
-    if (!result) {
-      return MakeUnexpected(result.error());
-    }
-
-    if (transport::IsErrorResponse(*result)) {
-      return MakeUnexpected(MakeError(ErrorCode::kClientServerError, ErrorBody(*result)));
-    }
-
-    return *result;
-  }
+  Expected<std::string, Error> CacheStats() const { return SendExpectingBody("CACHE STATS"); }
 
   Expected<void, Error> CacheClear() const { return SimpleCacheCommand("CACHE CLEAR"); }
 
@@ -805,12 +747,7 @@ class NvecdClient::Impl {
   }
 
   // Extract the human-readable body of an error response for the Error message.
-  static std::string ErrorBody(const std::string& response) {
-    if (response.find("ERROR ") == 0) {
-      return response.substr(kErrorPrefixLen);
-    }
-    return response;
-  }
+  static std::string ErrorBody(const std::string& response) { return std::string(transport::ErrorBody(response)); }
 
   // Validate a generic success response, accepting both "OK ..." and the
   // Redis-style "+OK ..." prefix (AUTH returns "+OK").
@@ -833,6 +770,18 @@ class NvecdClient::Impl {
       return MakeUnexpected(MakeError(ErrorCode::kClientProtocolError, "Unexpected response: " + response));
     }
     return {};
+  }
+
+  // Send a command whose success reply is returned verbatim; error replies become kClientServerError.
+  Expected<std::string, Error> SendExpectingBody(const std::string& command) const {
+    auto result = SendCommand(command);
+    if (!result) {
+      return MakeUnexpected(result.error());
+    }
+    if (transport::IsErrorResponse(*result)) {
+      return MakeUnexpected(MakeError(ErrorCode::kClientServerError, ErrorBody(*result)));
+    }
+    return *result;
   }
 
   // Issue a CACHE command whose success response is a single "OK ..." line.

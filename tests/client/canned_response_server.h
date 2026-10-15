@@ -15,6 +15,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -29,12 +30,14 @@ namespace nvecd::testing {
  *
  * Accepts a single connection. The n-th complete line received is answered
  * with the n-th scripted reply; once the script is exhausted the last reply is
- * repeated. The peer must disconnect before the server is destroyed.
+ * repeated. The peer must disconnect before the server is destroyed. A non-zero
+ * @c reply_delay holds every reply back for that long after its request line.
  */
 class CannedResponseServer {
  public:
-  explicit CannedResponseServer(std::vector<std::string> replies, bool close_after_script = false)
-      : replies_(std::move(replies)), close_after_script_(close_after_script) {
+  explicit CannedResponseServer(std::vector<std::string> replies, bool close_after_script = false,
+                                std::chrono::milliseconds reply_delay = std::chrono::milliseconds::zero())
+      : replies_(std::move(replies)), close_after_script_(close_after_script), reply_delay_(reply_delay) {
     listener_ = ::socket(AF_INET, SOCK_STREAM, 0);
     if (listener_ < 0) {
       return;
@@ -104,6 +107,9 @@ class CannedResponseServer {
         pending.erase(0, line_end + 1);
         const std::string& reply = replies_[reply_index < replies_.size() ? reply_index : replies_.size() - 1];
         ++reply_index;
+        if (reply_delay_ > std::chrono::milliseconds::zero()) {
+          std::this_thread::sleep_for(reply_delay_);
+        }
         if (::send(connection, reply.data(), reply.size(), 0) < 0) {
           ::close(connection);
           return;
@@ -124,6 +130,7 @@ class CannedResponseServer {
   int listener_ = -1;
   uint16_t port_ = 0;
   bool close_after_script_ = false;
+  std::chrono::milliseconds reply_delay_;
   std::thread worker_;
 };
 

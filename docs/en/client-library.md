@@ -138,7 +138,7 @@ struct SimResponse { std::vector<SimResultItem> results; std::string mode; };
 
 An unset `SearchOptions` field is omitted from the command, which leaves the server's default in force. `filter` uses the grammar documented in [protocol.md](./protocol.md).
 
-`Sim` sends `using=<mode>` when `mode` is non-empty, and `adaptive=on|off` when `options.adaptive` is set. `Simv` sends neither: the wire command has no mode and no adaptive option, so its `mode` parameter is validated as a protocol token and then used only to fill `SimResponse::mode` in the returned value. Passing `"events"` to `Simv` does not produce a co-occurrence search.
+`Sim` sends `using=<mode>` when `mode` is non-empty, and `adaptive=on|off` when `options.adaptive` is set. `Simv` sends neither: the wire command has no mode and no adaptive option, so a vector search is the only search it can run. Its `mode` must be empty or `"vectors"`; any other value, such as `"events"` or `"fusion"`, is rejected with `kClientInvalidArgument` before anything is sent, and `SimResponse::mode` is always `"vectors"`.
 
 An empty query vector is rejected locally with `kClientInvalidArgument`.
 

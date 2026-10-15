@@ -17,6 +17,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "utils/error.h"
@@ -58,7 +59,7 @@ bool IsResponseComplete(const std::string& buffer);
  * response. Callers use this length to preserve trailing bytes for the next
  * command instead of letting them contaminate the current response.
  */
-std::optional<size_t> CompleteResponseLength(const std::string& buffer, bool requires_end_terminator = false);
+std::optional<size_t> CompleteResponseLength(const std::string& buffer);
 
 }  // namespace detail
 
@@ -137,14 +138,17 @@ struct ServerInfo {
   uint64_t ctx_count = 0;                 ///< Distinct event contexts (INFO key: ctx_count)
 };
 
+// NOLINTBEGIN(readability-magic-numbers,cppcoreguidelines-avoid-magic-numbers) - Default nvecd client
+// settings
+inline constexpr std::string_view kDefaultHost = "127.0.0.1";  ///< Default server address
+inline constexpr uint16_t kDefaultPort = 11017;                ///< Default port for nvecd protocol
+
 /**
  * @brief Client configuration
  */
-// NOLINTBEGIN(readability-magic-numbers,cppcoreguidelines-avoid-magic-numbers) - Default nvecd client
-// settings
 struct ClientConfig {
-  std::string host = "127.0.0.1";     ///< Server hostname or IPv4 address
-  uint16_t port = 11017;              ///< Default port for nvecd protocol
+  std::string host{kDefaultHost};     ///< Server hostname or IPv4 address
+  uint16_t port = kDefaultPort;       ///< Server port
   uint32_t timeout_ms = 5000;         ///< Default timeout in milliseconds
   uint32_t recv_buffer_size = 65536;  ///< Default buffer size (64KB)
   std::string unix_socket_path;       ///< Unix socket path (empty = use TCP)

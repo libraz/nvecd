@@ -25,6 +25,7 @@
 #include "events/co_occurrence_index.h"
 #include "storage/snapshot_format.h"
 #include "utils/error.h"
+#include "utils/log_level.h"
 #include "utils/structured_log.h"
 
 using nlohmann::json;
@@ -34,8 +35,7 @@ namespace nvecd::config {
 
 namespace {
 
-constexpr size_t kBytesPerMB = 1024 * 1024;  // Bytes in one megabyte
-constexpr int kMaxPortNumber = 65535;        // Maximum TCP/UDP port number
+constexpr int kMaxPortNumber = 65535;  // Maximum TCP/UDP port number
 
 /**
  * @brief Convert YAML node to JSON (recursive)
@@ -462,7 +462,7 @@ CacheConfig ParseCacheConfig(const YAML::Node& node) {
   }
   if (node["max_memory_mb"]) {
     // Convert MB to bytes
-    config.max_memory_bytes = static_cast<size_t>(read.As<int>("max_memory_mb")) * kBytesPerMB;
+    config.max_memory_bytes = static_cast<size_t>(read.As<int>("max_memory_mb")) * defaults::kBytesPerMB;
   }
   if (node["min_query_cost_ms"]) {
     config.min_query_cost_ms = read.As<double>("min_query_cost_ms");
@@ -857,8 +857,7 @@ utils::Expected<void, utils::Error> ValidateConfig(const Config& config) {
   }
 
   // Validate logging configuration
-  if (config.logging.level != "trace" && config.logging.level != "debug" && config.logging.level != "info" &&
-      config.logging.level != "warn" && config.logging.level != "error") {
+  if (!utils::ParseLogLevel(config.logging.level)) {
     return utils::MakeUnexpected(utils::MakeError(
         utils::ErrorCode::kConfigInvalidValue,
         "logging.level must be one of: trace, debug, info, warn, error (got: " + config.logging.level + ")"));

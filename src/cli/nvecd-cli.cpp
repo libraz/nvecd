@@ -26,6 +26,7 @@
 #include <utility>
 #include <vector>
 
+#include "client/nvecdclient.h"
 #include "client/protocol_transport.h"
 #include "utils/fd_guard.h"
 
@@ -42,11 +43,9 @@ namespace {
 // Buffer and string prefix size constants
 constexpr size_t kReceiveBufferSize = 65536;  // Receive buffer size (64KB)
 constexpr size_t kOkPrefixLength = 3;         // "OK " length
-constexpr size_t kErrorPrefixLength = 6;      // "ERROR " length
 constexpr int kMaxWaitReadyRetries = 100;     // Maximum retries for --wait-ready (~5 minutes)
 constexpr size_t kMaxPasswordBytes = 4096;
-constexpr int kCliTimeoutSeconds = 5;       // Interactive send/receive deadline
-constexpr int kAdminTimeoutSeconds = 3600;  // Receive deadline for snapshot save/load/verify
+constexpr uint32_t kCliTimeoutMs = 5000;  // Interactive send/receive deadline
 
 bool ValidatePassword(std::string* password, std::string* error) {
   if (password->empty()) {
@@ -57,17 +56,11 @@ bool ValidatePassword(std::string* password, std::string* error) {
     *error = "password exceeds 4096 bytes";
     return false;
   }
-  if (password->find_first_of("\r\n\0", 0, 3) != std::string::npos) {
-    *error = "password contains a line delimiter";
+  if (auto invalid = nvecd::client::transport::ValidateNoFramingBytes(*password, "password")) {
+    *error = *invalid;
     return false;
   }
   return true;
-}
-
-void SetReceiveTimeout(int socket_fd, int seconds) {
-  struct timeval timeout_value = {};
-  timeout_value.tv_sec = seconds;
-  (void)setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout_value, sizeof(timeout_value));
 }
 
 std::optional<std::string> ReadPasswordFile(const std::string& path, std::string* error) {
@@ -115,7 +108,7 @@ std::optional<std::string> ReadPasswordFile(const std::string& path, std::string
 // Command list for tab completion
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays,cppcoreguidelines-avoid-non-const-global-variables)
 const char* command_list[] = {"EVENT", "VECSET", "VECDEL", "METASET", "SIM",  "SIMV", "INFO", "CONFIG",
-                              "CACHE", "DUMP",   "DEBUG",  "quit",    "exit", "help", nullptr};
+                              "CACHE", "DUMP",   "DEBUG",  "AUTH",    "quit", "exit", "help", nullptr};
 
 /**
  * @brief Command name generator for readline completion
@@ -302,10 +295,10 @@ char** CommandCompletion(const char* text, int start, int /* end */) {
     return nullptr;
   }
 
-  // DUMP SAVE|LOAD|VERIFY|INFO [filename]
+  // DUMP SAVE|LOAD|VERIFY|INFO [filename] | DUMP STATUS
   if (command == "DUMP") {
     if (token_count == 1) {
-      current_keywords = {"SAVE", "LOAD", "VERIFY", "INFO"};
+      current_keywords = {"SAVE", "LOAD", "VERIFY", "INFO", "STATUS"};
       return rl_completion_matches(text, KeywordGeneratorWrapper);
     }
     // Enable filename completion for DUMP commands
@@ -354,8 +347,8 @@ char** CommandCompletion(const char* text, int start, int /* end */) {
 #endif
 
 struct Config {
-  std::string host = "127.0.0.1";
-  uint16_t port = 11017;  // nvecd default port
+  std::string host{nvecd::client::kDefaultHost};
+  uint16_t port = nvecd::client::kDefaultPort;
   bool interactive = true;
   int retry_count = 0;     // Number of retries (0 = no retry)
   int retry_interval = 3;  // Seconds between retries
@@ -410,10 +403,7 @@ class NvecdClient {
         }
         (void)nvecd::client::transport::ConfigureNoSigpipe(sock_.Get());
 
-        SetReceiveTimeout(sock_.Get(), kCliTimeoutSeconds);
-        struct timeval timeout_value = {};
-        timeout_value.tv_sec = kCliTimeoutSeconds;
-        (void)setsockopt(sock_.Get(), SOL_SOCKET, SO_SNDTIMEO, &timeout_value, sizeof(timeout_value));
+        nvecd::client::transport::ApplySocketTimeouts(sock_.Get(), kCliTimeoutMs);
 
         if (connect(sock_.Get(), candidate->ai_addr, candidate->ai_addrlen) == 0) {
           connected = true;
@@ -437,7 +427,7 @@ class NvecdClient {
           std::cerr << "\nPossible reasons:\n";
           std::cerr << "  1. nvecd server is not running\n";
           std::cerr << "  2. Server is still initializing (loading snapshot)\n";
-          std::cerr << "  3. Wrong port (check config.yaml - default is 11017)\n";
+          std::cerr << "  3. Wrong port (check config.yaml - default is " << nvecd::client::kDefaultPort << ")\n";
           std::cerr << "\nTo check server status:\n";
           std::cerr << "  ps aux | grep nvecd\n";
           std::cerr << "  lsof -i -P | grep LISTEN | grep " << config_.port << "\n";
@@ -508,11 +498,11 @@ class NvecdClient {
     nvecd::client::transport::ResponseScanner scanner(frame);
     // Snapshot save/load/verify can legitimately outlast the interactive deadline.
     if (frame.long_running) {
-      SetReceiveTimeout(sock_.Get(), kAdminTimeoutSeconds);
+      nvecd::client::transport::SetReceiveTimeout(sock_.Get(), nvecd::client::transport::kAdminTimeoutMs);
     }
     const nvecd::utils::ScopeGuard restore_timeout([this, &frame]() {
       if (frame.long_running && IsConnected()) {
-        SetReceiveTimeout(sock_.Get(), kCliTimeoutSeconds);
+        nvecd::client::transport::SetReceiveTimeout(sock_.Get(), kCliTimeoutMs);
       }
     });
     while (true) {
@@ -702,10 +692,14 @@ class NvecdClient {
     std::cout << "  CONFIG VERIFY <file>               - Validate a configuration file" << '\n';
     std::cout << "  CACHE STATS                        - Show cache statistics" << '\n';
     std::cout << "  CACHE CLEAR                        - Clear all cache entries" << '\n';
+    std::cout << "  CACHE ENABLE                       - Enable the similarity cache" << '\n';
+    std::cout << "  CACHE DISABLE                      - Disable the similarity cache" << '\n';
     std::cout << "  DUMP SAVE [filename]               - Save snapshot to disk" << '\n';
     std::cout << "  DUMP LOAD <filename>               - Load snapshot from disk" << '\n';
     std::cout << "  DUMP VERIFY <filename>             - Verify snapshot integrity" << '\n';
     std::cout << "  DUMP INFO <filename>               - Show snapshot metadata" << '\n';
+    std::cout << "  DUMP STATUS                        - Show snapshot save progress" << '\n';
+    std::cout << "  AUTH <password>                    - Authenticate (see --password-file/--password-env)" << '\n';
     std::cout << "  DEBUG ON                           - Enable debug mode" << '\n';
     std::cout << "  DEBUG OFF                          - Disable debug mode" << '\n';
     std::cout << '\n';
@@ -765,7 +759,7 @@ class NvecdClient {
       }
     } else if (response.find("ERROR") == 0) {
       // Error response
-      std::cout << "(error) " << response.substr(kErrorPrefixLength) << '\n';
+      std::cout << "(error) " << nvecd::client::transport::ErrorBody(response) << '\n';
     } else {
       // Unknown response
       std::cout << response << '\n';
@@ -787,8 +781,9 @@ void PrintUsage(const char* program_name) {
   std::cout << "Usage: " << program_name << " [OPTIONS] [COMMAND]" << '\n';
   std::cout << '\n';
   std::cout << "Options:" << '\n';
-  std::cout << "  -h HOST         Server hostname or IPv4 address (default: 127.0.0.1)" << '\n';
-  std::cout << "  -p PORT         Server port (default: 11017)" << '\n';
+  std::cout << "  -h HOST         Server hostname or IPv4 address (default: " << nvecd::client::kDefaultHost << ")"
+            << '\n';
+  std::cout << "  -p PORT         Server port (default: " << nvecd::client::kDefaultPort << ")" << '\n';
   std::cout << "  --retry N       Retry connection N times if refused (default: 0)" << '\n';
   std::cout << "  --wait-ready    Keep retrying until server is ready (max 100 attempts)" << '\n';
   std::cout << "  --password-file FILE  Read AUTH password from a private file" << '\n';
@@ -797,7 +792,8 @@ void PrintUsage(const char* program_name) {
   std::cout << '\n';
   std::cout << "Examples:" << '\n';
   std::cout << "  " << program_name << "                           # Interactive mode" << '\n';
-  std::cout << "  " << program_name << " -h localhost -p 11017     # Connect to specific server" << '\n';
+  std::cout << "  " << program_name << " -h localhost -p " << nvecd::client::kDefaultPort
+            << "     # Connect to specific server" << '\n';
   std::cout << "  " << program_name << " --retry 5 INFO            # Retry 5 times if server not ready" << '\n';
   std::cout << "  " << program_name << " --wait-ready INFO         # Wait until server is ready" << '\n';
   std::cout << "  " << program_name << " SIM product123 10         # Execute single command" << '\n';

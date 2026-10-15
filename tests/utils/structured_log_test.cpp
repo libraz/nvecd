@@ -4,6 +4,7 @@
 #include <spdlog/sinks/ostream_sink.h>
 
 #include <algorithm>
+#include <limits>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -85,6 +86,29 @@ TEST_F(StructuredLogTest, JsonEscapesEventAndMessageFields) {
   logger_->flush();
   const std::string logged = output_.str();
   EXPECT_NE(logged.find(R"({"event":"ev\"ent","message":"mes\\sage\nline"})"), std::string::npos) << logged;
+}
+
+TEST_F(StructuredLogTest, DoubleFieldsKeepTheirSignificantDigits) {
+  StructuredLog().Event("metric").Field("small", 1e-9).Field("ratio", 0.25).Info();
+  logger_->flush();
+  const std::string logged = output_.str();
+  EXPECT_NE(logged.find(R"("small":1e-09)"), std::string::npos) << logged;
+  EXPECT_NE(logged.find(R"("ratio":0.25)"), std::string::npos) << logged;
+}
+
+TEST_F(StructuredLogTest, NonFiniteDoubleFieldsAreNullInJsonAndNamedInText) {
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double inf = std::numeric_limits<double>::infinity();
+  StructuredLog().Event("metric").Field("a", nan).Field("b", inf).Info();
+  logger_->flush();
+  const std::string json = output_.str();
+  EXPECT_NE(json.find(R"("a":null,"b":null)"), std::string::npos) << json;
+
+  output_.str("");
+  StructuredLog::SetFormat(LogFormat::TEXT);
+  StructuredLog().Event("metric").Field("b", inf).Info();
+  logger_->flush();
+  EXPECT_NE(output_.str().find("b=inf"), std::string::npos) << output_.str();
 }
 
 }  // namespace

@@ -20,6 +20,7 @@
 #include "server/nvecd_server.h"
 #include "utils/error.h"
 #include "utils/expected.h"
+#include "utils/log_level.h"
 #include "utils/structured_log.h"
 #include "vectors/distance_simd.h"
 #include "version.h"
@@ -56,17 +57,7 @@ void SignalHandler(int signal) {
  */
 nvecd::utils::Expected<void, nvecd::utils::Error> ApplyLoggingConfig(const nvecd::config::Config& config,
                                                                      bool open_file_sink) {
-  // Map config level string to spdlog level
-  spdlog::level::level_enum level = spdlog::level::info;
-  if (config.logging.level == "trace") {
-    level = spdlog::level::trace;
-  } else if (config.logging.level == "debug") {
-    level = spdlog::level::debug;
-  } else if (config.logging.level == "warn") {
-    level = spdlog::level::warn;
-  } else if (config.logging.level == "error") {
-    level = spdlog::level::err;
-  }
+  const auto level = nvecd::utils::ParseLogLevel(config.logging.level).value_or(spdlog::level::info);
   spdlog::set_level(level);
 
   // Apply structured log format (JSON or text)

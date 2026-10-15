@@ -17,6 +17,8 @@
 #include <string_view>
 
 #include "cache/similarity_cache_controller.h"
+#include "utils/log_level.h"
+#include "utils/number_format.h"
 #include "utils/structured_log.h"
 
 namespace nvecd::config {
@@ -38,17 +40,6 @@ std::string CanonicalVariableName(const std::string& variable_name) {
     return "performance." + variable_name.substr(kLegacyPrefix.size());
   }
   return variable_name;
-}
-
-std::string CanonicalDouble(double value) {
-  char buffer[64];
-  const auto [end, ec] = std::to_chars(buffer, buffer + sizeof(buffer), value, std::chars_format::general);
-  if (ec == std::errc{}) {
-    return {buffer, end};
-  }
-  // ParseDouble already guarantees a finite value. This fallback is only for
-  // platforms whose floating-point to_chars implementation reports an error.
-  return std::to_string(value);
 }
 
 }  // namespace
@@ -169,7 +160,7 @@ void RuntimeVariableManager::InitializeRuntimeValues() {
   runtime_values_["logging.level"] = base_config_.logging.level;
   runtime_values_["logging.json"] = base_config_.logging.json ? "true" : "false";
   runtime_values_["cache.enabled"] = base_config_.cache.enabled ? "true" : "false";
-  runtime_values_["cache.min_query_cost_ms"] = CanonicalDouble(base_config_.cache.min_query_cost_ms);
+  runtime_values_["cache.min_query_cost_ms"] = utils::FormatShortestDouble(base_config_.cache.min_query_cost_ms);
   runtime_values_["cache.ttl_seconds"] = std::to_string(base_config_.cache.ttl_seconds);
 }
 
@@ -219,7 +210,7 @@ Expected<void, Error> RuntimeVariableManager::SetVariable(const std::string& var
     if (!cost) {
       return MakeUnexpected(cost.error());
     }
-    canonical_value = CanonicalDouble(*cost);
+    canonical_value = utils::FormatShortestDouble(*cost);
     result = ApplyCacheMinQueryCost(*cost);
   } else if (canonical_name == "cache.ttl_seconds") {
     auto ttl = ParseInt(value);
@@ -310,25 +301,13 @@ void RuntimeVariableManager::SetCacheController(cache::SimilarityCacheController
 // ========== Apply functions ==========
 
 Expected<void, Error> RuntimeVariableManager::ApplyLoggingLevel(const std::string& value) {
-  // Validate and apply logging level
-  if (value != "trace" && value != "debug" && value != "info" && value != "warn" && value != "error") {
+  const auto level = utils::ParseLogLevel(value);
+  if (!level) {
     return MakeUnexpected(MakeError(ErrorCode::kInvalidArgument,
                                     "Invalid logging level (must be trace/debug/info/warn/error): " + value));
   }
 
-  // Apply to spdlog
-  if (value == "trace") {
-    spdlog::set_level(spdlog::level::trace);
-  } else if (value == "debug") {
-    spdlog::set_level(spdlog::level::debug);
-  } else if (value == "info") {
-    spdlog::set_level(spdlog::level::info);
-  } else if (value == "warn") {
-    spdlog::set_level(spdlog::level::warn);
-  } else if (value == "error") {
-    spdlog::set_level(spdlog::level::err);
-  }
-
+  spdlog::set_level(*level);
   return {};
 }
 
@@ -390,8 +369,7 @@ std::optional<std::string> RuntimeVariableManager::GetVariableInternal(const std
 
   // Cache
   if (variable_name == "cache.max_memory_mb") {
-    constexpr size_t kBytesPerMB = 1024 * 1024;
-    return std::to_string(base_config_.cache.max_memory_bytes / kBytesPerMB);
+    return std::to_string(base_config_.cache.max_memory_bytes / defaults::kBytesPerMB);
   }
   if (variable_name == "cache.compression_enabled") {
     return base_config_.cache.compression_enabled ? "true" : "false";
@@ -450,10 +428,10 @@ std::optional<std::string> RuntimeVariableManager::GetVariableInternal(const std
     return std::to_string(base_config_.events.max_neighbors_per_item);
   }
   if (variable_name == "events.min_support") {
-    return CanonicalDouble(base_config_.events.min_support);
+    return utils::FormatShortestDouble(base_config_.events.min_support);
   }
   if (variable_name == "events.decay_alpha") {
-    return CanonicalDouble(base_config_.events.decay_alpha);
+    return utils::FormatShortestDouble(base_config_.events.decay_alpha);
   }
   if (variable_name == "events.decay_interval_sec") {
     return std::to_string(base_config_.events.decay_interval_sec);
@@ -481,10 +459,10 @@ std::optional<std::string> RuntimeVariableManager::GetVariableInternal(const std
 
   // Similarity
   if (variable_name == "similarity.fusion_alpha") {
-    return CanonicalDouble(base_config_.similarity.fusion_alpha);
+    return utils::FormatShortestDouble(base_config_.similarity.fusion_alpha);
   }
   if (variable_name == "similarity.fusion_beta") {
-    return CanonicalDouble(base_config_.similarity.fusion_beta);
+    return utils::FormatShortestDouble(base_config_.similarity.fusion_beta);
   }
   if (variable_name == "similarity.default_top_k") {
     return std::to_string(base_config_.similarity.default_top_k);
@@ -555,15 +533,15 @@ std::optional<std::string> RuntimeVariableManager::GetVariableInternal(const std
   if (variable_name == "api.unix_socket.path")
     return base_config_.api.unix_socket.path;
   if (variable_name == "events.temporal_half_life_sec")
-    return CanonicalDouble(base_config_.events.temporal_half_life_sec);
+    return utils::FormatShortestDouble(base_config_.events.temporal_half_life_sec);
   if (variable_name == "events.negative_weight")
-    return CanonicalDouble(base_config_.events.negative_weight);
+    return utils::FormatShortestDouble(base_config_.events.negative_weight);
   if (variable_name == "similarity.sample_size")
     return std::to_string(base_config_.similarity.sample_size);
   if (variable_name == "similarity.adaptive_min_alpha")
-    return CanonicalDouble(base_config_.similarity.adaptive_min_alpha);
+    return utils::FormatShortestDouble(base_config_.similarity.adaptive_min_alpha);
   if (variable_name == "similarity.adaptive_max_alpha")
-    return CanonicalDouble(base_config_.similarity.adaptive_max_alpha);
+    return utils::FormatShortestDouble(base_config_.similarity.adaptive_max_alpha);
   if (variable_name == "similarity.adaptive_maturity_threshold")
     return std::to_string(base_config_.similarity.adaptive_maturity_threshold);
   if (variable_name == "similarity.ivf_nlist")

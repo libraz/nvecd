@@ -201,6 +201,26 @@ TEST(NvecdCliTest, MalformedSearchResultHasNonzeroExitStatus) {
   EXPECT_NE(run.output.find("Invalid SIM/SIMV response"), std::string::npos) << run.output;
 }
 
+TEST(NvecdCliTest, ABareErrorReplyIsPrintedWithoutCrashing) {
+  nvecd::testing::CannedResponseServer server({"ERROR\r\n"});
+  ASSERT_GT(server.Port(), 0);
+
+  const CliRun run = RunCliArgs({"-h", "127.0.0.1", "-p", std::to_string(server.Port()), "INFO"});
+  EXPECT_EQ(run.exit_code, 1) << run.output;
+  EXPECT_NE(run.output.find("(error)"), std::string::npos) << run.output;
+}
+
+TEST(NvecdCliTest, InteractiveHelpListsStatusCacheToggleAndAuthCommands) {
+  nvecd::testing::CannedResponseServer server({"OK\r\n"});
+  ASSERT_GT(server.Port(), 0);
+
+  const CliRun run = RunCliArgs({"-h", "127.0.0.1", "-p", std::to_string(server.Port())}, "help\n");
+  EXPECT_NE(run.output.find("DUMP STATUS"), std::string::npos) << run.output;
+  EXPECT_NE(run.output.find("CACHE ENABLE"), std::string::npos) << run.output;
+  EXPECT_NE(run.output.find("CACHE DISABLE"), std::string::npos) << run.output;
+  EXPECT_NE(run.output.find("AUTH <password>"), std::string::npos) << run.output;
+}
+
 TEST(NvecdCliTest, InteractiveSessionExitsWhenTheServerClosesMidResponse) {
   nvecd::testing::CannedResponseServer server({"OK RESULTS 2\r\nitem 0.9000\r\n"}, /*close_after_script=*/true);
   ASSERT_GT(server.Port(), 0);

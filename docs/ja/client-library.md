@@ -138,7 +138,7 @@ struct SimResponse { std::vector<SimResultItem> results; std::string mode; };
 
 `SearchOptions` の未設定フィールドはコマンドから省かれ、サーバーの既定値がそのまま効きます。`filter` は [protocol.md](./protocol.md) に記載した文法を使います。
 
-`Sim` は `mode` が空でなければ `using=<mode>` を、`options.adaptive` が設定されていれば `adaptive=on|off` を送ります。`Simv` はどちらも送りません。ワイヤ上のコマンドにモードも adaptive オプションも存在しないため、`Simv` の `mode` 引数はプロトコルトークンとして検査されたうえで、戻り値の `SimResponse::mode` を埋めるためだけに使われます。`Simv` に `"events"` を渡しても共起検索にはなりません。
+`Sim` は `mode` が空でなければ `using=<mode>` を、`options.adaptive` が設定されていれば `adaptive=on|off` を送ります。`Simv` はどちらも送りません。ワイヤ上のコマンドにモードも adaptive オプションも存在しないため、実行できるのはベクトル検索だけです。`mode` は空文字列か `"vectors"` でなければならず、`"events"` や `"fusion"` などそれ以外の値は、何も送信せずに `kClientInvalidArgument` で拒否されます。`SimResponse::mode` は常に `"vectors"` です。
 
 空のクエリベクトルはクライアント側で `kClientInvalidArgument` として拒否されます。
 

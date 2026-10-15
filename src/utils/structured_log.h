@@ -16,9 +16,12 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <string>
 #include <vector>
+
+#include "utils/number_format.h"
 
 namespace nvecd::utils {
 
@@ -135,8 +138,9 @@ class StructuredLog {
    * @brief Add double field
    */
   StructuredLog& Field(const std::string& key, double value) {
-    std::string val_str = std::to_string(value);
-    fields_.push_back(MakeJSONField(key, val_str, false));  // No quotes for numbers in JSON
+    const std::string val_str = FormatShortestDouble(value);
+    // JSON has no spelling for NaN or infinity.
+    fields_.push_back(MakeJSONField(key, std::isfinite(value) ? val_str : "null", false));
     fields_text_.push_back(key + "=" + val_str);
     return *this;
   }
@@ -410,21 +414,6 @@ inline void LogVectorStoreError(const std::string& operation, const std::string&
       .Field("dimension", static_cast<int64_t>(dimension))
       .Field("error", error_msg)
       .Error();
-}
-
-/**
- * @brief Log similarity search event in structured format
- */
-inline void LogSimilaritySearch(const std::string& item_id, int top_k, const std::string& mode, int result_count,
-                                double latency_us) {
-  StructuredLog()
-      .Event("similarity_search")
-      .Field("item_id", item_id)
-      .Field("top_k", static_cast<int64_t>(top_k))
-      .Field("mode", mode)
-      .Field("result_count", static_cast<int64_t>(result_count))
-      .Field("latency_us", latency_us)
-      .Info();
 }
 
 /**

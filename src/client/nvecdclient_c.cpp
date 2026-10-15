@@ -229,11 +229,19 @@ NvecdClient_C* nvecdclient_create(const NvecdClientConfig_C* config) {
   std::unique_ptr<NvecdClient_C> client_holder(client_c);
 
   ClientConfig cpp_config;
-  cpp_config.host = (config->host != nullptr) ? config->host : "127.0.0.1";
-  cpp_config.port = config->port != 0 ? config->port : 11017;  // NOLINT
-  // Zero timeout_ms / recv_buffer_size are resolved to defaults by the C++ client.
-  cpp_config.timeout_ms = config->timeout_ms;
-  cpp_config.recv_buffer_size = config->recv_buffer_size;
+  // Unset (NULL / zero) C fields keep the ClientConfig defaults.
+  if (config->host != nullptr) {
+    cpp_config.host = config->host;
+  }
+  if (config->port != 0) {
+    cpp_config.port = config->port;
+  }
+  if (config->timeout_ms != 0) {
+    cpp_config.timeout_ms = config->timeout_ms;
+  }
+  if (config->recv_buffer_size != 0) {
+    cpp_config.recv_buffer_size = config->recv_buffer_size;
+  }
 
   client_c->client = std::make_unique<NvecdClient>(cpp_config);
 

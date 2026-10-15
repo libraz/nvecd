@@ -38,6 +38,9 @@ constexpr double kFusionAlpha = 0.6;
 constexpr double kFusionBeta = 0.4;
 constexpr uint32_t kSampleSize = 10000;  ///< Default sample size for approximate search (0 = exact)
 
+// Cache defaults
+constexpr size_t kBytesPerMB = 1024 * 1024;  // Bytes in one megabyte
+
 // Snapshot defaults
 constexpr int kSnapshotIntervalSec = 0;  // 0 = disabled
 // Must carry a storage::snapshot_format::kRecoverableExtensions suffix, or an

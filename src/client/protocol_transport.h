@@ -7,6 +7,7 @@
 
 #include <netdb.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 
 #include <algorithm>
 #include <cctype>
@@ -82,6 +83,12 @@ struct ParsedSearchResponse {
 // drift apart.
 constexpr size_t kMaxBufferedResponseBytes = 64U * 1024U * 1024U;
 
+// Receive deadline for snapshot save/load/verify, which can legitimately outlast
+// a query by far (ResponseFrame::long_running).
+constexpr uint32_t kAdminTimeoutMs = 3600U * 1000U;
+
+constexpr std::string_view kErrorPrefix = "ERROR ";
+
 inline bool EqualsAsciiIgnoreCase(std::string_view lhs, std::string_view rhs) {
   if (lhs.size() != rhs.size()) {
     return false;
@@ -147,6 +154,19 @@ inline void UpdateDebugMode(std::string_view response, bool& debug_mode) {
  */
 inline bool IsErrorResponse(std::string_view response) {
   return response.rfind("ERROR", 0) == 0 || response.rfind("-ERR", 0) == 0 || response.rfind("(error)", 0) == 0;
+}
+
+/**
+ * @brief The human-readable body of an error reply.
+ *
+ * Strips the "ERROR " prefix; a reply without it (a bare "ERROR", "-ERR ...")
+ * is returned whole.
+ */
+inline std::string_view ErrorBody(std::string_view response) {
+  if (response.substr(0, kErrorPrefix.size()) == kErrorPrefix) {
+    response.remove_prefix(kErrorPrefix.size());
+  }
+  return response;
 }
 
 /**
@@ -620,6 +640,26 @@ inline std::optional<std::string> ResolveHostV4(const std::string& host, uint16_
  */
 inline bool IsReceiveTimeout(int error_code) {
   return error_code == EAGAIN || error_code == EWOULDBLOCK || error_code == ETIMEDOUT;
+}
+
+inline struct timeval MakeSocketTimeout(uint32_t timeout_ms) {
+  struct timeval value = {};
+  value.tv_sec = static_cast<decltype(value.tv_sec)>(timeout_ms / 1000U);
+  value.tv_usec = static_cast<decltype(value.tv_usec)>((timeout_ms % 1000U) * 1000U);
+  return value;
+}
+
+/// Set the receive deadline. Failure is non-critical: the socket just keeps its previous deadline.
+inline void SetReceiveTimeout(int socket_fd, uint32_t timeout_ms) {
+  const struct timeval value = MakeSocketTimeout(timeout_ms);
+  (void)::setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, &value, sizeof(value));
+}
+
+/// Set the receive and send deadlines to the same value.
+inline void ApplySocketTimeouts(int socket_fd, uint32_t timeout_ms) {
+  SetReceiveTimeout(socket_fd, timeout_ms);
+  const struct timeval value = MakeSocketTimeout(timeout_ms);
+  (void)::setsockopt(socket_fd, SOL_SOCKET, SO_SNDTIMEO, &value, sizeof(value));
 }
 
 inline bool ConfigureNoSigpipe(int socket_fd) {

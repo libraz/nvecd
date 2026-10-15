@@ -108,14 +108,6 @@ class ConfigSchemaExplorer {
    * @return Help information
    */
   static ConfigHelpInfo ExtractHelpInfo(const std::string& path, const nlohmann::json& node);
-
-  /**
-   * @brief Split path into components
-   *
-   * @param path Dot-separated path
-   * @return Vector of path components
-   */
-  static std::vector<std::string> SplitPath(const std::string& path);
 };
 
 /**
@@ -125,15 +117,6 @@ class ConfigSchemaExplorer {
  * @return True if the field is sensitive (should be masked)
  */
 bool IsSensitiveField(const std::string& path);
-
-/**
- * @brief Mask sensitive value for display
- *
- * @param path Configuration path
- * @param value Original value
- * @return Masked value (e.g., "***") if sensitive, otherwise original value
- */
-std::string MaskSensitiveValue(const std::string& path, const std::string& value);
 
 /**
  * @brief Format current config for display (mask sensitive fields)

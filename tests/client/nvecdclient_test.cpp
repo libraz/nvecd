@@ -854,6 +854,54 @@ TEST(NvecdClientSaveTest, KeepsStartedSaveDistinctFromCompletedSave) {
   client.Disconnect();
 }
 
+TEST(NvecdClientSaveTest, SnapshotCommandsOutlastTheConfiguredTimeoutAndRestoreIt) {
+  // DUMP LOAD can run far longer than a query, so the receive deadline is
+  // raised for it alone; the next ordinary command is back on the configured one.
+  nvecd::testing::CannedResponseServer server({"OK DUMP_LOADED /tmp/slow.dmp\r\n", "END\r\n"},
+                                              /*close_after_script=*/false, std::chrono::milliseconds(600));
+  ASSERT_GT(server.Port(), 0);
+
+  ClientConfig config;
+  config.host = "127.0.0.1";
+  config.port = server.Port();
+  config.timeout_ms = 200;
+
+  NvecdClient client(config);
+  ASSERT_TRUE(client.Connect());
+
+  const auto loaded = client.Load("/tmp/slow.dmp");
+  ASSERT_TRUE(loaded) << loaded.error().message();
+  EXPECT_EQ(*loaded, "/tmp/slow.dmp");
+
+  const auto info = client.SendCommand("INFO");
+  ASSERT_FALSE(info);
+  EXPECT_EQ(info.error().code(), ErrorCode::kClientTimeout) << info.error().message();
+}
+
+TEST(NvecdClientErrorParsingTest, ErrorBodyKeepsRepliesWithoutTheErrorPrefixWhole) {
+  EXPECT_EQ(transport::ErrorBody("ERROR Item not found"), "Item not found");
+  EXPECT_EQ(transport::ErrorBody("ERROR"), "ERROR");
+  EXPECT_EQ(transport::ErrorBody("-ERR unauthorized"), "-ERR unauthorized");
+}
+
+TEST(NvecdClientValidationTest, SimvRejectsModesItCannotSend) {
+  // SIMV carries no mode on the wire, so any mode but vectors would only be
+  // echoed back as a label for a search that never ran in that mode.
+  NvecdClient client(ClientConfig{});
+  const std::vector<float> query = {1.0F, 0.0F, 0.0F};
+
+  for (const char* mode : {"fusion", "events", "bogus"}) {
+    const auto rejected = client.Simv(query, 10, mode);
+    ASSERT_FALSE(rejected) << mode;
+    EXPECT_EQ(rejected.error().code(), ErrorCode::kClientInvalidArgument) << mode;
+  }
+  for (const char* mode : {"", "vectors"}) {
+    const auto accepted = client.Simv(query, 10, mode);
+    ASSERT_FALSE(accepted) << mode;
+    EXPECT_EQ(accepted.error().code(), ErrorCode::kClientNotConnected) << mode;
+  }
+}
+
 TEST(NvecdClientErrorParsingTest, EveryMethodSurvivesTheDocumentedErrorShapes) {
   // A bare "ERROR" is five bytes. Taking the body as substr(6) threw
   // std::out_of_range straight out of a library whose contract is to report

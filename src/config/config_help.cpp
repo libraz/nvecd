@@ -173,10 +173,9 @@ nlohmann::json ConfigToJson(const Config& config) {
   json["logging"]["file"] = config.logging.file;
 
   // Cache configuration
-  constexpr size_t kBytesPerMB = 1024 * 1024;  // Bytes in one megabyte
   json["cache"] = {
       {"enabled", config.cache.enabled},
-      {"max_memory_mb", config.cache.max_memory_bytes / kBytesPerMB},  // Convert bytes to MB for display
+      {"max_memory_mb", config.cache.max_memory_bytes / defaults::kBytesPerMB},  // Convert bytes to MB for display
       {"min_query_cost_ms", config.cache.min_query_cost_ms},
       {"ttl_seconds", config.cache.ttl_seconds},
       {"compression_enabled", config.cache.compression_enabled},
@@ -203,13 +202,8 @@ nlohmann::json ConfigToJson(const Config& config) {
   return json;
 }
 
-/**
- * @brief Split path into components (local helper)
- *
- * @param path Dot-separated path
- * @return Vector of path components
- */
-std::vector<std::string> SplitPathHelper(const std::string& path) {
+/// Split a dot-separated path into its non-empty components.
+std::vector<std::string> SplitPath(const std::string& path) {
   std::vector<std::string> result;
   if (path.empty()) {
     return result;
@@ -238,7 +232,7 @@ std::optional<nlohmann::json> NavigateJsonPath(const nlohmann::json& json, const
     return json;
   }
 
-  std::vector<std::string> parts = SplitPathHelper(path);
+  std::vector<std::string> parts = SplitPath(path);
   nlohmann::json current = json;
 
   for (const auto& part : parts) {
@@ -593,23 +587,6 @@ ConfigHelpInfo ConfigSchemaExplorer::ExtractHelpInfo(const std::string& path, co
   return info;
 }
 
-std::vector<std::string> ConfigSchemaExplorer::SplitPath(const std::string& path) {
-  std::vector<std::string> result;
-  if (path.empty()) {
-    return result;
-  }
-
-  std::istringstream stream(path);
-  std::string part;
-  while (std::getline(stream, part, '.')) {
-    if (!part.empty()) {
-      result.push_back(part);
-    }
-  }
-
-  return result;
-}
-
 // Standalone functions
 
 bool IsSensitiveField(const std::string& path) {
@@ -617,13 +594,6 @@ bool IsSensitiveField(const std::string& path) {
   return lower_path.find("password") != std::string::npos || lower_path.find("secret") != std::string::npos ||
          lower_path.find("key") != std::string::npos || lower_path.find("token") != std::string::npos ||
          lower_path.find("requirepass") != std::string::npos || lower_path.find("pass") != std::string::npos;
-}
-
-std::string MaskSensitiveValue(const std::string& path, const std::string& value) {
-  if (IsSensitiveField(path) && !value.empty()) {
-    return "***";
-  }
-  return value;
 }
 
 utils::Expected<std::string, utils::Error> FormatConfigForDisplay(const Config& config, const std::string& path) {
