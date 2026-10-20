@@ -84,7 +84,7 @@ make CMAKE_OPTIONS="-DCMAKE_BUILD_TYPE=Release" configure
 make
 ```
 
-`CMAKE_OPTIONS` is read by the `configure` target only. Once `build/` holds a CMake cache, later `make` invocations reuse it, so changing an option means re-running `configure`.
+`CMAKE_OPTIONS` is read by the `configure` target only. Once `build/` holds a CMake cache, later `make` invocations reuse it: `BUILD_TESTS` and the install prefix are passed to CMake only when set on the command line (`make PREFIX=/opt/nvecd install`, `make BUILD_TESTS=OFF configure`), so values chosen at configure time persist. Changing any other option means re-running `configure`.
 
 ## Building with CMake directly
 
@@ -126,7 +126,7 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release -DNVECD_PORTABLE_BUILD=ON
 
 Sanitizers are mutually exclusive: a build with both `ENABLE_ASAN` and `ENABLE_TSAN` on does not link.
 
-The version compiled into the binary comes from the `NVECD_VERSION` environment variable when it is set, and from `git describe --tags --abbrev=0` otherwise.
+The version comes from the `NVECD_VERSION` environment variable when it is set, and from `git describe --tags --abbrev=0` otherwise. That one value is the project version: it is compiled into the binary (`--version`, `INFO`, `GET /info`) and sets the client library version and the CMake package version.
 
 ## Artifacts
 
@@ -153,9 +153,16 @@ The default prefix is `/usr/local`. Installed files:
 | `lib/libnvecdclient.*` | The shared client library |
 | `include/nvecd/` | `nvecdclient.h`, `nvecdclient_c.h`, and `utils/error.h`, `utils/expected.h` |
 | `lib/cmake/nvecd/` | The CMake package, exporting the `nvecd::client` target |
-| `etc/nvecd/config.yaml` | The annotated example configuration |
+| `etc/nvecd/config.yaml.example` | The annotated example configuration, installed as a sample |
 | `etc/nvecd/config-schema.json` | The schema the server validates configuration against |
-| `share/doc/nvecd/` | `README.md` and both documentation trees |
+| `share/doc/nvecd/` | `README.md` and the `docs/` tree (`en`, `ja` and `images`), laid out so the relative links resolve |
+
+The server reads `/etc/nvecd/config.yaml` when no path is given. Installation never creates or removes that file, so an edited configuration survives reinstalling and uninstalling. Copy the sample into place and edit the copy:
+
+```bash
+sudo mkdir -p /etc/nvecd
+sudo cp /usr/local/etc/nvecd/config.yaml.example /etc/nvecd/config.yaml
+```
 
 A CMake project consumes the installed client library with:
 
@@ -163,6 +170,8 @@ A CMake project consumes the installed client library with:
 find_package(nvecd CONFIG REQUIRED)
 target_link_libraries(my_app PRIVATE nvecd::client)
 ```
+
+On Linux, run `sudo ldconfig` after installing so the dynamic linker finds `libnvecdclient.so` under `/usr/local/lib`. The library's install name is `@rpath`-relative on macOS, so a program linked by hand (not through the CMake target) must add `-Wl,-rpath,/usr/local/lib` to its link command to load it; [Client Library](./client-library.md) shows the commands.
 
 ### To another prefix
 

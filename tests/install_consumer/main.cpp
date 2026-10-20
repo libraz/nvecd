@@ -3,5 +3,6 @@
 int main() {
   nvecd::client::ClientConfig config;
   config.host = "127.0.0.1";
-  return config.host.empty() ? 1 : 0;
+  nvecd::client::NvecdClient client(config);
+  return client.IsConnected() ? 1 : 0;
 }

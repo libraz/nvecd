@@ -13,7 +13,6 @@
 #include <cstring>
 #include <mutex>
 #include <optional>
-#include <shared_mutex>
 #include <sstream>
 
 // Include concrete types before request_dispatcher.h to resolve forward declarations
@@ -549,13 +548,14 @@ std::string RequestDispatcher::Dispatch(const std::string& request, ConnectionCo
     return FormatError(refusal);
   }
 
-  // Keep the shared gate for the full store-mutation and WAL append sequence.
-  // A lock-mode snapshot sets read_only first, then takes this gate exclusively
-  // to drain any writer that already passed the initial flag check. Rechecking
-  // after acquisition closes the check-then-mutate race at the boundary.
-  std::shared_lock<std::shared_mutex> snapshot_write_guard;
-  if (IsSnapshotProtectedCommand(cmd->type) && ctx_.snapshot_write_gate != nullptr) {
-    snapshot_write_guard = std::shared_lock(*ctx_.snapshot_write_gate);
+  // Hold store access for the full store-mutation and WAL append sequence. A
+  // lock-mode snapshot sets read_only first, then drains writers that already
+  // passed the initial flag check; searches are drained only by DUMP LOAD.
+  // Rechecking after acquisition closes the check-then-mutate race.
+  SnapshotCoordinator::AccessGuard snapshot_access;
+  if (IsSnapshotProtectedCommand(cmd->type)) {
+    snapshot_access = ctx_.snapshot_coordinator.AcquireStoreAccess(
+        IsSnapshotProtectedWrite(cmd->type) ? StoreAccess::kWrite : StoreAccess::kSearch);
     if (ctx_.loading.load(std::memory_order_acquire)) {
       return FormatError("LOADING Snapshot load in progress");
     }

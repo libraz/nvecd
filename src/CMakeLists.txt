@@ -17,6 +17,15 @@ target_link_libraries(nvecd_utils PUBLIC
   spdlog
 )
 
+# version.h is generated from the project version so every reported version
+# derives from one place.
+configure_file(
+  ${CMAKE_CURRENT_SOURCE_DIR}/version.h.in
+  ${CMAKE_CURRENT_BINARY_DIR}/version.h
+  @ONLY
+)
+target_include_directories(nvecd_utils PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
+
 # Server library
 add_library(nvecd_server STATIC
   server/thread_pool.cpp
@@ -37,6 +46,7 @@ add_library(nvecd_server STATIC
   server/request_dispatcher.cpp
   server/wal_codec.cpp
   server/snapshot_scheduler.cpp
+  server/snapshot_coordinator.cpp
   server/decay_scheduler.cpp
   server/http_server.cpp
   server/nvecd_server.cpp
@@ -183,26 +193,37 @@ target_link_libraries(nvecd_storage PUBLIC
 )
 
 # Client library (C++ API)
-add_library(nvecdclient SHARED
+set(NVECD_CLIENT_SOURCES
   client/nvecdclient.cpp
   client/nvecdclient_c.cpp
 )
+add_library(nvecdclient SHARED ${NVECD_CLIENT_SOURCES})
 add_library(nvecd::client ALIAS nvecdclient)
 target_include_directories(nvecdclient PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
   $<INSTALL_INTERFACE:include/nvecd>
 )
+target_compile_features(nvecdclient PUBLIC cxx_std_17)
 target_link_libraries(nvecdclient PRIVATE
   nvecd_utils
   Threads::Threads
 )
-target_compile_definitions(nvecdclient PRIVATE $<$<BOOL:${BUILD_TESTS}>:NVECD_ENABLE_TEST_HOOKS>)
 set_target_properties(nvecdclient PROPERTIES
   EXPORT_NAME client
-  VERSION 0.3.0
+  VERSION ${PROJECT_VERSION}
   SOVERSION 0
   PUBLIC_HEADER "client/nvecdclient.h;client/nvecdclient_c.h"
 )
+
+# The same sources with the failure-injection hooks compiled in. Never
+# installed or exported, so the shipped library carries no test entry points.
+if(BUILD_TESTS)
+  add_library(nvecdclient_testing SHARED ${NVECD_CLIENT_SOURCES})
+  target_include_directories(nvecdclient_testing PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+  target_compile_features(nvecdclient_testing PUBLIC cxx_std_17)
+  target_compile_definitions(nvecdclient_testing PRIVATE NVECD_ENABLE_TEST_HOOKS)
+  target_link_libraries(nvecdclient_testing PRIVATE nvecd_utils Threads::Threads)
+endif()
 
 # Main executable
 add_executable(nvecd

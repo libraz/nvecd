@@ -1,7 +1,7 @@
 /**
  * @file snapshot_recovery_base_test.cpp
- * @brief Which snapshot startup recovery selects after an interrupted overwrite
- *        or a DUMP LOAD racing a background save
+ * @brief Which snapshot startup recovery selects after an interrupted overwrite,
+ *        a DUMP LOAD racing a background save, or a failed DUMP LOAD handshake
  */
 
 #include <gtest/gtest.h>
@@ -218,6 +218,51 @@ TEST(SnapshotRecoveryBase, AutoSnapshotsUnderConcurrentWritesLoseNoAcknowledgedW
     const auto pos = info.find("vector_count: ");
     ASSERT_NE(pos, std::string::npos) << info;
     EXPECT_EQ(std::stoul(info.substr(pos + 14)), acknowledged);
+  }
+  recovered.Stop();
+  fs::remove_all(root);
+}
+
+TEST(SnapshotRecoveryBase, FailedDumpLoadHandshakeLeavesThePreviousBaseSelected) {
+  const auto root = MakeRoot("nvecd_load_handshake_failure");
+  auto config = MakeConfig(root, "lock");
+  // One record per segment, so truncation really drops records below a base.
+  config.wal.max_file_size = 1;
+  const fs::path snapshots = root / "snapshots";
+
+  {
+    nvecd::server::NvecdServer server(config);
+    ASSERT_TRUE(server.Start());
+    TcpClient client("127.0.0.1", server.GetPort());
+    ASSERT_TRUE(IsOk(client.SendCommand("VECSET a 1 0")));
+    ASSERT_TRUE(IsOk(client.SendCommand("DUMP SAVE old.nvec")));
+    ASSERT_TRUE(IsOk(client.SendCommand("VECSET b 0 1")));
+    ASSERT_TRUE(IsOk(client.SendCommand("DUMP SAVE base.nvec")));
+    ASSERT_TRUE(IsOk(client.SendCommand("VECSET c 1 1")));
+    ASSERT_TRUE(IsOk(client.SendCommand("DUMP SAVE base.nvec")));
+    ASSERT_TRUE(IsOk(client.SendCommand("VECSET d 1 2")));
+    ASSERT_TRUE(nvecd::storage::ReadWalCheckpoint((snapshots / "old.nvec").string()));
+
+    // The loaded file still carries its own valid sidecar from the first save.
+    // Its new sidecar cannot be written, so the load fail-stops.
+    fs::permissions(snapshots, fs::perms::owner_read | fs::perms::owner_exec, fs::perm_options::replace);
+    const std::string failed = client.SendCommand("DUMP LOAD old.nvec");
+    fs::permissions(snapshots, fs::perms::owner_all, fs::perm_options::replace);
+    EXPECT_EQ(failed.rfind("ERROR", 0), 0U) << failed;
+    client.Close();
+    server.Stop();
+  }
+
+  const auto candidates = nvecd::storage::ListRecoveryCandidates(snapshots.string(), /*require_checkpoint=*/true);
+  ASSERT_FALSE(candidates.empty());
+  EXPECT_EQ(fs::path(candidates.front()).filename().string(), "base.nvec");
+
+  nvecd::server::NvecdServer recovered(config);
+  auto started = recovered.Start();
+  ASSERT_TRUE(started) << started.error().message();
+  {
+    TcpClient client("127.0.0.1", recovered.GetPort());
+    EXPECT_NE(client.SendCommand("INFO").find("vector_count: 4"), std::string::npos);
   }
   recovered.Stop();
   fs::remove_all(root);

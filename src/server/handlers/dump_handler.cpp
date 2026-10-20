@@ -10,9 +10,8 @@
 
 #include <array>
 #include <ctime>
-#include <filesystem>
 #include <memory>
-#include <shared_mutex>
+#include <mutex>
 #include <sstream>
 #include <utility>
 
@@ -27,7 +26,6 @@
 #include "storage/snapshot_lock.h"
 #include "storage/snapshot_session.h"
 #include "storage/wal.h"
-#include "utils/flag_guard.h"
 #include "utils/path_utils.h"
 #include "utils/structured_log.h"
 #include "vectors/vector_store.h"
@@ -101,16 +99,13 @@ utils::Expected<void, utils::Error> StartForkSnapshot(HandlerContext& ctx, const
         utils::MakeError(utils::ErrorCode::kInternalError, "Fork snapshot writer not initialized"));
   }
 
-  // Serialize the pre-fork store barrier and WAL sequence capture with both
-  // regular mutations and DUMP LOAD. The guard only covers fork(), not the
-  // child write, so serving resumes immediately after the COW image exists.
-  std::shared_lock<std::shared_mutex> snapshot_write_guard;
-  if (ctx.snapshot_write_gate != nullptr) {
-    snapshot_write_guard = std::shared_lock(*ctx.snapshot_write_gate);
-  }
-  if (ctx.loading.load(std::memory_order_acquire)) {
-    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kSnapshotAlreadyInProgress,
-                                                  "Cannot save snapshot while a snapshot load is in progress"));
+  // Admission stays held until the child exists, so no other session starts
+  // between the WAL sequence capture and fork(); the child then counts as the
+  // running session. The serialization gate keeps every write either wholly
+  // before or wholly after the capture.
+  auto session = ctx.snapshot_coordinator.BeginBriefSession();
+  if (!session) {
+    return utils::MakeUnexpected(session.error());
   }
   std::unique_lock<std::mutex> write_serialization_guard;
   if (ctx.write_serialization_gate != nullptr) {
@@ -137,36 +132,27 @@ utils::Expected<std::string, utils::Error> HandleDumpSave(HandlerContext& ctx, c
     return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kInternalError, error_msg));
   }
 
-  // An argument-less DUMP SAVE writes to the configured name. It goes through
-  // the same dump-path validation as a client-supplied path: the value comes
+  // An argument-less DUMP SAVE writes to the configured name, or to a
+  // timestamped one when none is configured. Every form goes through the same
+  // dump-path validation as a client-supplied path: the configured value comes
   // from a config file, so a name that escapes the dump directory is refused
   // rather than resolved against it.
-  std::string resolved_path;
-  const std::string requested_path = filepath.empty() ? ctx.config->snapshot.default_filename : filepath;
-
-  if (!requested_path.empty()) {
-    auto validated = utils::ValidateDumpPath(requested_path, ctx.dump_dir, utils::DumpPathUse::kRecoveryBase);
-    if (!validated) {
-      return utils::MakeUnexpected(validated.error());
-    }
-    resolved_path = *validated;
-  } else {
-    // No configured name to fall back on: keep the timestamped form so a save
-    // still lands somewhere unambiguous.
+  std::string requested_path = filepath.empty() ? ctx.config->snapshot.default_filename : filepath;
+  if (requested_path.empty()) {
     auto now = std::time(nullptr);
     std::tm tm_buf{};
     localtime_r(&now, &tm_buf);  // Thread-safe version of localtime
     std::array<char, kFilepathBufferSize> buf{};
     std::strftime(buf.data(), buf.size(), "snapshot_%Y%m%d_%H%M%S.dmp", &tm_buf);
-    resolved_path = ctx.dump_dir + "/" + std::string(buf.data());
+    requested_path = buf.data();
   }
+  auto validated = utils::ValidateDumpPath(requested_path, ctx.dump_dir, utils::DumpPathUse::kRecoveryBase);
+  if (!validated) {
+    return utils::MakeUnexpected(validated.error());
+  }
+  const std::string resolved_path = *validated;
 
   utils::LogStorageInfo("dump_save", "Attempting to save snapshot to: " + resolved_path);
-
-  if (ctx.loading.load(std::memory_order_acquire)) {
-    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kSnapshotAlreadyInProgress,
-                                                  "Cannot save snapshot while a snapshot load is in progress"));
-  }
 
   // Branch on snapshot mode
   if (ctx.config->snapshot.mode == "fork") {
@@ -181,19 +167,11 @@ utils::Expected<std::string, utils::Error> HandleDumpSave(HandlerContext& ctx, c
     return std::string("OK DUMP_SAVE_STARTED " + resolved_path + "\r\n");
 
   } else {
-    // Lock mode: synchronous blocking save
-    bool expected = false;
-    if (!ctx.read_only.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-      return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kSnapshotAlreadyInProgress,
-                                                    "Another snapshot save is already in progress"));
-    }
-    utils::FlagResetGuard read_only_guard(ctx.read_only);
-    // Publish read_only before taking the exclusive gate. Existing writers
-    // drain under their shared guards; writers arriving afterwards block, then
-    // observe read_only and fail without crossing the snapshot boundary.
-    std::unique_lock<std::shared_mutex> snapshot_write_guard;
-    if (ctx.snapshot_write_gate != nullptr) {
-      snapshot_write_guard = std::unique_lock(*ctx.snapshot_write_gate);
+    // Lock mode: synchronous save. Store writes are refused and drained for
+    // its whole duration; searches keep being served.
+    auto lock_save = ctx.snapshot_coordinator.BeginLockSave(ctx.fork_snapshot_writer);
+    if (!lock_save) {
+      return utils::MakeUnexpected(lock_save.error());
     }
 
     uint64_t captured_wal_sequence = 0;
@@ -241,19 +219,11 @@ utils::Expected<std::string, utils::Error> HandleDumpLoad(HandlerContext& ctx, c
     return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kInternalError, error_msg));
   }
 
-  // Reserve the load operation before waiting for the lifecycle gates. This
-  // makes concurrent LOAD calls fail deterministically instead of allowing two
-  // deserializers to clear and repopulate the same live stores.
-  bool expected = false;
-  if (!ctx.loading.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-    return utils::MakeUnexpected(
-        utils::MakeError(utils::ErrorCode::kSnapshotAlreadyInProgress, "Another snapshot load is already in progress"));
-  }
-  utils::FlagResetGuard loading_guard(ctx.loading);
-
-  if (ctx.read_only.load(std::memory_order_acquire)) {
-    return utils::MakeUnexpected(
-        utils::MakeError(utils::ErrorCode::kSnapshotAlreadyInProgress, "A snapshot save is already in progress"));
+  // Admission makes concurrent LOAD and SAVE calls fail deterministically
+  // instead of letting two sessions touch the same live stores.
+  auto load = ctx.snapshot_coordinator.BeginLoad(ctx.fork_snapshot_writer);
+  if (!load) {
+    return utils::MakeUnexpected(load.error());
   }
 
   // Deserialize into isolated stores first. A corrupt or semantically invalid
@@ -268,26 +238,11 @@ utils::Expected<std::string, utils::Error> HandleDumpLoad(HandlerContext& ctx, c
   }
 
   // Drain all mutations and similarity queries only for the short publication
-  // phase. The lock order mirrors normal requests: snapshot gate, then WAL
-  // serialization gate. New requests observe loading=true and fail promptly.
-  std::unique_lock<std::shared_mutex> snapshot_write_guard;
-  if (ctx.snapshot_write_gate != nullptr) {
-    snapshot_write_guard = std::unique_lock(*ctx.snapshot_write_gate);
-  }
+  // phase. New requests observe loading=true and fail promptly.
+  auto publication = load->Publish();
   std::unique_lock<std::mutex> write_serialization_guard;
   if (ctx.write_serialization_gate != nullptr) {
     write_serialization_guard = std::unique_lock(*ctx.write_serialization_gate);
-  }
-
-  // A fork child still writing a pre-load image would finish after the load
-  // and become a newer recovery base than the loaded file. With loading set
-  // and the gate held, no new child can start, so this check is final.
-  if (ctx.fork_snapshot_writer != nullptr) {
-    ctx.fork_snapshot_writer->CheckChild();
-    if (ctx.fork_snapshot_writer->IsInProgress()) {
-      return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kSnapshotAlreadyInProgress,
-                                                    "Cannot load snapshot while a background save is in progress"));
-    }
   }
 
   staged.Publish(ctx, /*rebuild_ann=*/true);
@@ -298,8 +253,7 @@ utils::Expected<std::string, utils::Error> HandleDumpLoad(HandlerContext& ctx, c
     // fail-stop and keep loading set until an operator restarts after fixing
     // storage.
     ctx.durability_failed.store(true, std::memory_order_release);
-    ctx.loading.store(true, std::memory_order_release);
-    loading_guard.KeepSet();
+    load->KeepLoading();
     utils::LogStorageError("dump_load_fail_stop", resolved_path, error.message());
     return utils::MakeUnexpected(error);
   };
@@ -311,14 +265,8 @@ utils::Expected<std::string, utils::Error> HandleDumpLoad(HandlerContext& ctx, c
       // a later restart would replay mutations that the operator deliberately
       // rolled back.
       const uint64_t checkpoint_sequence = ctx.wal->CurrentSequence();
-      std::error_code ec;
-      std::filesystem::last_write_time(resolved_path, std::filesystem::file_time_type::clock::now(), ec);
-      if (ec) {
-        return fail_stop(utils::MakeError(utils::ErrorCode::kStorageWriteError,
-                                          "Failed to mark loaded snapshot as recovery base: " + ec.message()));
-      }
-      // Same handshake as a save: sidecar first, truncate only once it is
-      // durable. Routing it through a session keeps that order in one place.
+      // Same handshake as a save: the sidecar binds the file, only then does it
+      // become the newest recovery base, and the WAL is truncated last.
       storage::SnapshotSession session(resolved_path, utils::Expected<void, utils::Error>{}, checkpoint_sequence,
                                        ctx.wal);
       auto outcome = session.Finish(0);

@@ -18,7 +18,10 @@
 
 #include "events/co_occurrence_index.h"
 #include "events/event_store.h"
+#include "server/handlers/dump_handler.h"
 #include "storage/snapshot_fork.h"
+#include "storage/snapshot_format_v1.h"
+#include "storage/wal.h"
 #include "storage/wal_checkpoint.h"
 #include "vectors/vector_store.h"
 
@@ -153,18 +156,14 @@ TEST_F(SnapshotSchedulerTest, CleanupKeepsExactlyTheNewestAutoSnapshotsAndTheirS
     return names;
   };
 
-  SnapshotScheduler scheduler(MakeTestConfig(1, 3, temp_dir_.string()), ctx_);
+  // The interval never elapses, so the only child is the one started here and
+  // retention runs exactly once, after the scheduler reaps it.
+  SnapshotScheduler scheduler(MakeTestConfig(3600, 3, temp_dir_.string()), ctx_);
   scheduler.Start();
   ASSERT_TRUE(scheduler.IsRunning());
+  ASSERT_TRUE(handlers::StartForkSnapshot(ctx_, (temp_dir_ / "auto_20990101_000000.nvec").string()));
 
-  // The first tick forks a real snapshot (six files). Once it is published,
-  // a load-in-progress flag makes every later tick refuse to fork, so
-  // retention runs exactly once, after that child is reaped.
-  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-  while (auto_snapshots().size() != 6 && std::chrono::steady_clock::now() < deadline) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  }
-  loading_.store(true);
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
   while (auto_snapshots().size() != 3 && std::chrono::steady_clock::now() < deadline) {
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
@@ -211,6 +210,90 @@ TEST_F(SnapshotSchedulerTest, CleanupReclaimsTemporariesOfDeadWritersOnly) {
   // A temporary owned by a living process is still being written; removing it
   // would corrupt an in-flight snapshot.
   EXPECT_TRUE(std::filesystem::exists(live));
+}
+
+TEST_F(SnapshotSchedulerTest, StartupSweepReclaimsTemporariesCarryingTheOwnPid) {
+  // Before this process starts a writer, a temporary with its PID was left by
+  // a previous run that had the same PID (PID 1 in a container).
+  const std::filesystem::path own = temp_dir_ / (".auto_20260101_000000.nvec.tmp." + std::to_string(::getpid()) + ".0");
+  std::ofstream(own) << "partial snapshot";
+
+  ReclaimAbandonedTemporaries(temp_dir_.string(), /*own_pid_is_abandoned=*/false);
+  EXPECT_TRUE(std::filesystem::exists(own));
+  ReclaimAbandonedTemporaries(temp_dir_.string(), /*own_pid_is_abandoned=*/true);
+  EXPECT_FALSE(std::filesystem::exists(own));
+}
+
+TEST_F(SnapshotSchedulerTest, RefusedScheduledSnapshotIsRetriedOnTheNextTick) {
+  const auto has_auto_snapshot = [this] {
+    for (const auto& entry : std::filesystem::directory_iterator(temp_dir_)) {
+      if (entry.path().filename().string().rfind("auto_", 0) == 0) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  // The snapshot due at 2 s is refused by a load; with the load gone the 3 s
+  // tick must take it, not the 4 s tick a full interval later.
+  loading_.store(true);
+  const auto started = std::chrono::steady_clock::now();
+  SnapshotScheduler scheduler(MakeTestConfig(2, 3, temp_dir_.string()), ctx_);
+  scheduler.Start();
+  std::this_thread::sleep_until(started + std::chrono::milliseconds(2400));
+  EXPECT_FALSE(has_auto_snapshot());
+  loading_.store(false);
+
+  while (!has_auto_snapshot() && std::chrono::steady_clock::now() < started + std::chrono::milliseconds(3700)) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  const bool retried = has_auto_snapshot();
+  scheduler.Stop();
+  EXPECT_TRUE(retried) << "the refused snapshot waited for the next interval";
+}
+
+TEST_F(SnapshotSchedulerTest, RetentionWithWalCountsOnlySnapshotsWhoseSidecarValidates) {
+  namespace fs = std::filesystem;
+  storage::WriteAheadLog wal;
+  storage::WriteAheadLog::Config wal_config;
+  wal_config.directory = (temp_dir_ / "wal").string();
+  fs::create_directories(wal_config.directory);
+  ASSERT_TRUE(wal.Open(wal_config));
+  ASSERT_TRUE(wal.Append(storage::WalOpType::kVecSet, nullptr, 0));
+  ctx_.wal = &wal;
+
+  // The base the WAL was last truncated against, older than everything else.
+  const auto now = fs::file_time_type::clock::now();
+  const fs::path base = temp_dir_ / "auto_20260101_000000.nvec";
+  ASSERT_TRUE(
+      storage::snapshot_v1::WriteSnapshotV1(base.string(), full_config_, event_store_, co_index_, vector_store_));
+  ASSERT_TRUE(storage::WriteWalCheckpoint(base.string(), wal.CurrentSequence()));
+  fs::last_write_time(base, now - std::chrono::minutes(10));
+  // A newer snapshot whose sidecar write failed.
+  const fs::path unbound = temp_dir_ / "auto_20260101_000001.nvec";
+  std::ofstream(unbound) << "snapshot without sidecar";
+  fs::last_write_time(unbound, now - std::chrono::minutes(5));
+
+  // The fork writer has no WAL, so the child it reaps publishes no sidecar
+  // either: the newest file is again one whose sidecar never landed.
+  const fs::path newest = temp_dir_ / "auto_20990101_000000.nvec";
+  SnapshotScheduler scheduler(MakeTestConfig(3600, 1, temp_dir_.string()), ctx_);
+  scheduler.Start();
+  ASSERT_TRUE(handlers::StartForkSnapshot(ctx_, newest.string()));
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+  while (fs::exists(unbound) && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  scheduler.Stop();
+  ctx_.wal = nullptr;
+
+  EXPECT_FALSE(fs::exists(unbound));
+  EXPECT_FALSE(fs::exists(newest));
+  ASSERT_TRUE(fs::exists(base));
+  EXPECT_TRUE(storage::ReadWalCheckpoint(base.string()));
+  const auto candidates = storage::ListRecoveryCandidates(temp_dir_.string(), /*require_checkpoint=*/true);
+  ASSERT_EQ(candidates.size(), 1U);
+  EXPECT_EQ(fs::path(candidates.front()).filename().string(), base.filename().string());
 }
 
 }  // namespace

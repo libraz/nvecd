@@ -24,7 +24,6 @@
 #include "server/http_server.h"
 #include "server/request_dispatcher.h"
 #include "server/wal_codec.h"
-#include "storage/snapshot_format.h"
 #include "storage/wal_checkpoint.h"
 #include "utils/error.h"
 #include "utils/network_utils.h"
@@ -37,76 +36,6 @@ constexpr int kShutdownCheckIntervalMs = 10;
 constexpr size_t kBytesPerMegabyte = 1024 * 1024;  // Bytes in a megabyte
 /// Snapshot WAL-off decay maintenance writes inside snapshot.dir.
 constexpr const char* kMaintenanceSnapshotFilename = "maintenance.nvec";
-
-/**
- * @brief Find completed snapshots in @p dir, newest first.
- *
- * Startup recovery must replay the WAL relative to the exact snapshot the WAL
- * was last truncated against. Every snapshot that triggered a truncation wrote a
- * "<snapshot>.walseq" checkpoint sidecar (see WriteWalCheckpoint), so the set of
- * files with a sidecar is precisely the set of valid recovery bases. Among them
- * the newest by modification time is chosen, mirroring the mtime ordering the
- * SnapshotScheduler uses for cleanup. Snapshots without a sidecar are ignored:
- * the WAL was not truncated for them, so replaying the full WAL tail already
- * reconstructs their contents.
- *
- * @param dir Snapshot directory to scan
- * @param require_checkpoint Whether a WAL checkpoint sidecar is mandatory
- * @return Eligible paths sorted by modification time (then path) descending
- */
-std::vector<std::string> FindSnapshotCandidates(const std::string& dir, bool require_checkpoint) {
-  std::error_code ec;
-  std::filesystem::path snapshot_dir(dir);
-  if (!std::filesystem::is_directory(snapshot_dir, ec)) {
-    return {};
-  }
-
-  struct Candidate {
-    std::string path;
-    std::filesystem::file_time_type mtime;
-  };
-  std::vector<Candidate> candidates;
-  for (const auto& entry : std::filesystem::directory_iterator(snapshot_dir, ec)) {
-    if (ec) {
-      break;
-    }
-    const auto status = std::filesystem::symlink_status(entry.path(), ec);
-    if (ec || !std::filesystem::is_regular_file(status)) {
-      continue;
-    }
-    // Only a final snapshot suffix denotes a published recovery candidate.
-    // Writer temporary files contain an additional ".tmp.<random>" suffix;
-    // checkpoint sidecars and unrelated files are therefore excluded too.
-    if (!storage::snapshot_format::IsRecoverableExtension(entry.path().extension().string())) {
-      continue;
-    }
-    // With WAL enabled, only snapshots with a checkpoint sidecar are valid
-    // bases: the sidecar tells us exactly where replay must begin. Without WAL
-    // there is no sidecar by design, so the newest valid snapshot is the sole
-    // durable recovery source and must not be ignored.
-    const std::string sidecar = entry.path().string() + storage::kWalCheckpointSuffix;
-    if (require_checkpoint && !std::filesystem::exists(sidecar, ec)) {
-      continue;
-    }
-    const auto mtime = std::filesystem::last_write_time(entry, ec);
-    if (ec) {
-      continue;
-    }
-    candidates.push_back({entry.path().string(), mtime});
-  }
-  std::sort(candidates.begin(), candidates.end(), [](const Candidate& lhs, const Candidate& rhs) {
-    if (lhs.mtime != rhs.mtime) {
-      return lhs.mtime > rhs.mtime;
-    }
-    return lhs.path > rhs.path;
-  });
-  std::vector<std::string> paths;
-  paths.reserve(candidates.size());
-  for (auto& candidate : candidates) {
-    paths.push_back(std::move(candidate.path));
-  }
-  return paths;
-}
 }  // namespace
 
 NvecdServer::NvecdServer(config::Config config) : config_(std::move(config)) {}
@@ -292,8 +221,9 @@ void NvecdServer::Stop() {
   spdlog::info("Stopping nvecd server...");
 
   running_.store(false);
-  shutdown_.store(true);
 
+  // Refuses new snapshot sessions before reaping the child, so none can start
+  // while the request surfaces below are still draining.
   StopBackgroundWork();
 
   // Stop HTTP server
@@ -350,7 +280,8 @@ void NvecdServer::Stop() {
   unix_acceptor_.reset();
 
   // Close the WAL last: all surfaces (TCP worker threads, HTTP server) are now
-  // stopped and the fork child has been reaped, so no write can race the close.
+  // stopped, and the fork child has been reaped with no new one admitted since
+  // shutdown began, so no write can race the close.
   // Close() flushes pending writes and joins the background sync thread.
   if (wal_.IsOpen()) {
     wal_.Close();
@@ -376,6 +307,9 @@ void NvecdServer::StopBackgroundWork() {
   // configured shutdown budget rather than the writer's own default, so a
   // snapshot child cannot hold shutdown open past what the deployment allows.
   // The cast is safe because the schema constrains this key to 100..60000.
+  // No DUMP SAVE or DUMP LOAD can start a session after BeginShutdown, so the
+  // child waited for here is the last one.
+  handler_ctx_.snapshot_coordinator.BeginShutdown();
   if (fork_writer_) {
     fork_writer_->WaitForChild(static_cast<uint32_t>(config_.perf.shutdown_timeout_ms));
   }
@@ -406,7 +340,6 @@ void NvecdServer::AbortStart() {
 }
 
 utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
-  handler_ctx_.snapshot_write_gate = &snapshot_write_gate_;
   handler_ctx_.write_serialization_gate = &write_serialization_gate_;
   spdlog::info("Initializing server components...");
 
@@ -482,7 +415,9 @@ utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
   // destructor runs in that case, and the retention sweep that would otherwise
   // catch them only exists while the scheduler thread does, which the default
   // snapshot interval never starts.
-  ReclaimAbandonedTemporaries(config_.snapshot.dir);
+  // No writer exists in this process yet, so a temporary carrying its PID is
+  // one a previous run with the same PID left behind.
+  ReclaimAbandonedTemporaries(config_.snapshot.dir, /*own_pid_is_abandoned=*/true);
 
   // Create ForkSnapshotWriter (always create, even in lock mode, for DUMP STATUS)
   fork_writer_ = std::make_unique<storage::ForkSnapshotWriter>();
@@ -529,21 +464,16 @@ utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
   };
   auto load_newest_valid_snapshot = [&](bool require_checkpoint) -> utils::Expected<RecoverySnapshot, utils::Error> {
     std::optional<utils::Error> last_error;
-    for (const auto& candidate : FindSnapshotCandidates(config_.snapshot.dir, require_checkpoint)) {
-      uint64_t checkpoint = 0;
-      if (require_checkpoint) {
-        auto checkpoint_result = storage::ReadWalCheckpoint(candidate);
-        if (!checkpoint_result) {
-          spdlog::warn("Skipping snapshot with invalid WAL checkpoint {}: {}", candidate,
-                       checkpoint_result.error().message());
-          last_error = checkpoint_result.error();
-          continue;
-        }
-        checkpoint = *checkpoint_result;
+    for (const auto& candidate : storage::ListRecoveryCandidates(config_.snapshot.dir, require_checkpoint)) {
+      auto checkpoint = storage::RecoveryCheckpoint(candidate, require_checkpoint);
+      if (!checkpoint) {
+        spdlog::warn("Skipping snapshot with invalid WAL checkpoint {}: {}", candidate, checkpoint.error().message());
+        last_error = checkpoint.error();
+        continue;
       }
       auto loaded = load_snapshot(candidate);
       if (loaded) {
-        return RecoverySnapshot{candidate, checkpoint};
+        return RecoverySnapshot{candidate, *checkpoint};
       }
       last_error = loaded.error();
     }
@@ -600,7 +530,7 @@ utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
     fork_writer_->SetWal(&wal_);
     spdlog::info("WAL enabled (dir={}, current_sequence={})", config_.wal.dir, wal_.CurrentSequence());
   } else {
-    // WAL-off is the default configuration. Its snapshots have no .walseq
+    // WAL-off is the default configuration. Its snapshots have no checkpoint
     // sidecar, so recover the latest snapshot directly instead of starting
     // every restart from an empty in-memory store.
     auto loaded_snapshot = load_newest_valid_snapshot(/*require_checkpoint=*/false);
@@ -629,7 +559,7 @@ utils::Expected<void, utils::Error> NvecdServer::InitializeComponents() {
       co_index_.get(), static_cast<int>(config_.events.decay_interval_sec), config_.events.decay_alpha,
       [this](double alpha, bool prune) -> utils::Expected<void, utils::Error> {
         {
-          std::shared_lock snapshot_guard(snapshot_write_gate_);
+          auto snapshot_access = handler_ctx_.snapshot_coordinator.AcquireStoreAccess(StoreAccess::kWrite);
           std::lock_guard write_guard(write_serialization_gate_);
           if (read_only_.load(std::memory_order_acquire) ||
               handler_ctx_.durability_failed.load(std::memory_order_acquire)) {

@@ -84,7 +84,7 @@ make CMAKE_OPTIONS="-DCMAKE_BUILD_TYPE=Release" configure
 make
 ```
 
-`CMAKE_OPTIONS` を読むのは `configure` ターゲットだけです。`build/` に CMake のキャッシュができた後の `make` はそれを再利用するので、オプションを変えるには `configure` をやり直します。
+`CMAKE_OPTIONS` を読むのは `configure` ターゲットだけです。`build/` に CMake のキャッシュができた後の `make` はそれを再利用します。`BUILD_TESTS` とインストール先プレフィックスはコマンドラインで指定したときだけ CMake に渡されるため（`make PREFIX=/opt/nvecd install`、`make BUILD_TESTS=OFF configure`）、configure 時に選んだ値は保たれます。それ以外のオプションを変えるには `configure` をやり直します。
 
 ## CMake を直接使ってビルドする
 
@@ -126,7 +126,7 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release -DNVECD_PORTABLE_BUILD=ON
 
 サニタイザーは排他です。`ENABLE_ASAN` と `ENABLE_TSAN` を両方有効にしたビルドはリンクできません。
 
-バイナリに埋め込まれるバージョンは、環境変数 `NVECD_VERSION` が設定されていればその値、なければ `git describe --tags --abbrev=0` の結果です。
+バージョンは、環境変数 `NVECD_VERSION` が設定されていればその値、なければ `git describe --tags --abbrev=0` の結果です。この 1 つの値がプロジェクトのバージョンであり、バイナリ（`--version`、`INFO`、`GET /info`）に埋め込まれ、クライアントライブラリと CMake パッケージのバージョンにもなります。
 
 ## 生成される成果物
 
@@ -153,9 +153,16 @@ sudo make install
 | `lib/libnvecdclient.*` | 共有クライアントライブラリ |
 | `include/nvecd/` | `nvecdclient.h`、`nvecdclient_c.h`、および `utils/error.h`、`utils/expected.h` |
 | `lib/cmake/nvecd/` | `nvecd::client` ターゲットをエクスポートする CMake パッケージ |
-| `etc/nvecd/config.yaml` | 注釈付きの設定例 |
+| `etc/nvecd/config.yaml.example` | 注釈付きの設定例（サンプルとしてインストールされます） |
 | `etc/nvecd/config-schema.json` | サーバーが設定を検証するスキーマ |
-| `share/doc/nvecd/` | `README.md` と両言語のドキュメント一式 |
+| `share/doc/nvecd/` | `README.md` と `docs/` ツリー（`en`、`ja`、`images`）。相対リンクが解決できる配置です |
+
+パスを指定しない場合、サーバーは `/etc/nvecd/config.yaml` を読みます。インストールがこのファイルを作成・削除することはないため、編集した設定は再インストールやアンインストールの後も残ります。サンプルを所定の場所にコピーして、コピーの方を編集してください。
+
+```bash
+sudo mkdir -p /etc/nvecd
+sudo cp /usr/local/etc/nvecd/config.yaml.example /etc/nvecd/config.yaml
+```
 
 CMake プロジェクトからは次のようにインストール済みのクライアントライブラリを使います。
 
@@ -163,6 +170,8 @@ CMake プロジェクトからは次のようにインストール済みのク�
 find_package(nvecd CONFIG REQUIRED)
 target_link_libraries(my_app PRIVATE nvecd::client)
 ```
+
+Linux ではインストール後に `sudo ldconfig` を実行し、動的リンカーが `/usr/local/lib` の `libnvecdclient.so` を見つけられるようにします。macOS ではライブラリのインストール名が `@rpath` 相対のため、CMake ターゲットを使わず手動でリンクするプログラムは、リンクコマンドに `-Wl,-rpath,/usr/local/lib` を加えないとロードできません。コマンド例は[クライアントライブラリ](./client-library.md)を参照してください。
 
 ### 別のプレフィックスへ
 

@@ -206,11 +206,15 @@ if(ENABLE_COVERAGE)
   endif()
 endif()
 
-install(FILES examples/config.yaml src/config/config-schema.json
+# The example is installed as a sample so an install or uninstall never
+# overwrites or removes an operator-edited etc/nvecd/config.yaml.
+install(FILES examples/config.yaml
   DESTINATION etc/nvecd
+  RENAME config.yaml.example
 )
+install(FILES src/config/config-schema.json DESTINATION etc/nvecd)
 install(FILES README.md DESTINATION share/doc/nvecd)
-install(DIRECTORY docs/en docs/ja DESTINATION share/doc/nvecd)
+install(DIRECTORY docs DESTINATION share/doc/nvecd)
 
 configure_file(cmake/uninstall.cmake.in ${CMAKE_CURRENT_BINARY_DIR}/uninstall.cmake @ONLY)
 add_custom_target(nvecd-uninstall

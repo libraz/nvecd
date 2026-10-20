@@ -143,8 +143,9 @@ Expected<NextRecord, Error> ReadNextRecord(int fd, off_t file_size, const std::s
         utils::MakeError(utils::ErrorCode::kWalReadError, "Failed to read WAL record body: " + path));
   }
 
-  // A CRC mismatch marks a corrupt/torn tail whose length prefix is itself
-  // untrustworthy, so the rest of the segment is never reinterpreted as records.
+  // A CRC mismatch means the length prefix is itself untrustworthy, so the rest
+  // of the segment is never reinterpreted as records. It is corruption, not a
+  // torn tail: only a short header or body is repaired.
   const uint32_t actual_crc = snapshot_v1::CalculateCRC32(record.body.data(), record.body.size());
   if (actual_crc != expected_crc) {
     utils::StructuredLog()
@@ -383,8 +384,9 @@ Expected<uint64_t, Error> WriteAheadLog::Append(WalOpType op, const void* payloa
     }
   }
 
-  ++current_sequence_;
-  uint64_t seq = current_sequence_;
+  // The counter advances only once the record is completely written, so a
+  // checkpoint taken from CurrentSequence() never names a torn record.
+  const uint64_t seq = current_sequence_ + 1;
   uint64_t timestamp = NowMicros();
 
   // Build record body: sequence(8) + timestamp(8) + op(1) + payload
@@ -406,8 +408,8 @@ Expected<uint64_t, Error> WriteAheadLog::Append(WalOpType op, const void* payloa
 
   auto poison_current_segment = [this](const std::string& message) -> Expected<uint64_t, Error> {
     // A short/failed write leaves an untrusted tail. Never append another ACKed
-    // record to that segment: recovery stops at its corrupt tail and would
-    // otherwise lose every later record in the same file.
+    // record to that segment: recovery cuts only a torn tail on the newest
+    // segment, so any record written after it would be lost or fail startup.
     if (current_fd_ >= 0) {
       ::close(current_fd_);
       current_fd_ = -1;
@@ -424,6 +426,8 @@ Expected<uint64_t, Error> WriteAheadLog::Append(WalOpType op, const void* payloa
     return poison_current_segment("Failed to write record body: " + std::string(std::strerror(errno)));
   }
 
+  // Fully written: an fsync failure below still leaves a complete record.
+  current_sequence_ = seq;
   current_file_size_ += total_record_size;
 
   // Update file metadata

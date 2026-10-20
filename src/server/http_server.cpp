@@ -23,7 +23,6 @@
 #include <limits>
 #include <mutex>
 #include <optional>
-#include <shared_mutex>
 #include <sstream>
 #include <string_view>
 #include <unordered_map>
@@ -384,11 +383,30 @@ bool LoadInProgress(const HandlerContext* handler_context) {
   return handler_context != nullptr && handler_context->loading.load(std::memory_order_acquire);
 }
 
-std::shared_lock<std::shared_mutex> AcquireSnapshotWriteGuard(const HandlerContext* handler_context) {
-  if (handler_context == nullptr || handler_context->snapshot_write_gate == nullptr) {
+/**
+ * @brief Admit a store write, refusing it before it waits on the snapshot gate
+ *
+ * The refusal is re-checked once admitted, as on TCP.
+ *
+ * @return true when admitted with @p access held; false with the reason in @p message
+ */
+bool AdmitWrite(const HandlerContext* handler_context, CommandType type, SnapshotCoordinator::AccessGuard* access,
+                std::string* message) {
+  if (WriteRefused(handler_context, type, message)) {
+    return false;
+  }
+  if (handler_context == nullptr) {
+    return true;
+  }
+  *access = handler_context->snapshot_coordinator.AcquireStoreAccess(StoreAccess::kWrite);
+  return !WriteRefused(handler_context, type, message);
+}
+
+SnapshotCoordinator::AccessGuard AcquireSearchAccess(const HandlerContext* handler_context) {
+  if (handler_context == nullptr) {
     return {};
   }
-  return std::shared_lock(*handler_context->snapshot_write_gate);
+  return handler_context->snapshot_coordinator.AcquireStoreAccess(StoreAccess::kSearch);
 }
 
 utils::Expected<vectors::Metadata, utils::Error> ParseMetadataJson(const json& value) {
@@ -1164,8 +1182,8 @@ void HttpServer::HandleEvent(const httplib::Request& req, httplib::Response& res
     command.timestamp = timestamp;
 
     // Taken after parsing so a slow or malformed body never holds up a snapshot.
-    auto snapshot_write_guard = AcquireSnapshotWriteGuard(handler_context_);
-    if (WriteRefused(handler_context_, CommandType::kEvent, &refusal)) {
+    SnapshotCoordinator::AccessGuard snapshot_access;
+    if (!AdmitWrite(handler_context_, CommandType::kEvent, &snapshot_access, &refusal)) {
       SendError(res, kHttpServiceUnavailable, refusal);
       return;
     }
@@ -1231,8 +1249,8 @@ void HttpServer::HandleVecset(const httplib::Request& req, httplib::Response& re
     }
 
     // Taken after parsing so a slow or malformed body never holds up a snapshot.
-    auto snapshot_write_guard = AcquireSnapshotWriteGuard(handler_context_);
-    if (WriteRefused(handler_context_, CommandType::kVecset, &refusal)) {
+    SnapshotCoordinator::AccessGuard snapshot_access;
+    if (!AdmitWrite(handler_context_, CommandType::kVecset, &snapshot_access, &refusal)) {
       SendError(res, kHttpServiceUnavailable, refusal);
       return;
     }
@@ -1283,8 +1301,8 @@ void HttpServer::HandleVecdel(const httplib::Request& req, httplib::Response& re
     }
 
     // Taken after parsing so a slow or malformed body never holds up a snapshot.
-    auto snapshot_write_guard = AcquireSnapshotWriteGuard(handler_context_);
-    if (WriteRefused(handler_context_, CommandType::kVecdel, &refusal)) {
+    SnapshotCoordinator::AccessGuard snapshot_access;
+    if (!AdmitWrite(handler_context_, CommandType::kVecdel, &snapshot_access, &refusal)) {
       SendError(res, kHttpServiceUnavailable, refusal);
       return;
     }
@@ -1340,8 +1358,8 @@ void HttpServer::HandleMetaset(const httplib::Request& req, httplib::Response& r
     command.metadata = std::move(*metadata_result);
 
     // Taken after parsing so a slow or malformed body never holds up a snapshot.
-    auto snapshot_write_guard = AcquireSnapshotWriteGuard(handler_context_);
-    if (WriteRefused(handler_context_, CommandType::kMetaset, &refusal)) {
+    SnapshotCoordinator::AccessGuard snapshot_access;
+    if (!AdmitWrite(handler_context_, CommandType::kMetaset, &snapshot_access, &refusal)) {
       SendError(res, kHttpServiceUnavailable, refusal);
       return;
     }
@@ -1382,7 +1400,7 @@ void HttpServer::HandleSim(const httplib::Request& req, httplib::Response& res) 
     SendError(res, kHttpServiceUnavailable, "Server is loading, please try again later");
     return;
   }
-  auto snapshot_write_guard = AcquireSnapshotWriteGuard(handler_context_);
+  auto snapshot_access = AcquireSearchAccess(handler_context_);
   if (LoadInProgress(handler_context_)) {
     SendError(res, kHttpServiceUnavailable, "Server is loading, please try again later");
     return;
@@ -1469,7 +1487,7 @@ void HttpServer::HandleSimv(const httplib::Request& req, httplib::Response& res)
     SendError(res, kHttpServiceUnavailable, "Server is loading, please try again later");
     return;
   }
-  auto snapshot_write_guard = AcquireSnapshotWriteGuard(handler_context_);
+  auto snapshot_access = AcquireSearchAccess(handler_context_);
   if (LoadInProgress(handler_context_)) {
     SendError(res, kHttpServiceUnavailable, "Server is loading, please try again later");
     return;

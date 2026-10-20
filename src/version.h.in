@@ -1,6 +1,6 @@
 /**
  * @file version.h
- * @brief nvecd version information
+ * @brief nvecd version information, generated from the CMake project version
  */
 
 #pragma once
@@ -18,22 +18,22 @@ class Version {
    * @brief Get version string
    * @return Version string (e.g., "0.3.0")
    */
-  static std::string String() { return "0.3.0"; }
+  static std::string String() { return "@PROJECT_VERSION@"; }
 
   /**
    * @brief Get major version
    */
-  static int Major() { return 0; }
+  static int Major() { return @PROJECT_VERSION_MAJOR@; }
 
   /**
    * @brief Get minor version
    */
-  static int Minor() { return 2; }
+  static int Minor() { return @PROJECT_VERSION_MINOR@; }
 
   /**
    * @brief Get patch version
    */
-  static int Patch() { return 1; }
+  static int Patch() { return @PROJECT_VERSION_PATCH@; }
 };
 
 }  // namespace nvecd

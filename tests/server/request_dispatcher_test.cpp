@@ -16,7 +16,6 @@
 #include <limits>
 #include <memory>
 #include <mutex>
-#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <variant>
@@ -331,21 +330,40 @@ TEST_F(RequestDispatcherTest, ReadsAndWritesAreRejectedWhileSnapshotLoadIsInProg
 }
 
 TEST_F(RequestDispatcherTest, SnapshotWriteGateClosesCheckThenMutateRace) {
-  std::shared_mutex gate;
-  ctx_->snapshot_write_gate = &gate;
-
-  std::unique_lock<std::shared_mutex> snapshot_guard(gate);
+  // Hold the write gate exclusively with no flag published yet, as a write that
+  // passed its first check before the session published its flag would see.
+  auto load = ctx_->snapshot_coordinator.BeginLoad(nullptr);
+  ASSERT_TRUE(load.has_value());
+  auto publication = load->Publish();
+  loading_.store(false, std::memory_order_release);
   auto pending_write = std::async(std::launch::async, [this] { return Dispatch("VECSET item 1 0\r\n"); });
 
   // The write acquired neither the gate nor the store mutation path while the
   // snapshot owns the exclusive barrier.
   EXPECT_EQ(pending_write.wait_for(std::chrono::milliseconds(20)), std::future_status::timeout);
   read_only_.store(true, std::memory_order_release);
-  snapshot_guard.unlock();
+  publication.searches.unlock();
+  publication.writes.unlock();
 
   const std::string response = pending_write.get();
   EXPECT_NE(response.find("READONLY"), std::string::npos);
   EXPECT_FALSE(vector_store_->HasVector("item"));
+  read_only_.store(false, std::memory_order_release);
+}
+
+TEST_F(RequestDispatcherTest, LockModeSaveRefusesWritesWithoutWaitingAndKeepsServingSearches) {
+  ASSERT_NE(Dispatch("VECSET item1 1 0\r\n").find("OK"), std::string::npos);
+  auto lock_save = ctx_->snapshot_coordinator.BeginLockSave(nullptr);
+  ASSERT_TRUE(lock_save.has_value());
+
+  auto write = std::async(std::launch::async, [this] { return Dispatch("VECSET item2 0 1\r\n"); });
+  ASSERT_EQ(write.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+  EXPECT_NE(write.get().find("READONLY"), std::string::npos);
+  EXPECT_FALSE(vector_store_->HasVector("item2"));
+
+  auto search = std::async(std::launch::async, [this] { return Dispatch("SIMV 1 1 0\r\n"); });
+  ASSERT_EQ(search.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+  EXPECT_NE(search.get().find("item1"), std::string::npos);
 }
 
 TEST_F(RequestDispatcherTest, WriteSerializationGateCoversMutationUntilWalAppend) {

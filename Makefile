@@ -7,8 +7,11 @@
 # Build directory
 BUILD_DIR := build
 
-# Install prefix (can be overridden: make PREFIX=/opt/nvecd install)
+# Install prefix (can be overridden: make PREFIX=/opt/nvecd install). Only passed
+# to CMake when set explicitly, so the prefix cached at configure time persists.
 PREFIX ?= /usr/local
+
+# Left unset so the cached BUILD_TESTS persists (make BUILD_TESTS=OFF configure)
 
 # clang-format command (can be overridden: make CLANG_FORMAT=clang-format-18 format)
 CLANG_FORMAT ?= clang-format
@@ -72,7 +75,7 @@ help:
 # Configure CMake
 configure:
 	@mkdir -p $(BUILD_DIR)
-	cd $(BUILD_DIR) && cmake -DCMAKE_INSTALL_PREFIX=$(PREFIX) -DBUILD_TESTS=ON $(CMAKE_OPTIONS) ..
+	cd $(BUILD_DIR) && cmake $(if $(filter command line environment,$(origin PREFIX)),-DCMAKE_INSTALL_PREFIX=$(PREFIX)) $(if $(BUILD_TESTS),-DBUILD_TESTS=$(BUILD_TESTS)) $(CMAKE_OPTIONS) ..
 
 # Build the project
 build: configure
@@ -119,7 +122,7 @@ install: build
 	@echo ""
 	@echo "Installation complete!"
 	@echo "  Binary:        $(PREFIX)/bin/nvecd"
-	@echo "  Config example: $(PREFIX)/etc/nvecd/config.yaml"
+	@echo "  Config example: $(PREFIX)/etc/nvecd/config.yaml.example"
 	@echo "  Documentation: $(PREFIX)/share/doc/nvecd/"
 	@echo ""
 	@echo "To run: $(PREFIX)/bin/nvecd -c config.yaml"

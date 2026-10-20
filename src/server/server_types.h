@@ -14,13 +14,13 @@
 #include <ctime>
 #include <memory>
 #include <mutex>
-#include <shared_mutex>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "config/config.h"
 #include "server/command_types.h"
+#include "server/snapshot_coordinator.h"
 #include "utils/network_utils.h"
 
 // Forward declarations (must be outside nvecd::server namespace)
@@ -385,12 +385,6 @@ struct HandlerContext {
   /// Whole-dataset publication generation, advanced by transactional LOAD.
   std::atomic<uint64_t> dataset_generation{0};
 
-  /// Optional server-wide barrier for lock-mode snapshots. Core write handlers
-  /// hold this shared for their full mutation/WAL sequence; a snapshot holds it
-  /// exclusively after publishing read_only, so no write can cross the
-  /// snapshot's point-in-time boundary.
-  std::shared_mutex* snapshot_write_gate = nullptr;
-
   /// Serializes a core mutation with its WAL append. This preserves WAL order
   /// across VECSET/METASET from concurrent TCP and HTTP clients: a METASET
   /// that observed a vector cannot be replayed before that vector's record.
@@ -403,6 +397,10 @@ struct HandlerContext {
   /// admitted, and never cleared until restart. Kept apart from read_only so a
   /// snapshot releasing its own flag cannot reopen writes.
   std::atomic<bool> durability_failed{false};
+
+  /// Admission and exclusion for every snapshot session; the only writer of
+  /// loading and read_only.
+  SnapshotCoordinator snapshot_coordinator{loading, read_only};
 
   // NOLINTEND(cppcoreguidelines-avoid-const-or-ref-data-members)
 };

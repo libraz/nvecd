@@ -20,7 +20,6 @@
 #include <future>
 #include <memory>
 #include <mutex>
-#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <unordered_set>
@@ -110,7 +109,6 @@ class HandlerTest : public ::testing::Test {
     cache_ = &cache_controller_->Cache();
     variable_manager_->SetCacheController(cache_controller_.get());
     ctx_->cache_controller = cache_controller_.get();
-    ctx_->snapshot_write_gate = &snapshot_write_gate_;
     ctx_->write_serialization_gate = &write_serialization_gate_;
   }
 
@@ -139,7 +137,6 @@ class HandlerTest : public ::testing::Test {
   std::unique_ptr<nvecd::cache::SimilarityCacheController> cache_controller_;
   std::unique_ptr<nvecd::config::RuntimeVariableManager> variable_manager_;
   std::filesystem::path dump_dir_;
-  std::shared_mutex snapshot_write_gate_;
   std::mutex write_serialization_gate_;
 
   // Placement-new storage for HandlerContext (avoids copy/move of atomics)
@@ -652,7 +649,7 @@ TEST_F(HandlerTest, DumpSave_LockModeDoesNotClearADurabilityLatchSetDuringTheSav
   config_->snapshot.dir = dump_dir_.string();
   const std::string dump_path = (dump_dir_ / "latched.nvec").string();
 
-  std::shared_lock admitted_writer(snapshot_write_gate_);
+  auto admitted_writer = ctx_->snapshot_coordinator.AcquireStoreAccess(StoreAccess::kWrite);
   auto save = std::async(std::launch::async, [this, &dump_path] { return HandleDumpSave(*ctx_, dump_path); });
   while (!read_only_.load(std::memory_order_acquire)) {
     std::this_thread::yield();
@@ -742,7 +739,7 @@ TEST_F(HandlerTest, DumpLoad_IsSingleFlightAndTakesExclusiveSnapshotGate) {
   const std::string dump_path = (dump_dir_ / "single_flight.dmp").string();
   ASSERT_TRUE(HandleDumpSave(*ctx_, dump_path).has_value());
 
-  std::shared_lock<std::shared_mutex> active_query(snapshot_write_gate_);
+  auto active_query = ctx_->snapshot_coordinator.AcquireStoreAccess(StoreAccess::kSearch);
   auto first_load = std::async(std::launch::async, [this, &dump_path] { return HandleDumpLoad(*ctx_, dump_path); });
 
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);

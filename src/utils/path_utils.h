@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <cstdint>
@@ -380,7 +381,9 @@ enum class DumpPathUse : uint8_t {
  *
  * If the filepath is not absolute, it is prepended with dump_dir.
  * The resulting path is canonicalized and checked for path traversal
- * (i.e., the canonical path must reside within the dump directory). A path
+ * (i.e., the canonical path must name an entry strictly inside the dump
+ * directory, never the directory itself). Only a ".." component counts as
+ * traversal; a name that merely contains two dots is accepted. A path
  * that becomes a recovery base must also carry an extension startup recovery
  * scans for; otherwise its WAL checkpoint would name a file recovery skips.
  *
@@ -402,8 +405,10 @@ inline Expected<std::string, Error> ValidateDumpPath(const std::string& filepath
     return MakeUnexpected(MakeError(ErrorCode::kInvalidArgument, "Invalid filepath: must not be empty"));
   }
 
-  // Defense-in-depth: reject paths containing ".." segments before canonicalization
-  if (filepath.find("..") != std::string::npos) {
+  // Defense-in-depth: reject ".." components before canonicalization. A name
+  // that merely contains two dots, such as "nightly..v2.dmp", is not one.
+  const std::filesystem::path requested(filepath);
+  if (std::any_of(requested.begin(), requested.end(), [](const std::filesystem::path& part) { return part == ".."; })) {
     return MakeUnexpected(MakeError(ErrorCode::kInvalidArgument, "Invalid filepath: path traversal detected"));
   }
 
@@ -438,10 +443,14 @@ inline Expected<std::string, Error> ValidateDumpPath(const std::string& filepath
     return MakeUnexpected(MakeError(ErrorCode::kInvalidArgument, "Invalid filepath: " + ec.message()));
   }
 
-  // Verify resolved path resides within dump directory
+  // Verify resolved path resides strictly within dump directory
   auto rel = resolved_canonical.lexically_relative(dump_canonical);
-  if (rel.empty() || rel.string().substr(0, 2) == "..") {
+  if (rel.empty() || *rel.begin() == "..") {
     return MakeUnexpected(MakeError(ErrorCode::kInvalidArgument, "Invalid filepath: path traversal detected"));
+  }
+  if (rel == ".") {
+    return MakeUnexpected(
+        MakeError(ErrorCode::kInvalidArgument, "Invalid filepath: names the dump directory itself, not a file"));
   }
 
   const auto target_parent =

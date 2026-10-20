@@ -51,7 +51,7 @@ utils::Expected<void, utils::Error> PreserveRecoveryBase(const std::string& snap
 struct SnapshotOutcome {
   std::string filepath;                 ///< Snapshot that was published
   uint64_t wal_sequence = 0;            ///< Sequence captured under the pre-write barrier
-  bool wal_checkpoint_written = false;  ///< A ".walseq" sidecar now binds the snapshot
+  bool wal_checkpoint_written = false;  ///< A checkpoint sidecar now binds the snapshot
   bool wal_truncated = false;           ///< The WAL was truncated up to wal_sequence
 };
 

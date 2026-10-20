@@ -9,6 +9,7 @@
 #include "server/snapshot_scheduler.h"
 
 #include <signal.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cctype>
@@ -39,9 +40,10 @@ constexpr int kTickIntervalMs = 1000;  // Cadence for polling a finished fork se
  * PrivateStorageTarget::CreateTemporaryFile names temporaries
  * ".<snapshot>.tmp.<pid>.<n>". A temporary owned by a live process is left
  * alone; one whose owner no longer exists can never be published, so it is
- * reclaimable.
+ * reclaimable. With @p own_pid_is_abandoned a temporary carrying this
+ * process's PID is reclaimable too.
  */
-bool IsAbandonedTemporary(const std::string& filename) {
+bool IsAbandonedTemporary(const std::string& filename, bool own_pid_is_abandoned) {
   static constexpr char kMarker[] = ".tmp.";
   if (filename.empty() || filename.front() != '.') {
     return false;
@@ -67,6 +69,9 @@ bool IsAbandonedTemporary(const std::string& filename) {
   const long owner_pid = std::strtol(pid_text.c_str(), nullptr, 10);
   if (errno != 0 || owner_pid <= 0 || owner_pid > std::numeric_limits<pid_t>::max()) {
     return false;
+  }
+  if (owner_pid == ::getpid()) {
+    return own_pid_is_abandoned;
   }
   errno = 0;
   return ::kill(static_cast<pid_t>(owner_pid), 0) != 0 && errno == ESRCH;
@@ -117,7 +122,7 @@ void SnapshotScheduler::Stop() {
   worker_.Stop();
 
   // Drain a final CheckChild on shutdown so a snapshot that completed just
-  // before Stop() still records its checkpoint and truncates the WAL.
+  // before Stop() is published and its retention pass runs.
   CheckFinishedSnapshot();
 
   utils::StructuredLog().Event("snapshot_scheduler_stopped").Info();
@@ -134,7 +139,10 @@ void SnapshotScheduler::CheckFinishedSnapshot() {
   // snapshot can appear after CleanupOldSnapshots() has counted files and
   // leave retain + 1 files behind.
   if (was_in_progress && !ctx_.fork_snapshot_writer->IsInProgress()) {
-    CleanupOldSnapshots();
+    cleanup_pending_ = true;
+  }
+  if (cleanup_pending_) {
+    cleanup_pending_ = !CleanupOldSnapshots();
   }
 }
 
@@ -148,13 +156,12 @@ void SnapshotScheduler::Tick() {
   // fork would be the only snapshot the process ever takes.
   CheckFinishedSnapshot();
 
-  if (std::chrono::steady_clock::now() >= next_save_time_) {
-    TakeSnapshot();
+  if (std::chrono::steady_clock::now() >= next_save_time_ && TakeSnapshot()) {
     next_save_time_ = std::chrono::steady_clock::now() + std::chrono::seconds(config_.interval_sec);
   }
 }
 
-void SnapshotScheduler::TakeSnapshot() {
+bool SnapshotScheduler::TakeSnapshot() {
   try {
     // Generate timestamp-based filename
     auto timestamp = std::time(nullptr);
@@ -167,19 +174,27 @@ void SnapshotScheduler::TakeSnapshot() {
 
     utils::StructuredLog().Event("snapshot_taking").Field("path", snapshot_path.string()).Info();
 
-    // A running save or load makes this tick fail; the next tick retries.
     auto result = handlers::StartForkSnapshot(ctx_, snapshot_path.string());
 
     if (result) {
       utils::StructuredLog().Event("snapshot_started").Field("path", snapshot_path.string()).Info();
-    } else {
-      utils::StructuredLog()
-          .Event("server_error")
-          .Field("operation", "snapshot_save")
-          .Field("filepath", snapshot_path.string())
-          .Field("error", result.error().message())
-          .Error();
+      return true;
     }
+    // A running save, load or child makes this tick fail; the next tick retries.
+    if (result.error().code() == utils::ErrorCode::kSnapshotAlreadyInProgress) {
+      utils::StructuredLog()
+          .Event("snapshot_deferred")
+          .Field("path", snapshot_path.string())
+          .Field("reason", result.error().message())
+          .Info();
+      return false;
+    }
+    utils::StructuredLog()
+        .Event("server_error")
+        .Field("operation", "snapshot_save")
+        .Field("filepath", snapshot_path.string())
+        .Field("error", result.error().message())
+        .Error();
 
   } catch (const std::exception& e) {
     utils::StructuredLog()
@@ -189,16 +204,18 @@ void SnapshotScheduler::TakeSnapshot() {
         .Field("error", e.what())
         .Error();
   }
+  return true;
 }
 
-void ReclaimAbandonedTemporaries(const std::string& dir) {
+void ReclaimAbandonedTemporaries(const std::string& dir, bool own_pid_is_abandoned) {
   std::error_code error;
   const std::filesystem::path snapshot_dir(dir);
   if (!std::filesystem::is_directory(snapshot_dir, error)) {
     return;
   }
   for (const auto& entry : std::filesystem::directory_iterator(snapshot_dir, error)) {
-    if (!entry.is_regular_file(error) || !IsAbandonedTemporary(entry.path().filename().string())) {
+    if (!entry.is_regular_file(error) ||
+        !IsAbandonedTemporary(entry.path().filename().string(), own_pid_is_abandoned)) {
       continue;
     }
     utils::StructuredLog().Event("snapshot_removing_abandoned_temp").Field("path", entry.path().string()).Info();
@@ -207,60 +224,55 @@ void ReclaimAbandonedTemporaries(const std::string& dir) {
   }
 }
 
-void SnapshotScheduler::CleanupOldSnapshots() {
+bool SnapshotScheduler::CleanupOldSnapshots() {
+  // Retention runs as a brief session, so no save or load can bind or touch
+  // a file between the ranking below and its removal.
+  auto session = ctx_.snapshot_coordinator.BeginBriefSession();
+  if (!session) {
+    return false;
+  }
+
   // Reclaim before the retention check: temporaries are dot-prefixed and carry
   // the writing process id, so the retention scan never sees them, and a
   // `retain` of 0 would otherwise skip the sweep entirely and let a killed
-  // writer's full-size file accumulate on every interrupted run.
-  ReclaimAbandonedTemporaries(config_.dir);
+  // writer's full-size file accumulate on every interrupted run. A lock-mode
+  // save in this process may own one, so this process's temporaries stay.
+  ReclaimAbandonedTemporaries(config_.dir, /*own_pid_is_abandoned=*/false);
 
   if (config_.retain <= 0) {
-    return;
+    return true;
   }
 
   try {
-    std::filesystem::path snapshot_dir(config_.dir);
-
-    if (!std::filesystem::exists(snapshot_dir) || !std::filesystem::is_directory(snapshot_dir)) {
-      return;
-    }
-
-    // Collect all auto_*.nvec files with their modification times
-    std::vector<std::pair<std::filesystem::path, std::filesystem::file_time_type>> snapshot_files;
-
-    for (const auto& entry : std::filesystem::directory_iterator(snapshot_dir)) {
-      if (!entry.is_regular_file()) {
+    // Only a recovery base counts toward retain: with the WAL enabled an
+    // auto-snapshot whose sidecar does not validate is removed rather than
+    // allowed to push the base the WAL was truncated against out of the set.
+    const bool require_checkpoint = ctx_.wal != nullptr;
+    const auto retain_count = static_cast<size_t>(config_.retain);
+    size_t kept = 0;
+    for (const auto& candidate : storage::ListRecoveryCandidates(config_.dir, /*require_checkpoint=*/false)) {
+      const std::filesystem::path path(candidate);
+      if (path.extension() != ".nvec" || path.filename().string().rfind("auto_", 0) != 0) {
         continue;
       }
-      const std::string name = entry.path().filename().string();
-      if (entry.path().extension() == ".nvec") {
-        // Only manage auto-saved files (starting with "auto_")
-        if (name.rfind("auto_", 0) == 0) {
-          snapshot_files.emplace_back(entry.path(), std::filesystem::last_write_time(entry));
-        }
+      if (kept < retain_count && storage::RecoveryCheckpoint(candidate, require_checkpoint)) {
+        ++kept;
+        continue;
       }
-    }
 
-    // Sort by modification time (newest first)
-    std::sort(snapshot_files.begin(), snapshot_files.end(),
-              [](const auto& lhs, const auto& rhs) { return lhs.second > rhs.second; });
-
-    // Delete old files beyond retain count
-    const auto retain_count = static_cast<size_t>(config_.retain);
-    for (size_t i = retain_count; i < snapshot_files.size(); ++i) {
-      utils::StructuredLog().Event("snapshot_removing_old").Field("path", snapshot_files[i].first.string()).Info();
+      utils::StructuredLog().Event("snapshot_removing_old").Field("path", candidate).Info();
       // The checkpoint sidecar goes first: a crash between the two removals
       // then leaves a snapshot without a sidecar, never an orphan sidecar.
       std::error_code remove_error;
-      std::filesystem::remove(snapshot_files[i].first.string() + storage::kWalCheckpointSuffix, remove_error);
+      std::filesystem::remove(storage::WalCheckpointPath(candidate), remove_error);
       if (!remove_error) {
-        std::filesystem::remove(snapshot_files[i].first, remove_error);
+        std::filesystem::remove(path, remove_error);
       }
       if (remove_error) {
         utils::StructuredLog()
             .Event("server_error")
             .Field("operation", "snapshot_cleanup")
-            .Field("path", snapshot_files[i].first.string())
+            .Field("path", candidate)
             .Field("error", remove_error.message())
             .Error();
       }
@@ -274,6 +286,7 @@ void SnapshotScheduler::CleanupOldSnapshots() {
         .Field("error", e.what())
         .Error();
   }
+  return true;
 }
 
 }  // namespace nvecd::server

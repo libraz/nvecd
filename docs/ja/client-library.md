@@ -34,16 +34,18 @@ target_link_libraries(app PRIVATE nvecd::client)
 手で書く場合は次のようになります。
 
 ```bash
-c++ -std=c++17 -I /usr/local/include/nvecd main.cpp -L /usr/local/lib -lnvecdclient -o app
+c++ -std=c++17 -I /usr/local/include/nvecd main.cpp -L /usr/local/lib -Wl,-rpath,/usr/local/lib -lnvecdclient -o app
 ```
 
 C のプログラムには C ヘッダだけが必要で、C++ 標準ライブラリのフラグは要りません。
 
 ```bash
-cc -I /usr/local/include/nvecd main.c -L /usr/local/lib -lnvecdclient -o app
+cc -I /usr/local/include/nvecd main.c -L /usr/local/lib -Wl,-rpath,/usr/local/lib -lnvecdclient -o app
 ```
 
 ライブラリのビルドには C++17 が必要ですが、C API の利用者は通常の共有ライブラリとしてリンクするだけで、それは不要です。
+
+`-Wl,-rpath,/usr/local/lib` は、実行時にプログラムがライブラリを見つけるための指定です。macOS ではライブラリの install name が `@rpath` 相対になっています。Linux では、インストール後に `sudo ldconfig` を実行すれば同じ効果が得られます。
 
 ## 接続する
 

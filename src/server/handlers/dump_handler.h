@@ -69,11 +69,12 @@ class StagedStores {
  * @brief Start a background fork snapshot of the live stores
  *
  * The one routine every fork capture goes through: DUMP SAVE in fork mode, the
- * auto-snapshot scheduler and WAL-off decay maintenance. It holds the snapshot
- * gate shared and the write serialization gate across the WAL sequence capture
- * and fork(), so no write sits between its WAL append and its store apply, and
- * it refuses while a DUMP LOAD is in flight. The captured sequence therefore
- * equals exactly what the forked image contains.
+ * auto-snapshot scheduler and WAL-off decay maintenance. It is admitted as a
+ * brief snapshot session, so it refuses while any other session or child is in
+ * flight or shutdown has begun, and it holds the write serialization gate
+ * across the WAL sequence capture and fork(), so no write sits between its WAL
+ * append and its store apply. The captured sequence therefore equals exactly
+ * what the forked image contains.
  *
  * @param ctx Handler context (stores, config, fork writer, gates)
  * @param resolved_path Validated snapshot path
@@ -86,7 +87,7 @@ utils::Expected<void, utils::Error> StartForkSnapshot(HandlerContext& ctx, const
  *
  * With no @p filepath the snapshot goes to `snapshot.default_filename` inside
  * the dump directory, and only to a timestamped name when that setting is
- * empty. Both forms are resolved through the same dump-path validation.
+ * empty. Every form is resolved through ValidateDumpPath.
  *
  * @param ctx Handler context (stores, config, snapshot writer, WAL)
  * @param filepath Client-supplied path, or empty to use the configured default
@@ -97,8 +98,9 @@ utils::Expected<std::string, utils::Error> HandleDumpSave(HandlerContext& ctx, c
 /**
  * @brief Handle DUMP LOAD command
  *
- * Loads a snapshot from the specified filepath into the stores. Sets loading
- * mode during the load operation. Filepath is required.
+ * Loads a snapshot from the specified filepath into the stores as a snapshot
+ * session, so loading is set for the whole operation and a concurrent save,
+ * load or running fork child refuses it. Filepath is required.
  *
  * @param ctx Handler context (must have event_store, co_index, vector_store)
  * @param filepath Source file path (must not be empty)

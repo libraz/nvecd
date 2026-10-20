@@ -45,8 +45,8 @@ struct WriteOutcome {
  *
  * WAL ordering: the mutation and its WAL append are serialised against other
  * writers through HandlerContext::write_serialization_gate, which is acquired
- * here. Snapshot admission (the loading/read-only flags and
- * HandlerContext::snapshot_write_gate) stays with the caller, because a
+ * here. Snapshot admission (the loading/read-only flags and store access
+ * through HandlerContext::snapshot_coordinator) stays with the caller, because a
  * rejected write must be reported in that surface's own wire form.
  *
  * @param ctx Handler context owning the stores, WAL and cache

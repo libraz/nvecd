@@ -34,8 +34,8 @@ utils::Expected<void, utils::Error> WriteSnapshotWithLock(
   // locks on all stores, then release them immediately. This ensures a
   // consistent point-in-time boundary.
   //
-  // After this barrier, the caller should have set the read_only flag
-  // (cleared by a FlagResetGuard in dump_handler) to prevent new writes from starting.
+  // The caller holds a lock-mode save session, which refuses new writes for
+  // the whole serialization.
   // WriteSnapshotV1 then serializes via const getters that acquire
   // shared (read) locks internally.
   {

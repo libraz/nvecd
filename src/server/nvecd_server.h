@@ -134,7 +134,8 @@ class NvecdServer {
   utils::Expected<void, utils::Error> InitializeComponents();
 
   /**
-   * @brief Join the snapshot and decay schedulers and reap any snapshot child
+   * @brief Refuse new snapshot sessions, join the snapshot and decay
+   *        schedulers, and reap any snapshot child
    */
   void StopBackgroundWork();
 
@@ -160,11 +161,9 @@ class NvecdServer {
 
   // Server state
   std::atomic<bool> running_{false};
-  std::atomic<bool> shutdown_{false};  // Set to true when shutting down
   std::atomic<bool> loading_{false};
   std::atomic<bool> read_only_{false};         // Set to true during snapshot save
   std::atomic<size_t> in_flight_requests_{0};  // TCP requests inside ProcessRequest
-  std::shared_mutex snapshot_write_gate_;
   std::mutex write_serialization_gate_;
 
   // Statistics

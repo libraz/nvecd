@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "storage/fd_io.h"
+#include "storage/snapshot_format.h"
 #include "storage/snapshot_format_v1.h"
 #include "utils/path_utils.h"
 
@@ -226,6 +227,74 @@ utils::Expected<uint64_t, utils::Error> ReadWalCheckpoint(const std::string& sna
         utils::MakeError(utils::ErrorCode::kStorageCorrupted, "WAL checkpoint does not match snapshot", final_path));
   }
   return sequence;
+}
+
+std::vector<std::string> ListRecoveryCandidates(const std::string& dir, bool require_checkpoint) {
+  std::error_code ec;
+  const std::filesystem::path snapshot_dir(dir);
+  if (!std::filesystem::is_directory(snapshot_dir, ec)) {
+    return {};
+  }
+
+  struct Candidate {
+    std::string path;
+    std::filesystem::file_time_type mtime;
+  };
+  std::vector<Candidate> candidates;
+  for (const auto& entry : std::filesystem::directory_iterator(snapshot_dir, ec)) {
+    if (ec) {
+      break;
+    }
+    const auto status = std::filesystem::symlink_status(entry.path(), ec);
+    if (ec || !std::filesystem::is_regular_file(status)) {
+      continue;
+    }
+    if (!snapshot_format::IsRecoverableExtension(entry.path().extension().string())) {
+      continue;
+    }
+    if (require_checkpoint && !std::filesystem::exists(WalCheckpointPath(entry.path().string()), ec)) {
+      continue;
+    }
+    const auto mtime = std::filesystem::last_write_time(entry, ec);
+    if (ec) {
+      continue;
+    }
+    candidates.push_back({entry.path().string(), mtime});
+  }
+  std::sort(candidates.begin(), candidates.end(), [](const Candidate& lhs, const Candidate& rhs) {
+    if (lhs.mtime != rhs.mtime) {
+      return lhs.mtime > rhs.mtime;
+    }
+    return lhs.path > rhs.path;
+  });
+  std::vector<std::string> paths;
+  paths.reserve(candidates.size());
+  for (auto& candidate : candidates) {
+    paths.push_back(std::move(candidate.path));
+  }
+  return paths;
+}
+
+utils::Expected<uint64_t, utils::Error> RecoveryCheckpoint(const std::string& snapshot_path, bool require_checkpoint) {
+  if (!require_checkpoint) {
+    return uint64_t{0};
+  }
+  return ReadWalCheckpoint(snapshot_path);
+}
+
+utils::Expected<void, utils::Error> BindRecoveryBase(const std::string& snapshot_path, uint64_t sequence) {
+  auto checkpoint = WriteWalCheckpoint(snapshot_path, sequence);
+  if (!checkpoint) {
+    return checkpoint;
+  }
+  std::error_code ec;
+  std::filesystem::last_write_time(snapshot_path, std::filesystem::file_time_type::clock::now(), ec);
+  if (ec) {
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kStorageWriteError,
+                                                  "Failed to mark snapshot as recovery base: " + ec.message(),
+                                                  snapshot_path));
+  }
+  return {};
 }
 
 }  // namespace nvecd::storage

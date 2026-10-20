@@ -34,16 +34,18 @@ target_link_libraries(app PRIVATE nvecd::client)
 By hand:
 
 ```bash
-c++ -std=c++17 -I /usr/local/include/nvecd main.cpp -L /usr/local/lib -lnvecdclient -o app
+c++ -std=c++17 -I /usr/local/include/nvecd main.cpp -L /usr/local/lib -Wl,-rpath,/usr/local/lib -lnvecdclient -o app
 ```
 
 For a C program, only the C header is needed and no C++ standard library flag:
 
 ```bash
-cc -I /usr/local/include/nvecd main.c -L /usr/local/lib -lnvecdclient -o app
+cc -I /usr/local/include/nvecd main.c -L /usr/local/lib -Wl,-rpath,/usr/local/lib -lnvecdclient -o app
 ```
 
 The library requires C++17 to build; a consumer of the C API links it as an ordinary shared library and does not.
+
+`-Wl,-rpath,/usr/local/lib` lets the program find the library at run time: its install name is `@rpath`-relative on macOS. On Linux, running `sudo ldconfig` after installing does the same.
 
 ## Connecting
 

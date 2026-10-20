@@ -797,8 +797,9 @@ Expected<void, Error> DeserializeEventStore(std::istream& input_stream, events::
 
       // Restore the event verbatim so its original timestamp (temporal-decay
       // weight) and type (DEL negative-signal / SET dedup semantics) are
-      // preserved. RestoreEvent bypasses deduplication to keep the buffer
-      // byte-for-byte identical to the snapshot.
+      // preserved. RestoreEvent appends without deduplicating, so the buffer
+      // matches the snapshot, and reseeds the ADD dedup window and SET state
+      // cache from each restored event.
       events::Event event(item_id, score, timestamp, static_cast<events::EventType>(event_type));
       auto result = event_store.RestoreEvent(ctx, event);
       if (!result) {

@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include <filesystem>
+#include <string>
 
 using namespace nvecd::utils;
 
@@ -96,10 +97,49 @@ TEST_F(PathUtilsTest, NestedRelativePath) {
   EXPECT_TRUE(result->find("file.dmp") != std::string::npos);
 }
 
-TEST_F(PathUtilsTest, DoubleDotsInFilenameRejected) {
-  // Even if ".." is part of a filename, it is rejected as defense-in-depth
-  auto result = ValidateDumpPath("my..file.dmp", test_dir_.string());
-  EXPECT_FALSE(result.has_value());
+TEST_F(PathUtilsTest, DoubleDotsInsideAFilenameAreAccepted) {
+  // Only a ".." component is traversal; two dots inside a name are not.
+  for (const char* name : {"nightly..v2.dmp", "..leading.dmp"}) {
+    auto result = ValidateDumpPath(name, test_dir_.string(), DumpPathUse::kRecoveryBase);
+    ASSERT_TRUE(result.has_value()) << name << ": " << result.error().message();
+    EXPECT_EQ(std::filesystem::path(*result).filename().string(), std::string(name));
+  }
+}
+
+TEST_F(PathUtilsTest, DotDotComponentRejectedEvenWhenItStaysInside) {
+  std::filesystem::create_directories(test_dir_ / "subdir");
+  auto result = ValidateDumpPath("subdir/../inside.dmp", test_dir_.string());
+  ASSERT_FALSE(result.has_value());
+  EXPECT_NE(result.error().message().find("path traversal"), std::string::npos) << result.error().message();
+}
+
+TEST_F(PathUtilsTest, PathNamingTheDumpDirectoryItselfRejected) {
+  for (const std::string& path : {std::string("."), std::string("./"), test_dir_.string()}) {
+    auto result = ValidateDumpPath(path, test_dir_.string());
+    ASSERT_FALSE(result.has_value()) << path << " resolved to " << result.value();
+    EXPECT_EQ(result.error().code(), ErrorCode::kInvalidArgument) << path;
+    EXPECT_NE(result.error().message().find("dump directory itself"), std::string::npos)
+        << path << ": " << result.error().message();
+  }
+}
+
+TEST_F(PathUtilsTest, SymlinkEscapingTheDumpDirectoryRejected) {
+  const auto outside = test_dir_.parent_path() / ("nvecd_path_outside_" + std::to_string(::getpid()));
+  std::filesystem::create_directories(outside);
+  std::error_code error;
+  std::filesystem::create_directory_symlink(outside, test_dir_ / "escape", error);
+  ASSERT_FALSE(error) << error.message();
+
+  auto result = ValidateDumpPath("escape/snapshot.dmp", test_dir_.string());
+  std::filesystem::remove_all(outside, error);
+  ASSERT_FALSE(result.has_value()) << "escaping symlink resolved to " << result.value();
+  EXPECT_NE(result.error().message().find("path traversal"), std::string::npos) << result.error().message();
+}
+
+TEST_F(PathUtilsTest, TimestampedDumpSaveFallbackNameIsAValidRecoveryBase) {
+  auto result = ValidateDumpPath("snapshot_20261021_120000.dmp", test_dir_.string(), DumpPathUse::kRecoveryBase);
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+  EXPECT_EQ(std::filesystem::path(*result).parent_path(), std::filesystem::canonical(test_dir_));
 }
 
 TEST_F(PathUtilsTest, GroupWritableDumpDirectoryRejected) {

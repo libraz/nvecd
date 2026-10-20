@@ -286,10 +286,10 @@ utils::Expected<SnapshotOutcome, utils::Error> SnapshotSession::RunDurabilityHan
     return outcome;
   }
 
-  // Record the checkpoint sidecar first and truncate only after it is durable,
-  // so a crash between the two can never leave a WAL that was cut back to a
-  // snapshot no reader will accept as a recovery base.
-  auto checkpoint = WriteWalCheckpoint(filepath_, wal_sequence_);
+  // Bind the snapshot as the recovery base first and truncate only after that
+  // is durable, so a crash between the two can never leave a WAL that was cut
+  // back to a snapshot no reader will accept as a recovery base.
+  auto checkpoint = BindRecoveryBase(filepath_, wal_sequence_);
   if (!checkpoint) {
     const auto error = utils::MakeError(utils::ErrorCode::kStorageWriteError,
                                         "Failed to write WAL checkpoint: " + checkpoint.error().message(), filepath_);

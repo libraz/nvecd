@@ -181,6 +181,26 @@ gtest_discover_tests(io_reactor_test
   PROPERTIES TIMEOUT 30
 )
 
+add_executable(protocol_framing_test
+  server/protocol_framing_test.cpp
+)
+target_link_libraries(protocol_framing_test
+  nvecd_server
+  gtest_main
+)
+gtest_discover_tests(protocol_framing_test)
+
+add_executable(snapshot_coordinator_test
+  server/snapshot_coordinator_test.cpp
+)
+target_link_libraries(snapshot_coordinator_test
+  nvecd_server
+  gtest_main
+)
+gtest_discover_tests(snapshot_coordinator_test
+  PROPERTIES TIMEOUT 60
+)
+
 add_executable(command_stats_test
   server/command_stats_test.cpp
 )
@@ -758,7 +778,7 @@ add_executable(nvecdclient_c_test
   client/nvecdclient_c_test.cpp
 )
 target_link_libraries(nvecdclient_c_test
-  nvecdclient
+  nvecdclient_testing
   nvecd_server
   nvecd_config
   nvecd_similarity

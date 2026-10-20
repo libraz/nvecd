@@ -29,8 +29,11 @@ namespace nvecd::server {
  * only path that recovers its files. Safe to call when @p dir does not exist.
  *
  * @param dir Snapshot directory to scan
+ * @param own_pid_is_abandoned Whether a temporary carrying this process's PID
+ *        is reclaimable; true only before this process has started a writer,
+ *        when such a file belongs to a previous run that reused the PID
  */
-void ReclaimAbandonedTemporaries(const std::string& dir);
+void ReclaimAbandonedTemporaries(const std::string& dir, bool own_pid_is_abandoned);
 
 /**
  * @brief Background snapshot scheduler
@@ -41,7 +44,7 @@ void ReclaimAbandonedTemporaries(const std::string& dir);
  * Key responsibilities:
  * - Periodic snapshot creation via ForkSnapshotWriter
  * - Cleanup of old auto-snapshot files
- * - Mutual exclusion with manual DUMP SAVE and DUMP LOAD through the shared gates
+ * - Mutual exclusion with manual DUMP SAVE and DUMP LOAD through the snapshot coordinator
  *
  * Thread Safety:
  * - Start/Stop are not thread-safe (call from main thread only)
@@ -98,6 +101,8 @@ class SnapshotScheduler {
 
   /**
    * @brief Publish the outcome of a finished fork session and clean up after it
+   *
+   * A cleanup refused by a running save or load is retried on the next tick.
    */
   void CheckFinishedSnapshot();
 
@@ -106,23 +111,29 @@ class SnapshotScheduler {
    *
    * Generates a timestamped filename and starts a background fork save through
    * the same gated capture routine as DUMP SAVE.
+   *
+   * @return false when another snapshot session refused the attempt, so the
+   *         next tick retries instead of waiting a whole interval
    */
-  void TakeSnapshot();
+  bool TakeSnapshot();
 
   /**
    * @brief Clean up old auto-snapshots based on retention policy
    *
-   * Iterates the snapshot directory, collects files matching auto_*.nvec,
-   * sorts by modification time (newest first), and deletes files beyond
-   * the retain count.
+   * Ranks auto_*.nvec files newest first and keeps the first `retain` that are
+   * recovery bases (with the WAL enabled, those whose sidecar validates);
+   * every other auto-snapshot is deleted with its sidecar.
+   *
+   * @return false when another snapshot session refused the pass
    */
-  void CleanupOldSnapshots();
+  bool CleanupOldSnapshots();
 
   config::SnapshotConfig config_;
   HandlerContext& ctx_;
 
   std::atomic<bool> running_{false};
   std::chrono::steady_clock::time_point next_save_time_;  // Worker thread only
+  bool cleanup_pending_ = false;                          // Worker thread only
   utils::PeriodicWorker worker_;
 };
 

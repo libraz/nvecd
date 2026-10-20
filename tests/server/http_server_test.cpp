@@ -26,7 +26,6 @@
 #include <future>
 #include <mutex>
 #include <nlohmann/json.hpp>
-#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <utility>
@@ -1999,9 +1998,12 @@ TEST_F(HttpServerTest, CacheToggleFailureUsesTheSharedErrorMapping) {
 }
 
 TEST_F(HttpServerTest, MalformedWriteBodyDoesNotWaitForTheSnapshotGate) {
-  std::shared_mutex snapshot_gate;
-  handler_ctx_.snapshot_write_gate = &snapshot_gate;
-  std::unique_lock snapshot_guard(snapshot_gate);
+  // Hold the write gate exclusively with no flag published, so only the gate
+  // itself could delay the request.
+  auto load = handler_ctx_.snapshot_coordinator.BeginLoad(nullptr);
+  ASSERT_TRUE(load.has_value());
+  auto publication = load->Publish();
+  loading_.store(false, std::memory_order_release);
 
   auto request = std::async(std::launch::async, [url = BaseUrl()] {
     httplib::Client client(url);
@@ -2009,10 +2011,30 @@ TEST_F(HttpServerTest, MalformedWriteBodyDoesNotWaitForTheSnapshotGate) {
     return response ? response->status : -1;
   });
   const bool answered = request.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
-  snapshot_guard.unlock();
+  publication.searches.unlock();
+  publication.writes.unlock();
   EXPECT_TRUE(answered) << "a request that fails to parse must be rejected before it takes the snapshot gate";
   EXPECT_EQ(request.get(), 400);
-  handler_ctx_.snapshot_write_gate = nullptr;
+}
+
+TEST_F(HttpServerTest, WriteDuringLockModeSaveReturnsReadOnlyPromptly) {
+  auto lock_save = handler_ctx_.snapshot_coordinator.BeginLockSave(nullptr);
+  ASSERT_TRUE(lock_save.has_value());
+
+  auto request = std::async(std::launch::async, [url = BaseUrl()] {
+    httplib::Client client(url);
+    json body;
+    body["id"] = "during_save";
+    body["vector"] = {1.0, 0.0, 0.0, 0.0};
+    auto response = client.Post("/vecset", body.dump(), "application/json");
+    return response ? std::make_pair(response->status, response->body) : std::make_pair(-1, std::string());
+  });
+  ASSERT_EQ(request.wait_for(std::chrono::seconds(2)), std::future_status::ready)
+      << "a write during a lock-mode save must be refused, not queued behind it";
+  const auto [status, body] = request.get();
+  EXPECT_EQ(status, 503);
+  EXPECT_NE(body.find("READONLY"), std::string::npos) << body;
+  EXPECT_FALSE(vector_store_->HasVector("during_save"));
 }
 
 }  // namespace

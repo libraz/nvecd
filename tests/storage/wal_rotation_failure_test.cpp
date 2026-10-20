@@ -1,6 +1,6 @@
 /**
  * @file wal_rotation_failure_test.cpp
- * @brief Tests that a failed WAL segment creation leaves no orphan segment behind
+ * @brief Tests that failed WAL writes leave no orphan segment and consume no sequence
  */
 
 #include <gtest/gtest.h>
@@ -88,6 +88,31 @@ TEST_F(WalRotationFailureTest, OpenSucceedsAfterFailedHeaderWrite) {
   ASSERT_TRUE(reopened.has_value()) << reopened.error().to_string();
   EXPECT_TRUE(wal.Append(WalOpType::kEventAdd, nullptr, 0).has_value());
   EXPECT_EQ(SegmentCount(), 1U);
+}
+
+TEST_F(WalRotationFailureTest, FailedAppendConsumesNoSequenceACheckpointCanCapture) {
+  uint64_t checkpoint = 0;
+  {
+    WriteAheadLog wal;
+    ASSERT_TRUE(wal.Open(MakeConfig()).has_value());
+    ASSERT_TRUE(wal.Append(WalOpType::kEventAdd, nullptr, 0).has_value());
+    ASSERT_TRUE(wal.Append(WalOpType::kEventAdd, nullptr, 0).has_value());
+    {
+      WriteLimitGuard guard;
+      EXPECT_FALSE(wal.Append(WalOpType::kEventAdd, nullptr, 0).has_value());
+    }
+    // A snapshot taken now records this as its checkpoint.
+    checkpoint = wal.CurrentSequence();
+    EXPECT_EQ(checkpoint, 2U);
+    wal.Close();
+  }
+
+  WriteAheadLog reopened;
+  auto opened = reopened.Open(MakeConfig(), checkpoint);
+  ASSERT_TRUE(opened.has_value()) << opened.error().to_string();
+  auto next = reopened.Append(WalOpType::kEventAdd, nullptr, 0);
+  ASSERT_TRUE(next.has_value()) << next.error().to_string();
+  EXPECT_EQ(*next, checkpoint + 1);
 }
 
 }  // namespace
