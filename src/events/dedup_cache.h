@@ -102,6 +102,20 @@ class DedupCache {
   bool CheckAndInsert(const EventKey& key, uint64_t timestamp);
 
   /**
+   * @brief Record an already accepted event without testing for a duplicate.
+   *
+   * Used by snapshot restore and WAL replay so the window is seeded exactly as
+   * a live accept would leave it. The stored timestamp only moves forward.
+   * Counters are untouched.
+   */
+  void Seed(const EventKey& key, uint64_t timestamp);
+
+  /**
+   * @brief Estimated memory usage in bytes, including container bookkeeping
+   */
+  size_t MemoryUsage() const;
+
+  /**
    * @brief Clear all entries from cache
    */
   void Clear();
@@ -147,6 +161,12 @@ class DedupCache {
   // Statistics (atomic for thread-safe const access)
   mutable std::atomic<uint64_t> total_hits_{0};
   mutable std::atomic<uint64_t> total_misses_{0};
+
+  /**
+   * @brief Insert @p key or advance its timestamp (never backwards) and make it most recent
+   * @pre mutex_ is locked for writing
+   */
+  void RecordLocked(const EventKey& key, uint64_t timestamp);
 
   /**
    * @brief Evict least recently used entry

@@ -9,6 +9,7 @@
 #include <chrono>
 
 #include "events/id_validation.h"
+#include "utils/container_memory.h"
 #include "utils/error.h"
 #include "utils/structured_log.h"
 
@@ -158,21 +159,25 @@ utils::Expected<void, utils::Error> EventStore::RestoreEvent(const std::string& 
   std::unique_lock lock(mutex_);
   total_events_.fetch_add(1, std::memory_order_relaxed);
   AppendValidatedLocked(*validated, nullptr);
+  SeedCachesLocked(*validated);
+  return {};
+}
 
-  // Restore the last-value state cache in the same insertion order as the
-  // ring buffer. Snapshot/WAL recovery bypasses AddEventAndGetPrior(), so
-  // without this reseed a replayed SET/DEL would look new and apply its
-  // co-occurrence delta a second time after restart.
-  if (state_cache_) {
-    StateKey key(ctx, event.item_id);
-    if (event.type == EventType::SET) {
-      state_cache_->UpdateScore(key, event.score);
-    } else if (event.type == EventType::DEL) {
-      state_cache_->MarkDeleted(key);
-    }
+utils::Expected<EventStore::IngestResult, utils::Error> EventStore::ReplayEvent(const std::string& ctx,
+                                                                                const Event& event) {
+  auto validated = EventValidator::Validate(ctx, event);
+  if (!validated) {
+    utils::LogEventStoreError("replay_event", ctx, validated.error().message());
+    return utils::MakeUnexpected(validated.error());
   }
 
-  return {};
+  std::unique_lock lock(mutex_);
+  total_events_.fetch_add(1, std::memory_order_relaxed);
+  IngestResult result;
+  result.stored_event = event;
+  AppendValidatedLocked(*validated, &result.prior_events);
+  SeedCachesLocked(*validated);
+  return result;
 }
 
 std::vector<Event> EventStore::GetEvents(const std::string& ctx) const {
@@ -265,10 +270,17 @@ size_t EventStore::MemoryUsageLocked() const {
   // Base container overhead
   total += sizeof(*this);
 
+  total += utils::UnorderedBookkeeping(ctx_events_) + utils::UnorderedBookkeeping(ctx_lru_pos_);
+
   // Ring buffers and context strings
   for (const auto& [ctx, ring_buffer] : ctx_events_) {
     // Context string
     total += sizeof(std::string) + ctx.capacity();
+
+    // Recency tracking: the list node and the position map entry each own a
+    // copy of the context name.
+    total += sizeof(std::string) + ctx.capacity() + utils::kListNodeOverhead;
+    total += sizeof(std::string) + ctx.capacity() + sizeof(std::list<std::string>::iterator);
 
     // Heap storage behind each event's item_id. Traversed in place: materializing
     // events with GetAll() would deep-copy each one on every statistics read.
@@ -277,6 +289,13 @@ size_t EventStore::MemoryUsageLocked() const {
     // Ring buffer overhead; the event slots themselves are counted once, here.
     total += sizeof(RingBuffer<Event>);
     total += config_.ctx_buffer_size * sizeof(Event);
+  }
+
+  if (dedup_cache_) {
+    total += dedup_cache_->MemoryUsage();
+  }
+  if (state_cache_) {
+    total += state_cache_->MemoryUsage();
   }
 
   return total;
@@ -311,10 +330,43 @@ void EventStore::IngestValidatedLocked(const ValidatedEvent& validated, IngestRe
     return;
   }
 
+  // An accepted ADD makes the item present again, so the next DEL is a new removal.
+  if (event.type == EventType::ADD && state_cache_ != nullptr) {
+    state_cache_->ClearDeleted(StateKey(pair.ctx, event.item_id));
+  }
+
   if (result != nullptr) {
     result->stored_event = event;
   }
   AppendValidatedLocked(validated, result != nullptr ? &result->prior_events : nullptr);
+}
+
+void EventStore::SeedCachesLocked(const ValidatedEvent& validated) {
+  const ContextEvent& pair = *validated;
+  const Event& event = pair.event;
+
+  // Recovery bypasses the dedup decision, so without this a replayed event
+  // would look new and a client retry after restart would be accepted twice.
+  switch (event.type) {
+    case EventType::ADD:
+      if (dedup_cache_ != nullptr) {
+        dedup_cache_->Seed(EventKey(pair.ctx, event.item_id, event.score), event.timestamp);
+      }
+      if (state_cache_ != nullptr) {
+        state_cache_->ClearDeleted(StateKey(pair.ctx, event.item_id));
+      }
+      break;
+    case EventType::SET:
+      if (state_cache_ != nullptr) {
+        state_cache_->UpdateScore(StateKey(pair.ctx, event.item_id), event.score);
+      }
+      break;
+    case EventType::DEL:
+      if (state_cache_ != nullptr) {
+        state_cache_->MarkDeleted(StateKey(pair.ctx, event.item_id));
+      }
+      break;
+  }
 }
 
 void EventStore::AppendValidatedLocked(const ValidatedEvent& validated, std::vector<Event>* prior_events) {

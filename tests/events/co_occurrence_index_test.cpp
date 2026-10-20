@@ -676,6 +676,22 @@ TEST(CoOccurrenceIndexTest, ApplyDecay_RemovesNearZeroEntries) {
   EXPECT_FLOAT_EQ(index.GetScore("item1", "item2"), 0.0f);
 }
 
+// Each directed edge costs at least its key string, its score and the node links.
+TEST(CoOccurrenceIndexTest, MemoryUsageIncludesNodeAndBucketBookkeeping) {
+  CoOccurrenceIndex index;
+  const size_t empty = index.MemoryUsage();
+
+  std::vector<std::tuple<std::string, int, uint64_t>> data;
+  for (int i = 0; i < 10; ++i) {
+    data.emplace_back("item" + std::to_string(i), 10, 1000 + i);
+  }
+  index.UpdateFromEvents("ctx1", MakeEvents(data));
+
+  constexpr size_t kDirectedEdges = 10 * 9;
+  constexpr size_t kPerEdge = sizeof(std::string) + sizeof(float) + 2 * sizeof(void*);
+  EXPECT_GE(index.MemoryUsage() - empty, kDirectedEdges * kPerEdge);
+}
+
 }  // namespace
 // Items tied at the top-k boundary are chosen by ascending id, not by whatever
 // order the hash map yields them in.

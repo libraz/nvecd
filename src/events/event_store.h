@@ -81,7 +81,8 @@ using ValidatedEvent = Validated<ContextEvent, EventValidator>;
  * @brief Sole producer of ValidatedEvent
  *
  * Wire ingestion (EventStore::PrepareEvent, EventStore::AddEventAndGetPrior)
- * and snapshot/WAL restore (EventStore::RestoreEvent) both mint here, so an
+ * and snapshot/WAL restore (EventStore::RestoreEvent, EventStore::ReplayEvent)
+ * all mint here, so an
  * input the live path rejects is rejected by the restore path as well.
  * Restore keeps the original score value, type and timestamp; what it does not
  * get is an exemption from the invariants those values must satisfy.
@@ -205,11 +206,13 @@ class EventStore {
    * @brief Restore an event verbatim into a context buffer (snapshot load only)
    *
    * Appends @p event to the context's ring buffer exactly as given, preserving
-   * its item_id, score, type, and timestamp. Unlike AddEvent(), this bypasses
-   * deduplication and the dedup/state caches so a serialized buffer reloads
-   * byte-for-byte: temporal-decay weights depend on the original timestamps and
-   * DEL/SET semantics depend on the original types, neither of which must be
-   * altered by replaying through the dedup path. The total event counter is
+   * its item_id, score, type, and timestamp. Unlike AddEvent(), this skips the
+   * duplicate decision so a serialized buffer reloads byte-for-byte:
+   * temporal-decay weights depend on the original timestamps and DEL/SET
+   * semantics depend on the original types. The dedup window and the SET/DEL
+   * state are then reseeded as a live accept would leave them, so a retry
+   * after restore is deduplicated exactly as it would have been before. The
+   * total event counter is
    * incremented once per restored event, so after a restore it counts the
    * restored buffer contents rather than the original ingestion total.
    *
@@ -226,6 +229,21 @@ class EventStore {
    * @return Expected<void, Error> Success or error (empty ctx / empty item_id)
    */
   utils::Expected<void, utils::Error> RestoreEvent(const std::string& ctx, const Event& event);
+
+  /**
+   * @brief Apply a WAL EVENT record during replay
+   *
+   * Every record in the WAL was accepted live exactly once, so it is appended
+   * unconditionally (never re-judged against the dedup or state caches), the
+   * caches are reseeded as RestoreEvent() does, and the pre-append buffer is
+   * returned so the caller can apply the matching co-occurrence delta.
+   *
+   * @param ctx Context identifier
+   * @param event Event exactly as logged (resolved timestamp, DEL score 0)
+   * @return Expected<IngestResult, Error> Never deduped; stored_event and
+   *         prior_events populated
+   */
+  utils::Expected<IngestResult, utils::Error> ReplayEvent(const std::string& ctx, const Event& event);
 
   /**
    * @brief Get all events for a context
@@ -324,6 +342,12 @@ class EventStore {
    * @pre mutex_ is held exclusively
    */
   void IngestValidatedLocked(const ValidatedEvent& validated, IngestResult* result);
+
+  /**
+   * @brief Reseed the dedup window and SET/DEL state from an event applied without a dedup decision
+   * @pre mutex_ is held exclusively
+   */
+  void SeedCachesLocked(const ValidatedEvent& validated);
 
   /**
    * @brief Append a validated event while mutex_ is held exclusively

@@ -7,6 +7,8 @@
 
 #include <mutex>
 
+#include "utils/container_memory.h"
+
 namespace nvecd::events {
 
 StateCache::StateCache(size_t max_size) : max_size_(max_size) {}
@@ -59,6 +61,27 @@ void StateCache::UpdateScore(const StateKey& key, int score) {
 void StateCache::MarkDeleted(const StateKey& key) {
   std::unique_lock lock(mutex_);
   UpsertLocked(states_.find(key), key, kDeletedScore);
+}
+
+void StateCache::ClearDeleted(const StateKey& key) {
+  std::unique_lock lock(mutex_);
+  auto it = states_.find(key);
+  if (it == states_.end() || it->second.first != kDeletedScore) {
+    return;
+  }
+  lru_list_.erase(it->second.second);
+  states_.erase(it);
+}
+
+size_t StateCache::MemoryUsage() const {
+  std::shared_lock lock(mutex_);
+  size_t total = sizeof(*this) + utils::UnorderedBookkeeping(states_);
+  // Each entry holds one key in the map and one in the LRU list.
+  for (const auto& [key, state] : states_) {
+    total += 2 * (sizeof(StateKey) + key.ctx.capacity() + key.id.capacity());
+    total += sizeof(state) + utils::kListNodeOverhead;
+  }
+  return total;
 }
 
 void StateCache::Clear() {

@@ -10,6 +10,7 @@
 #include <mutex>
 
 #include "events/id_validation.h"
+#include "utils/container_memory.h"
 
 namespace nvecd::events {
 
@@ -641,12 +642,13 @@ size_t CoOccurrenceIndex::MemoryUsageLocked() const {
   total += sizeof(*this);
 
   // Co-occurrence matrix
+  total += utils::UnorderedBookkeeping(co_scores_);
   for (const auto& [item_id_1, neighbors] : co_scores_) {
     // Outer map key (item_id_1)
     total += sizeof(std::string) + item_id_1.capacity();
 
     // Inner map
-    total += sizeof(std::unordered_map<std::string, float>);
+    total += sizeof(std::unordered_map<std::string, float>) + utils::UnorderedBookkeeping(neighbors);
     for (const auto& [item_id_2, score] : neighbors) {
       total += sizeof(std::string) + item_id_2.capacity();
       total += sizeof(float);

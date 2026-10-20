@@ -757,10 +757,9 @@ TEST(EventStoreTest, SwapStateMovesLruBookkeepingWithTheContexts) {
 
 namespace {
 
-// Full-copy reference estimate: it materializes every stored event the way the
-// accessor used to, and must agree with the in-place traversal exactly.
-// Identifiers are kept short so the copies carry the same string capacity as
-// the stored originals.
+// Full-copy reference estimate of the event payload: it materializes every
+// stored event the way the accessor used to. The store's figure also carries
+// container and cache bookkeeping, so it must be at least this large.
 size_t ReferenceMemoryUsage(const EventStore& store, uint32_t ctx_buffer_size) {
   size_t total = sizeof(EventStore);
   for (const auto& ctx : store.GetAllContexts()) {
@@ -782,31 +781,45 @@ TEST(EventStoreTest, MemoryUsageMatchesFullCopyReference) {
   config.max_contexts = 4;
   EventStore store(config);
 
-  EXPECT_EQ(store.MemoryUsage(), ReferenceMemoryUsage(store, kBufferSize)) << "empty store";
+  EXPECT_GE(store.MemoryUsage(), ReferenceMemoryUsage(store, kBufferSize)) << "empty store";
 
   // Append, ring-buffer overwrite, restore, context eviction and clear: every
   // mutation kind that can change the accounted set.
   for (int i = 0; i < 12; ++i) {
     ASSERT_TRUE(store.AddEvent("ctx" + std::to_string(i % 6), "item" + std::to_string(i), 7).has_value());
-    EXPECT_EQ(store.MemoryUsage(), ReferenceMemoryUsage(store, kBufferSize)) << "after add " << i;
-    EXPECT_EQ(store.GetStatistics().memory_bytes, ReferenceMemoryUsage(store, kBufferSize)) << "after add " << i;
+    EXPECT_GE(store.MemoryUsage(), ReferenceMemoryUsage(store, kBufferSize)) << "after add " << i;
+    EXPECT_EQ(store.GetStatistics().memory_bytes, store.MemoryUsage()) << "after add " << i;
   }
 
   for (int i = 0; i < 4; ++i) {
     ASSERT_TRUE(store.RestoreEvent("ctx" + std::to_string(i), Event("re" + std::to_string(i), 7, 4000, EventType::SET))
                     .has_value());
-    EXPECT_EQ(store.MemoryUsage(), ReferenceMemoryUsage(store, kBufferSize)) << "after restore " << i;
+    EXPECT_GE(store.MemoryUsage(), ReferenceMemoryUsage(store, kBufferSize)) << "after restore " << i;
   }
 
   store.Clear();
-  EXPECT_EQ(store.MemoryUsage(), ReferenceMemoryUsage(store, kBufferSize)) << "after clear";
+  EXPECT_GE(store.MemoryUsage(), ReferenceMemoryUsage(store, kBufferSize)) << "after clear";
+}
+
+// Per-context recency tracking and the dedup/state caches are part of the figure.
+TEST(EventStoreTest, MemoryUsageGrowsByContextAndCacheBookkeeping) {
+  EventStore store(MakeConfig(4));
+  const size_t empty = store.MemoryUsage();
+
+  ASSERT_TRUE(store.AddEvent("ctx", "item", 7).has_value());
+  ASSERT_TRUE(store.AddEvent("ctx", "item", 9, EventType::SET).has_value());
+
+  const size_t payload = sizeof(std::string) + sizeof(RingBuffer<Event>) + 4 * sizeof(Event);
+  EXPECT_GE(store.MemoryUsage() - empty, payload + 2 * sizeof(std::string) + 2 * sizeof(void*));
 }
 
 // The ring buffer's slots are accounted once through its capacity, so storing
 // an event adds only the heap behind its item_id.
 TEST(EventStoreTest, MemoryUsageCountsEventSlotsOnce) {
   constexpr uint32_t kBufferSize = 4;
-  EventStore store(MakeConfig(kBufferSize));
+  auto config = MakeConfig(kBufferSize);
+  config.dedup_window_sec = 0;  // keep the dedup cache out of the delta
+  EventStore store(config);
 
   ASSERT_TRUE(store.AddEvent("ctx", "first", 7).has_value());
   const size_t one_event = store.MemoryUsage();

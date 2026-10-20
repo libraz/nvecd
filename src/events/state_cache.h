@@ -105,6 +105,19 @@ class StateCache {
   void MarkDeleted(const StateKey& key);
 
   /**
+   * @brief Drop the deleted marker for a key; any other state is kept
+   *
+   * An accepted ADD makes the item present again, so a later DEL must not be
+   * deduplicated against the earlier one.
+   */
+  void ClearDeleted(const StateKey& key);
+
+  /**
+   * @brief Estimated memory usage in bytes, including container bookkeeping
+   */
+  size_t MemoryUsage() const;
+
+  /**
    * @brief Clear all cached states
    */
   void Clear();

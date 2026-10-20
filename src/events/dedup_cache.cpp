@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <mutex>
 
+#include "utils/container_memory.h"
+
 namespace nvecd::events {
 
 DedupCache::DedupCache(size_t max_size, uint32_t window_sec) : max_size_(max_size), window_sec_(window_sec) {}
@@ -41,26 +43,50 @@ bool DedupCache::CheckAndInsert(const EventKey& key, uint64_t timestamp) {
 
   std::unique_lock lock(mutex_);
   auto it = cache_.find(key);
-  if (it != cache_.end()) {
-    if (IsWithinWindow(it->second, timestamp)) {
-      total_hits_.fetch_add(1, std::memory_order_relaxed);
-      lru_list_.splice(lru_list_.begin(), lru_list_, it->second.lru_iter);
-      return true;
-    }
-
-    total_misses_.fetch_add(1, std::memory_order_relaxed);
-    it->second.timestamp = timestamp;
+  if (it != cache_.end() && IsWithinWindow(it->second, timestamp)) {
+    total_hits_.fetch_add(1, std::memory_order_relaxed);
     lru_list_.splice(lru_list_.begin(), lru_list_, it->second.lru_iter);
-    return false;
+    return true;
   }
 
   total_misses_.fetch_add(1, std::memory_order_relaxed);
+  RecordLocked(key, timestamp);
+  return false;
+}
+
+void DedupCache::Seed(const EventKey& key, uint64_t timestamp) {
+  if (window_sec_ == 0) {
+    return;
+  }
+  std::unique_lock lock(mutex_);
+  RecordLocked(key, timestamp);
+}
+
+void DedupCache::RecordLocked(const EventKey& key, uint64_t timestamp) {
+  auto it = cache_.find(key);
+  if (it != cache_.end()) {
+    // A backdated event must not pull the anchor behind a newer accepted one.
+    it->second.timestamp = std::max(it->second.timestamp, timestamp);
+    lru_list_.splice(lru_list_.begin(), lru_list_, it->second.lru_iter);
+    return;
+  }
+
   if (cache_.size() >= max_size_) {
     EvictLRU();
   }
   lru_list_.push_front(key);
   cache_[key] = CacheEntry{timestamp, lru_list_.begin()};
-  return false;
+}
+
+size_t DedupCache::MemoryUsage() const {
+  std::shared_lock lock(mutex_);
+  size_t total = sizeof(*this) + utils::UnorderedBookkeeping(cache_);
+  // Each entry holds one key in the map and one in the LRU list.
+  for (const auto& [key, entry] : cache_) {
+    total += 2 * (sizeof(EventKey) + key.ctx.capacity() + key.id.capacity());
+    total += sizeof(CacheEntry) + utils::kListNodeOverhead;
+  }
+  return total;
 }
 
 void DedupCache::Clear() {

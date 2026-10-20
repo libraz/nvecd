@@ -206,5 +206,22 @@ TEST(StateCacheTest, CheckAndMarkDeletedRecordsThenDeduplicates) {
   EXPECT_EQ(cache.Size(), 1);
 }
 
+TEST(StateCacheTest, ClearDeletedDropsOnlyTheDeletedMarker) {
+  StateCache cache(10);
+  StateKey deleted("ctx", "gone");
+  StateKey set("ctx", "kept");
+  cache.MarkDeleted(deleted);
+  cache.UpdateScore(set, 7);
+
+  cache.ClearDeleted(set);
+  EXPECT_EQ(cache.Size(), 2U);
+  EXPECT_TRUE(cache.WouldDeduplicateSet(set, 7));
+
+  cache.ClearDeleted(deleted);
+  EXPECT_EQ(cache.Size(), 1U);
+  EXPECT_FALSE(cache.WouldDeduplicateDel(deleted));
+  EXPECT_FALSE(cache.CheckAndMarkDeleted(deleted));
+}
+
 }  // namespace
 }  // namespace nvecd::events

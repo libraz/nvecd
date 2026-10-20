@@ -186,6 +186,77 @@ TEST_F(EventStoreDeduplicationTest, RestoreSeedsStateCacheForSetAndDelete) {
   EXPECT_TRUE(del_replay->deduped);
 }
 
+TEST_F(EventStoreDeduplicationTest, RestoreSeedsAddDedupWindow) {
+  EventStore store(config_);
+  ASSERT_TRUE(store.RestoreEvent("ctx", Event("item", 42, 1000, EventType::ADD)));
+
+  auto retry = store.AddEventAndGetPrior("ctx", "item", 42, EventType::ADD, 1030);
+  ASSERT_TRUE(retry);
+  EXPECT_TRUE(retry->deduped);
+  EXPECT_EQ(store.GetEvents("ctx").size(), 1U);
+
+  auto later = store.AddEventAndGetPrior("ctx", "item", 42, EventType::ADD, 1100);
+  ASSERT_TRUE(later);
+  EXPECT_FALSE(later->deduped);
+}
+
+TEST_F(EventStoreDeduplicationTest, SecondDelAfterReAddIsApplied) {
+  EventStore store(config_);
+  ASSERT_TRUE(store.AddEvent("ctx", "item", 80, EventType::ADD, 1000));
+  auto first_del = store.AddEventAndGetPrior("ctx", "item", 0, EventType::DEL, 1001);
+  ASSERT_TRUE(first_del);
+  EXPECT_FALSE(first_del->deduped);
+
+  auto repeat_del = store.AddEventAndGetPrior("ctx", "item", 0, EventType::DEL, 1002);
+  ASSERT_TRUE(repeat_del);
+  EXPECT_TRUE(repeat_del->deduped);
+
+  auto re_add = store.AddEventAndGetPrior("ctx", "item", 80, EventType::ADD, 2000);
+  ASSERT_TRUE(re_add);
+  EXPECT_FALSE(re_add->deduped);
+
+  auto prepared = store.PrepareEvent("ctx", "item", 0, EventType::DEL, 2001);
+  ASSERT_TRUE(prepared);
+  EXPECT_FALSE(prepared->deduped);
+  auto second_del = store.AddEventAndGetPrior("ctx", "item", 0, EventType::DEL, 2001);
+  ASSERT_TRUE(second_del);
+  EXPECT_FALSE(second_del->deduped);
+}
+
+TEST_F(EventStoreDeduplicationTest, RestoredAddClearsDeletedMarker) {
+  EventStore store(config_);
+  ASSERT_TRUE(store.RestoreEvent("ctx", Event("item", 0, 1000, EventType::DEL)));
+  ASSERT_TRUE(store.RestoreEvent("ctx", Event("item", 80, 2000, EventType::ADD)));
+
+  auto del = store.AddEventAndGetPrior("ctx", "item", 0, EventType::DEL, 2001);
+  ASSERT_TRUE(del);
+  EXPECT_FALSE(del->deduped);
+}
+
+// A logged record was accepted exactly once live, so replay applies it even
+// when the caches already hold an identical entry, and returns the prior buffer.
+TEST_F(EventStoreDeduplicationTest, ReplayAppliesRecordsRegardlessOfCacheContents) {
+  EventStore store(config_);
+  ASSERT_TRUE(store.AddEvent("ctx", "item", 42, EventType::ADD, 1000));
+
+  auto replayed = store.ReplayEvent("ctx", Event("item", 42, 1010, EventType::ADD));
+  ASSERT_TRUE(replayed);
+  EXPECT_FALSE(replayed->deduped);
+  EXPECT_EQ(replayed->prior_events.size(), 1U);
+  EXPECT_EQ(replayed->stored_event.timestamp, 1010U);
+  EXPECT_EQ(store.GetEvents("ctx").size(), 2U);
+
+  auto retry = store.AddEventAndGetPrior("ctx", "item", 42, EventType::ADD, 1020);
+  ASSERT_TRUE(retry);
+  EXPECT_TRUE(retry->deduped);
+}
+
+TEST_F(EventStoreDeduplicationTest, ReplayRejectsInvalidEvents) {
+  EventStore store(config_);
+  EXPECT_FALSE(store.ReplayEvent("ctx", Event("item", 101, 1000, EventType::ADD)));
+  EXPECT_EQ(store.GetEvents("ctx").size(), 0U);
+}
+
 // The duplicate check and cache update must be a single transaction. Under the
 // former check-then-insert flow multiple concurrent ADDs could all pass the
 // read-side check before any writer recorded the key.

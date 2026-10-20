@@ -178,15 +178,46 @@ TEST_F(DedupCacheTest, ZeroWindowDisabled) {
 
 // Whether a record is a duplicate depends on event time alone, so a timestamp
 // that jumps backwards beyond the window is a new event however soon it
-// arrives, and it becomes the baseline its own retries are judged against.
-TEST_F(DedupCacheTest, BackwardsTimestampBeyondWindowEstablishesNewBaseline) {
+// arrives. It does not pull the anchor back, so retries of the newer event
+// stay deduplicated.
+TEST_F(DedupCacheTest, BackdatedEventNeverMovesAnchorBackwards) {
   DedupCache cache(100, 60);
   EventKey key("ctx1", "id1", 100);
 
   EXPECT_FALSE(cache.CheckAndInsert(key, 1'000'000));
   EXPECT_FALSE(cache.CheckAndInsert(key, 1'000));
-  EXPECT_TRUE(cache.CheckAndInsert(key, 1'000));
-  EXPECT_EQ(cache.GetStatistics().total_hits, 1U);
+  EXPECT_TRUE(cache.CheckAndInsert(key, 1'000'000));
+  EXPECT_TRUE(cache.CheckAndInsert(key, 1'000'030));
+  EXPECT_EQ(cache.GetStatistics().total_hits, 2U);
+}
+
+TEST_F(DedupCacheTest, SeedAdvancesAnchorForwardOnlyAndSkipsCounters) {
+  DedupCache cache(100, 60);
+  EventKey key("ctx1", "id1", 100);
+
+  cache.Seed(key, 5'000);
+  EXPECT_TRUE(cache.WouldDeduplicate(key, 5'030));
+  cache.Seed(key, 100);
+  EXPECT_TRUE(cache.WouldDeduplicate(key, 5'030));
+  EXPECT_FALSE(cache.WouldDeduplicate(key, 100));
+
+  const auto stats = cache.GetStatistics();
+  EXPECT_EQ(stats.size, 1U);
+  EXPECT_EQ(stats.total_hits, 0U);
+  EXPECT_EQ(stats.total_misses, 0U);
+}
+
+TEST_F(DedupCacheTest, SeedIsNoOpWhenWindowDisabled) {
+  DedupCache cache(100, 0);
+  cache.Seed(EventKey("ctx1", "id1", 100), 1'000);
+  EXPECT_EQ(cache.Size(), 0U);
+}
+
+TEST_F(DedupCacheTest, MemoryUsageGrowsWithEntries) {
+  DedupCache cache(100, 60);
+  const size_t empty = cache.MemoryUsage();
+  cache.Seed(EventKey("ctx1", "id1", 100), 1'000);
+  EXPECT_GE(cache.MemoryUsage() - empty, 2 * sizeof(EventKey) + sizeof(void*));
 }
 
 TEST_F(DedupCacheTest, TimestampDistanceUsesOverflowSafeSubtraction) {
