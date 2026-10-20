@@ -24,6 +24,8 @@
 #include <string_view>
 #include <vector>
 
+#include "utils/wire_limits.h"
+
 namespace nvecd::client::transport {
 
 struct ResponseFrame {
@@ -87,8 +89,13 @@ constexpr size_t kMaxBufferedResponseBytes = 64U * 1024U * 1024U;
 // a query by far (ResponseFrame::long_running).
 constexpr uint32_t kAdminTimeoutMs = 3600U * 1000U;
 
-// Longest AUTH password any client surface sends.
-constexpr size_t kMaxPasswordBytes = 4096;
+/// Receive deadline for a long-running command: never shorter than the configured timeout.
+constexpr uint32_t AdminReceiveTimeoutMs(uint32_t configured_timeout_ms) {
+  return configured_timeout_ms > kAdminTimeoutMs ? configured_timeout_ms : kAdminTimeoutMs;
+}
+
+using nvecd::utils::kMaxPasswordBytes;
+using nvecd::utils::ValidateNoFramingBytes;
 
 constexpr std::string_view kErrorPrefix = "ERROR ";
 
@@ -173,40 +180,11 @@ inline std::string_view ErrorBody(std::string_view response) {
 }
 
 /**
- * @brief Reject bytes the line protocol cannot carry.
- *
- * The wire protocol is the authority on what a command may contain: the server
- * refuses an embedded NUL and an embedded CR/LF and accepts every other byte
- * (see ParseCommand in src/server/command_parser.cpp). Rejecting more than
- * that - a blanket std::iscntrl test also excludes TAB - makes the shipped
- * clients refuse input the server and a hand-written socket client accept.
- *
- * These three bytes are exactly the ones that would break framing: NUL
- * terminates the command for the parser, CR/LF splits one command into two.
- * Every client surface checks the finished command line with this one
- * function before any byte is sent.
- *
- * @param value Text to check.
- * @param field_name Human-readable name used in the message.
- * @return std::nullopt when the text is carriable, otherwise the reason.
- */
-inline std::optional<std::string> ValidateNoFramingBytes(std::string_view value, const char* field_name) {
-  for (unsigned char character : value) {
-    if (character == '\0' || character == '\r' || character == '\n') {
-      std::ostringstream oss;
-      oss << "Input for " << field_name << " contains byte 0x" << std::uppercase << std::hex << std::setw(2)
-          << std::setfill('0') << static_cast<int>(character) << ", which the line protocol cannot carry";
-      return oss.str();
-    }
-  }
-  return std::nullopt;
-}
-
-/**
  * @brief Classify a command's reply framing.
  *
  * This is the one table of multi-line replies: the verb tokens decide, so
- * "DUMP INFO <file>" frames like "DUMP INFO" and extra whitespace between
+ * "DUMP INFO <file>" frames like "DUMP INFO", "INFO <anything>" frames like
+ * "INFO" (the server ignores its arguments), and extra whitespace between
  * tokens does not change the answer.
  */
 inline ResponseFrame FrameForCommand(std::string_view command, bool debug_mode) {
@@ -220,7 +198,7 @@ inline ResponseFrame FrameForCommand(std::string_view command, bool debug_mode) 
   const bool dump = EqualsAsciiIgnoreCase(verb, "DUMP");
   frame.similarity_search = EqualsAsciiIgnoreCase(verb, "SIM") || EqualsAsciiIgnoreCase(verb, "SIMV");
   frame.end_terminated =
-      (info && subcommand.empty()) || config || (cache && EqualsAsciiIgnoreCase(subcommand, "STATS")) ||
+      info || config || (cache && EqualsAsciiIgnoreCase(subcommand, "STATS")) ||
       (dump && (EqualsAsciiIgnoreCase(subcommand, "INFO") || EqualsAsciiIgnoreCase(subcommand, "STATUS")));
   frame.debug_similarity = debug_mode && frame.similarity_search;
   frame.long_running =

@@ -303,9 +303,10 @@ class NvecdClient::Impl {
     std::string response;
     const transport::ResponseFrame frame = transport::FrameForCommand(command, debug_mode_);
     transport::ResponseScanner scanner(frame);
-    // Snapshot save/load/verify can legitimately outlast the configured deadline.
+    // Snapshot save/load/verify can legitimately outlast the configured deadline;
+    // wait at least an hour, longer when timeout_ms asks for more.
     if (frame.long_running) {
-      transport::SetReceiveTimeout(sock_, transport::kAdminTimeoutMs);
+      transport::SetReceiveTimeout(sock_, transport::AdminReceiveTimeoutMs(config_.timeout_ms));
     }
     const ScopeGuard restore_timeout([this, &frame]() {
       if (frame.long_running && sock_ >= 0) {

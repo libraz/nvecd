@@ -185,10 +185,10 @@ struct ClientConfig {
  *   }
  *
  *   // Register event
- *   client.Event("ctx123", "vec456", 95);
+ *   client.Event("ctx123", "ADD", "vec456", 95);
  *
  *   // Register vector
- *   std::vector<float> vec = {0.1f, 0.2f, 0.3f, ...};
+ *   std::vector<float> vec = {0.1f, 0.2f, 0.3f};
  *   client.Vecset("vec456", vec);
  *
  *   // Search by ID

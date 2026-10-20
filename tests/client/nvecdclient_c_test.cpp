@@ -690,3 +690,69 @@ TEST(NvecdClientCFramingTest, DumpInfoReturnsTheWholeBlockAndKeepsTheStreamAlign
   nvecdclient_disconnect(client);
   nvecdclient_destroy(client);
 }
+
+TEST(NvecdClientCFailureTest, EveryStoredErrorMessageCarriesAClientErrorCode) {
+  NvecdClientConfig_C config = {};
+  config.host = "127.0.0.1";
+  config.port = 1;  // Never connected
+  NvecdClient_C* client = nvecdclient_create(&config);
+  ASSERT_NE(client, nullptr);
+
+  const auto expect_client_code = [](const std::string& message) {
+    const auto open = message.find('(');
+    const auto close = message.find(')', open);
+    ASSERT_NE(open, std::string::npos) << message;
+    ASSERT_NE(close, std::string::npos) << message;
+    const int code = std::stoi(message.substr(open + 1, close - open - 1));
+    EXPECT_GE(code, 7000) << message;
+    EXPECT_LT(code, 8000) << message;
+  };
+
+  // Null-argument rejection.
+  EXPECT_EQ(nvecdclient_vecdel(client, nullptr), -1);
+  expect_client_code(nvecdclient_get_last_error(client));
+  // Transport failure.
+  EXPECT_EQ(nvecdclient_connect(client), -1);
+  expect_client_code(nvecdclient_get_last_error(client));
+
+  nvecdclient_destroy(client);
+}
+
+TEST(NvecdClientCSnapshotTest, LoadAndVerifyReturnOwnedStringsAndLeaveOutputNullOnError) {
+  nvecd::testing::CannedResponseServer server({"OK DUMP_LOADED /tmp/snap.dmp\r\n", "OK DUMP_VERIFIED /tmp/snap.dmp\r\n",
+                                               "ERROR snapshot is corrupt\r\n", "ERROR snapshot is corrupt\r\n"});
+  ASSERT_GT(server.Port(), 0);
+
+  NvecdClientConfig_C config = {};
+  config.host = "127.0.0.1";
+  config.port = server.Port();
+  config.timeout_ms = 2000;
+  NvecdClient_C* client = nvecdclient_create(&config);
+  ASSERT_NE(client, nullptr);
+  ASSERT_EQ(nvecdclient_connect(client), 0) << nvecdclient_get_last_error(client);
+
+  char* loaded = nullptr;
+  ASSERT_EQ(nvecdclient_load(client, "/tmp/snap.dmp", &loaded), 0) << nvecdclient_get_last_error(client);
+  ASSERT_NE(loaded, nullptr);
+  EXPECT_STREQ(loaded, "/tmp/snap.dmp");
+  nvecdclient_free_string(loaded);
+
+  char* verified = nullptr;
+  ASSERT_EQ(nvecdclient_verify(client, "/tmp/snap.dmp", &verified), 0) << nvecdclient_get_last_error(client);
+  ASSERT_NE(verified, nullptr);
+  EXPECT_NE(std::string(verified).find("DUMP_VERIFIED"), std::string::npos) << verified;
+  nvecdclient_free_string(verified);
+
+  auto* load_sentinel = reinterpret_cast<char*>(std::uintptr_t{1});
+  EXPECT_EQ(nvecdclient_load(client, "/tmp/bad.dmp", &load_sentinel), -1);
+  EXPECT_EQ(load_sentinel, nullptr);
+  EXPECT_NE(std::string(nvecdclient_get_last_error(client)).find("snapshot is corrupt"), std::string::npos);
+
+  auto* verify_sentinel = reinterpret_cast<char*>(std::uintptr_t{1});
+  EXPECT_EQ(nvecdclient_verify(client, "/tmp/bad.dmp", &verify_sentinel), -1);
+  EXPECT_EQ(verify_sentinel, nullptr);
+  EXPECT_NE(std::string(nvecdclient_get_last_error(client)).find("snapshot is corrupt"), std::string::npos);
+
+  nvecdclient_disconnect(client);
+  nvecdclient_destroy(client);
+}

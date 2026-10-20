@@ -497,7 +497,8 @@ class NvecdClient {
     nvecd::client::transport::ResponseScanner scanner(frame);
     // Snapshot save/load/verify can legitimately outlast the interactive deadline.
     if (frame.long_running) {
-      nvecd::client::transport::SetReceiveTimeout(sock_.Get(), nvecd::client::transport::kAdminTimeoutMs);
+      nvecd::client::transport::SetReceiveTimeout(sock_.Get(),
+                                                  nvecd::client::transport::AdminReceiveTimeoutMs(kCliTimeoutMs));
     }
     const nvecd::utils::ScopeGuard restore_timeout([this, &frame]() {
       if (frame.long_running && IsConnected()) {

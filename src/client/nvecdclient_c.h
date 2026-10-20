@@ -46,7 +46,7 @@ typedef struct NvecdClient_C NvecdClient_C;
 typedef struct {
   const char* host;           ///< Server hostname or IPv4 address (default: "127.0.0.1")
   uint16_t port;              ///< Server port (default: 11017)
-  uint32_t timeout_ms;        ///< Connection timeout in milliseconds (default: 5000)
+  uint32_t timeout_ms;        ///< Send and receive timeout in milliseconds (default: 5000)
   uint32_t recv_buffer_size;  ///< Receive buffer size (default: 65536)
 } NvecdClientConfig_C;
 

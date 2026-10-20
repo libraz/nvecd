@@ -237,6 +237,7 @@ TEST(NvecdClientFramingTest, EveryMultiLineCommandIsClassifiedByItsVerbTokens) {
   EXPECT_TRUE(FrameForCommand("DUMP STATUS", false).end_terminated);
   EXPECT_TRUE(FrameForCommand("CACHE STATS", false).end_terminated);
   EXPECT_TRUE(FrameForCommand("INFO", false).end_terminated);
+  EXPECT_TRUE(FrameForCommand("INFO server", false).end_terminated);
   EXPECT_TRUE(FrameForCommand("CONFIG SHOW", false).end_terminated);
   EXPECT_FALSE(FrameForCommand("DUMP SAVE /tmp/snap.dmp", false).end_terminated);
   EXPECT_FALSE(FrameForCommand("DUMP VERIFY /tmp/snap.dmp", false).end_terminated);
@@ -247,6 +248,29 @@ TEST(NvecdClientFramingTest, EveryMultiLineCommandIsClassifiedByItsVerbTokens) {
   EXPECT_TRUE(FrameForCommand("DUMP VERIFY /tmp/snap.dmp", false).long_running);
   EXPECT_FALSE(FrameForCommand("DUMP INFO /tmp/snap.dmp", false).long_running);
   EXPECT_FALSE(FrameForCommand("SIM item 1", false).long_running);
+}
+
+TEST(NvecdClientFramingTest, LongRunningCommandsWaitAtLeastAnHourAndHonourALongerTimeout) {
+  EXPECT_EQ(transport::AdminReceiveTimeoutMs(5000), transport::kAdminTimeoutMs);
+  EXPECT_EQ(transport::AdminReceiveTimeoutMs(transport::kAdminTimeoutMs), transport::kAdminTimeoutMs);
+  EXPECT_EQ(transport::AdminReceiveTimeoutMs(transport::kAdminTimeoutMs + 1), transport::kAdminTimeoutMs + 1);
+}
+
+TEST(NvecdClientFramingTest, InfoWithAnArgumentStaysAlignedWithTheNextReply) {
+  nvecd::testing::CannedResponseServer server({"OK INFO\r\n\r\n# Server\r\nversion: 1\r\nEND\r\n", "OK\r\n"});
+  ASSERT_GT(server.Port(), 0);
+
+  ClientConfig config;
+  config.host = "127.0.0.1";
+  config.port = server.Port();
+  config.timeout_ms = 2000;
+  NvecdClient client(config);
+  ASSERT_TRUE(client.Connect());
+
+  auto info = client.SendCommand("INFO server");
+  ASSERT_TRUE(info) << info.error().message();
+  EXPECT_NE(info->find("version: 1"), std::string::npos) << *info;
+  EXPECT_TRUE(client.Vecdel("item")) << "second reply must not be left behind the INFO block";
 }
 
 TEST(NvecdClientFramingTest, DumpInfoBlockIsCompleteOnlyAtEndUnderSplitDelivery) {
@@ -1255,6 +1279,13 @@ TEST_F(NvecdClientTest, MetasetEnablesFilteredSim) {
   for (const auto& item : result->results) {
     EXPECT_NE(item.id, "vec2") << "vec2 should be filtered out by category:music";
   }
+
+  // The matching filter must return vec2, which fails if METASET stored nothing.
+  options.filter = "category:books";
+  auto matching = client.Sim("vec1", 10, "vectors", options);  // NOLINT
+  ASSERT_TRUE(matching) << "Sim failed: " << matching.error().message();
+  ASSERT_EQ(matching->results.size(), 1U);
+  EXPECT_EQ(matching->results[0].id, "vec2");
 }
 
 //
@@ -1382,6 +1413,11 @@ TEST_F(NvecdClientTest, SimvWithMinScoreOption) {
     EXPECT_GE(item.score, 0.99F) << "min_score filter was not applied server-side";
     EXPECT_NE(item.id, "vec2") << "orthogonal vec2 should be excluded by min_score";
   }
+  bool found_vec1 = false;
+  for (const auto& item : result->results) {
+    found_vec1 = found_vec1 || item.id == "vec1";
+  }
+  EXPECT_TRUE(found_vec1) << "the identical vec1 must survive the min_score filter";
 }
 
 TEST_F(NvecdClientTest, FloatPrecisionRoundTrips) {
@@ -1542,4 +1578,26 @@ TEST_F(NvecdClientTest, DumpCommandsBasic) {
   ASSERT_TRUE(load_result) << "Load failed: " << load_result.error().message();
   EXPECT_EQ(load_result->find("OK DUMP_LOADED"), std::string::npos);
   EXPECT_TRUE(std::filesystem::equivalent(*load_result, save_result->filepath));
+}
+
+TEST_F(NvecdClientTest, VerifyAcceptsAValidSnapshotAndRejectsAMissingFile) {
+  ClientConfig config;
+  config.host = "127.0.0.1";
+  config.port = port_;
+
+  NvecdClient client(config);
+  ASSERT_TRUE(client.Connect());
+  ASSERT_TRUE(client.Vecset("verify_item", {1.0F, 0.0F, 0.0F}));
+
+  auto save_result = client.Save("");
+  ASSERT_TRUE(save_result) << save_result.error().message();
+  ASSERT_TRUE(save_result->completed);
+
+  auto verified = client.Verify(save_result->filepath);
+  ASSERT_TRUE(verified) << verified.error().message();
+  EXPECT_NE(verified->find("DUMP_VERIFIED"), std::string::npos) << *verified;
+
+  auto missing = client.Verify("no_such_snapshot.dmp");
+  ASSERT_FALSE(missing);
+  EXPECT_EQ(missing.error().code(), ErrorCode::kClientServerError);
 }
