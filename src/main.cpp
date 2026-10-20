@@ -135,12 +135,15 @@ int main(int argc, char* argv[]) {
     if (arg == "-t" || arg == "--config-test") {
       config_test_mode = true;
     } else if (arg == "-c" || arg == "--config") {
-      if (i + 1 < argc) {
-        config_path = argv[++i];
-      } else {
+      if (i + 1 >= argc) {
         std::cerr << "Error: " << arg << " requires a file path\n";
         return 1;
       }
+      if (config_path != nullptr) {
+        std::cerr << "Error: Multiple config files specified\n";
+        return 1;
+      }
+      config_path = argv[++i];
     } else if (arg[0] != '-') {
       // Positional argument: config file path
       if (config_path == nullptr) {

@@ -8,8 +8,11 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <fstream>
 #include <limits>
+#include <optional>
+#include <string>
 
 #include "config/config_help.h"
 
@@ -455,4 +458,110 @@ TEST(ConfigTest, ValidateSnapshotDefaultFilenameExtension) {
 TEST(ConfigTest, SnapshotModeDefault) {
   Config config;
   EXPECT_EQ(config.snapshot.mode, "fork");
+}
+
+/**
+ * @brief A file with no sections loads as the all-defaults Config
+ */
+TEST(ConfigTest, EmptyAndCommentsOnlyFilesLoadDefaults) {
+  for (const char* content : {"", "# every section commented out\n# events:\n#   ctx_buffer_size: 10\n"}) {
+    std::ofstream("empty_test_config.yaml") << content;
+    auto config_result = LoadConfig("empty_test_config.yaml");
+    ASSERT_TRUE(config_result) << config_result.error().message();
+    EXPECT_EQ(config_result->events.ctx_buffer_size, defaults::kCtxBufferSize);
+    EXPECT_EQ(config_result->api.tcp.port, defaults::kTcpPort);
+    EXPECT_TRUE(config_result->network.allow_cidrs.empty());
+  }
+  std::remove("empty_test_config.yaml");
+}
+
+/**
+ * @brief The file accepts the same boolean words runtime SET does
+ */
+TEST(ConfigTest, BooleanWordsInFileMatchRuntimeSet) {
+  std::ofstream("bool_alias_test_config.yaml") << "logging:\n  json: on\ncache:\n  enabled: No\n";
+  auto config_result = LoadConfig("bool_alias_test_config.yaml");
+  ASSERT_TRUE(config_result) << config_result.error().message();
+  EXPECT_TRUE(config_result->logging.json);
+  EXPECT_FALSE(config_result->cache.enabled);
+  std::remove("bool_alias_test_config.yaml");
+
+  for (const char* word : {"true", "True", "TRUE", "yes", "Yes", "on", "ON"}) {
+    EXPECT_TRUE(ParseBoolLiteral(word) == std::optional<bool>(true)) << word;
+  }
+  for (const char* word : {"false", "False", "no", "NO", "off", "Off"}) {
+    EXPECT_TRUE(ParseBoolLiteral(word) == std::optional<bool>(false)) << word;
+  }
+  for (const char* word : {"tRUE", "1", "0", "y", ""}) {
+    EXPECT_FALSE(ParseBoolLiteral(word).has_value()) << word;
+  }
+}
+
+/**
+ * @brief A schema failure is one line, so CONFIG VERIFY can carry it as one ERROR reply
+ */
+TEST(ConfigTest, SchemaValidationErrorIsOneLine) {
+  std::ofstream("schema_error_test_config.yaml") << "events:\n  ctx_buffer_size: not-a-number\n";
+  auto config_result = LoadConfig("schema_error_test_config.yaml");
+  ASSERT_FALSE(config_result);
+  EXPECT_EQ(config_result.error().code(), nvecd::utils::ErrorCode::kConfigValidationError);
+  EXPECT_EQ(config_result.error().message().find_first_of("\r\n"), std::string::npos)
+      << config_result.error().message();
+  std::remove("schema_error_test_config.yaml");
+}
+
+/**
+ * @brief Every accepted allow_cidrs entry parses; a bad one fails the load instead of being skipped
+ */
+TEST(ConfigTest, MalformedCidrEntryFailsValidation) {
+  std::ofstream("cidr_test_config.yaml") << "network:\n  allow_cidrs:\n    - \"127.0.0.1/32\"\n    - \"10.0.0.0/33\"\n";
+  auto config_result = LoadConfig("cidr_test_config.yaml");
+  ASSERT_FALSE(config_result);
+  EXPECT_EQ(config_result.error().code(), nvecd::utils::ErrorCode::kConfigInvalidValue);
+  EXPECT_NE(config_result.error().message().find("10.0.0.0/33"), std::string::npos) << config_result.error().message();
+  std::remove("cidr_test_config.yaml");
+
+  Config config;
+  for (const char* bad : {"999.9.9.9/8", "10.0.0.0", "10.0.0.0/"}) {
+    config.network.allow_cidrs = {"127.0.0.1/32", bad};
+    EXPECT_FALSE(ValidateConfig(config)) << bad;
+  }
+  config.network.allow_cidrs = {"127.0.0.1/32", "192.168.0.0/16"};
+  EXPECT_TRUE(ValidateConfig(config));
+}
+
+/**
+ * @brief requirepass is accepted only when a TCP client can send it in AUTH
+ */
+TEST(ConfigTest, RequirepassMustBeSendableOverTcpAuth) {
+  Config config;
+  for (const std::string& bad :
+       {std::string("pass\nword"), std::string("pass\rword"), std::string("pass\0word", 9), std::string(4097, 'a')}) {
+    config.security.requirepass = bad;
+    auto result = ValidateConfig(config);
+    ASSERT_FALSE(result) << bad.size();
+    EXPECT_EQ(result.error().code(), nvecd::utils::ErrorCode::kConfigInvalidValue);
+  }
+  config.security.requirepass = std::string(4096, 'a');
+  EXPECT_TRUE(ValidateConfig(config));
+
+  std::ofstream("requirepass_test_config.yaml") << "security:\n  requirepass: \"pass\\nword\"\n";
+  EXPECT_FALSE(LoadConfig("requirepass_test_config.yaml"));
+  std::remove("requirepass_test_config.yaml");
+}
+
+/**
+ * @brief The legacy ivf_enabled flag is folded into index_type once, at load
+ */
+TEST(ConfigTest, IvfEnabledFoldsIntoIndexType) {
+  std::ofstream("ivf_fold_test_config.yaml") << "similarity:\n  ivf_enabled: true\n";
+  auto config_result = LoadConfig("ivf_fold_test_config.yaml");
+  ASSERT_TRUE(config_result) << config_result.error().message();
+  EXPECT_EQ(config_result->similarity.index_type, "ivf");
+
+  std::ofstream("ivf_fold_test_config.yaml") << "similarity:\n  index_type: hnsw\n  ivf_enabled: true\n";
+  auto hnsw_result = LoadConfig("ivf_fold_test_config.yaml");
+  ASSERT_TRUE(hnsw_result) << hnsw_result.error().message();
+  EXPECT_EQ(hnsw_result->similarity.index_type, "hnsw");
+  std::remove("ivf_fold_test_config.yaml");
 }

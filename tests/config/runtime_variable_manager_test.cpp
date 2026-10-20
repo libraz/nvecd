@@ -8,6 +8,8 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <cstdio>
+#include <fstream>
 #include <memory>
 #include <string>
 
@@ -360,6 +362,12 @@ TEST(RuntimeVariableManagerTest, SetVariable_CanonicalizesAcceptedValueAliases) 
   ASSERT_TRUE(manager->SetVariable("logging.json", "0"));
   EXPECT_EQ(*manager->GetVariable("logging.json"), "false");
 
+  // The same boolean words the config file accepts.
+  ASSERT_TRUE(manager->SetVariable("logging.json", "Yes"));
+  EXPECT_EQ(*manager->GetVariable("logging.json"), "true");
+  ASSERT_TRUE(manager->SetVariable("logging.json", "OFF"));
+  EXPECT_EQ(*manager->GetVariable("logging.json"), "false");
+
   ASSERT_TRUE(manager->SetVariable("cache.min_query_cost_ms", "5.5000"));
   EXPECT_EQ(*manager->GetVariable("cache.min_query_cost_ms"), "5.5");
 }
@@ -528,6 +536,31 @@ TEST(RuntimeVariableManagerTest, GetAllVariables_PrefixFilter_NoMatch) {
 
   auto vars = manager->GetAllVariables("zzz_nonexistent");
   EXPECT_TRUE(vars.empty());
+}
+
+TEST(RuntimeVariableManagerTest, GetAllVariables_LegacyPerfPrefixMatchesPerformanceRows) {
+  Config config = MakeDefaultConfig();
+  auto manager = *RuntimeVariableManager::Create(config);
+
+  const auto canonical = manager->GetAllVariables("performance.");
+  ASSERT_FALSE(canonical.empty());
+  const auto legacy = manager->GetAllVariables("perf.");
+  ASSERT_EQ(legacy.size(), canonical.size());
+  for (const auto& [name, info] : canonical) {
+    ASSERT_EQ(legacy.count(name), 1U) << name;
+    EXPECT_EQ(legacy.at(name).value, info.value) << name;
+  }
+}
+
+TEST(RuntimeVariableManagerTest, GetVariable_IndexTypeReportsIvfEnabledFromFile) {
+  std::ofstream("rvm_ivf_test_config.yaml") << "similarity:\n  ivf_enabled: true\n";
+  auto config = LoadConfig("rvm_ivf_test_config.yaml");
+  std::remove("rvm_ivf_test_config.yaml");
+  ASSERT_TRUE(config) << config.error().message();
+  auto manager = *RuntimeVariableManager::Create(*config);
+
+  EXPECT_EQ(*manager->GetVariable("similarity.index_type"), "ivf");
+  EXPECT_EQ(manager->GetAllVariables("similarity.index_type").at("similarity.index_type").value, "ivf");
 }
 
 // ============================================================================

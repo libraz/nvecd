@@ -202,8 +202,11 @@ def check_schema_wiring(source_root: Path) -> None:
 
     # A key the server never reads configures nothing, however carefully it is
     # parsed and documented. The struct field is named after the schema key
-    # except where the parser converts units.
-    field_names = {"cache.max_memory_mb": "max_memory_bytes"}
+    # except where the parser converts units or folds a legacy alias.
+    field_names = {
+        "cache.max_memory_mb": "max_memory_bytes",
+        "similarity.ivf_enabled": "index_type",
+    }
     consumers = "\n".join(
         path.read_text(encoding="utf-8", errors="ignore")
         for path in sorted((source_root / "src").rglob("*"))

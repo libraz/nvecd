@@ -10,6 +10,8 @@
 
 #include <yaml-cpp/yaml.h>
 
+#include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cmath>
 #include <cstdlib>
@@ -17,7 +19,6 @@
 #include <fstream>
 #include <nlohmann/json-schema.hpp>
 #include <nlohmann/json.hpp>
-#include <sstream>
 #include <stdexcept>
 #include <utility>
 
@@ -26,7 +27,9 @@
 #include "storage/snapshot_format.h"
 #include "utils/error.h"
 #include "utils/log_level.h"
+#include "utils/network_utils.h"
 #include "utils/structured_log.h"
+#include "utils/wire_limits.h"
 
 using nlohmann::json;
 using nlohmann::json_schema::json_validator;
@@ -58,12 +61,8 @@ nlohmann::json YamlToJson(const YAML::Node& yaml_node) {
       return scalar;
     }
 
-    // Try bool (YAML 1.1 true/false variants)
-    if (scalar == "true" || scalar == "True" || scalar == "TRUE") {
-      return true;
-    }
-    if (scalar == "false" || scalar == "False" || scalar == "FALSE") {
-      return false;
+    if (const auto boolean = ParseBoolLiteral(scalar)) {
+      return *boolean;
     }
 
     // Try integer
@@ -103,6 +102,16 @@ nlohmann::json YamlToJson(const YAML::Node& yaml_node) {
   }
 
   return {};
+}
+
+/**
+ * @brief Convert a whole config document to JSON
+ *
+ * An empty or comments-only file is a null document; it is the empty mapping,
+ * so every section takes its defaults.
+ */
+nlohmann::json DocumentToJson(const YAML::Node& root) {
+  return root.IsNull() ? nlohmann::json::object() : YamlToJson(root);
 }
 
 /**
@@ -275,6 +284,11 @@ SimilarityConfig ParseSimilarityConfig(const YAML::Node& node) {
   }
   if (node["hnsw_max_elements"]) {
     config.hnsw_max_elements = read.As<uint32_t>("hnsw_max_elements");
+  }
+  // The legacy flag selects IVF over flat; folding it here gives the engine and
+  // every introspection surface the same index_type.
+  if (config.ivf_enabled && config.index_type == "flat") {
+    config.index_type = "ivf";
   }
 
   return config;
@@ -542,16 +556,16 @@ utils::Expected<void, utils::Error> ValidateConfigSchema(const nlohmann::json& c
     validator.validate(config_json);
     utils::StructuredLog().Event("config_validation").Field("status", "passed").Info();
   } catch (const std::exception& e) {
-    std::stringstream err_msg;
-    err_msg << "Configuration validation failed:\n";
-    err_msg << "  " << e.what() << "\n\n";
-    err_msg << "  Common configuration issues:\n";
-    err_msg << "    - Invalid data types (string instead of number, etc.)\n";
-    err_msg << "    - Invalid enum values (check allowed values)\n";
-    err_msg << "    - Out of range values (check min/max constraints)\n\n";
-    err_msg << "  Please check your configuration against the schema.\n";
-    err_msg << "  Use 'CONFIG HELP <path>' to see configuration options.";
-    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kConfigValidationError, err_msg.str()));
+    // One line: the message travels as a single-line ERROR reply from CONFIG VERIFY.
+    std::string detail = e.what();
+    std::replace(detail.begin(), detail.end(), '\n', ' ');
+    std::replace(detail.begin(), detail.end(), '\r', ' ');
+    while (!detail.empty() && detail.back() == ' ') {
+      detail.pop_back();
+    }
+    return utils::MakeUnexpected(utils::MakeError(
+        utils::ErrorCode::kConfigValidationError,
+        "Configuration validation failed: " + detail + " (see CONFIG HELP <path> for the allowed values)"));
   }
 
   return {};
@@ -566,7 +580,7 @@ utils::Expected<Config, utils::Error> LoadConfig(const std::string& path) {
     YAML::Node root = YAML::LoadFile(path);
 
     // Convert to JSON for schema validation
-    nlohmann::json config_json = YamlToJson(root);
+    nlohmann::json config_json = DocumentToJson(root);
 
     // Validate against JSON Schema
     auto validation_result = ValidateConfigSchema(config_json);
@@ -856,6 +870,26 @@ utils::Expected<void, utils::Error> ValidateConfig(const Config& config) {
     }
   }
 
+  // Validate network configuration: the ACL parser skips an entry it cannot read,
+  // which would silently narrow access.
+  for (const auto& cidr : config.network.allow_cidrs) {
+    if (!utils::CIDR::Parse(cidr)) {
+      return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
+                                                    "network.allow_cidrs entry is not a valid CIDR: " + cidr));
+    }
+  }
+
+  // Validate security configuration: a password no client can send over TCP AUTH
+  // would lock every write and admin command.
+  if (config.security.requirepass.size() > utils::kMaxPasswordBytes) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kConfigInvalidValue,
+                         "security.requirepass exceeds " + std::to_string(utils::kMaxPasswordBytes) + " bytes"));
+  }
+  if (auto framing = utils::ValidateNoFramingBytes(config.security.requirepass, "security.requirepass")) {
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kConfigInvalidValue, *framing));
+  }
+
   // Validate logging configuration
   if (!utils::ParseLogLevel(config.logging.level)) {
     return utils::MakeUnexpected(utils::MakeError(
@@ -888,6 +922,29 @@ utils::Expected<void, utils::Error> ValidateConfig(const Config& config) {
   }
 
   return {};
+}
+
+std::optional<bool> ParseBoolLiteral(std::string_view text) {
+  struct BoolWord {
+    std::string_view lower;
+    std::string_view capitalised;
+    std::string_view upper;
+    bool value;
+  };
+  static constexpr std::array<BoolWord, 6> kWords = {{
+      {"true", "True", "TRUE", true},
+      {"false", "False", "FALSE", false},
+      {"yes", "Yes", "YES", true},
+      {"no", "No", "NO", false},
+      {"on", "On", "ON", true},
+      {"off", "Off", "OFF", false},
+  }};
+  for (const auto& word : kWords) {
+    if (text == word.lower || text == word.capitalised || text == word.upper) {
+      return word.value;
+    }
+  }
+  return std::nullopt;
 }
 
 }  // namespace nvecd::config

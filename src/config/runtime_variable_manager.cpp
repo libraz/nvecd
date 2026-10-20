@@ -276,10 +276,11 @@ Config RuntimeVariableManager::EffectiveConfig() const {
 std::map<std::string, VariableInfo> RuntimeVariableManager::GetAllVariables(const std::string& prefix) const {
   std::shared_lock lock(mutex_);
   std::map<std::string, VariableInfo> result;
+  const auto canonical_prefix = CanonicalVariableName(prefix);
 
   // Add all known variables
   for (const auto& [name, is_mutable] : kVariableMutability) {
-    if (!prefix.empty() && name.find(prefix) != 0) {
+    if (!canonical_prefix.empty() && name.find(canonical_prefix) != 0) {
       continue;  // Skip if doesn't match prefix
     }
 
@@ -590,14 +591,15 @@ std::optional<std::string> RuntimeVariableManager::GetVariableInternal(const std
 // ========== Parse helpers ==========
 
 Expected<bool, Error> RuntimeVariableManager::ParseBool(const std::string& value) {
-  if (value == "true" || value == "on" || value == "1" || value == "yes") {
-    return true;
+  // SET knows the key is boolean, so 1/0 are unambiguous here, unlike in YAML.
+  if (value == "1" || value == "0") {
+    return value == "1";
   }
-  if (value == "false" || value == "off" || value == "0" || value == "no") {
-    return false;
+  if (const auto boolean = ParseBoolLiteral(value)) {
+    return *boolean;
   }
   return MakeUnexpected(
-      MakeError(ErrorCode::kInvalidArgument, "Invalid boolean value (use true/false, on/off, 1/0): " + value));
+      MakeError(ErrorCode::kInvalidArgument, "Invalid boolean value (use true/false, on/off, yes/no, 1/0): " + value));
 }
 
 Expected<int, Error> RuntimeVariableManager::ParseInt(const std::string& value) {

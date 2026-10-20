@@ -9,7 +9,9 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "utils/error.h"
@@ -268,5 +270,17 @@ utils::Expected<Config, utils::Error> LoadConfig(const std::string& path);
  * @return Expected<void, Error> with success or validation error
  */
 utils::Expected<void, utils::Error> ValidateConfig(const Config& config);
+
+/**
+ * @brief Read a boolean word: true/false, yes/no or on/off
+ *
+ * Each word is accepted in lower, Capitalised or UPPER case, the YAML 1.1
+ * spellings yaml-cpp reads as bool. This is the one alias table for both the
+ * config file and runtime SET.
+ *
+ * @param text Scalar text
+ * @return The boolean, or std::nullopt when @p text is not a boolean word
+ */
+std::optional<bool> ParseBoolLiteral(std::string_view text);
 
 }  // namespace nvecd::config
