@@ -9,6 +9,7 @@
 #include <cmath>
 
 #include "events/id_validation.h"
+#include "utils/container_memory.h"
 #include "utils/error.h"
 #include "utils/structured_log.h"
 #include "vectors/distance.h"
@@ -341,7 +342,10 @@ size_t VectorStore::MemoryUsageLocked() const {
   }
 
   // id_to_idx_ hash map overhead
-  total += id_to_idx_.bucket_count() * (sizeof(size_t) + sizeof(std::string) + sizeof(void*));
+  total += utils::UnorderedBookkeeping(id_to_idx_);
+  for (const auto& entry : id_to_idx_) {
+    total += sizeof(entry) + entry.first.capacity();
+  }
 
   return total;
 }
@@ -383,6 +387,7 @@ VectorStore::CompactSnapshot VectorStore::GetCompactSnapshot() const {
   snap.matrix = matrix_.data();
   snap.norms = norms_.data();
   snap.count = idx_to_id_.size();
+  snap.active_count = active_count_;
   snap.dim = dimension_.load(std::memory_order_relaxed);
   snap.id_to_idx = &id_to_idx_;
   snap.idx_to_id = &idx_to_id_;

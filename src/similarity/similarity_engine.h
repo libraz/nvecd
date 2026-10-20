@@ -30,6 +30,7 @@
 #include "utils/error.h"
 #include "utils/expected.h"
 #include "vectors/ann_index.h"
+#include "vectors/ann_index_factory.h"
 #include "vectors/distance.h"
 #include "vectors/ivf_index.h"
 #include "vectors/metadata_filter.h"
@@ -337,6 +338,9 @@ class SimilarityEngine {
   /// ANN index (HNSW or IVF adapter; null for flat/brute-force)
   std::unique_ptr<vectors::AnnIndex> ann_index_;
 
+  /// Construction options, kept so a replacement index can be built aside.
+  vectors::AnnIndexOptions ann_options_;
+
   /// Publishes ANN labels and the VectorStore generation as one mapping.
   mutable std::shared_mutex ann_publication_mutex_;
   std::atomic<uint64_t> ann_generation_{0};
@@ -358,6 +362,21 @@ class SimilarityEngine {
    * @param deleted Per-row tombstone flags, or nullptr when every row is live
    */
   void ReplaceAnnContents(const float* matrix, uint32_t count, uint32_t dimension, const std::vector<bool>* deleted);
+
+  /**
+   * @brief Rebuild an HNSW index from the store without blocking searches
+   *
+   * Copies the live rows, builds a replacement graph holding no lock, then swaps
+   * it in under the publication lock only if the store generation is unchanged.
+   * Searches keep using the previous index (or the flat path) meanwhile.
+   *
+   * @return false when the store is empty or kAsideRebuildAttempts builds were
+   *         each overtaken by a mutation; the caller rebuilds in place
+   */
+  bool RebuildHnswAside();
+
+  /// Rebuild aside once the HNSW tombstone ratio calls for compaction.
+  void MaybeCompactHnsw();
 
   /// True once the ANN index has been bound to the real data dimension
   /// (via the first vector add or a rebuild-from-store).

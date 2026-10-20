@@ -122,6 +122,26 @@ TEST_F(HnswIndexTest, RepeatedUpdatesAutoCompactAndBoundMemory) {
   EXPECT_EQ(results.front().first, 0U);
 }
 
+TEST(HnswIndexCompactionTest, DisabledAutoCompactReportsNeedWithoutRebuilding) {
+  constexpr uint32_t kDim = 8;
+  HnswIndex::Config config;
+  config.m = 8;
+  config.ef_construction = 50;
+  config.auto_compact = false;
+  HnswIndex index(kDim, CosineDistanceRaw, config);
+
+  std::vector<float> vector(kDim, 0.0F);
+  for (uint32_t update = 0; update < 500; ++update) {
+    std::fill(vector.begin(), vector.end(), 0.0F);
+    vector[update % kDim] = 1.0F;
+    index.Add(0, vector.data());
+  }
+
+  EXPECT_EQ(index.Size(), 1U);
+  EXPECT_EQ(index.GetNodeCount(), 500U);
+  EXPECT_TRUE(index.NeedsCompaction());
+}
+
 TEST_F(HnswIndexTest, DeletedCandidatesDoNotUnderfillRequestedLiveTopK) {
   HnswIndex::Config config;
   config.m = 8;

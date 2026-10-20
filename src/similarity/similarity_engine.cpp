@@ -55,12 +55,7 @@ SimilarityEngine::SimilarityEngine(events::EventStore* event_store, events::CoOc
       config_(config),
       distance_func_(vectors::GetDistanceFunc(vectors_config.distance_metric)),
       use_prenorm_(vectors_config.distance_metric.empty() || vectors_config.distance_metric == "cosine") {
-  // Determine effective index type: support legacy ivf_enabled flag
-  if (config_.index_type == "flat" && config_.ivf_enabled) {
-    config_.index_type = "ivf";
-  }
-  // An unrecognised name keeps its configured spelling and falls back to
-  // brute-force search, as an explicitly flat configuration does.
+  // Config load rejects unknown names; the fallback only guards a hand-built config.
   index_type_ = vectors::AnnIndexTypeFromString(config_.index_type).value_or(vectors::AnnIndexType::kFlat);
 
   vectors::AnnIndexOptions ann_options;
@@ -78,6 +73,10 @@ SimilarityEngine::SimilarityEngine(events::EventStore* event_store, events::CoOc
 
   // Every ANN implementation is built here, through the single construction
   // point, so a new one cannot reach production without being routed through it.
+  // The engine compacts HNSW aside (MaybeCompactHnsw) so a search never waits
+  // on an in-index compaction while the publication lock is held.
+  ann_options.hnsw.auto_compact = false;
+  ann_options_ = ann_options;
   ann_index_ = vectors::MakeAnnIndex(index_type_, ann_options);
 
   switch (index_type_) {
@@ -147,6 +146,9 @@ void SimilarityEngine::RebuildAnnFromStore() {
     return;  // flat: nothing to rebuild
   }
   JoinTrainThread();
+  if (index_type_ == vectors::AnnIndexType::kHnsw && RebuildHnswAside()) {
+    return;
+  }
   {
     std::unique_lock publication_lock(ann_publication_mutex_);
     // A rebuild drops the trained layout and both write tiers. Excluding a seal
@@ -181,6 +183,66 @@ void SimilarityEngine::RebuildAnnFromStore() {
   // Training takes its own store snapshot, so it starts only once the locks
   // above are released.
   MaybeTrainIvfIndex();
+}
+
+bool SimilarityEngine::RebuildHnswAside() {
+  constexpr int kAsideRebuildAttempts = 3;
+  for (int attempt = 0; attempt < kAsideRebuildAttempts; ++attempt) {
+    std::vector<float> matrix;
+    std::vector<bool> deleted;
+    uint64_t generation = 0;
+    uint32_t count = 0;
+    uint32_t dim = 0;
+    {
+      auto snap = vector_store_->GetCompactSnapshot();
+      if (snap.Empty()) {
+        return false;
+      }
+      generation = snap.generation;
+      count = static_cast<uint32_t>(snap.count);
+      dim = static_cast<uint32_t>(snap.dim);
+      matrix.assign(snap.matrix, snap.matrix + static_cast<size_t>(count) * dim);
+      if (snap.deleted != nullptr) {
+        deleted = *snap.deleted;
+      }
+    }
+
+    auto replacement = vectors::MakeAnnIndex(index_type_, ann_options_);
+    replacement->Rebuild(matrix.data(), count, dim, &deleted);
+
+    std::unique_lock publication_lock(ann_publication_mutex_);
+    auto snap = vector_store_->GetCompactSnapshot();
+    if (snap.generation != generation) {
+      continue;  // the store moved during the build; the copy is stale
+    }
+    ann_index_ = std::move(replacement);
+    ann_rebuild_count_.fetch_add(1, std::memory_order_relaxed);
+    ann_generation_.store(generation, std::memory_order_release);
+    ann_dimension_ = dim;
+    ann_dimension_bound_ = true;
+
+    utils::StructuredLog()
+        .Event("ann_index_rebuilt_from_store")
+        .Field("index_type", config_.index_type)
+        .Field("count", static_cast<uint64_t>(count))
+        .Field("dimension", static_cast<uint64_t>(dim))
+        .Info();
+    return true;
+  }
+  return false;
+}
+
+void SimilarityEngine::MaybeCompactHnsw() {
+  if (index_type_ != vectors::AnnIndexType::kHnsw || !ann_index_) {
+    return;
+  }
+  {
+    std::shared_lock publication_lock(ann_publication_mutex_);
+    if (!static_cast<const vectors::HnswIndex*>(ann_index_.get())->NeedsCompaction()) {
+      return;
+    }
+  }
+  RebuildAnnFromStore();
 }
 
 SimilarityEngine::~SimilarityEngine() {
@@ -625,9 +687,15 @@ utils::Expected<std::vector<SimilarityResult>, utils::Error> SimilarityEngine::S
 
   // A filter is applied per row, so sampling first would leave a sparse filter
   // too few survivors to fill top_k; a filtered query scans every row instead.
-  const bool use_sampling = !has_filter && config_.sample_size > 0 && snap.count > config_.sample_size * 2;
+  // The threshold counts live rows: tombstoned slots must not tip an
+  // otherwise exact corpus into sampling.
+  const bool use_sampling = !has_filter && config_.sample_size > 0 && snap.active_count > config_.sample_size * 2;
   if (use_sampling) {
-    for (size_t idx : SampleIndices(snap.count, config_.sample_size)) {
+    // Draw slots in proportion to the tombstone share so the sample holds about
+    // sample_size live rows.
+    const size_t draw =
+        std::min(snap.count, (config_.sample_size * snap.count + snap.active_count - 1) / snap.active_count);
+    for (size_t idx : SampleIndices(snap.count, draw)) {
       push_candidate(idx);
     }
   } else {
@@ -801,6 +869,7 @@ void SimilarityEngine::NotifyVectorAdded(size_t compact_index, const float* vect
   if (start_ivf_training) {
     MaybeTrainIvfIndex();
   }
+  MaybeCompactHnsw();
   // The write path only reports that the buffer moved. Whether that leaves
   // anything to seal is decided by the maintenance thread, which also runs
   // after the last write and so can drain a buffer that a write-path test
@@ -827,6 +896,9 @@ void SimilarityEngine::NotifyVectorRemoved(size_t compact_index) {
   }
   ann_index_->MarkDeleted(static_cast<uint32_t>(compact_index));
   ann_generation_.store(snap.generation, std::memory_order_release);
+  snap.lock.unlock();
+  publication_lock.unlock();
+  MaybeCompactHnsw();
 }
 
 bool SimilarityEngine::IsIvfTrained() const {

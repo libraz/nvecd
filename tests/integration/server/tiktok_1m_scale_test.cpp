@@ -1062,7 +1062,7 @@ class TikTok1MScaleIvfTest : public NvecdTestFixture {
     config_.events.ctx_buffer_size = 1000;
 
     // Enable IVF — train after bulk load completes
-    config_.similarity.ivf_enabled = true;
+    config_.similarity.index_type = "ivf";
     config_.similarity.ivf_nlist = 256;  // Fixed: good balance for 1M-10M
     config_.similarity.ivf_nprobe = 10;
     config_.similarity.ivf_train_threshold = 100000;  // Train early at 100K

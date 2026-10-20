@@ -51,6 +51,9 @@ class HnswIndex : public AnnIndex {
     uint32_t max_elements = 0;              ///< Pre-allocate capacity (0 = grow dynamically)
     float rebuild_tombstone_ratio = 0.25F;  ///< Churn ratio that triggers compaction
     uint32_t rebuild_min_nodes = 64;        ///< Minimum graph size before auto-compaction
+    /// Compact inside Add/MarkDeleted. A caller that must not stall readers while
+    /// the graph is rebuilt clears this and compacts aside on NeedsCompaction().
+    bool auto_compact = true;
   };
 
   /**
@@ -120,6 +123,9 @@ class HnswIndex : public AnnIndex {
   /** @brief Get the number of retired nodes. */
   uint32_t GetTombstoneCount() const;
 
+  /** @brief Whether the tombstone ratio has reached the compaction threshold. */
+  bool NeedsCompaction() const;
+
   /** @brief Estimate all memory owned by vectors, nodes, and adjacency lists. */
   size_t MemoryUsage() const;
 
@@ -146,6 +152,9 @@ class HnswIndex : public AnnIndex {
 
   /// Rebuild from the latest live node per compact index when churn is high.
   void MaybeCompactLocked();
+
+  /// Tombstone-ratio test shared by MaybeCompactLocked and NeedsCompaction.
+  bool NeedsCompactionLocked() const;
 
   /**
    * @brief Greedy search from entry point at a single layer

@@ -8,6 +8,7 @@
 #include <gtest/gtest.h>
 
 #include <limits>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -36,6 +37,23 @@ TEST(VectorStoreTest, ConstructEmpty) {
   EXPECT_EQ(store.GetVectorCount(), 0);
   EXPECT_EQ(store.GetDimension(), 0);
   EXPECT_TRUE(store.GetAllIds().empty());
+}
+
+TEST(VectorStoreTest, MemoryUsageGrowsWithEntriesAndKeyLength) {
+  auto config = MakeConfig();
+  const std::vector<float> vec = {0.1f, 0.2f, 0.3f};
+  auto usage_with = [&](size_t entries, size_t key_length) {
+    VectorStore store(config);
+    for (size_t i = 0; i < entries; ++i) {
+      std::string id = std::to_string(i);
+      id.resize(key_length, 'k');
+      EXPECT_TRUE(store.SetVector(id, vec).has_value());
+    }
+    return store.MemoryUsage();
+  };
+
+  EXPECT_GT(usage_with(200, 8), usage_with(100, 8));
+  EXPECT_GT(usage_with(100, 200), usage_with(100, 8));
 }
 
 TEST(VectorStoreTest, DetectsAvx2AtRuntimeInBaselineBuilds) {

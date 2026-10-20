@@ -8,6 +8,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -529,6 +530,83 @@ TEST_F(SimilarityEngineAnnSyncTest, RebuildLeavesTombstonedRowsOut) {
   EXPECT_EQ(ids.count("v0"), 0U);
 }
 
+// Compaction builds the replacement graph aside from the store, so the index
+// stays current and a query sees every live row whichever graph is published.
+TEST_F(SimilarityEngineAnnSyncTest, HnswChurnCompactsAsideAndKeepsEveryLiveRow) {
+  BuildEngine("hnsw");
+  constexpr size_t kCount = 200;
+  for (size_t i = 0; i < kCount; ++i) {
+    Put("v" + std::to_string(i), Row(i));
+  }
+  const uint64_t rebuilds = engine_->GetAnnRebuildCount();
+  for (size_t i = 0; i < kCount; i += 2) {
+    Remove("v" + std::to_string(i));
+  }
+
+  EXPECT_GT(engine_->GetAnnRebuildCount(), rebuilds);
+  EXPECT_EQ(engine_->GetAnnGeneration(), vector_store_->GetGeneration());
+  const auto ids = SearchIds(static_cast<int>(kCount));
+  EXPECT_EQ(ids.size(), kCount / 2);
+  for (size_t i = 0; i < kCount; i += 2) {
+    EXPECT_EQ(ids.count("v" + std::to_string(i)), 0U);
+  }
+}
+
+// Searches that overlap repeated rebuilds read either the previous index or the
+// fresh one (or the flat path); none returns a partial or empty result.
+TEST_F(SimilarityEngineAnnSyncTest, SearchesDuringRepeatedHnswRebuildsStayComplete) {
+  BuildEngine("hnsw");
+  constexpr size_t kCount = 300;
+  for (size_t i = 0; i < kCount; ++i) {
+    Put("v" + std::to_string(i), Row(i));
+  }
+
+  std::atomic<bool> done{false};
+  std::thread rebuilder([&] {
+    for (int round = 0; round < 10; ++round) {
+      engine_->RebuildAnnFromStore();
+    }
+    done.store(true);
+  });
+  size_t incomplete = 0;
+  while (!done.load()) {
+    if (SearchIds(static_cast<int>(kCount)).size() != kCount) {
+      ++incomplete;
+    }
+  }
+  rebuilder.join();
+
+  EXPECT_EQ(incomplete, 0U);
+  EXPECT_EQ(engine_->GetAnnGeneration(), vector_store_->GetGeneration());
+  EXPECT_EQ(SearchIds(static_cast<int>(kCount)).size(), kCount);
+}
+
+// Sampling engages on the live row count: tombstones that push the slot count
+// past twice sample_size must not make an exact-sized corpus approximate.
+TEST(SimilarityEngineSamplingTest, TombstonesDoNotTriggerSampling) {
+  auto vectors_config = MakeVectorsConfig();
+  auto similarity_config = MakeSimilarityConfig();
+  similarity_config.sample_size = 10;
+  events::EventStore event_store(MakeEventsConfig());
+  events::CoOccurrenceIndex co_index;
+  vectors::VectorStore vector_store(vectors_config);
+  SimilarityEngine engine(&event_store, &co_index, &vector_store, similarity_config, vectors_config);
+
+  constexpr size_t kSlots = 24;
+  for (size_t i = 0; i < kSlots; ++i) {
+    const auto angle = static_cast<float>(i) * 0.1F;
+    ASSERT_TRUE(vector_store.SetVector("v" + std::to_string(i), {std::cos(angle), std::sin(angle), 0.5F}).has_value());
+  }
+  for (size_t i = 0; i < 4; ++i) {
+    ASSERT_TRUE(vector_store.DeleteVector("v" + std::to_string(i)));
+  }
+  ASSERT_EQ(vector_store.GetCompactCount(), kSlots);  // tombstones, not compacted
+
+  auto results = engine.SearchByVector({1.0F, 0.0F, 0.0F}, static_cast<int>(kSlots));
+  ASSERT_TRUE(results.has_value());
+  EXPECT_EQ(results->size(), 20U);  // 20 live rows == 2 * sample_size: exact scan
+}
+
 // An IVF index trains only through the background trainer, and only once the
 // corpus reaches ivf_train_threshold; below it every query stays exact.
 TEST_F(SimilarityEngineAnnSyncTest, IvfRebuildBelowTrainThresholdStaysUntrained) {
@@ -654,17 +732,6 @@ TEST_F(SimilarityEngineIndexSelectionTest, IvfStaysUntrainedBelowTrainThreshold)
   // the index untrained and queries take the exact path.
   EXPECT_FALSE(engine_->IsIvfTrained());
   EXPECT_FALSE(engine_->IsAnnIndexReady());
-  ExpectSearchCoversStore();
-}
-
-// The legacy ivf_enabled flag still promotes the default flat configuration.
-TEST_F(SimilarityEngineIndexSelectionTest, LegacyIvfEnabledPromotesFlatToIvf) {
-  auto similarity_config = MakeSimilarityConfig();
-  similarity_config.index_type = "flat";
-  similarity_config.ivf_enabled = true;
-  BuildEngine(similarity_config);
-
-  EXPECT_EQ(engine_->GetIndexType(), "ivf");
   ExpectSearchCoversStore();
 }
 

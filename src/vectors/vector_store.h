@@ -253,6 +253,7 @@ class VectorStore {
     const float* matrix = nullptr;  ///< Pointer to contiguous matrix
     const float* norms = nullptr;   ///< Pointer to norm array
     size_t count = 0;               ///< Number of vectors (including tombstones)
+    size_t active_count = 0;        ///< Number of live vectors (excluding tombstones)
     size_t dim = 0;                 ///< Vector dimension
     uint64_t generation = 0;        ///< Corpus layout/content generation
     const std::unordered_map<std::string, size_t>* id_to_idx = nullptr;

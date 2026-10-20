@@ -358,16 +358,27 @@ std::vector<uint32_t> HnswIndex::SelectNeighbors(const std::vector<std::pair<flo
 void HnswIndex::Add(uint32_t compact_index, const float* vector) {
   std::unique_lock lock(mutex_);
   AddLocked(compact_index, vector);
-  MaybeCompactLocked();
+  if (config_.auto_compact) {
+    MaybeCompactLocked();
+  }
+}
+
+bool HnswIndex::NeedsCompactionLocked() const {
+  if (nodes_.size() < config_.rebuild_min_nodes || nodes_.empty()) {
+    return false;
+  }
+  const size_t tombstones = nodes_.size() - active_count_;
+  return static_cast<double>(tombstones) / static_cast<double>(nodes_.size()) >=
+         static_cast<double>(config_.rebuild_tombstone_ratio);
+}
+
+bool HnswIndex::NeedsCompaction() const {
+  std::shared_lock lock(mutex_);
+  return NeedsCompactionLocked();
 }
 
 void HnswIndex::MaybeCompactLocked() {
-  if (nodes_.size() < config_.rebuild_min_nodes || nodes_.empty()) {
-    return;
-  }
-  const size_t tombstones = nodes_.size() - active_count_;
-  if (static_cast<double>(tombstones) / static_cast<double>(nodes_.size()) <
-      static_cast<double>(config_.rebuild_tombstone_ratio)) {
+  if (!NeedsCompactionLocked()) {
     return;
   }
 
@@ -515,7 +526,9 @@ void HnswIndex::MarkDeleted(uint32_t compact_index) {
     if (active_count_ > 0) {
       --active_count_;
     }
-    MaybeCompactLocked();
+    if (config_.auto_compact) {
+      MaybeCompactLocked();
+    }
   }
 }
 
