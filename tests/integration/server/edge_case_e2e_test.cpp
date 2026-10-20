@@ -156,8 +156,8 @@ TEST_F(EdgeCaseE2ETest, CaseInsensitiveCommands) {
   EXPECT_TRUE(ContainsOK(resp)) << "Lowercase 'event' command should succeed, got: " + resp;
 
   resp = client.SendCommand("info");
-  EXPECT_TRUE(ContainsOK(resp) || resp.find("INFO") != std::string::npos)
-      << "Lowercase 'info' command should succeed, got: " + resp;
+  EXPECT_EQ(resp.rfind("OK INFO\r\n\r\n# Server\r\nversion: ", 0), 0u)
+      << "Lowercase 'info' command should return the INFO report, got: " + resp;
 }
 
 // ---------------------------------------------------------------------------
@@ -317,9 +317,19 @@ TEST_F(EdgeCaseE2ETest, ConfigVerifyValidYaml) {
   }
 
   auto resp = client.SendCommand("CONFIG VERIFY " + config_path.string());
-  // CONFIG VERIFY returns "+OK" (Redis-style) rather than "OK"
-  EXPECT_TRUE(ContainsOK(resp) || resp.find("+OK") == 0)
-      << "CONFIG VERIFY with valid YAML should return OK, got: " + resp;
+  // CONFIG VERIFY answers with the Redis-style "+OK" status followed by a summary block.
+  EXPECT_EQ(resp,
+            "+OK\r\n"
+            "Configuration is valid\r\n"
+            "  Vectors:\r\n"
+            "    dimension: 3\r\n"
+            "    distance_metric: cosine\r\n"
+            "  Events:\r\n"
+            "    ctx_buffer_size: 100\r\n"
+            "    decay_interval_sec: 300\r\n"
+            "  API:\r\n"
+            "    tcp: 127.0.0.1:6820\r\n"
+            "END\r\n");
 }
 
 // ---------------------------------------------------------------------------

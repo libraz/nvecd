@@ -55,11 +55,8 @@ TEST_F(AdversarialE2ETest, BinaryDataInCommand) {
   cmd += "bad 3 0.1 0.2 0.3";
 
   auto resp = client.SendCommand(cmd);
-  // Null bytes may cause the server to see a truncated command (no \r\n
-  // terminator visible), so an empty response (recv timeout) is acceptable.
-  // The server may also respond with ERROR if it processes the partial data.
-  EXPECT_TRUE(resp.empty() || ContainsOK(resp) || ContainsError(resp))
-      << "Null byte command: unexpected response: " + resp;
+  // An embedded NUL byte is rejected rather than truncating the command.
+  EXPECT_EQ(resp, "ERROR Command must not contain embedded NUL bytes\r\n");
 
   // Use a fresh connection to verify server is still functional, since the
   // null byte may have corrupted the stream state on the original connection.
@@ -82,10 +79,8 @@ TEST_F(AdversarialE2ETest, VeryLargePayload) {
   }
 
   auto resp = client.SendCommand(cmd);
-  // Should reject due to dimension mismatch or accept if dimension is ignored.
-  // Must not crash.
-  EXPECT_FALSE(resp.empty()) << "Server should respond (not crash) to very large payload";
-  EXPECT_TRUE(ContainsOK(resp) || ContainsError(resp)) << "Response should be OK or ERROR, got: " + resp;
+  // Rejected by the store's hard dimension ceiling before any dimension comparison.
+  EXPECT_EQ(resp, "ERROR Vector dimension exceeds maximum of 4096\r\n");
 
   // Verify server health
   auto health = client.SendCommand("INFO");
@@ -196,16 +191,15 @@ TEST_F(AdversarialE2ETest, EmptyAndWhitespaceOnlyCommands) {
 
   // Send empty line (just \r\n is appended by SendCommand)
   auto resp = client.SendCommand("");
-  // Server may ignore empty lines (timeout/empty response) or return error
-  EXPECT_TRUE(resp.empty() || ContainsError(resp) || ContainsOK(resp)) << "Empty command: unexpected response: " + resp;
+  // A bare line terminator is consumed silently: no reply is sent.
+  EXPECT_EQ(resp, "");
 
   // Send whitespace-only commands
   resp = client.SendCommand("   ");
-  EXPECT_TRUE(resp.empty() || ContainsError(resp) || ContainsOK(resp))
-      << "Whitespace command: unexpected response: " + resp;
+  EXPECT_EQ(resp, "ERROR Empty command\r\n");
 
   resp = client.SendCommand("\t");
-  EXPECT_TRUE(resp.empty() || ContainsError(resp) || ContainsOK(resp)) << "Tab command: unexpected response: " + resp;
+  EXPECT_EQ(resp, "ERROR Empty command\r\n");
 
   // Server must remain functional
   auto health = client.SendCommand("INFO");
@@ -222,16 +216,17 @@ TEST_F(AdversarialE2ETest, SpecialCharactersInIds) {
   // ID with space (will be parsed as two tokens, so it is effectively invalid)
   auto resp = client.SendCommand("VECSET item 1 1.0 0.0 0.0");
   // "item" becomes the ID, "1" becomes the first float value.
-  // This will likely be a dimension mismatch (4 values for 3-dim).
-  EXPECT_TRUE(ContainsOK(resp) || ContainsError(resp)) << "ID with space: unexpected response: " + resp;
+  // The first VECSET on an empty store fixes the dimension, so these four values are accepted
+  // and every later 3-value VECSET is a mismatch against that dimension.
+  EXPECT_EQ(resp, "OK VECSET\r\n");
 
   // ID with equals sign
   resp = client.SendCommand("VECSET item=1 1.0 0.0 0.0");
-  EXPECT_TRUE(ContainsOK(resp) || ContainsError(resp)) << "ID with equals: unexpected response: " + resp;
+  EXPECT_EQ(resp, "ERROR Vector dimension mismatch: expected 4, got 3\r\n");
 
   // ID with backslash
   resp = client.SendCommand("VECSET item\\1 1.0 0.0 0.0");
-  EXPECT_TRUE(ContainsOK(resp) || ContainsError(resp)) << "ID with backslash: unexpected response: " + resp;
+  EXPECT_EQ(resp, "ERROR Vector dimension mismatch: expected 4, got 3\r\n");
 
   // Verify server health
   auto health = client.SendCommand("INFO");
@@ -263,12 +258,11 @@ TEST_F(AdversarialE2ETest, ZeroDimensionVector) {
 
   // VECSET with no float values at all
   auto resp = client.SendCommand("VECSET item_empty");
-  EXPECT_TRUE(ContainsError(resp)) << "VECSET with no values should return error, got: " + resp;
+  EXPECT_EQ(resp, "ERROR VECSET requires at least 2 arguments: <id> <floats>\r\n");
 
   // VECSET with ID only, trailing space
   resp = client.SendCommand("VECSET item_empty2 ");
-  EXPECT_TRUE(resp.empty() || ContainsError(resp))
-      << "VECSET with trailing space only should return error, got: " + resp;
+  EXPECT_EQ(resp, "ERROR VECSET requires at least 2 arguments: <id> <floats>\r\n");
 
   // Server must remain functional
   auto health = client.SendCommand("INFO");
@@ -284,14 +278,8 @@ TEST_F(AdversarialE2ETest, ExtremelyLargeTopK) {
   PopulateBasicData(client);
 
   auto resp = client.SendCommand("SIM item1 999999999 using=vectors");
-  // Should either be capped to max_top_k (100) and succeed, or return error
-  EXPECT_TRUE(ContainsOK(resp) || ContainsError(resp)) << "Extremely large top-K should be handled, got: " + resp;
-
-  if (ContainsOK(resp)) {
-    int count = GetResultCount(resp);
-    // Should not exceed total items in store minus the query item itself
-    EXPECT_LE(count, 100) << "Result count should be capped by max_top_k";
-  }
+  // A top_k above similarity.max_top_k (100) is rejected, not capped.
+  EXPECT_EQ(resp, "ERROR top_k 999999999 exceeds maximum allowed: 100\r\n");
 
   // Server must remain functional
   auto health = client.SendCommand("INFO");
@@ -437,14 +425,24 @@ TEST_F(AdversarialE2ETest, DeleteAllItemsThenSearch) {
     EXPECT_TRUE(ContainsOK(del_resp));
   }
 
-  // Search should return 0 results or handle gracefully
+  // DEL records a zero score and never subtracts from co-occurrence, so the
+  // pairs accumulated by the earlier ADDs (score_i * score_j) still rank.
   auto resp = client.SendCommand("SIM del_item1 10 using=events");
-  EXPECT_TRUE(ContainsOK(resp) || ContainsError(resp))
-      << "SIM after deleting all events should be handled gracefully, got: " + resp;
+  EXPECT_EQ(resp,
+            "OK RESULTS 4\r\n"
+            "del_item5 500.0000\r\n"
+            "del_item4 400.0000\r\n"
+            "del_item3 300.0000\r\n"
+            "del_item2 200.0000\r\n");
 
+  // Every vector is zero, so all candidates tie at similarity 0 in id order.
   resp = client.SendCommand("SIM del_item1 10 using=vectors");
-  EXPECT_TRUE(ContainsOK(resp) || ContainsError(resp))
-      << "SIM after zeroing all vectors should be handled gracefully, got: " + resp;
+  EXPECT_EQ(resp,
+            "OK RESULTS 4\r\n"
+            "del_item2 0.0000\r\n"
+            "del_item3 0.0000\r\n"
+            "del_item4 0.0000\r\n"
+            "del_item5 0.0000\r\n");
 
   // INFO should still work
   info = client.SendCommand("INFO");

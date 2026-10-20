@@ -583,7 +583,7 @@ cache.ttl_seconds=600 (mutable)
 
 | メッセージ | 原因 |
 |---|---|
-| `Empty command` | 空行 |
+| `Empty command` | 空白やタブだけの行（何も含まない空行は応答なしで読み飛ばす） |
 | `Command must be a single line` | CR または LF が行中にある |
 | `Command must not contain embedded NUL bytes` | リクエストに NUL バイトがある |
 | `Unknown command: <NAME>` | 先頭トークンが未知 |

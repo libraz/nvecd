@@ -54,6 +54,7 @@ class NvecdClientCTest : public ::testing::Test {
     config_->snapshot.dir = snapshot_dir_.string();  // Isolated from parallel CTest processes
 
     // Create and start server (server owns stores)
+    server_start_ = std::chrono::steady_clock::now();
     server_ = std::make_unique<server::NvecdServer>(*config_);
     auto start_result = server_->Start();
     ASSERT_TRUE(start_result) << "Failed to start server";
@@ -73,6 +74,12 @@ class NvecdClientCTest : public ::testing::Test {
 
   std::unique_ptr<config::Config> config_;
   std::unique_ptr<server::NvecdServer> server_;
+  uint64_t SecondsSinceServerStart() const {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - server_start_).count());
+  }
+
+  std::chrono::steady_clock::time_point server_start_;
   std::filesystem::path snapshot_dir_;
   uint16_t port_ = 0;
 };
@@ -448,7 +455,8 @@ TEST_F(NvecdClientCTest, InfoCommand) {
   ASSERT_NE(info, nullptr);
 
   EXPECT_NE(info->version, nullptr);
-  EXPECT_GE(info->uptime_seconds, 0);
+  // Uptime is counted from server start, so it cannot exceed the time since the fixture began starting it.
+  EXPECT_LE(info->uptime_seconds, SecondsSinceServerStart());
   EXPECT_GT(info->total_commands_processed, 0U);
   EXPECT_GT(info->vector_count, 0U);
   EXPECT_GT(info->id_count, 0U);

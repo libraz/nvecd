@@ -583,7 +583,7 @@ Every failure is a single `ERROR <message>` line. A rejected command, including 
 
 | Message | Cause |
 |---|---|
-| `Empty command` | blank line |
+| `Empty command` | line of only spaces or tabs (a completely empty line is skipped without a reply) |
 | `Command must be a single line` | embedded CR or LF |
 | `Command must not contain embedded NUL bytes` | NUL byte in the request |
 | `Unknown command: <NAME>` | unrecognised first token |

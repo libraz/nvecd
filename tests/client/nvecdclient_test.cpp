@@ -81,6 +81,7 @@ class NvecdClientTest : public ::testing::Test {
     config_->snapshot.mode = "lock";                 // Save/Load round-trip is synchronous
 
     // Create and start server (server owns stores)
+    server_start_ = std::chrono::steady_clock::now();
     server_ = std::make_unique<server::NvecdServer>(*config_);
     auto start_result = server_->Start();
     ASSERT_TRUE(start_result) << "Failed to start server: " << start_result.error().message();
@@ -102,6 +103,12 @@ class NvecdClientTest : public ::testing::Test {
 
   std::unique_ptr<config::Config> config_;
   std::unique_ptr<server::NvecdServer> server_;
+  uint64_t SecondsSinceServerStart() const {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - server_start_).count());
+  }
+
+  std::chrono::steady_clock::time_point server_start_;
   std::filesystem::path snapshot_dir_;
   uint16_t port_ = 0;
 };
@@ -1465,7 +1472,8 @@ TEST_F(NvecdClientTest, InfoSuccess) {
   ASSERT_TRUE(result) << "Info failed: " << result.error().message();
 
   EXPECT_FALSE(result->version.empty());
-  EXPECT_GE(result->uptime_seconds, 0);
+  // Uptime is counted from server start, so it cannot exceed the time since the fixture began starting it.
+  EXPECT_LE(result->uptime_seconds, SecondsSinceServerStart());
 }
 
 TEST_F(NvecdClientTest, InfoParsesRealKeysToNonZero) {
