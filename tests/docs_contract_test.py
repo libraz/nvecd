@@ -11,7 +11,9 @@ correspondence rather than spot-checking one sentence:
   schema and must be current;
 * every schema key is parsed, introspectable and actually read by the server;
 * every field name, status word and JSON key the docs promise exists verbatim
-  in the source that produces it;
+  in a string literal of the source that produces it, never only in a comment;
+* the protocol error table lists exactly the ERROR messages a TCP client can
+  receive, and the metric, cache-statistics and IVF figures match the code;
 * the English and Japanese guides state the same set of facts;
 * every error code is reachable from a `MakeError` call site.
 """
@@ -76,6 +78,81 @@ ERROR_CODES_WITHOUT_CONSTRUCTOR = (
 # Documentation pages whose vocabulary the server must produce verbatim.
 WIRE_DOCS = ("protocol.md", "http-api.md", "persistence.md")
 
+# Pages among WIRE_DOCS that also name on-disk and process mechanics. There a
+# token may instead be an identifier in comment-free code, or a file magic that
+# a 32-bit constant spells in little-endian byte order.
+FORMAT_DOCS = ("persistence.md",)
+
+# Sources whose error text reaches a TCP client as "ERROR <message>". A file
+# paired with a function name contributes only that function's messages.
+WIRE_ERROR_SOURCES: tuple[tuple[str, str | None], ...] = (
+    ("src/server/command_parser.cpp", None),
+    ("src/server/argument_validation.cpp", None),
+    ("src/server/filter_parser.cpp", None),
+    ("src/server/request_dispatcher.cpp", None),
+    ("src/server/reactor_connection.cpp", None),
+    ("src/server/nvecd_server.cpp", None),
+    ("src/server/snapshot_coordinator.cpp", None),
+    ("src/server/handlers/admin_handler.cpp", None),
+    ("src/server/handlers/cache_handler.cpp", None),
+    ("src/server/handlers/debug_handler.cpp", None),
+    ("src/server/handlers/dump_handler.cpp", None),
+    ("src/server/handlers/info_handler.cpp", None),
+    ("src/server/handlers/variable_handler.cpp", None),
+    ("src/config/runtime_variable_manager.cpp", None),
+    ("src/events/id_validation.h", None),
+    ("src/events/event_store.cpp", None),
+    ("src/vectors/vector_store.cpp", None),
+    ("src/similarity/similarity_engine.cpp", None),
+    ("src/storage/snapshot_fork.cpp", None),
+    ("src/utils/path_utils.h", "ValidateDumpPath"),
+)
+
+# Messages from WIRE_ERROR_SOURCES that the protocol error table does not list,
+# because a TCP client cannot provoke them. "<>" stands for a computed part.
+UNLISTED_ERROR_MESSAGES = (
+    # Internal invariants and unwired components.
+    "Cannot save snapshot: required stores not initialized",
+    "Cannot save snapshot: server configuration is not available",
+    "Cannot load snapshot: required stores not initialized",
+    "Event apply diverged after WAL acceptance",
+    "Event dedup state changed during acceptance",
+    "EventStore not initialized",
+    "Fork snapshot writer not initialized",
+    "MetadataStore not initialized",
+    "METASET carries no metadata",
+    "No value resolver for variable: <>",
+    "Not a search command: <>",
+    "Not a write command: <>",
+    "RuntimeVariableManager not initialized",
+    "Server configuration is not available",
+    "Server not initialized",
+    "SimilarityEngine not initialized",
+    "Unknown command",
+    "Unknown command type",
+    "Variable not implemented: <>",
+    "VectorStore not initialized",
+    "Write produced an unformattable outcome",
+    # Values the parser rejects before the layer that would report them.
+    "<> exceeds the finite float range",
+    "Both event and vector searches failed for ID: <>",
+    "Cannot normalize zero vector",
+    "DEL score must be 0, got <>",
+    "Invalid event type: <>",
+    "Invalid filepath: must not be empty",
+    "Invalid logging format (must be json/text): <>",
+    "top_k exceeds maximum allowed: <>",
+    "top_k must be positive",
+    "Vector components must be finite",
+    # Snapshot restore reasons, which reach the wire only inside
+    # "Failed to load snapshot from <path>: <reason>".
+    "Cannot restore dimension <> onto a store holding <>-dimensional vectors",
+    "Restored dimension out of range: <>",
+    # Lifecycle paths that are not requests.
+    "Server already running",
+    "Server is read-only; decay maintenance skipped",
+)
+
 # A token that names something the reader can type or receive: an identifier,
 # a dotted path, an endpoint, an HTTP verb plus path, or a status code. Prose
 # fragments and signature spellings are excluded so translation style does not
@@ -131,6 +208,196 @@ def strip_code(text: str) -> str:
 def backticked(text: str) -> set[str]:
     """Return every inline-code token in a document."""
     return set(re.findall(r"`([^`\n]{1,60})`", strip_code(text)))
+
+
+def unescape(literal: str) -> str:
+    """Decode the escapes of a C++ string literal body that matter to text."""
+    controls = {"n": "\n", "r": "\r", "t": "\t", "0": "\0"}
+    return re.sub(r"\\(.)", lambda m: controls.get(m.group(1), m.group(1)), literal)
+
+
+def scan_cpp(text: str) -> tuple[str, list[str]]:
+    """Split C++ source into comment-free code and its string literals.
+
+    Literals stay in the returned code; only comments are dropped. A quote
+    after a digit is a digit separator, not a character literal.
+    """
+    code: list[str] = []
+    literals: list[str] = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if text.startswith("//", index):
+            end = text.find("\n", index)
+            index = len(text) if end < 0 else end
+            continue
+        if text.startswith("/*", index):
+            end = text.find("*/", index + 2)
+            index = len(text) if end < 0 else end + 2
+            continue
+        raw = re.match(r'R"([^()\\\s]{0,16})\(', text[index:])
+        if raw is not None and (index == 0 or not text[index - 1].isalnum()):
+            terminator = ")" + raw.group(1) + '"'
+            start = index + raw.end()
+            end = text.find(terminator, start)
+            end = len(text) if end < 0 else end
+            literals.append(text[start:end])
+            code.append(text[index : end + len(terminator)])
+            index = end + len(terminator)
+            continue
+        if char == '"' or (char == "'" and not (index > 0 and text[index - 1].isdigit())):
+            end = index + 1
+            while end < len(text) and text[end] != char and text[end] != "\n":
+                end += 2 if text[end] == "\\" else 1
+            if char == '"':
+                literals.append(unescape(text[index + 1 : end]))
+            code.append(text[index : end + 1])
+            index = end + 1
+            continue
+        code.append(char)
+        index += 1
+    return "".join(code), literals
+
+
+def balanced(text: str, start: int, opener: str = "(", closer: str = ")") -> int:
+    """Index just past the bracket that closes the one before @p start.
+
+    String and character literals are skipped, so a bracket inside a message
+    does not end the span.
+    """
+    depth = 1
+    index = start
+    while index < len(text) and depth > 0:
+        char = text[index]
+        if char in "\"'" and not (char == "'" and text[index - 1].isdigit()):
+            index += 1
+            while index < len(text) and text[index] != char:
+                index += 2 if text[index] == "\\" else 1
+        elif char == opener:
+            depth += 1
+        elif char == closer:
+            depth -= 1
+        index += 1
+    return index
+
+
+def split_top_level(expression: str, separators: str) -> list[str]:
+    """Split on separators that sit outside brackets and literals."""
+    parts = [""]
+    depth = 0
+    index = 0
+    while index < len(expression):
+        char = expression[index]
+        if char == '"':
+            end = index + 1
+            while end < len(expression) and expression[end] != '"':
+                end += 2 if expression[end] == "\\" else 1
+            parts[-1] += expression[index : end + 1]
+            index = end + 1
+            continue
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        scope = expression[index : index + 2] == "::" or (index > 0 and expression[index - 1] == ":")
+        if depth == 0 and char in separators and not (char == ":" and scope):
+            parts.append("")
+            index += 1
+            continue
+        parts[-1] += char
+        index += 1
+    return [part.strip() for part in parts]
+
+
+def message_templates(expression: str) -> list[str]:
+    """Message text an expression can produce, with "<>" for computed parts.
+
+    Each branch of a conditional is its own template. An expression that holds
+    no literal forwards a message from elsewhere and yields nothing.
+    """
+    templates = []
+    for branch in split_top_level(expression, "?:")[-2:] if "?" in expression else [expression]:
+        text = ""
+        has_literal = False
+        for piece in split_top_level(branch, "+"):
+            literal = re.fullmatch(r'(?:std::string\()?((?:"(?:[^"\\]|\\.)*"\s*)+)\)?', piece)
+            if literal is None:
+                text += "<>"
+                continue
+            has_literal = True
+            text += "".join(
+                unescape(part) for part in re.findall(r'"((?:[^"\\]|\\.)*)"', literal.group(1))
+            )
+        if has_literal:
+            templates.append(text)
+    return templates
+
+
+def function_body(code: str, name: str) -> str:
+    """The body of the function definition named @p name, or empty."""
+    for match in re.finditer(rf"\b{re.escape(name)}\s*\(", code):
+        after = balanced(code, match.end())
+        brace = re.match(r"\s*(?:const\s*)?\{", code[after:])
+        if brace is not None:
+            open_index = after + brace.end()
+            return code[open_index : balanced(code, open_index, "{", "}") - 1]
+    return ""
+
+
+def wire_error_templates(source_root: Path) -> dict[str, str]:
+    """Every TCP error message template in WIRE_ERROR_SOURCES, with its file."""
+    templates: dict[str, str] = {}
+    for relative, function in WIRE_ERROR_SOURCES:
+        code, _ = scan_cpp((source_root / relative).read_text(encoding="utf-8"))
+        if function is not None:
+            code = function_body(code, function)
+            if not code:
+                fail(f"WIRE_ERROR_SOURCES names a function {relative} does not define: {function}")
+                continue
+        expressions: list[str] = []
+        for call in re.finditer(r"\b(MakeError|refuse|Refuse|FormatError)\(", code):
+            arguments = split_top_level(code[call.end() : balanced(code, call.end()) - 1], ",")
+            # MakeError takes the message second; the refusal helpers take it last.
+            if call.group(1) != "MakeError":
+                expressions.append(arguments[-1])
+            elif len(arguments) > 1:
+                expressions.append(arguments[1])
+        expressions += re.findall(
+            r'(?:\*message|\berror_msg)\s*=\s*((?:"(?:[^"\\]|\\.)*"|[^;"])+);', code
+        )
+        # A message held in a named constant is spelled where it is declared.
+        constants = dict(
+            re.findall(
+                r'constexpr (?:const char\*|std::string_view) (k\w+) = ("(?:[^"\\]|\\.)*");', code
+            )
+        )
+        for expression in expressions:
+            expression = re.sub(
+                r"\bk\w+\b", lambda m: constants.get(m.group(0), m.group(0)), expression
+            )
+            for template in message_templates(expression):
+                templates.setdefault(template, relative)
+        for literal in re.findall(r'"ERROR ([^"\\]+)(?:\\r\\n)?"', code):
+            templates.setdefault(literal, relative)
+    return templates
+
+
+def template_pattern(template: str) -> re.Pattern:
+    """Match documented text against a template whose "<>" parts vary."""
+    return re.compile(".+".join(re.escape(part) for part in template.split("<>")))
+
+
+def documented_error_messages(text: str) -> list[str]:
+    """Messages in the first column of the protocol page's error table."""
+    for block in re.findall(r"(?:^\|.*\n)+", strip_code(text), re.M):
+        if "`Empty command`" not in block:
+            continue
+        messages = []
+        for row in block.splitlines()[2:]:
+            cell = re.split(r"(?<!\\)\|", row)[1]
+            messages += [m.replace("\\|", "|") for m in re.findall(r"`([^`]+)`", cell)]
+        return messages
+    return []
 
 
 def headings(text: str) -> list[int]:
@@ -283,14 +550,29 @@ def walk_schema_sections(schema: dict):
 
 def check_wire_vocabulary(source_root: Path) -> None:
     """Every documented field, status word and JSON key exists in the source."""
-    sources = "\n".join(
-        path.read_text(encoding="utf-8", errors="ignore")
-        for path in sorted((source_root / "src").rglob("*"))
-        if path.is_file() and path.suffix in (".cpp", ".h", ".c")
-    )
+    code_parts = []
+    literal_words: set[str] = set()
+    for path in sorted((source_root / "src").rglob("*")):
+        if not (path.is_file() and path.suffix in (".cpp", ".h", ".c")):
+            continue
+        code, literals = scan_cpp(path.read_text(encoding="utf-8", errors="ignore"))
+        code_parts.append(code)
+        for literal in literals:
+            literal_words.update(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", literal))
+    sources = "\n".join(code_parts)
+    without_literals = re.sub(r'"(?:[^"\\\n]|\\.)*"', "", sources)
+    identifiers = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", without_literals))
+    magics = {
+        bytes.fromhex(value)[::-1].decode("latin-1")
+        for value in re.findall(r"constexpr uint32_t k\w*Magic = 0x([0-9A-Fa-f]{8})", sources)
+    }
 
-    def produced(token: str) -> bool:
-        return f'"{token}"' in sources or token in sources
+    def produced(token: str, name: str) -> bool:
+        # A whole word of a string literal: text in a comment, or a longer word
+        # that merely contains the token, is not output.
+        if token in literal_words:
+            return True
+        return name in FORMAT_DOCS and (token in identifiers or token in magics)
 
     for language in ("en", "ja"):
         for name in WIRE_DOCS:
@@ -300,17 +582,19 @@ def check_wire_vocabulary(source_root: Path) -> None:
             for token in sorted(backticked(text)):
                 if not (FIELD_NAME.match(token) or STATUS_WORD.match(token)):
                     continue
-                if not produced(token):
+                if not produced(token, name):
                     fail(
                         f"{language}/{name} documents a token no source produces: "
                         f"{token}"
                     )
 
+            # Keys under "metadata" are the caller's own, not the server's.
             keys = set()
             for _language, block in FENCED_BLOCK.findall(text):
+                block = re.sub(r'"metadata"\s*:\s*\{[^{}]*\}', '"metadata": {}', block)
                 keys |= set(re.findall(r'"([a-z][a-z0-9_]*)"\s*:', block))
             for key in sorted(keys):
-                if not produced(key):
+                if not produced(key, name):
                     fail(
                         f"{language}/{name} documents a response field no source "
                         f"produces: {key}"
@@ -337,6 +621,159 @@ def check_wire_vocabulary(source_root: Path) -> None:
                         f"{language}/{name} shows a response the server cannot "
                         f"send: {line.strip()[:60]}"
                     )
+
+
+def check_source_scanner() -> None:
+    """Comment text never counts as output; literal text always does."""
+    code, literals = scan_cpp(
+        '// "comment_only"\n/* "block_only" */ x = "emitted_word: " + y; c = \'"\'; n = 1\'000;'
+        ' s = R"(raw_word)"; t = "ERROR Tail\\r\\n";'
+    )
+    words = {w for literal in literals for w in re.findall(r"[A-Za-z_]\w*", literal)}
+    if "comment_only" in code or {"comment_only", "block_only"} & words:
+        fail("the source scanner reads comments as source")
+    if not {"emitted_word", "raw_word", "Tail"} <= words:
+        fail(f"the source scanner misses string literals: {sorted(words)}")
+    if message_templates('flag ? "A " + name : std::string("B")') != ["A <>", "B"]:
+        fail("message templates mishandle a conditional message")
+
+
+def check_protocol_error_table(source_root: Path) -> None:
+    """The protocol error table lists exactly the messages a TCP client can get.
+
+    A documented row must be text some template in WIRE_ERROR_SOURCES produces,
+    and every such template outside UNLISTED_ERROR_MESSAGES must have a row.
+    """
+    templates = wire_error_templates(source_root)
+    patterns = {template: template_pattern(template) for template in templates}
+    for template in UNLISTED_ERROR_MESSAGES:
+        if template not in templates:
+            fail(f"UNLISTED_ERROR_MESSAGES names a message no source sends: {template}")
+
+    for language in ("en", "ja"):
+        text = (source_root / "docs" / language / "protocol.md").read_text(encoding="utf-8")
+        documented = documented_error_messages(text)
+        if not documented:
+            fail(f"{language}/protocol.md has no error table")
+            continue
+        for message in documented:
+            if not any(pattern.fullmatch(message) for pattern in patterns.values()):
+                fail(f"{language}/protocol.md lists an error no source sends: {message}")
+        for template, pattern in sorted(patterns.items()):
+            listed = any(pattern.fullmatch(message) for message in documented)
+            if template in UNLISTED_ERROR_MESSAGES:
+                if listed and "<>" not in template:
+                    fail(f"UNLISTED_ERROR_MESSAGES names a documented message: {template}")
+                continue
+            if not listed:
+                fail(
+                    f"{language}/protocol.md error table is missing "
+                    f"{template!r} ({templates[template]})"
+                )
+
+
+def source_code(source_root: Path, relative: str) -> str:
+    """Comment-free text of one source file."""
+    return scan_cpp((source_root / relative).read_text(encoding="utf-8"))[0]
+
+
+def check_metrics_exposition(source_root: Path) -> None:
+    """Documented metric names, types and help text match /metrics."""
+    code = source_code(source_root, "src/server/http_server.cpp")
+    body = function_body(code, "HandleMetrics")
+    types = dict(re.findall(r'"# TYPE (nvecd_\w+) (\w+)\\n"', body))
+    helps = dict(re.findall(r'"# HELP (nvecd_\w+) ([^"\\]+)\\n"', body))
+    if not types:
+        fail("cannot locate the TYPE lines HandleMetrics emits")
+        return
+
+    for language in ("en", "ja"):
+        text = (source_root / "docs" / language / "http-api.md").read_text(encoding="utf-8")
+        for _language, block in FENCED_BLOCK.findall(text):
+            for name, kind in re.findall(r"^# TYPE (nvecd_\w+) (\w+)$", block, re.M):
+                if types.get(name) != kind:
+                    fail(
+                        f"{language}/http-api.md shows '# TYPE {name} {kind}'; "
+                        f"code: {types.get(name)}"
+                    )
+            for name, help_text in re.findall(r"^# HELP (nvecd_\w+) (.+)$", block, re.M):
+                if helps.get(name) != help_text:
+                    fail(
+                        f"{language}/http-api.md shows '# HELP {name} {help_text}'; "
+                        f"code: {helps.get(name)}"
+                    )
+        rows = dict(re.findall(r"^\| `(nvecd_\w+)` \| (\w+) \|", strip_code(text), re.M))
+        for name, kind in sorted(rows.items()):
+            if types.get(name) != kind:
+                fail(f"{language}/http-api.md types {name} as {kind}; code: {types.get(name)}")
+        for name in sorted(set(types) - set(rows)):
+            fail(f"{language}/http-api.md metric table is missing {name}")
+
+
+def check_cache_stats_fields(source_root: Path) -> None:
+    """CACHE STATS samples and the /cache/stats body match the emitted fields."""
+    handler = source_code(source_root, "src/server/handlers/cache_handler.cpp")
+    tcp = re.findall(r'oss << "(\w+): "', function_body(handler, "HandleCacheStats"))
+    http_code = source_code(source_root, "src/server/http_server.cpp")
+    http = re.findall(r'response\["(\w+)"\]', function_body(http_code, "HandleCacheStats"))
+    if not tcp or not http:
+        fail("cannot locate the fields the two CACHE STATS handlers emit")
+        return
+
+    for path in sorted((source_root / "docs").rglob("*.md")):
+        for _language, block in FENCED_BLOCK.findall(path.read_text(encoding="utf-8")):
+            lines = [line for line in block.split("\n") if line.strip()]
+            if "OK CACHE_STATS" not in lines[:3]:
+                continue
+            start = lines.index("OK CACHE_STATS") + 1
+            shown = [line.split(":", 1)[0] for line in lines[start:] if line != "END"]
+            if shown != tcp:
+                fail(
+                    f"{path.relative_to(source_root)} CACHE STATS sample differs "
+                    f"from the handler: {shown}"
+                )
+
+    renamed = sorted(set(tcp) - set(http))
+    for language in ("en", "ja"):
+        text = (source_root / "docs" / language / "http-api.md").read_text(encoding="utf-8")
+        section = re.search(r"^### `GET /cache/stats`\n(.*?)^#", text, re.M | re.S)
+        if section is None:
+            fail(f"{language}/http-api.md has no GET /cache/stats section")
+            continue
+        for _language, block in FENCED_BLOCK.findall(section.group(1)):
+            shown = re.findall(r'^\s*"(\w+)"\s*:', block, re.M)
+            if shown and sorted(shown) != sorted(http):
+                fail(
+                    f"{language}/http-api.md /cache/stats sample differs from the "
+                    f"handler: {shown}"
+                )
+        for name in renamed:
+            if f"`{name}`" not in section.group(1):
+                fail(f"{language}/http-api.md does not say what TCP {name} is called over HTTP")
+
+
+def check_ivf_numbers(source_root: Path) -> None:
+    """Every number in the IVF section is a schema default or an IvfIndex constant."""
+    schema_path = source_root / "src" / "config" / "config-schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    similarity = schema["properties"]["similarity"]["properties"]
+    allowed = {"0"} | {
+        str(node["default"]) for key, node in similarity.items() if key.startswith("ivf_")
+    }
+    header = (source_root / "src" / "vectors" / "ivf_index.h").read_text(encoding="utf-8")
+    allowed |= set(re.findall(r"static constexpr \w+ k\w+ = (\d+);", header))
+    for language in ("en", "ja"):
+        text = (source_root / "docs" / language / "vector-search.md").read_text(encoding="utf-8")
+        section = re.search(r"^### ivf\n(.*?)^#", strip_code(text), re.M | re.S)
+        if section is None:
+            fail(f"{language}/vector-search.md has no ivf section")
+            continue
+        for number in re.findall(r"(?<![\w.])\d[\d,]*(?![\w.])", section.group(1)):
+            if number.replace(",", "") not in allowed:
+                fail(
+                    f"{language}/vector-search.md ivf section states {number}, "
+                    "which no IVF constant holds"
+                )
 
 
 def check_client_api_signatures(source_root: Path) -> None:
@@ -610,7 +1047,12 @@ def main() -> int:
     check_required_text(source_root)
     check_generated_docs(source_root)
     check_schema_wiring(source_root)
+    check_source_scanner()
     check_wire_vocabulary(source_root)
+    check_protocol_error_table(source_root)
+    check_metrics_exposition(source_root)
+    check_cache_stats_fields(source_root)
+    check_ivf_numbers(source_root)
     check_client_api_signatures(source_root)
     check_language_parity(source_root)
     check_error_code_reachability(source_root)
