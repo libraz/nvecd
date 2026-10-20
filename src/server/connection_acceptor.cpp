@@ -13,6 +13,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
@@ -50,10 +51,28 @@ inline struct sockaddr* ToSockaddr(struct sockaddr_in* addr) {
 inline struct sockaddr* ToSockaddrUn(struct sockaddr_un* addr) {
   return reinterpret_cast<struct sockaddr*>(addr);  // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
 }
+
+/// Returns an acquired budget slot on scope exit unless Commit() handed it to connection tracking.
+class SlotGuard {
+ public:
+  explicit SlotGuard(ConnectionBudget* budget) : budget_(budget) {}
+  ~SlotGuard() {
+    if (budget_ != nullptr)
+      budget_->Release();
+  }
+  SlotGuard(const SlotGuard&) = delete;
+  SlotGuard& operator=(const SlotGuard&) = delete;
+  void Commit() { budget_ = nullptr; }
+
+ private:
+  ConnectionBudget* budget_;
+};
 }  // namespace
 
 ConnectionAcceptor::ConnectionAcceptor(ServerConfig config, ThreadPool* thread_pool)
-    : config_(std::move(config)), thread_pool_(thread_pool) {
+    : config_(std::move(config)),
+      thread_pool_(thread_pool),
+      budget_(std::make_shared<ConnectionBudget>(static_cast<size_t>(std::max(config_.max_connections, 0)))) {
   if (thread_pool_ == nullptr) {
     nvecd::utils::StructuredLog()
         .Event("server_error")
@@ -485,18 +504,17 @@ void ConnectionAcceptor::AcceptLoop() {
     SetClientSocketOptions(client_fd);
 
     // SECURITY: Check connection limit BEFORE any processing to prevent resource exhaustion
-    {
-      std::lock_guard<std::mutex> lock(fds_mutex_);
-      if (static_cast<int>(active_fds_.size()) >= config_.max_connections) {
-        nvecd::utils::StructuredLog()
-            .Event("server_warning")
-            .Field("type", "connection_limit_reached")
-            .Field("active_connections", static_cast<uint64_t>(active_fds_.size()))
-            .Field("max_connections", static_cast<uint64_t>(config_.max_connections))
-            .Warn();
-        continue;
-      }
+    if (!budget_->TryAcquire()) {
+      nvecd::utils::StructuredLog()
+          .Event("server_warning")
+          .Field("type", "connection_limit_reached")
+          .Field("active_connections", static_cast<uint64_t>(budget_->Used()))
+          .Field("max_connections", static_cast<uint64_t>(budget_->Max()))
+          .Warn();
+      continue;
     }
+    // Returned on every rejection below; once the fd is tracked, RemoveConnection() owns it.
+    SlotGuard slot(budget_.get());
 
     // ACL check (skip for Unix domain sockets -- filesystem permissions apply)
     if (!IsUnixSocket()) {
@@ -546,6 +564,7 @@ void ConnectionAcceptor::AcceptLoop() {
     {
       std::lock_guard<std::mutex> lock(fds_mutex_);
       active_fds_.insert(client_fd);
+      slot.Commit();
       if (!client_ip.empty() && client_ip != "unix") {
         per_ip_connections_[client_ip]++;
         fd_to_ip_[client_fd] = client_ip;
@@ -665,7 +684,9 @@ void ConnectionAcceptor::SetClientSocketOptions(int socket_fd) const {
 
 void ConnectionAcceptor::RemoveConnection(int socket_fd) {
   std::lock_guard<std::mutex> lock(fds_mutex_);
-  active_fds_.erase(socket_fd);
+  if (active_fds_.erase(socket_fd) > 0) {
+    budget_->Release();
+  }
 
   // Decrement per-IP connection count
   auto ip_it = fd_to_ip_.find(socket_fd);

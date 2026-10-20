@@ -221,6 +221,129 @@ TEST(IoReactorTest, RequestOverTheConfiguredLimitIsRefusedWithoutReachingTheProc
   ::close(sockets[1]);
 }
 
+TEST(IoReactorTest, UnterminatedLineOverTheLimitIsRefusedWithTheNoNewlineReply) {
+  ThreadPool pool(1);
+  IoReactor reactor({10, 0});
+  ASSERT_TRUE(reactor.Start());
+
+  int sockets[2];
+  ASSERT_EQ(MakeSocketPair(sockets), 0);
+  IOConfig config = TestIoConfig();
+  config.max_query_length = 8;
+  config.max_accumulated_bytes = 64;
+  std::atomic<int> processor_calls{0};
+  ASSERT_TRUE(reactor.Register(sockets[0], &pool, config, [&processor_calls](const std::string&, ConnectionContext&) {
+    ++processor_calls;
+    return std::string("OK");
+  }));
+
+  // A line exactly at the limit may still be completed by its newline.
+  ASSERT_EQ(::write(sockets[1], "12345678", 8), 8);
+  EXPECT_EQ(ReadAvailable(sockets[1], 100), "");
+  ASSERT_EQ(::write(sockets[1], "9", 1), 1);
+  EXPECT_EQ(ReadAvailable(sockets[1]), "ERROR Request too large (no newline detected)\r\n");
+  EXPECT_TRUE(PeerClosed(sockets[1]));
+  EXPECT_EQ(processor_calls.load(), 0);
+
+  reactor.Stop();
+  pool.Shutdown();
+  ::close(sockets[1]);
+}
+
+TEST(IoReactorTest, DeepPipelineOfShortRequestsIsThrottledNotDisconnected) {
+  ThreadPool pool(1);
+  IoReactor reactor({10, 0});
+  ASSERT_TRUE(reactor.Start());
+
+  int sockets[2];
+  ASSERT_EQ(MakeSocketPair(sockets), 0);
+  std::atomic<bool> release_processor{false};
+  std::atomic<int> processor_calls{0};
+  ASSERT_TRUE(reactor.Register(sockets[0], &pool, TestIoConfig(),
+                               [&release_processor, &processor_calls](const std::string& request, ConnectionContext&) {
+                                 while (!release_processor.load(std::memory_order_acquire))
+                                   std::this_thread::yield();
+                                 ++processor_calls;
+                                 return "OK " + request;
+                               }));
+
+  // More frames than the queue may hold, each within the query limit.
+  constexpr int kRequests = 3000;
+  const std::string request_line = "A\n";
+  std::string pipelined;
+  std::string expected;
+  for (int index = 0; index < kRequests; ++index) {
+    pipelined += request_line;
+    expected += "OK A\r\n";
+  }
+  std::thread writer([&] {
+    size_t offset = 0;
+    while (offset < pipelined.size()) {
+      const ssize_t written = ::write(sockets[1], pipelined.data() + offset, pipelined.size() - offset);
+      if (written <= 0)
+        break;
+      offset += static_cast<size_t>(written);
+    }
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  release_processor.store(true, std::memory_order_release);
+
+  const std::string received = ReadUntilLength(sockets[1], expected.size(), 5000);
+  writer.join();
+  EXPECT_EQ(received, expected);
+  EXPECT_EQ(processor_calls.load(), kRequests);
+
+  reactor.Stop();
+  pool.Shutdown();
+  ::close(sockets[1]);
+}
+
+TEST(IoReactorTest, PipelineOfLargeRequestsIsThrottledByQueuedBytes) {
+  ThreadPool pool(1);
+  IoReactor reactor({10, 0});
+  ASSERT_TRUE(reactor.Start());
+
+  int sockets[2];
+  ASSERT_EQ(MakeSocketPair(sockets), 0);
+  IOConfig config = TestIoConfig();
+  config.recv_buffer_size = 4096;
+  std::atomic<bool> release_processor{false};
+  ASSERT_TRUE(reactor.Register(sockets[0], &pool, config, [&release_processor](const std::string&, ConnectionContext&) {
+    while (!release_processor.load(std::memory_order_acquire))
+      std::this_thread::yield();
+    return std::string("OK");
+  }));
+
+  // Each request fits the query limit but the queued total exceeds the byte budget.
+  constexpr int kRequests = 150;
+  const std::string request_line(config.max_query_length, 'x');
+  std::string pipelined;
+  std::string expected;
+  for (int index = 0; index < kRequests; ++index) {
+    pipelined += request_line + "\n";
+    expected += "OK\r\n";
+  }
+  std::thread writer([&] {
+    size_t offset = 0;
+    while (offset < pipelined.size()) {
+      const ssize_t written = ::write(sockets[1], pipelined.data() + offset, pipelined.size() - offset);
+      if (written <= 0)
+        break;
+      offset += static_cast<size_t>(written);
+    }
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  release_processor.store(true, std::memory_order_release);
+
+  const std::string received = ReadUntilLength(sockets[1], expected.size(), 5000);
+  writer.join();
+  EXPECT_EQ(received, expected);
+
+  reactor.Stop();
+  pool.Shutdown();
+  ::close(sockets[1]);
+}
+
 TEST(IoReactorTest, AlreadyTerminatedResponseIsNormalizedExactlyOnce) {
   ThreadPool pool(1);
   IoReactor reactor({10, 0});

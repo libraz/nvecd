@@ -65,7 +65,24 @@ class ReactorConnection : public std::enable_shared_from_this<ReactorConnection>
   bool HasPendingRequests() const;
   void CloseAfterFlush();
 
-  static constexpr size_t kMaxPendingFrames = 1024;
+  /// Outcome of framing the buffered bytes into queued requests.
+  enum class FrameStatus {
+    kDrained,    ///< No complete frame is left in accumulated_.
+    kWatermark,  ///< A complete frame is left; the queue is over its watermark.
+    kTooLarge,   ///< A terminated request exceeds the query limit or the byte budget.
+    kNoNewline,  ///< The unterminated tail exceeds the query limit.
+  };
+
+  /// Frame accumulated_ into requests_ and pause reads when the queue is full.
+  FrameStatus FrameRequestsLocked(bool& queued);
+  FrameStatus ExtractFramesLocked(bool& queued);
+  bool OverHighWatermarkLocked() const;
+  bool UnderLowWatermarkLocked() const;
+  void PauseReadsLocked();
+  void ResumeReadsLocked();
+  /// Answer a rejected request and close once the reply is flushed.
+  void RejectRequest(FrameStatus status);
+
   static constexpr size_t kPendingFramesHighWatermark = 768;
   static constexpr size_t kPendingFramesLowWatermark = 512;
   static constexpr size_t kMaxWriteQueueBytes = 16 * 1024 * 1024;

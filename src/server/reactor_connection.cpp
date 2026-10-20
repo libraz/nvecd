@@ -84,59 +84,34 @@ bool ReactorConnection::OnReadable() {
 
   std::array<char, kReadChunkBytes> chunk{};
   bool queued = false;
-  bool pause_read = false;
   size_t read_bytes = 0;
   while (!read_eof_.load(std::memory_order_acquire)) {
+    {
+      // A readiness event dispatched before the pause landed must not read more.
+      std::lock_guard<std::mutex> lock(read_mutex_);
+      if (read_paused_)
+        break;
+    }
     const ssize_t read = ::recv(Fd(), chunk.data(), chunk.size(), 0);
     if (read > 0) {
       read_bytes += static_cast<size_t>(read);
-      bool overflow = false;
+      FrameStatus status = FrameStatus::kDrained;
+      bool paused = false;
       {
         std::lock_guard<std::mutex> lock(read_mutex_);
-        if (accumulated_.size() + static_cast<size_t>(read) > config_.max_accumulated_bytes ||
-            (memory_budget_ != nullptr && !memory_budget_->TryAcquire(static_cast<size_t>(read)))) {
-          overflow = true;
+        if (memory_budget_ != nullptr && !memory_budget_->TryAcquire(static_cast<size_t>(read))) {
+          status = FrameStatus::kTooLarge;
         } else {
           accumulated_.append(chunk.data(), static_cast<size_t>(read));
-          while (true) {
-            const auto frame = FindRequestFrame(accumulated_);
-            if (!frame.has_value())
-              break;
-            const size_t end = frame->request_size;
-            const size_t delimiter = frame->delimiter_size;
-            if (end > config_.max_query_length || requests_.size() >= kMaxPendingFrames ||
-                request_bytes_ + end > config_.max_accumulated_bytes) {
-              overflow = true;
-              break;
-            }
-            std::string request = accumulated_.substr(0, end);
-            // Framed request bytes move from accumulated_ to requests_; only
-            // the delimiter leaves the logical buffered-byte accounting.
-            if (memory_budget_ != nullptr)
-              memory_budget_->Release(delimiter);
-            accumulated_.erase(0, end + delimiter);
-            if (!request.empty()) {
-              received_frame_.store(true, std::memory_order_release);
-              request_bytes_ += request.size();
-              requests_.push_back(std::move(request));
-              queued = true;
-            }
-          }
-          if (requests_.size() >= kPendingFramesHighWatermark) {
-            read_paused_ = true;
-            pause_read = true;
-            // Under read_mutex_, or DrainRequests could re-enable reads before this disable lands.
-            reactor_->SetReadEnabled(Fd(), false);
-          }
+          status = FrameRequestsLocked(queued);
+          paused = read_paused_;
         }
       }
-      if (overflow) {
-        spdlog::warn("Reactor request buffer limit reached on fd {}", Fd());
-        (void)EnqueueResponse("ERROR Request too large");
-        CloseAfterFlush();
+      if (status == FrameStatus::kTooLarge || status == FrameStatus::kNoNewline) {
+        RejectRequest(status);
         return true;
       }
-      if (pause_read)
+      if (paused)
         break;
       // Level-triggered readiness will report this fd again while the peer
       // still has data. Yield after a bounded turn so one streaming client
@@ -165,6 +140,80 @@ bool ReactorConnection::OnReadable() {
     CloseAfterFlush();
   }
   return true;
+}
+
+bool ReactorConnection::OverHighWatermarkLocked() const {
+  return requests_.size() >= kPendingFramesHighWatermark || request_bytes_ >= config_.max_accumulated_bytes / 2;
+}
+
+bool ReactorConnection::UnderLowWatermarkLocked() const {
+  return requests_.size() <= kPendingFramesLowWatermark && request_bytes_ <= config_.max_accumulated_bytes / 4;
+}
+
+void ReactorConnection::PauseReadsLocked() {
+  if (read_paused_)
+    return;
+  read_paused_ = true;
+  // Under read_mutex_, or DrainRequests could re-enable reads before this disable lands.
+  reactor_->SetReadEnabled(Fd(), false);
+}
+
+void ReactorConnection::ResumeReadsLocked() {
+  // Complete frames left in accumulated_ are framed once the queue empties; reads
+  // stay off until then so the buffer cannot grow past what is already held.
+  if (!read_paused_ || !UnderLowWatermarkLocked() || FindRequestFrame(accumulated_).has_value())
+    return;
+  read_paused_ = false;
+  // Ordered against the high-watermark disable in PauseReadsLocked().
+  reactor_->SetReadEnabled(Fd(), true);
+}
+
+ReactorConnection::FrameStatus ReactorConnection::FrameRequestsLocked(bool& queued) {
+  const FrameStatus status = ExtractFramesLocked(queued);
+  if (status == FrameStatus::kWatermark || OverHighWatermarkLocked())
+    PauseReadsLocked();
+  return status;
+}
+
+ReactorConnection::FrameStatus ReactorConnection::ExtractFramesLocked(bool& queued) {
+  while (true) {
+    const auto frame = FindRequestFrame(accumulated_);
+    if (!frame.has_value()) {
+      // A trailing CR may be the first half of a CRLF delimiter.
+      size_t tail = accumulated_.size();
+      if (tail > 0 && accumulated_.back() == '\r')
+        --tail;
+      return tail > config_.max_query_length ? FrameStatus::kNoNewline : FrameStatus::kDrained;
+    }
+    // Stop before the hard limits: the remaining bytes wait in accumulated_ with reads paused.
+    if (OverHighWatermarkLocked())
+      return FrameStatus::kWatermark;
+    const size_t end = frame->request_size;
+    const size_t delimiter = frame->delimiter_size;
+    if (end > config_.max_query_length)
+      return FrameStatus::kTooLarge;
+    if (request_bytes_ + end > config_.max_accumulated_bytes)
+      return request_bytes_ > 0 ? FrameStatus::kWatermark : FrameStatus::kTooLarge;
+    std::string request = accumulated_.substr(0, end);
+    // Framed request bytes move from accumulated_ to requests_; only
+    // the delimiter leaves the logical buffered-byte accounting.
+    if (memory_budget_ != nullptr)
+      memory_budget_->Release(delimiter);
+    accumulated_.erase(0, end + delimiter);
+    if (!request.empty()) {
+      received_frame_.store(true, std::memory_order_release);
+      request_bytes_ += request.size();
+      requests_.push_back(std::move(request));
+      queued = true;
+    }
+  }
+}
+
+void ReactorConnection::RejectRequest(FrameStatus status) {
+  spdlog::warn("Reactor request buffer limit reached on fd {}", Fd());
+  (void)EnqueueResponse(status == FrameStatus::kNoNewline ? "ERROR Request too large (no newline detected)"
+                                                          : "ERROR Request too large");
+  CloseAfterFlush();
 }
 
 bool ReactorConnection::OnWritable() {
@@ -220,10 +269,19 @@ bool ReactorConnection::ScheduleDrain() {
 void ReactorConnection::DrainRequests() {
   while (true) {
     std::string request;
+    FrameStatus status = FrameStatus::kDrained;
     {
       std::lock_guard<std::mutex> lock(read_mutex_);
       if (requests_.empty()) {
+        // Frames held back by the watermark are framed once the queue has emptied.
+        bool queued = false;
+        status = FrameRequestsLocked(queued);
+      }
+      if (requests_.empty()) {
         drain_scheduled_.store(false, std::memory_order_release);
+        ResumeReadsLocked();
+        if (status == FrameStatus::kTooLarge || status == FrameStatus::kNoNewline)
+          RejectRequest(status);
         break;
       }
       request = std::move(requests_.front());
@@ -231,11 +289,7 @@ void ReactorConnection::DrainRequests() {
       if (memory_budget_ != nullptr)
         memory_budget_->Release(request.size());
       requests_.pop_front();
-      if (read_paused_ && requests_.size() <= kPendingFramesLowWatermark) {
-        read_paused_ = false;
-        // Ordered against the high-watermark disable in OnReadable().
-        reactor_->SetReadEnabled(Fd(), true);
-      }
+      ResumeReadsLocked();
     }
     std::string response;
     try {

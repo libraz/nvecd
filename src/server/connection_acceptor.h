@@ -8,6 +8,7 @@
 #include <sys/types.h>
 
 #include <atomic>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -16,6 +17,7 @@
 #include <thread>
 #include <unordered_map>
 
+#include "server/connection_budget.h"
 #include "server/server_types.h"
 #include "utils/error.h"
 #include "utils/expected.h"
@@ -97,6 +99,14 @@ class ConnectionAcceptor {
   /** Install the reactor registration callback before Start(). */
   void SetReactorHandler(ReactorHandler handler);
 
+  /**
+   * @brief Admit connections against a budget shared with other acceptors
+   *
+   * Without it the acceptor enforces max_connections on its own connections only.
+   * Install before Start(). The slot is returned by RemoveConnection().
+   */
+  void SetConnectionBudget(std::shared_ptr<ConnectionBudget> budget) { budget_ = std::move(budget); }
+
   /** Remove a connection from accounting after the reactor releases it. */
   void RemoveConnection(int socket_fd);
 
@@ -138,6 +148,7 @@ class ConnectionAcceptor {
   ThreadPool* thread_pool_;
   ConnectionHandler connection_handler_;
   ReactorHandler reactor_handler_;
+  std::shared_ptr<ConnectionBudget> budget_;
 
   /// Listening socket. Atomic because Stop() swaps it out and closes it while
   /// the accept thread is reading it; the thread must never pass a stale (and
