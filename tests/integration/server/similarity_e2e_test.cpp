@@ -319,9 +319,7 @@ TEST_F(SimilarityE2ETest, EmptyStoreSearch) {
 
   auto resp = client.SendCommand("SIM nonexistent 10 using=events");
 
-  // Should not crash; either OK with 0 results or ERROR
-  EXPECT_FALSE(resp.empty()) << "Server should respond (not crash)";
-  EXPECT_TRUE(ContainsOK(resp) || ContainsError(resp)) << "Response should be OK or ERROR, got: " + resp;
+  EXPECT_EQ(resp, "OK RESULTS 0\r\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -333,9 +331,7 @@ TEST_F(SimilarityE2ETest, EmptyStoreSimv) {
 
   auto resp = client.SendCommand("SIMV 10 1.0 0.0 0.0");
 
-  // Should not crash; either OK with 0 results or ERROR
-  EXPECT_FALSE(resp.empty()) << "Server should respond (not crash)";
-  EXPECT_TRUE(ContainsOK(resp) || ContainsError(resp)) << "Response should be OK or ERROR, got: " + resp;
+  EXPECT_EQ(resp, "OK RESULTS 0\r\n");
 }
 
 // ---------------------------------------------------------------------------

@@ -4,6 +4,10 @@ import socket
 
 import pytest
 
+from lib.assertions import assert_error
+
+_EVENT_ARITY = "EVENT requires at least 3 arguments: <ctx> <type> <id> [<score>]"
+
 
 def _read_until(sock: socket.socket, terminator: bytes) -> bytes:
     """Read from the socket until the terminator appears in the stream."""
@@ -29,9 +33,7 @@ def _raw_session(nvecd, timeout: float = 10.0) -> socket.socket:
 @pytest.mark.edge_cases
 class TestInvalidCommands:
     def test_unknown_command(self, nvecd):
-        resp = nvecd.tcp_command("FOOBAR")
-        assert resp is not None
-        assert "ERROR" in resp or "ERR" in resp
+        assert_error(nvecd.tcp_command("FOOBAR"), "Unknown command: FOOBAR")
 
     def test_blank_line_is_skipped_without_a_response(self, nvecd):
         """A bare line terminator carries no command and is consumed silently.
@@ -53,11 +55,7 @@ class TestInvalidCommands:
         assert response == b"ERROR Empty command\r\n", response
 
     def test_partial_command(self, nvecd):
-        resp = nvecd.tcp_command("EVENT")
-        assert resp is not None
-        assert "ERROR" in resp or "ERR" in resp
+        assert_error(nvecd.tcp_command("EVENT"), _EVENT_ARITY)
 
     def test_sim_missing_args(self, nvecd):
-        resp = nvecd.tcp_command("SIM")
-        assert resp is not None
-        assert "ERROR" in resp or "ERR" in resp
+        assert_error(nvecd.tcp_command("SIM"), "SIM requires at least 2 arguments: <id> <top_k>")

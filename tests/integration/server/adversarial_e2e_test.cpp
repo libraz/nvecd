@@ -666,20 +666,25 @@ TEST_F(AdversarialE2ETest, CacheClearResetsEverything) {
   int entries_after = std::stoi(ParseResponseField(stats_after, "cache_entries"));
   EXPECT_EQ(entries_after, 0) << "CACHE CLEAR should reset entries to 0";
   EXPECT_LE(entries_after, entries_before) << "Entries after clear should not exceed entries before";
+  const int hits_at_clear = std::stoi(ParseResponseField(stats_after, "cache_hits"));
 
-  // Run same queries again: they should all be misses (not hits)
-  client.SendCommand("SIM item1 10 using=vectors");
-  client.SendCommand("SIM item2 10 using=vectors");
-  client.SendCommand("SIM item3 10 using=vectors");
-
+  // Run same queries again: they must all be misses, so hits stay at the clear point
+  const std::vector<std::string> queries = {"SIM item1 10 using=vectors", "SIM item2 10 using=vectors",
+                                            "SIM item3 10 using=vectors"};
+  for (const auto& query : queries) {
+    ASSERT_TRUE(ContainsOK(client.SendCommand(query)));
+  }
   auto stats_post_requery = client.SendCommand("CACHE STATS");
   ASSERT_TRUE(ContainsOK(stats_post_requery));
+  EXPECT_EQ(std::stoi(ParseResponseField(stats_post_requery, "cache_hits")), hits_at_clear)
+      << "Queries after CACHE CLEAR must miss";
 
-  // When cache is wired into SIM, all post-clear queries should be misses.
-  // cache_hits should not have increased from the clear point.
-  int hits_post_clear = std::stoi(ParseResponseField(stats_post_requery, "cache_hits"));
-  // Since cache was just cleared, the re-queries are all misses. Hits should
-  // be 0 or remain at whatever baseline the CACHE CLEAR reset to.
-  // Document: CACHE CLEAR resets stats in some implementations.
-  EXPECT_GE(hits_post_clear, 0) << "Post-clear hits should be non-negative";
+  // A second run of the same queries is served from the entries the first run inserted
+  for (const auto& query : queries) {
+    ASSERT_TRUE(ContainsOK(client.SendCommand(query)));
+  }
+  auto stats_second_run = client.SendCommand("CACHE STATS");
+  ASSERT_TRUE(ContainsOK(stats_second_run));
+  EXPECT_GT(std::stoi(ParseResponseField(stats_second_run, "cache_hits")), hits_at_clear)
+      << "Repeating the queries should hit the cache";
 }

@@ -1053,13 +1053,17 @@ TEST_F(WalTest, ReplayPropagatesCallbackFailure) {
   ASSERT_TRUE(wal.Open(MakeConfig()));
   const std::string payload = "record";
   ASSERT_TRUE(wal.Append(WalOpType::kVecSet, payload.data(), static_cast<uint32_t>(payload.size())).has_value());
+  ASSERT_TRUE(wal.Append(WalOpType::kVecSet, payload.data(), static_cast<uint32_t>(payload.size())).has_value());
 
-  auto replayed = wal.Replay(1, [](const WalRecord&) -> Expected<void, Error> {
+  int invoked = 0;
+  auto replayed = wal.Replay(1, [&invoked](const WalRecord&) -> Expected<void, Error> {
+    ++invoked;
     return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kStorageCorrupted, "apply failed"));
   });
 
   ASSERT_FALSE(replayed.has_value());
   EXPECT_EQ(replayed.error().message(), "apply failed");
+  EXPECT_EQ(invoked, 1) << "records after the failing one must not be delivered";
 }
 
 // --- Concurrent Append ---

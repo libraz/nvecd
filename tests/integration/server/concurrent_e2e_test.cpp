@@ -231,8 +231,11 @@ TEST_F(ConcurrentE2ETest, CacheUnderConcurrentAccess) {
   std::string cache_hits_str = ParseResponseField(stats, "cache_hits");
   ASSERT_FALSE(cache_hits_str.empty()) << "Failed to parse cache_hits from CACHE STATS";
 
-  int cache_hits = std::stoi(cache_hits_str);
-  EXPECT_GE(cache_hits, 0) << "cache_hits should be a valid non-negative value";
+  // 500 identical queries: every one is a hit or a miss, and most are hits.
+  const int cache_hits = std::stoi(cache_hits_str);
+  const int cache_misses = std::stoi(ParseResponseField(stats, "cache_misses"));
+  EXPECT_GT(cache_hits, 0);
+  EXPECT_EQ(cache_hits + cache_misses, 500);
 }
 
 TEST_F(ConcurrentE2ETest, DumpSaveDuringConcurrentWrites) {

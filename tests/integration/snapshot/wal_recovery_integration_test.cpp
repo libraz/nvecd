@@ -325,10 +325,14 @@ TEST(WalRecoveryIntegration, ReplayStillStopsOnACorruptRecord) {
     a.OpenWal(wal_dir);
     a.EnableWalForLiveWrites();
     ASSERT_NE(a.Dispatch("EVENT ctx1 ADD item_a 90").find("OK"), std::string::npos);
+    ASSERT_NE(a.Dispatch("EVENT ctx1 ADD item_b 80").find("OK"), std::string::npos);
 
     // Tolerating an intended gap must not turn into tolerating a damaged log.
     const char payload = 'x';
     ASSERT_TRUE(a.wal.Append(storage::WalOpType::kCoOccurrenceMaintenance, &payload, 1).has_value());
+
+    // A valid record behind the damaged one must not be applied.
+    ASSERT_NE(a.Dispatch("EVENT ctx1 ADD item_after 70").find("OK"), std::string::npos);
     a.wal.Close();
 
     Instance b(root);
@@ -337,6 +341,38 @@ TEST(WalRecoveryIntegration, ReplayStillStopsOnACorruptRecord) {
     auto replayed = b.TryReplay(/*from=*/0);
     ASSERT_FALSE(replayed.has_value());
     EXPECT_EQ(replayed.error().code(), utils::ErrorCode::kWalCorrupted);
+    EXPECT_GT(b.co_index->GetScore("item_a", "item_b"), 0.0F);
+    EXPECT_EQ(b.co_index->GetScore("item_a", "item_after"), 0.0F);
+    EXPECT_EQ(b.co_index->GetScore("item_b", "item_after"), 0.0F);
+  }
+
+  fs::remove_all(root);
+}
+
+TEST(WalRecoveryIntegration, ReplayStopsAtTheFirstFailingCallback) {
+  const std::string root = MakeTempDir("callback_failure");
+  const std::string wal_dir = root + "/wal";
+  fs::create_directories(wal_dir);
+
+  {
+    Instance a(root);
+    a.OpenWal(wal_dir);
+    a.EnableWalForLiveWrites();
+    ASSERT_NE(a.Dispatch("EVENT ctx1 ADD item_a 90").find("OK"), std::string::npos);
+    ASSERT_NE(a.Dispatch("EVENT ctx1 ADD item_b 80").find("OK"), std::string::npos);
+    a.wal.Close();
+
+    Instance b(root);
+    b.OpenWal(wal_dir);
+    int invoked = 0;
+    auto replayed =
+        b.wal.Replay(/*from=*/0, [&invoked](const storage::WalRecord&) -> utils::Expected<void, utils::Error> {
+          ++invoked;
+          return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kStorageCorrupted, "apply failed"));
+        });
+    ASSERT_FALSE(replayed.has_value());
+    EXPECT_EQ(replayed.error().message(), "apply failed");
+    EXPECT_EQ(invoked, 1) << "records after the failing one must not be delivered";
   }
 
   fs::remove_all(root);

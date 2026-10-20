@@ -110,10 +110,12 @@ TEST_F(ThreadPoolTest, QueueSize) {
 
   std::atomic<bool> start_execution{false};
   std::atomic<int> tasks_completed{0};
+  std::atomic<int> tasks_started{0};
 
   // Submit tasks that will block
   for (int i = 0; i < 5; ++i) {
-    pool.Submit([&start_execution, &tasks_completed]() {
+    pool.Submit([&start_execution, &tasks_completed, &tasks_started]() {
+      tasks_started++;
       while (!start_execution.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
       }
@@ -121,19 +123,23 @@ TEST_F(ThreadPoolTest, QueueSize) {
     });
   }
 
-  // Give threads time to start processing
-  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  // Wait until both workers are running a blocked task
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (tasks_started.load() < 2 && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  ASSERT_EQ(tasks_started.load(), 2) << "workers never started";
 
-  // Queue should have tasks waiting (5 tasks - 2 executing = 3 in queue)
-  size_t queue_size = pool.GetQueueSize();
-  EXPECT_GE(queue_size, 0);  // At least 0 (may have started executing some)
-  EXPECT_LE(queue_size, 3);  // At most 3 (if 2 are executing)
+  // 5 tasks - 2 executing = 3 in queue
+  EXPECT_EQ(pool.GetQueueSize(), 3U);
 
   // Allow tasks to complete
   start_execution = true;
-  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  while (tasks_completed.load() < 5 && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
   EXPECT_EQ(tasks_completed, 5);
-  EXPECT_EQ(pool.GetQueueSize(), 0);
+  EXPECT_EQ(pool.GetQueueSize(), 0U);
 }
 
 TEST_F(ThreadPoolTest, BoundedQueue) {

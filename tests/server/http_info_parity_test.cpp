@@ -4,11 +4,15 @@
  */
 
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <atomic>
+#include <filesystem>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <nlohmann/json.hpp>
+#include <set>
 #include <sstream>
 #include <string>
 
@@ -19,6 +23,7 @@
 #include "server/handlers/info_handler.h"
 #include "server/http_server.h"
 #include "server/server_types.h"
+#include "storage/snapshot_fork.h"
 #include "vectors/vector_store.h"
 
 using json = nlohmann::json;
@@ -55,6 +60,55 @@ class HttpInfoParityTest : public ::testing::Test {
     if (http_server_) {
       http_server_->Stop();
     }
+    fork_writer_.WaitForChild();
+    handler_ctx_.fork_snapshot_writer = nullptr;
+    if (!snapshot_dir_.empty()) {
+      std::filesystem::remove_all(snapshot_dir_);
+    }
+  }
+
+  /// Attach a fork writer and a scratch directory for snapshot files.
+  void AttachForkWriter() {
+    snapshot_dir_ = std::filesystem::temp_directory_path() / ("nvecd_http_parity_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(snapshot_dir_);
+    std::filesystem::create_directories(snapshot_dir_);
+    handler_ctx_.fork_snapshot_writer = &fork_writer_;
+  }
+
+  /// "key: value" fields of the TCP DUMP STATUS block, without the status line and END.
+  static std::map<std::string, std::string> TcpStatusFields(const std::string& block) {
+    std::map<std::string, std::string> fields;
+    std::istringstream lines(block);
+    std::string line;
+    while (std::getline(lines, line)) {
+      if (!line.empty() && line.back() == '\r') {
+        line.pop_back();
+      }
+      const auto sep = line.find(": ");
+      if (sep != std::string::npos) {
+        fields[line.substr(0, sep)] = line.substr(sep + 2);
+      }
+    }
+    return fields;
+  }
+
+  /// Read DUMP STATUS over both surfaces and require the same keys and values.
+  /// Returns the shared field map for state-specific assertions.
+  std::map<std::string, std::string> ExpectDumpStatusParity() {
+    auto tcp = server::handlers::HandleDumpStatus(handler_ctx_);
+    EXPECT_TRUE(tcp.has_value());
+    auto http = client_->Get("/dump/status");
+    EXPECT_TRUE(http);
+    if (!tcp || !http) {
+      return {};
+    }
+    EXPECT_EQ(http->status, 200);
+    const auto body = json::parse(http->body);
+    EXPECT_EQ(body["status"], "ok");
+    EXPECT_FALSE(body.contains("data"));
+    const auto fields = TcpStatusFields(*tcp);
+    EXPECT_EQ(body["snapshot"], json(fields));
+    return fields;
   }
 
   /// Value of "<key>: " in a TCP INFO block.
@@ -78,6 +132,8 @@ class HttpInfoParityTest : public ::testing::Test {
   std::atomic<bool> read_only_{false};
   std::mutex write_serialization_gate_;
   server::HandlerContext handler_ctx_{.stats = stats_, .loading = loading_, .read_only = read_only_};
+  storage::ForkSnapshotWriter fork_writer_;
+  std::filesystem::path snapshot_dir_;
   std::unique_ptr<server::HttpServer> http_server_;
   std::unique_ptr<httplib::Client> client_;
 };
@@ -146,18 +202,50 @@ TEST_F(HttpInfoParityTest, MetricsHaveOnlyLabelledCommandSeriesThatSumToTheTotal
   EXPECT_NE(res->body.find("nvecd_commands_failed_total{command=\"vecset\"} 1"), std::string::npos);
 }
 
-TEST_F(HttpInfoParityTest, DumpStatusUsesTheTcpFieldsAndSpelling) {
+TEST_F(HttpInfoParityTest, DumpStatusIdleUsesTheTcpFieldsAndSpelling) {
   auto tcp = server::handlers::HandleDumpStatus(handler_ctx_);
   ASSERT_TRUE(tcp.has_value());
   EXPECT_NE(tcp->find("status: idle"), std::string::npos);
 
-  auto http = client_->Get("/dump/status");
-  ASSERT_TRUE(http);
-  ASSERT_EQ(http->status, 200);
-  const auto body = json::parse(http->body);
-  EXPECT_EQ(body["status"], "ok");
-  EXPECT_EQ(body["snapshot"]["status"], "idle");
-  EXPECT_FALSE(body.contains("data"));
+  const auto fields = ExpectDumpStatusParity();
+  EXPECT_EQ(fields, (std::map<std::string, std::string>{{"status", "idle"}}));
+
+  // A writer that has not run reports the same block.
+  AttachForkWriter();
+  EXPECT_EQ(ExpectDumpStatusParity(), fields);
+}
+
+TEST_F(HttpInfoParityTest, DumpStatusCompletedUsesTheTcpFieldsAndSpelling) {
+  AttachForkWriter();
+  const std::string path = (snapshot_dir_ / "parity.nvec").string();
+  ASSERT_TRUE(server::handlers::StartForkSnapshot(handler_ctx_, path).has_value());
+  fork_writer_.WaitForChild(10000);
+
+  const auto fields = ExpectDumpStatusParity();
+  EXPECT_EQ(fields.at("status"), "completed");
+  EXPECT_EQ(fields.at("filepath"), path);
+  std::set<std::string> keys;
+  for (const auto& [key, value] : fields) {
+    keys.insert(key);
+  }
+  EXPECT_EQ(keys, (std::set<std::string>{"status", "filepath", "start_time", "end_time"}));
+}
+
+TEST_F(HttpInfoParityTest, DumpStatusFailedUsesTheTcpFieldsAndSpelling) {
+  AttachForkWriter();
+  const std::string path = (snapshot_dir_ / "missing_dir" / "parity.nvec").string();
+  ASSERT_TRUE(server::handlers::StartForkSnapshot(handler_ctx_, path).has_value());
+  fork_writer_.WaitForChild(10000);
+
+  const auto fields = ExpectDumpStatusParity();
+  EXPECT_EQ(fields.at("status"), "failed");
+  EXPECT_EQ(fields.at("filepath"), path);
+  EXPECT_FALSE(fields.at("error").empty());
+  std::set<std::string> keys;
+  for (const auto& [key, value] : fields) {
+    keys.insert(key);
+  }
+  EXPECT_EQ(keys, (std::set<std::string>{"status", "filepath", "start_time", "end_time", "error"}));
 }
 
 }  // namespace

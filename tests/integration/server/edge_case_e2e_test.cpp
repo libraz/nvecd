@@ -44,9 +44,8 @@ TEST_F(EdgeCaseE2ETest, VeryLongId) {
   std::string cmd = "VECSET " + long_id + " 1.0 0.0 0.0";
   auto resp = client.SendCommand(cmd);
 
-  // Should not crash. Either OK or ERROR is acceptable.
-  EXPECT_FALSE(resp.empty()) << "Server should respond (not crash)";
-  EXPECT_TRUE(ContainsOK(resp) || ContainsError(resp)) << "Response should be OK or ERROR, got: " + resp;
+  // IDs carry no documented length limit, so a long one is stored.
+  EXPECT_EQ(resp, "OK VECSET\r\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -83,11 +82,8 @@ TEST_F(EdgeCaseE2ETest, SpecialCharIds) {
 TEST_F(EdgeCaseE2ETest, NaNVectorValues) {
   TcpClient client("127.0.0.1", port_);
 
-  auto resp = client.SendCommand("VECSET item_nan NaN 0.0 0.0");
-  // Server currently accepts NaN values (C++ stof("NaN") succeeds without
-  // error and no validation rejects NaN in the parser or vector store).
-  // Document actual behavior: both OK and ERROR are acceptable.
-  EXPECT_TRUE(ContainsOK(resp) || ContainsError(resp)) << "VECSET with NaN: server response: " + resp;
+  EXPECT_EQ(client.SendCommand("VECSET item_nan NaN 0.0 0.0"), "ERROR Invalid float: NaN\r\n");
+  EXPECT_EQ(ParseResponseField(client.SendCommand("INFO"), "vector_count"), "0");
 }
 
 // ---------------------------------------------------------------------------
@@ -97,17 +93,8 @@ TEST_F(EdgeCaseE2ETest, NaNVectorValues) {
 TEST_F(EdgeCaseE2ETest, InfVectorValues) {
   TcpClient client("127.0.0.1", port_);
 
-  auto resp = client.SendCommand("VECSET item_inf Inf 0.0 0.0");
-
-  // Document behavior: should return ERROR, but OK is also acceptable
-  // if the server accepts Inf values.
-  EXPECT_FALSE(resp.empty()) << "Server should respond (not crash)";
-  if (ContainsOK(resp)) {
-    // Server accepts Inf values - document this behavior
-    SUCCEED() << "Server accepts Inf vector values (documented behavior)";
-  } else {
-    EXPECT_TRUE(ContainsError(resp)) << "VECSET with Inf should return ERROR, got: " + resp;
-  }
+  EXPECT_EQ(client.SendCommand("VECSET item_inf Inf 0.0 0.0"), "ERROR Invalid float: Inf\r\n");
+  EXPECT_EQ(ParseResponseField(client.SendCommand("INFO"), "vector_count"), "0");
 }
 
 // ---------------------------------------------------------------------------
@@ -117,15 +104,8 @@ TEST_F(EdgeCaseE2ETest, InfVectorValues) {
 TEST_F(EdgeCaseE2ETest, NegativeScores) {
   TcpClient client("127.0.0.1", port_);
 
-  auto resp = client.SendCommand("EVENT ctx1 ADD item1 -100");
-
-  // Document behavior: negative scores may or may not be accepted
-  EXPECT_FALSE(resp.empty()) << "Server should respond (not crash)";
-  if (ContainsOK(resp)) {
-    SUCCEED() << "Server accepts negative scores (documented behavior)";
-  } else {
-    EXPECT_TRUE(ContainsError(resp)) << "EVENT with negative score should return ERROR, got: " + resp;
-  }
+  EXPECT_EQ(client.SendCommand("EVENT ctx1 ADD item1 -100"), "ERROR Score must be in range [0, 100], got -100\r\n");
+  EXPECT_EQ(ParseResponseField(client.SendCommand("INFO"), "event_count"), "0");
 }
 
 // ---------------------------------------------------------------------------
@@ -187,13 +167,9 @@ TEST_F(EdgeCaseE2ETest, CaseInsensitiveCommands) {
 TEST_F(EdgeCaseE2ETest, EmptyCommand) {
   TcpClient client("127.0.0.1", port_);
 
-  // Empty string sends just "\r\n" — server may ignore empty lines
-  // (no response). Send a whitespace-only command instead.
+  // A bare "\r\n" is consumed silently, so send a whitespace-only command instead.
   auto resp = client.SendCommand(" ");
-  // Server may return ERROR or ignore whitespace-only input
-  // Either response or empty (timeout) is acceptable behavior
-  EXPECT_TRUE(resp.empty() || ContainsError(resp) || ContainsOK(resp))
-      << "Whitespace command: unexpected response: " + resp;
+  EXPECT_EQ(resp, "ERROR Empty command\r\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -204,7 +180,7 @@ TEST_F(EdgeCaseE2ETest, PartialCommand) {
   TcpClient client("127.0.0.1", port_);
 
   auto resp = client.SendCommand("EVENT ctx1");
-  EXPECT_TRUE(ContainsError(resp)) << "Partial command should return ERROR, got: " + resp;
+  EXPECT_EQ(resp, "ERROR EVENT requires at least 3 arguments: <ctx> <type> <id> [<score>]\r\n");
 }
 
 // ---------------------------------------------------------------------------

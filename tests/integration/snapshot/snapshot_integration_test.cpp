@@ -13,17 +13,16 @@
  * - Concurrent DUMP operations
  */
 
-#include <arpa/inet.h>
 #include <gtest/gtest.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <thread>
 
+#include "../test_tcp_client.h"
 #include "config/config.h"
 #include "server/nvecd_server.h"
 
@@ -32,54 +31,22 @@ namespace fs = std::filesystem;
 using namespace nvecd;
 using namespace nvecd::server;
 
-/**
- * @brief Helper class for TCP client connections
- * Reference: ../mygram-db/tests/integration/server/end_to_end_test.cpp
- */
-class TcpClient {
- public:
-  TcpClient(const std::string& host, uint16_t port) {
-    sock_ = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock_ < 0) {
-      throw std::runtime_error("Failed to create socket");
-    }
+namespace {
 
-    struct sockaddr_in server_addr;
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(port);
-    inet_pton(AF_INET, host.c_str(), &server_addr.sin_addr);
+bool EndsWith(const std::string& text, const std::string& suffix) {
+  return text.size() >= suffix.size() && text.compare(text.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
 
-    if (connect(sock_, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-      close(sock_);
-      throw std::runtime_error("Failed to connect");
-    }
+/// Ids of a SIM reply in rank order.
+std::vector<std::string> SimIds(const std::string& response) {
+  std::vector<std::string> ids;
+  for (const auto& [id, score] : ParseSimResults(response)) {
+    ids.push_back(id);
   }
+  return ids;
+}
 
-  ~TcpClient() { Close(); }
-
-  void Close() {
-    if (sock_ >= 0) {
-      close(sock_);
-      sock_ = -1;
-    }
-  }
-
-  std::string SendCommand(const std::string& command) {
-    std::string request = command + "\r\n";
-    send(sock_, request.c_str(), request.length(), 0);
-
-    char buffer[65536];  // Larger buffer for DUMP INFO responses
-    ssize_t received = recv(sock_, buffer, sizeof(buffer) - 1, 0);
-    if (received <= 0) {
-      return "";
-    }
-    buffer[received] = '\0';
-    return std::string(buffer);
-  }
-
- private:
-  int sock_ = -1;
-};
+}  // namespace
 
 /**
  * @brief Test fixture for snapshot integration tests
@@ -169,21 +136,22 @@ class SnapshotIntegrationTest : public ::testing::Test {
    * @brief Helper to verify test data integrity via TCP protocol
    */
   void VerifyTestData(TcpClient& client) {
-    // Verify SIM works (implicitly checks events and vectors exist)
-    std::string response = client.SendCommand("SIM vec1 10 using=events");
-    EXPECT_TRUE(response.find("OK") == 0 || response.find("RESULTS") != std::string::npos);
+    // Co-occurrence: vec1 pairs with vec2 at 100*90 and with vec3 at 100*80.
+    EXPECT_EQ(SimIds(client.SendCommand("SIM vec1 10 using=events")), (std::vector<std::string>{"vec2", "vec3"}));
 
-    response = client.SendCommand("SIM vec2 10 using=vectors");
-    EXPECT_TRUE(response.find("OK") == 0 || response.find("RESULTS") != std::string::npos);
+    // The three vectors are parallel, so both others are returned.
+    auto vector_ids = SimIds(client.SendCommand("SIM vec2 10 using=vectors"));
+    std::sort(vector_ids.begin(), vector_ids.end());
+    EXPECT_EQ(vector_ids, (std::vector<std::string>{"vec1", "vec3"}));
 
-    response = client.SendCommand("SIM vec1 10 using=vectors filter=status:active");
-    EXPECT_TRUE(response.find("OK") == 0);
-    EXPECT_TRUE(response.find("vec2") != std::string::npos);
-    EXPECT_TRUE(response.find("vec3") == std::string::npos);
+    // Metadata survived: only vec2 is active.
+    EXPECT_EQ(SimIds(client.SendCommand("SIM vec1 10 using=vectors filter=status:active")),
+              (std::vector<std::string>{"vec2"}));
 
-    // Check INFO command shows non-zero counts
-    response = client.SendCommand("INFO");
-    EXPECT_TRUE(response.find("vector_count") != std::string::npos);
+    // INFO reports the seeded counts
+    std::string info = client.SendCommand("INFO");
+    EXPECT_EQ(ParseResponseField(info, "vector_count"), "3");
+    EXPECT_EQ(ParseResponseField(info, "event_count"), "5");
   }
 
   /**
@@ -286,8 +254,8 @@ TEST_F(SnapshotIntegrationTest, VerifySnapshot) {
 
   // Verify snapshot
   std::string verify_response = client.SendCommand("DUMP VERIFY test_verify.dmp");
-  EXPECT_TRUE(verify_response.find("OK") == 0);
-  EXPECT_TRUE(verify_response.find("valid") != std::string::npos || verify_response.find("OK") == 0);
+  EXPECT_EQ(verify_response.find("OK DUMP_VERIFIED "), 0U) << verify_response;
+  EXPECT_TRUE(EndsWith(verify_response, "test_verify.dmp\r\n")) << verify_response;
 }
 
 /**
@@ -318,7 +286,7 @@ TEST_F(SnapshotIntegrationTest, LoadNonExistentFile) {
   TcpClient client("127.0.0.1", port_);
 
   std::string response = client.SendCommand("DUMP LOAD nonexistent.dmp");
-  EXPECT_TRUE(response.find("ERR") == 0);
+  EXPECT_TRUE(ContainsError(response)) << response;
 }
 
 /**
@@ -328,7 +296,7 @@ TEST_F(SnapshotIntegrationTest, VerifyNonExistentFile) {
   TcpClient client("127.0.0.1", port_);
 
   std::string response = client.SendCommand("DUMP VERIFY nonexistent.dmp");
-  EXPECT_TRUE(response.find("ERR") == 0);
+  EXPECT_TRUE(ContainsError(response)) << response;
 }
 
 /**
@@ -339,11 +307,11 @@ TEST_F(SnapshotIntegrationTest, PathTraversalProtection) {
 
   // Try to save outside dump directory
   std::string response = client.SendCommand("DUMP SAVE ../../../etc/passwd");
-  EXPECT_TRUE(response.find("ERR") == 0);
+  EXPECT_TRUE(ContainsError(response)) << response;
 
   // Try to load from outside dump directory
   response = client.SendCommand("DUMP LOAD ../../sensitive_file");
-  EXPECT_TRUE(response.find("ERR") == 0);
+  EXPECT_TRUE(ContainsError(response)) << response;
 }
 
 /**

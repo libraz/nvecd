@@ -4,10 +4,23 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <thread>
 
 namespace nvecd::server {
 namespace {
+
+/// Poll until the scheduler has invoked its callback at least once; false on timeout.
+bool WaitForCallback(const std::atomic<int>& callbacks) {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (callbacks.load(std::memory_order_relaxed) < 1) {
+    if (std::chrono::steady_clock::now() >= deadline) {
+      return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  return true;
+}
 
 TEST(DecaySchedulerTest, RoutesMaintenanceThroughDurabilityCallbackBeforeApply) {
   events::CoOccurrenceIndex index;
@@ -21,24 +34,28 @@ TEST(DecaySchedulerTest, RoutesMaintenanceThroughDurabilityCallbackBeforeApply) 
     return {};
   });
   scheduler.Start();
-  std::this_thread::sleep_for(std::chrono::milliseconds(1300));
+  const bool fired = WaitForCallback(callbacks);
   scheduler.Stop();
 
-  EXPECT_EQ(callbacks.load(std::memory_order_relaxed), 1);
-  EXPECT_FLOAT_EQ(index.GetScore("item1", "item2"), 50.0F);
+  ASSERT_TRUE(fired) << "decay scheduler never invoked its callback";
+  // Each callback was followed by exactly one decay of 0.5.
+  EXPECT_FLOAT_EQ(index.GetScore("item1", "item2"), std::ldexp(100.0F, -callbacks.load(std::memory_order_relaxed)));
 }
 
 TEST(DecaySchedulerTest, FailedDurabilityCallbackDoesNotApplyMaintenance) {
   events::CoOccurrenceIndex index;
   index.SetScore("item1", "item2", 100.0F);
+  std::atomic<int> callbacks{0};
 
-  DecayScheduler scheduler(&index, 1, 0.5, [](double, bool) -> utils::Expected<void, utils::Error> {
+  DecayScheduler scheduler(&index, 1, 0.5, [&](double, bool) -> utils::Expected<void, utils::Error> {
+    callbacks.fetch_add(1, std::memory_order_relaxed);
     return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kEventDecayFailed, "injected persistence failure"));
   });
   scheduler.Start();
-  std::this_thread::sleep_for(std::chrono::milliseconds(1300));
+  const bool fired = WaitForCallback(callbacks);
   scheduler.Stop();
 
+  ASSERT_TRUE(fired) << "decay scheduler never invoked its callback";
   EXPECT_FLOAT_EQ(index.GetScore("item1", "item2"), 100.0F);
 }
 

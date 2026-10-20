@@ -12,16 +12,13 @@
  * - Full pipeline workflow
  */
 
-#include <arpa/inet.h>
 #include <gtest/gtest.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
 
 #include <chrono>
 #include <filesystem>
 #include <thread>
 
+#include "../test_tcp_client.h"
 #include "config/config.h"
 #include "server/nvecd_server.h"
 
@@ -29,59 +26,6 @@ namespace fs = std::filesystem;
 
 using namespace nvecd;
 using namespace nvecd::server;
-
-/**
- * @brief Helper class for TCP client connections
- * Reference: tests/integration/snapshot/snapshot_integration_test.cpp
- */
-class TcpClient {
- public:
-  TcpClient(const std::string& host, uint16_t port) {
-    sock_ = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock_ < 0) {
-      throw std::runtime_error("Failed to create socket");
-    }
-
-    struct sockaddr_in server_addr {};
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(port);
-    inet_pton(AF_INET, host.c_str(), &server_addr.sin_addr);
-
-    if (connect(sock_, reinterpret_cast<struct sockaddr*>(&server_addr), sizeof(server_addr)) < 0) {
-      close(sock_);
-      throw std::runtime_error("Failed to connect");
-    }
-  }
-
-  ~TcpClient() { Close(); }
-
-  // Non-copyable
-  TcpClient(const TcpClient&) = delete;
-  TcpClient& operator=(const TcpClient&) = delete;
-
-  void Close() {
-    if (sock_ >= 0) {
-      close(sock_);
-      sock_ = -1;
-    }
-  }
-
-  std::string SendCommand(const std::string& command) {
-    std::string request = command + "\r\n";
-    send(sock_, request.c_str(), request.length(), 0);
-
-    char buffer[65536];
-    ssize_t received = recv(sock_, buffer, sizeof(buffer) - 1, 0);
-    if (received <= 0) {
-      return "";
-    }
-    buffer[received] = '\0';
-    return std::string(buffer);
-  }
-
- private:
-  int sock_ = -1;
-};
 
 /**
  * @brief Test fixture for end-to-end integration tests
@@ -148,20 +92,18 @@ class EndToEndTest : public ::testing::Test {
 
 TEST_F(EndToEndTest, EventAdd_Basic) {
   TcpClient client("127.0.0.1", port_);
-  auto resp = client.SendCommand("EVENT ctx1 ADD item1 100");
-  EXPECT_TRUE(resp.find("OK") == 0);
+  EXPECT_EQ(client.SendCommand("EVENT ctx1 ADD item1 100"), "OK EVENT\r\n");
 }
 
 TEST_F(EndToEndTest, EventAdd_InvalidScore) {
   TcpClient client("127.0.0.1", port_);
-  auto resp = client.SendCommand("EVENT ctx1 ADD item1 notanumber");
-  EXPECT_TRUE(resp.find("ERROR") != std::string::npos || resp.find("ERR") != std::string::npos);
+  EXPECT_EQ(client.SendCommand("EVENT ctx1 ADD item1 notanumber"), "ERROR Failed to parse integer: notanumber\r\n");
 }
 
 TEST_F(EndToEndTest, EventAdd_MissingArgs) {
   TcpClient client("127.0.0.1", port_);
-  auto resp = client.SendCommand("EVENT ctx1 ADD");
-  EXPECT_TRUE(resp.find("ERROR") != std::string::npos || resp.find("ERR") != std::string::npos);
+  EXPECT_EQ(client.SendCommand("EVENT ctx1 ADD"),
+            "ERROR EVENT requires at least 3 arguments: <ctx> <type> <id> [<score>]\r\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -170,17 +112,15 @@ TEST_F(EndToEndTest, EventAdd_MissingArgs) {
 
 TEST_F(EndToEndTest, Vecset_Basic) {
   TcpClient client("127.0.0.1", port_);
-  auto resp = client.SendCommand("VECSET item1 1.0 2.0 3.0");
-  EXPECT_TRUE(resp.find("OK") == 0);
+  EXPECT_EQ(client.SendCommand("VECSET item1 1.0 2.0 3.0"), "OK VECSET\r\n");
 }
 
 TEST_F(EndToEndTest, Vecset_DimensionMismatch) {
   TcpClient client("127.0.0.1", port_);
   // First set a vector with 3 dimensions
-  client.SendCommand("VECSET item1 1.0 2.0 3.0");
+  ASSERT_EQ(client.SendCommand("VECSET item1 1.0 2.0 3.0"), "OK VECSET\r\n");
   // Try to set a different vector with 2 dimensions (mismatch)
-  auto resp = client.SendCommand("VECSET item2 1.0 2.0");
-  EXPECT_TRUE(resp.find("ERROR") != std::string::npos || resp.find("ERR") != std::string::npos);
+  EXPECT_EQ(client.SendCommand("VECSET item2 1.0 2.0"), "ERROR Vector dimension mismatch: expected 3, got 2\r\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -194,8 +134,11 @@ TEST_F(EndToEndTest, Sim_EventBased) {
   client.SendCommand("EVENT ctx1 ADD item2 90");
   client.SendCommand("EVENT ctx1 ADD item3 80");
   // Search
-  auto resp = client.SendCommand("SIM item1 10 using=events");
-  EXPECT_TRUE(resp.find("OK") == 0);
+  auto results = ParseSimResults(client.SendCommand("SIM item1 10 using=events"));
+  // item1 pairs with item2 at 100*90 and with item3 at 100*80.
+  ASSERT_EQ(results.size(), 2U);
+  EXPECT_EQ(results[0].first, "item2");
+  EXPECT_EQ(results[1].first, "item3");
 }
 
 TEST_F(EndToEndTest, Sim_VectorBased) {
@@ -203,8 +146,12 @@ TEST_F(EndToEndTest, Sim_VectorBased) {
   client.SendCommand("VECSET vec1 1.0 0.0 0.0");
   client.SendCommand("VECSET vec2 0.9 0.1 0.0");
   client.SendCommand("VECSET vec3 0.0 1.0 0.0");
-  auto resp = client.SendCommand("SIM vec1 10 using=vectors");
-  EXPECT_TRUE(resp.find("OK") == 0);
+  auto results = ParseSimResults(client.SendCommand("SIM vec1 10 using=vectors"));
+  ASSERT_FALSE(results.empty());
+  EXPECT_EQ(results[0].first, "vec2");
+  for (const auto& [id, score] : results) {
+    EXPECT_NE(id, "vec1");
+  }
 }
 
 TEST_F(EndToEndTest, Sim_Fusion) {
@@ -213,15 +160,20 @@ TEST_F(EndToEndTest, Sim_Fusion) {
   client.SendCommand("EVENT ctx1 ADD item2 90");
   client.SendCommand("VECSET item1 1.0 0.0 0.0");
   client.SendCommand("VECSET item2 0.9 0.1 0.0");
-  auto resp = client.SendCommand("SIM item1 10 using=fusion");
-  EXPECT_TRUE(resp.find("OK") == 0);
+  auto results = ParseSimResults(client.SendCommand("SIM item1 10 using=fusion"));
+  ASSERT_EQ(results.size(), 1U);
+  EXPECT_EQ(results[0].first, "item2");
 }
 
-TEST_F(EndToEndTest, Sim_NotFound) {
+TEST_F(EndToEndTest, Sim_NotFound_EventsIsEmpty) {
   TcpClient client("127.0.0.1", port_);
-  auto resp = client.SendCommand("SIM nonexistent 10 using=events");
-  // Should return OK with 0 results or ERROR
-  EXPECT_TRUE(resp.find("OK") == 0 || resp.find("ERROR") != std::string::npos);
+  EXPECT_EQ(client.SendCommand("SIM nonexistent 10 using=events"), "OK RESULTS 0\r\n");
+}
+
+TEST_F(EndToEndTest, Sim_NotFound_VectorsAndFusionAreErrors) {
+  TcpClient client("127.0.0.1", port_);
+  EXPECT_EQ(client.SendCommand("SIM nonexistent 10 using=vectors"), "ERROR Query vector not found: nonexistent\r\n");
+  EXPECT_EQ(client.SendCommand("SIM nonexistent 10 using=fusion"), "ERROR Query vector not found: nonexistent\r\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -233,8 +185,10 @@ TEST_F(EndToEndTest, Simv_Basic) {
   client.SendCommand("VECSET vec1 1.0 0.0 0.0");
   client.SendCommand("VECSET vec2 0.9 0.1 0.0");
   client.SendCommand("VECSET vec3 0.0 1.0 0.0");
-  auto resp = client.SendCommand("SIMV 10 1.0 0.0 0.0");
-  EXPECT_TRUE(resp.find("OK") == 0);
+  auto results = ParseSimResults(client.SendCommand("SIMV 10 1.0 0.0 0.0"));
+  ASSERT_FALSE(results.empty());
+  EXPECT_EQ(results[0].first, "vec1");
+  EXPECT_NEAR(results[0].second, 1.0F, 1e-3F);
 }
 
 // ---------------------------------------------------------------------------
@@ -254,10 +208,9 @@ TEST_F(EndToEndTest, Info_AfterData) {
   client.SendCommand("EVENT ctx1 ADD item1 100");
   client.SendCommand("VECSET item1 1.0 2.0 3.0");
   auto resp = client.SendCommand("INFO");
-  EXPECT_TRUE(resp.find("OK INFO") != std::string::npos);
-  // Should have non-zero counts
-  EXPECT_TRUE(resp.find("vector_count: 0") == std::string::npos || resp.find("vector_count: 1") != std::string::npos);
-  EXPECT_TRUE(resp.find("event_count: 0") == std::string::npos || resp.find("event_count: 1") != std::string::npos);
+  EXPECT_EQ(resp.find("OK INFO"), 0U);
+  EXPECT_EQ(ParseResponseField(resp, "vector_count"), "1");
+  EXPECT_EQ(ParseResponseField(resp, "event_count"), "1");
 }
 
 // ---------------------------------------------------------------------------
@@ -267,20 +220,24 @@ TEST_F(EndToEndTest, Info_AfterData) {
 TEST_F(EndToEndTest, ConfigHelp_Root) {
   TcpClient client("127.0.0.1", port_);
   auto resp = client.SendCommand("CONFIG HELP");
-  EXPECT_TRUE(resp.find("+OK") != std::string::npos || resp.find("OK") != std::string::npos);
+  EXPECT_EQ(resp.find("+OK\r\n"), 0U);
+  EXPECT_TRUE(resp.size() >= 5 && resp.compare(resp.size() - 5, 5, "END\r\n") == 0);
+  EXPECT_NE(resp.find("api"), std::string::npos);
 }
 
 TEST_F(EndToEndTest, ConfigHelp_Path) {
   TcpClient client("127.0.0.1", port_);
-  auto resp = client.SendCommand("CONFIG HELP api");
-  EXPECT_TRUE(resp.find("+OK") != std::string::npos || resp.find("OK") != std::string::npos ||
-              resp.find("-ERR") != std::string::npos);
+  auto resp = client.SendCommand("CONFIG HELP similarity.index_type");
+  EXPECT_EQ(resp.find("+OK\r\nsimilarity.index_type\r\n"), 0U);
+  EXPECT_TRUE(resp.size() >= 5 && resp.compare(resp.size() - 5, 5, "END\r\n") == 0);
+  EXPECT_NE(resp.find("Type: string (enum)"), std::string::npos);
 }
 
 TEST_F(EndToEndTest, ConfigShow_Full) {
   TcpClient client("127.0.0.1", port_);
   auto resp = client.SendCommand("CONFIG SHOW");
-  EXPECT_TRUE(resp.find("+OK") != std::string::npos || resp.find("OK") != std::string::npos);
+  EXPECT_EQ(resp.find("+OK\r\n"), 0U);
+  EXPECT_TRUE(resp.size() >= 5 && resp.compare(resp.size() - 5, 5, "END\r\n") == 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -296,18 +253,15 @@ TEST_F(EndToEndTest, CacheStats_Empty) {
 
 TEST_F(EndToEndTest, CacheClear) {
   TcpClient client("127.0.0.1", port_);
-  auto resp = client.SendCommand("CACHE CLEAR");
-  EXPECT_TRUE(resp.find("OK") == 0);
+  EXPECT_EQ(client.SendCommand("CACHE CLEAR"), "OK CACHE_CLEARED\r\n");
 }
 
 TEST_F(EndToEndTest, CacheEnableDisable) {
   TcpClient client("127.0.0.1", port_);
-  auto resp = client.SendCommand("CACHE DISABLE");
-  EXPECT_TRUE(resp.find("OK") == 0);
-  resp = client.SendCommand("CACHE STATS");
+  EXPECT_EQ(client.SendCommand("CACHE DISABLE"), "OK CACHE_DISABLED\r\n");
+  auto resp = client.SendCommand("CACHE STATS");
   EXPECT_TRUE(resp.find("cache_enabled: false") != std::string::npos);
-  resp = client.SendCommand("CACHE ENABLE");
-  EXPECT_TRUE(resp.find("OK") == 0);
+  EXPECT_EQ(client.SendCommand("CACHE ENABLE"), "OK CACHE_ENABLED\r\n");
   resp = client.SendCommand("CACHE STATS");
   EXPECT_TRUE(resp.find("cache_enabled: true") != std::string::npos);
 }
@@ -318,10 +272,8 @@ TEST_F(EndToEndTest, CacheEnableDisable) {
 
 TEST_F(EndToEndTest, DebugOn_Off) {
   TcpClient client("127.0.0.1", port_);
-  auto resp = client.SendCommand("DEBUG ON");
-  EXPECT_TRUE(resp.find("OK") == 0);
-  resp = client.SendCommand("DEBUG OFF");
-  EXPECT_TRUE(resp.find("OK") == 0);
+  EXPECT_EQ(client.SendCommand("DEBUG ON"), "OK DEBUG_ON\r\n");
+  EXPECT_EQ(client.SendCommand("DEBUG OFF"), "OK DEBUG_OFF\r\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -330,17 +282,15 @@ TEST_F(EndToEndTest, DebugOn_Off) {
 
 TEST_F(EndToEndTest, SetGet_Variable) {
   TcpClient client("127.0.0.1", port_);
-  auto resp = client.SendCommand("SET cache.ttl_seconds 60");
-  EXPECT_TRUE(resp.find("+OK") == 0);
-  resp = client.SendCommand("GET cache.ttl_seconds");
-  EXPECT_TRUE(resp.find("60") != std::string::npos);
+  EXPECT_EQ(client.SendCommand("SET cache.ttl_seconds 60"), "+OK\r\n");
+  EXPECT_EQ(client.SendCommand("GET cache.ttl_seconds"), "$2\r\n60\r\n");
 }
 
 TEST_F(EndToEndTest, ShowVariables) {
   TcpClient client("127.0.0.1", port_);
   auto resp = client.SendCommand("SHOW VARIABLES");
   // Returns array format: *N\r\n...
-  EXPECT_TRUE(resp.find("*") == 0);
+  EXPECT_EQ(resp.rfind('*', 0), 0U);
 }
 
 // ---------------------------------------------------------------------------
@@ -351,27 +301,30 @@ TEST_F(EndToEndTest, FullPipeline) {
   TcpClient client("127.0.0.1", port_);
 
   // 1. Add events
-  EXPECT_TRUE(client.SendCommand("EVENT ctx1 ADD item1 100").find("OK") == 0);
-  EXPECT_TRUE(client.SendCommand("EVENT ctx1 ADD item2 90").find("OK") == 0);
-  EXPECT_TRUE(client.SendCommand("EVENT ctx1 ADD item3 80").find("OK") == 0);
+  EXPECT_EQ(client.SendCommand("EVENT ctx1 ADD item1 100"), "OK EVENT\r\n");
+  EXPECT_EQ(client.SendCommand("EVENT ctx1 ADD item2 90"), "OK EVENT\r\n");
+  EXPECT_EQ(client.SendCommand("EVENT ctx1 ADD item3 80"), "OK EVENT\r\n");
 
   // 2. Set vectors
-  EXPECT_TRUE(client.SendCommand("VECSET item1 1.0 0.0 0.0").find("OK") == 0);
-  EXPECT_TRUE(client.SendCommand("VECSET item2 0.9 0.1 0.0").find("OK") == 0);
-  EXPECT_TRUE(client.SendCommand("VECSET item3 0.0 1.0 0.0").find("OK") == 0);
+  EXPECT_EQ(client.SendCommand("VECSET item1 1.0 0.0 0.0"), "OK VECSET\r\n");
+  EXPECT_EQ(client.SendCommand("VECSET item2 0.9 0.1 0.0"), "OK VECSET\r\n");
+  EXPECT_EQ(client.SendCommand("VECSET item3 0.0 1.0 0.0"), "OK VECSET\r\n");
 
   // 3. SIM search (events)
-  auto resp = client.SendCommand("SIM item1 10 using=events");
-  EXPECT_TRUE(resp.find("OK") == 0);
+  auto results = ParseSimResults(client.SendCommand("SIM item1 10 using=events"));
+  ASSERT_EQ(results.size(), 2U);
+  EXPECT_EQ(results[0].first, "item2");
+  EXPECT_EQ(results[1].first, "item3");
 
   // 4. SIM search (vectors) - item2 should be most similar to item1
-  resp = client.SendCommand("SIM item1 10 using=vectors");
-  EXPECT_TRUE(resp.find("OK") == 0);
-  EXPECT_TRUE(resp.find("RESULTS") != std::string::npos);
+  results = ParseSimResults(client.SendCommand("SIM item1 10 using=vectors"));
+  ASSERT_FALSE(results.empty());
+  EXPECT_EQ(results[0].first, "item2");
 
-  // 5. INFO should show non-zero counts
-  resp = client.SendCommand("INFO");
-  EXPECT_TRUE(resp.find("vector_count: 3") != std::string::npos);
+  // 5. INFO should show the seeded counts
+  auto resp = client.SendCommand("INFO");
+  EXPECT_EQ(ParseResponseField(resp, "vector_count"), "3");
+  EXPECT_EQ(ParseResponseField(resp, "event_count"), "3");
 }
 
 // ---------------------------------------------------------------------------
@@ -380,6 +333,5 @@ TEST_F(EndToEndTest, FullPipeline) {
 
 TEST_F(EndToEndTest, UnknownCommand) {
   TcpClient client("127.0.0.1", port_);
-  auto resp = client.SendCommand("FOOBAR");
-  EXPECT_TRUE(resp.find("ERROR") != std::string::npos || resp.find("ERR") != std::string::npos);
+  EXPECT_EQ(client.SendCommand("FOOBAR"), "ERROR Unknown command: FOOBAR\r\n");
 }

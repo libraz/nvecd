@@ -15,7 +15,9 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
 #include <random>
+#include <set>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -77,6 +79,41 @@ bool IsKnownId(const std::string& id) {
     number = number * 10 + static_cast<size_t>(id[i] - '0');
   }
   return number < kIdSpace;
+}
+
+/// Queries run against the settled index to look for stale entries.
+constexpr int kSettledQueries = 50;
+
+/// Once the writers have stopped, the ANN mirrors the store: same generation, IVF trained when its
+/// threshold was crossed, and no search names a row the store no longer holds (flat returns them all).
+void ExpectSettledIndexMatchesStore(SimilarityEngine& engine, vectors::VectorStore& vector_store,
+                                    const std::string& index_type) {
+  if (index_type == "ivf") {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!engine.IsIvfTrained() && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_TRUE(engine.IsIvfTrained()) << "IVF never trained although the store crossed ivf_train_threshold";
+  }
+
+  if (index_type != "flat") {
+    EXPECT_EQ(engine.GetAnnGeneration(), vector_store.GetGeneration());
+  }
+
+  const auto live_ids = vector_store.GetAllIds();
+  const std::set<std::string> live(live_ids.begin(), live_ids.end());
+  std::mt19937 rng(4242);
+  for (int q = 0; q < kSettledQueries; ++q) {
+    auto results = engine.SearchByVector(MakeVector(rng, kDim), static_cast<int>(kIdSpace), {});
+    ASSERT_TRUE(results.has_value()) << results.error().message();
+    EXPECT_LE(results->size(), live.size());
+    for (const auto& result : *results) {
+      EXPECT_TRUE(live.count(result.item_id) == 1) << "search returned deleted id " << result.item_id;
+    }
+    if (index_type == "flat") {
+      EXPECT_EQ(results->size(), live.size());
+    }
+  }
 }
 
 /// Writes per writer thread for the index types whose publish path is cheap.
@@ -194,6 +231,7 @@ void RunStress(const std::string& index_type, bool exercise_dispatcher_path, int
   }
 
   EXPECT_GT(read_ops.load(), 0U);
+  ExpectSettledIndexMatchesStore(engine, vector_store, index_type);
 }
 
 TEST(VectorStoreConcurrencyStress, FlatBruteForce) {
