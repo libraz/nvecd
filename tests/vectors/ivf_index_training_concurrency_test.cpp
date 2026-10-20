@@ -58,6 +58,9 @@ class IvfTrainingConcurrencyTest : public ::testing::Test {
 
   void TrainAssigned() { index_->Train(matrix_.data(), valid_.data(), valid_.size(), kDim, true); }
 
+  /// The production training call: centroids only, rows reach the lists through the buffer.
+  void TrainUnassigned() { index_->Train(matrix_.data(), valid_.data(), valid_.size(), kDim, false); }
+
   /// Holds a training run inside its lock-free phase until released.
   struct Gate {
     std::promise<void> entered;
@@ -171,6 +174,58 @@ TEST_F(IvfTrainingConcurrencyTest, VectorRemovedDuringRetrainingStaysRemoved) {
   for (const auto& [score, idx] : SearchRow(5, kRows)) {
     EXPECT_NE(idx, 5U);
   }
+}
+
+TEST_F(IvfTrainingConcurrencyTest, BufferedRowsWrittenAndRemovedDuringTrainingAreKeptOrDropped) {
+  Gate gate;
+  index_->SetTrainHook([&gate] {
+    gate.entered.set_value();
+    gate.release_future.wait();
+  });
+  std::thread trainer([this] { TrainUnassigned(); });
+  ASSERT_EQ(gate.entered.get_future().wait_for(kTimeout), std::future_status::ready);
+
+  const auto kept = Row(kTrained);
+  const auto dropped = Row(1);
+  index_->AppendToBuffer(kTrained, kept.data());
+  index_->AppendToBuffer(1, dropped.data());
+  index_->RemoveVector(1);
+
+  gate.release.set_value();
+  trainer.join();
+
+  ASSERT_TRUE(index_->IsTrained());
+  EXPECT_EQ(index_->GetIndexedCount(), 0U);
+  EXPECT_EQ(index_->GetBufferSize(), 1U);
+  const auto results = SearchRow(kTrained, kRows);
+  ASSERT_EQ(results.size(), 1U);
+  EXPECT_EQ(results[0].second, kTrained);
+}
+
+TEST_F(IvfTrainingConcurrencyTest, SealDuringRetrainingKeepsTheSealedRows) {
+  TrainAssigned();
+  const auto row = Row(kTrained);
+  index_->AppendToBuffer(kTrained, row.data());
+
+  Gate gate;
+  index_->SetTrainHook([&gate] {
+    gate.entered.set_value();
+    gate.release_future.wait();
+  });
+  std::thread trainer([this] { TrainAssigned(); });
+  ASSERT_EQ(gate.entered.get_future().wait_for(kTimeout), std::future_status::ready);
+
+  // The seal publishes into the old lists, which the retrain is about to replace.
+  EXPECT_TRUE(index_->SealBuffer());
+
+  gate.release.set_value();
+  trainer.join();
+
+  ASSERT_TRUE(index_->IsTrained());
+  EXPECT_EQ(index_->GetIndexedCount() + index_->GetBufferSize(), kRows);
+  const auto results = SearchRow(kTrained, 1);
+  ASSERT_EQ(results.size(), 1U);
+  EXPECT_EQ(results[0].second, kTrained);
 }
 
 TEST_F(IvfTrainingConcurrencyTest, ResetDuringTrainingDiscardsTheResult) {

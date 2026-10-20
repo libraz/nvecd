@@ -724,6 +724,12 @@ bool IvfIndex::SealBuffer() {
       // newer embedding is in the write buffer and is assigned by the next seal.
       if (sealing_slots_.count(seal_indices[i]) != 0 && buffer_slots_.count(seal_indices[i]) == 0) {
         AppendToListLocked(cluster_assignments[i], seal_indices[i]);
+        // A training install rebuilds the lists from its own snapshot, so a row
+        // sealed meanwhile must be replayed or it leaves both tiers.
+        if (recording_changes_) {
+          const float* vec = seal_vectors.data() + i * dim;
+          change_log_.push_back({seal_indices[i], false, std::vector<float>(vec, vec + dim)});
+        }
       }
     }
     ClearTier(sealing_indices_, sealing_vectors_, sealing_norms_, sealing_slots_);
