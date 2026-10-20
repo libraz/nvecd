@@ -13,6 +13,8 @@
 #include <limits>
 #include <string>
 
+#include "events/id_validation.h"
+
 namespace nvecd::server {
 
 namespace {
@@ -104,6 +106,24 @@ utils::Expected<int, utils::Error> CheckTopK(int64_t value, uint32_t max_top_k, 
 }
 
 }  // namespace
+
+utils::Expected<void, utils::Error> ValidateItemId(const std::string& id) {
+  if (auto id_check = events::ValidateIdentifier("ID", id); !id_check) {
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kInvalidArgument, id_check.error().message()));
+  }
+  return {};
+}
+
+utils::Error UnsupportedSearchOption(std::string_view command, std::string_view name, std::string_view spelling) {
+  if (name == "candidate_limit") {
+    return utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "candidate_limit option is not supported");
+  }
+  if (name == "explain") {
+    return utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "explain option is not supported");
+  }
+  return utils::MakeError(utils::ErrorCode::kCommandSyntaxError,
+                          "Invalid " + std::string(command) + " option: " + std::string(spelling));
+}
 
 bool IsValidSearchMode(std::string_view mode) {
   return mode == kSearchModeEvents || mode == kSearchModeVectors || mode == kSearchModeFusion;

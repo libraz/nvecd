@@ -10,6 +10,7 @@
 #include <sstream>
 
 #include "cache/similarity_cache.h"
+#include "cache/similarity_cache_controller.h"
 #include "events/co_occurrence_index.h"
 #include "events/event_store.h"
 #include "utils/memory_utils.h"
@@ -18,11 +19,25 @@
 
 namespace nvecd::server::handlers {
 
+uint64_t VectorMatrixBytes(const HandlerContext& ctx) {
+  if (ctx.vector_store == nullptr) {
+    return 0;
+  }
+  return static_cast<uint64_t>(ctx.vector_store->GetVectorCount()) *
+         static_cast<uint64_t>(ctx.vector_store->GetDimension()) * sizeof(float);
+}
+
+const cache::SimilarityCache* ReportedCache(const HandlerContext& ctx) {
+  if (ctx.cache_controller != nullptr) {
+    return &ctx.cache_controller->Cache();
+  }
+  return ctx.cache.load(std::memory_order_acquire);
+}
+
 MemoryFigures GatherMemoryFigures(const HandlerContext& ctx) {
   MemoryFigures figures;
+  figures.vector_matrix_bytes = VectorMatrixBytes(ctx);
   if (ctx.vector_store != nullptr) {
-    figures.vector_matrix_bytes = static_cast<uint64_t>(ctx.vector_store->GetVectorCount()) *
-                                  static_cast<uint64_t>(ctx.vector_store->GetDimension()) * sizeof(float);
     figures.vectors_bytes = ctx.vector_store->MemoryUsage();
   }
   if (ctx.event_store != nullptr) {
@@ -66,7 +81,7 @@ utils::Expected<std::string, utils::Error> HandleInfo(const HandlerContext& ctx)
   oss << "\n";
 
   // Memory section
-  const uint64_t used_memory_bytes = GatherMemoryFigures(ctx).vector_matrix_bytes;
+  const uint64_t used_memory_bytes = VectorMatrixBytes(ctx);
   double used_memory_mb = static_cast<double>(used_memory_bytes) / (1024.0 * 1024.0);
   oss << "# Memory\n";
   oss << "used_memory_bytes: " << used_memory_bytes << "\n";
@@ -76,7 +91,7 @@ utils::Expected<std::string, utils::Error> HandleInfo(const HandlerContext& ctx)
   // Cache section
   oss << "\n";
   oss << "# Cache\n";
-  auto* info_cache_ptr = ctx.cache.load(std::memory_order_acquire);
+  const auto* info_cache_ptr = ReportedCache(ctx);
   if (info_cache_ptr != nullptr) {
     auto cache_stats = info_cache_ptr->GetStatistics();
     oss << "cache_entries: " << cache_stats.current_entries << "\n";

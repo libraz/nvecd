@@ -28,6 +28,15 @@ SimilarityCache::SimilarityCache(size_t max_memory_bytes, double min_query_cost_
   policies_[static_cast<size_t>(SearchType::kFilteredSearch)] = {true, 60};
 }
 
+bool SimilarityCache::AdmitsCost(double query_cost_ms) const {
+  return enabled_.load(std::memory_order_relaxed) &&
+         query_cost_ms >= min_query_cost_ms_.load(std::memory_order_relaxed);
+}
+
+bool SimilarityCache::WouldAdmit(double query_cost_ms, SearchType search_type) const {
+  return AdmitsCost(query_cost_ms) && ResolveEffectiveTtl(search_type).has_value();
+}
+
 std::optional<int> SimilarityCache::ResolveEffectiveTtl(SearchType search_type) const {
   // A positive per-type override wins, otherwise the global TTL applies.
   int effective_ttl = ttl_seconds_.load(std::memory_order_relaxed);
@@ -196,12 +205,7 @@ bool SimilarityCache::Insert(const CacheKey& key, const std::vector<similarity::
 bool SimilarityCache::InsertWithTtl(const CacheKey& key, const std::vector<similarity::SimilarityResult>& results,
                                     double query_cost_ms, int effective_ttl_seconds,
                                     const std::vector<std::string>* item_ids) {
-  if (!enabled_.load(std::memory_order_relaxed)) {
-    return false;
-  }
-
-  // Check if query cost meets threshold
-  if (query_cost_ms < min_query_cost_ms_.load(std::memory_order_relaxed)) {
+  if (!AdmitsCost(query_cost_ms)) {
     return false;
   }
 

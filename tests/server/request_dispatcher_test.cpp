@@ -6,25 +6,31 @@
 #include "server/request_dispatcher.h"
 
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <future>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <variant>
+#include <vector>
 
 #include "cache/similarity_cache.h"
 #include "config/config.h"
 #include "config/runtime_variable_manager.h"
 #include "events/co_occurrence_index.h"
 #include "events/event_store.h"
+#include "server/protocol_framing.h"
 #include "server/server_types.h"
 #include "server/wal_codec.h"
 #include "similarity/similarity_engine.h"
@@ -452,6 +458,30 @@ TEST_F(RequestDispatcherTest, EveryDispatchExitAccountsExactlyOneCommand) {
     EXPECT_EQ(stats_.failed_commands.load(), failed_before + (item.expect_failure ? 1U : 0U)) << item.request;
     EXPECT_LE(stats_.failed_commands.load(), stats_.total_commands.load()) << item.request;
   }
+}
+
+TEST_F(RequestDispatcherTest, MalformedRequestIsAccountedUnderTheGroupItsVerbNames) {
+  const auto calls = [this](CommandGroup group) { return stats_.calls_by_group[GroupIndex(group)].load(); };
+  const auto failed = [this](CommandGroup group) { return stats_.failed_by_group[GroupIndex(group)].load(); };
+
+  EXPECT_EQ(Dispatch("SIM only_id\r\n").rfind("ERROR", 0), 0U);
+  EXPECT_EQ(Dispatch("CONFIG BOGUS\r\n").rfind("ERROR", 0), 0U);
+  EXPECT_EQ(Dispatch("NOT_A_COMMAND\r\n").rfind("ERROR", 0), 0U);
+  EXPECT_EQ(calls(CommandGroup::kSim), 1U);
+  EXPECT_EQ(failed(CommandGroup::kSim), 1U);
+  EXPECT_EQ(calls(CommandGroup::kConfig), 1U);
+  EXPECT_EQ(failed(CommandGroup::kConfig), 1U);
+  EXPECT_EQ(calls(CommandGroup::kOther), 1U);
+  EXPECT_EQ(failed(CommandGroup::kOther), 1U);
+}
+
+TEST_F(RequestDispatcherTest, RefusedRequestIsOneFailedCommandOfItsGroup) {
+  EXPECT_EQ(dispatcher_->Refuse("VECSET item 1 0\r\n", "Rate limit exceeded"), "ERROR Rate limit exceeded\r\n");
+  EXPECT_EQ(stats_.total_commands.load(), 1U);
+  EXPECT_EQ(stats_.failed_commands.load(), 1U);
+  EXPECT_EQ(stats_.calls_by_group[GroupIndex(CommandGroup::kVecset)].load(), 1U);
+  EXPECT_EQ(stats_.failed_by_group[GroupIndex(CommandGroup::kVecset)].load(), 1U);
+  EXPECT_FALSE(vector_store_->HasVector("item"));
 }
 
 TEST_F(RequestDispatcherTest, ReadOnlyRejectionIsAccountedAsOneFailedCommand) {
@@ -936,6 +966,27 @@ TEST_F(RequestDispatcherTest, GateWaitIsNotCountedAsQueryCost) {
   EXPECT_EQ(entries_after_gated_miss(50.0), 0U);
 }
 
+TEST_F(RequestDispatcherTest, SearchTheCacheWouldNotStoreTakesNoWriteGate) {
+  ASSERT_TRUE(vector_store_->SetVector("item", {1.0F, 0.0F}).has_value());
+  nvecd::cache::SimilarityCache below_threshold(1024 * 1024, 1.0e9, 0);
+  nvecd::cache::SimilarityCache policy_off(1024 * 1024, 0.0, 0);
+  nvecd::cache::CachePolicy disabled;
+  disabled.enabled = false;
+  policy_off.SetSearchTypePolicy(nvecd::cache::SearchType::kItemSearch, disabled);
+
+  for (auto* cache : {&below_threshold, &policy_off}) {
+    ctx_->cache.store(cache, std::memory_order_release);
+    std::unique_lock gate(write_serialization_gate_);
+    auto query = std::async(std::launch::async, [this] { return Dispatch("SIM item 5 using=vectors\r\n"); });
+    const auto status = query.wait_for(std::chrono::seconds(5));
+    gate.unlock();
+    ASSERT_EQ(status, std::future_status::ready) << "search waited on the write gate";
+    EXPECT_NE(query.get().find("OK RESULTS"), std::string::npos);
+    EXPECT_EQ(cache->GetStatistics().current_entries, 0U);
+  }
+  ctx_->cache.store(cache_.get(), std::memory_order_release);
+}
+
 // ============================================================================
 // WAL replay: decay domain, invalid logged ids, legacy METASET text
 // ============================================================================
@@ -1006,6 +1057,61 @@ TEST_F(RequestDispatcherTest, ReplayTypesLegacyMetasetTextWithTheMetasetGrammar)
   ASSERT_TRUE(dispatcher_->ReplayRecord(CommandRecord(legacy)).has_value());
   EXPECT_EQ(stats_.wal_replay_records_skipped.load(), 1U);
   EXPECT_EQ(std::get<int64_t>(metadata_store_->Get("item")->at("price")), 12);
+}
+
+TEST_F(RequestDispatcherTest, ReplayAppliesEveryLoggedEventWhateverTheDedupCacheHolds) {
+  // Live run with a one-entry dedup cache: "b" evicts "a", so the repeated ADD
+  // of "a" inside the window is accepted and logged.
+  nvecd::config::EventsConfig live_cfg;
+  live_cfg.dedup_cache_size = 1;
+  nvecd::events::EventStore live_store(live_cfg);
+  nvecd::events::CoOccurrenceIndex live_index;
+  ServerStats live_stats;
+  std::atomic<bool> live_loading{false};
+  std::atomic<bool> live_read_only{false};
+  HandlerContext live_ctx{&live_store, &live_index, nullptr,       nullptr,      nullptr,       {},
+                          nullptr,     live_stats,  config_.get(), live_loading, live_read_only};
+
+  std::vector<Command> logged;
+  for (const auto& [item, ts] : std::vector<std::pair<std::string, uint64_t>>{{"a", 1000}, {"b", 1001}, {"a", 1002}}) {
+    Command cmd;
+    cmd.type = CommandType::kEvent;
+    cmd.ctx = "u1";
+    cmd.id = item;
+    cmd.score = 1;
+    cmd.timestamp = ts;
+    ASSERT_TRUE(ApplyWrite(live_ctx, cmd).has_value());
+    logged.push_back(cmd);
+  }
+  ASSERT_EQ(live_store.GetEvents("u1").size(), 3U);
+
+  // Replay into a store whose default dedup cache still holds "a".
+  for (const auto& cmd : logged) {
+    auto replayed = dispatcher_->ReplayRecord(CommandRecord(cmd));
+    ASSERT_TRUE(replayed.has_value()) << replayed.error().message();
+  }
+  EXPECT_EQ(event_store_->GetEvents("u1").size(), live_store.GetEvents("u1").size());
+  EXPECT_FLOAT_EQ(co_index_->GetScore("a", "b"), live_index.GetScore("a", "b"));
+  EXPECT_EQ(stats_.wal_replay_records_skipped.load(), 0U);
+}
+
+TEST_F(RequestDispatcherTest, SchemaInvalidConfigVerifyIsOneErrorLineAndInfoStaysAligned) {
+  const auto dir = std::filesystem::temp_directory_path() / ("nvecd_dispatch_verify_" + std::to_string(::getpid()));
+  std::filesystem::create_directories(dir);
+  {
+    std::ofstream out(dir / "bad.yaml");
+    out << "vectors:\n  default_dimension: 999999\n";
+  }
+  ctx_->config_dir = dir.string();
+
+  const std::string verify = NormalizeResponse(Dispatch("CONFIG VERIFY bad.yaml\r\n"));
+  const std::string info = NormalizeResponse(Dispatch("INFO\r\n"));
+  std::filesystem::remove_all(dir);
+
+  EXPECT_EQ(verify.rfind("ERROR Configuration validation failed: ", 0), 0U) << verify;
+  EXPECT_EQ(verify.find("\r\n"), verify.size() - 2) << verify;
+  EXPECT_EQ(verify.find("Configuration validation failed", 7), std::string::npos) << verify;
+  EXPECT_EQ(info.rfind("OK INFO\r\n", 0), 0U) << info;
 }
 
 TEST_F(RequestDispatcherTest, ConfigShowReportsTheRunningValueAfterSet) {

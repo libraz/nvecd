@@ -212,6 +212,14 @@ class SimilarityCache {
                          const std::vector<std::string>& item_ids, double query_cost_ms, SearchType search_type);
 
   /**
+   * @brief Whether an insert of a result costing @p query_cost_ms would be admitted
+   *
+   * The admission rule the insert paths apply (enabled, cost threshold, type
+   * policy), so a caller can skip preparing a result the cache would refuse.
+   */
+  [[nodiscard]] bool WouldAdmit(double query_cost_ms, SearchType search_type) const;
+
+  /**
    * @brief Set cache policy for a search type
    * @param search_type Search type
    * @param policy Cache policy
@@ -512,6 +520,9 @@ class SimilarityCache {
   bool InsertWithTtl(const CacheKey& key, const std::vector<similarity::SimilarityResult>& results,
                      double query_cost_ms, int effective_ttl_seconds,
                      const std::vector<std::string>* item_ids = nullptr);
+
+  /// Enabled and @p query_cost_ms at or above the threshold; the cost half of the admission rule.
+  [[nodiscard]] bool AdmitsCost(double query_cost_ms) const;
 
   /**
    * @brief Effective TTL for a search type, or nullopt when its policy disables caching

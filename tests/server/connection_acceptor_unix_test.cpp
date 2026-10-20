@@ -3,23 +3,32 @@
  * @brief Unit tests for Unix domain socket functionality in ConnectionAcceptor and NvecdServer
  */
 
+#include <arpa/inet.h>
 #include <gtest/gtest.h>
+#include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "config/config.h"
 #include "server/connection_acceptor.h"
+#include "server/connection_budget.h"
 #include "server/nvecd_server.h"
 #include "server/server_types.h"
 #include "server/thread_pool.h"
+#include "utils/network_utils.h"
 
 namespace fs = std::filesystem;
 
@@ -89,6 +98,57 @@ class ConnectionAcceptorUnixTest : public ::testing::Test {
     }
     buffer[received] = '\0';
     return std::string(buffer);
+  }
+
+  int ConnectUds(const std::string& path) {
+    int sock = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un addr {};
+    addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
+    if (connect(sock, reinterpret_cast<struct sockaddr*>(&addr),  // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+                sizeof(addr)) < 0) {
+      close(sock);
+      return -1;
+    }
+    return sock;
+  }
+
+  int ConnectTcp(uint16_t port) {
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in addr {};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+    if (connect(sock, reinterpret_cast<struct sockaddr*>(&addr),  // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+                sizeof(addr)) < 0) {
+      close(sock);
+      return -1;
+    }
+    return sock;
+  }
+
+  /// True when the server closes the connection without sending anything.
+  static bool ClosedByServer(int sock) {
+    pollfd poll_fd{sock, POLLIN, 0};
+    if (poll(&poll_fd, 1, 2000) <= 0) {  // NOLINT(cppcoreguidelines-avoid-magic-numbers)
+      return false;
+    }
+    char byte = 0;
+    return recv(sock, &byte, 1, 0) == 0;
+  }
+
+  /// Send INFO and wait for any reply, proving the server registered the connection.
+  static bool Roundtrip(int sock) {
+    const std::string request = "INFO\r\n";
+    if (send(sock, request.c_str(), request.length(), 0) < 0) {
+      return false;
+    }
+    pollfd poll_fd{sock, POLLIN, 0};
+    if (poll(&poll_fd, 1, 2000) <= 0) {  // NOLINT(cppcoreguidelines-avoid-magic-numbers)
+      return false;
+    }
+    char buffer[64];  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+    return recv(sock, buffer, sizeof(buffer), 0) > 0;
   }
 
   std::string socket_path_;
@@ -350,4 +410,150 @@ TEST_F(ConnectionAcceptorUnixTest, SocketPermissions) {
   EXPECT_EQ(st.st_mode & 0777, 0770) << "Socket permissions should be 0770, got: " << std::oct << (st.st_mode & 0777);
 
   acceptor.Stop();
+}
+
+// ============================================================================
+// Test 9: Shared connection budget across listeners
+// ============================================================================
+
+TEST_F(ConnectionAcceptorUnixTest, SharedBudgetGatesAdmissionAndIsReturnedOnClose) {
+  nvecd::server::ThreadPool pool(2);
+  auto config = MakeUdsConfig();
+  nvecd::server::ConnectionAcceptor acceptor(config, &pool);
+
+  std::atomic<int> handled{0};
+  acceptor.SetConnectionHandler([&handled](int) { ++handled; });
+  // Another listener already holds the whole budget.
+  auto budget = std::make_shared<nvecd::server::ConnectionBudget>(2);
+  ASSERT_TRUE(budget->TryAcquire());
+  ASSERT_TRUE(budget->TryAcquire());
+  acceptor.SetConnectionBudget(budget);
+  ASSERT_TRUE(acceptor.Start().has_value());
+
+  int refused = ConnectUds(socket_path_);
+  ASSERT_GE(refused, 0);
+  EXPECT_TRUE(ClosedByServer(refused));
+  close(refused);
+  EXPECT_EQ(handled.load(), 0);
+
+  budget->Release();
+  int admitted = ConnectUds(socket_path_);
+  ASSERT_GE(admitted, 0);
+  auto wait_until = [](auto&& condition) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!condition() && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+  };
+  wait_until([&] { return handled.load() == 1; });
+  close(admitted);
+  EXPECT_EQ(handled.load(), 1);
+  // The handler returned, so the slot it took is back; only the one held above remains.
+  wait_until([&] { return budget->Used() == 1; });
+  EXPECT_EQ(budget->Used(), 1U);
+
+  acceptor.Stop();
+}
+
+TEST_F(ConnectionAcceptorUnixTest, RacingAcceptorsNeverExceedTheSharedBudget) {
+  constexpr size_t kMax = 4;
+  constexpr int kClients = 24;
+  nvecd::server::ThreadPool pool(8);
+  auto budget = std::make_shared<nvecd::server::ConnectionBudget>(kMax);
+
+  std::atomic<int> current{0};
+  std::atomic<int> peak{0};
+  std::atomic<int> handled{0};
+  std::atomic<bool> release{false};
+  auto handler = [&](int) {
+    const int now = ++current;
+    int seen = peak.load();
+    while (now > seen && !peak.compare_exchange_weak(seen, now)) {
+    }
+    ++handled;
+    while (!release.load()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    --current;
+  };
+
+  auto tcp_config = MakeTcpConfig();
+  tcp_config.allow_cidrs = {"127.0.0.1/32"};
+  tcp_config.parsed_allow_cidrs = nvecd::utils::ParseCidrList(tcp_config.allow_cidrs);
+  nvecd::server::ConnectionAcceptor tcp(tcp_config, &pool);
+  nvecd::server::ConnectionAcceptor uds(MakeUdsConfig(), &pool);
+  tcp.SetConnectionBudget(budget);
+  uds.SetConnectionBudget(budget);
+  tcp.SetConnectionHandler(handler);
+  uds.SetConnectionHandler(handler);
+  ASSERT_TRUE(tcp.Start().has_value());
+  ASSERT_TRUE(uds.Start().has_value());
+
+  std::vector<int> sockets(kClients, -1);
+  std::vector<std::thread> clients;
+  for (int index = 0; index < kClients; ++index) {
+    clients.emplace_back(
+        [&, index] { sockets[index] = index % 2 == 0 ? ConnectTcp(tcp.GetPort()) : ConnectUds(socket_path_); });
+  }
+  for (auto& client : clients) {
+    client.join();
+  }
+  // A SYN dropped on a full listen queue is retried after a second, so wait for the budget to fill.
+  const auto fill_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (handled.load() < static_cast<int>(kMax) && std::chrono::steady_clock::now() < fill_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+  EXPECT_EQ(handled.load(), static_cast<int>(kMax));
+  EXPECT_LE(peak.load(), static_cast<int>(kMax));
+  EXPECT_EQ(budget->Used(), kMax);
+
+  release.store(true);
+  for (int sock : sockets) {
+    if (sock >= 0) {
+      close(sock);
+    }
+  }
+  // Worker tasks reference the acceptors and the locals above; drain them first.
+  pool.Shutdown();
+  tcp.Stop();
+  uds.Stop();
+}
+
+TEST_F(ConnectionAcceptorUnixTest, ServerSharesMaxConnectionsBetweenTcpAndUnixListeners) {
+  nvecd::config::Config config;
+  config.api.tcp.port = 0;
+  config.api.unix_socket.path = socket_path_;
+  config.perf.max_connections = 2;
+  config.network.allow_cidrs = {"127.0.0.1/32"};
+  config.perf.thread_pool_size = 2;
+  config.vectors.default_dimension = 3;
+  config.events.ctx_buffer_size = 100;   // NOLINT(cppcoreguidelines-avoid-magic-numbers)
+  config.similarity.default_top_k = 10;  // NOLINT(cppcoreguidelines-avoid-magic-numbers)
+  config.similarity.max_top_k = 100;     // NOLINT(cppcoreguidelines-avoid-magic-numbers)
+
+  auto server = std::make_unique<nvecd::server::NvecdServer>(config);
+  ASSERT_TRUE(server->Start().has_value());
+
+  int tcp = ConnectTcp(server->GetPort());
+  ASSERT_GE(tcp, 0);
+  ASSERT_TRUE(Roundtrip(tcp));
+  int uds = ConnectUds(socket_path_);
+  ASSERT_GE(uds, 0);
+  ASSERT_TRUE(Roundtrip(uds));
+
+  // Two connections fill the budget, so neither listener admits a third.
+  int extra_uds = ConnectUds(socket_path_);
+  ASSERT_GE(extra_uds, 0);
+  EXPECT_TRUE(ClosedByServer(extra_uds));
+  int extra_tcp = ConnectTcp(server->GetPort());
+  ASSERT_GE(extra_tcp, 0);
+  EXPECT_TRUE(ClosedByServer(extra_tcp));
+
+  close(extra_uds);
+  close(extra_tcp);
+  close(uds);
+  close(tcp);
+  server->Stop();
 }

@@ -23,6 +23,7 @@
 #include "storage/snapshot_format.h"
 #include "utils/error.h"
 #include "utils/expected.h"
+#include "utils/wire_limits.h"
 
 namespace nvecd::utils {
 
@@ -370,6 +371,17 @@ class PrivateStorageTarget {
 
 #endif
 
+/// Whether @p path has a ".." component; a name that merely contains two dots does not.
+inline bool HasParentComponent(const std::filesystem::path& path) {
+  return std::any_of(path.begin(), path.end(), [](const std::filesystem::path& part) { return part == ".."; });
+}
+
+/// Whether canonical @p path names an entry strictly inside canonical @p root, never @p root itself.
+inline bool IsStrictlyInside(const std::filesystem::path& path, const std::filesystem::path& root) {
+  const auto rel = path.lexically_relative(root);
+  return !rel.empty() && *rel.begin() != ".." && rel != ".";
+}
+
 /// What a validated dump path will be used for.
 enum class DumpPathUse : uint8_t {
   kInspect,       ///< Read or inspect an existing file under any name
@@ -405,10 +417,16 @@ inline Expected<std::string, Error> ValidateDumpPath(const std::string& filepath
     return MakeUnexpected(MakeError(ErrorCode::kInvalidArgument, "Invalid filepath: must not be empty"));
   }
 
+  // The resolved path is echoed into line-framed DUMP replies and must be
+  // sendable back as one DUMP LOAD token.
+  if (!IsSingleToken(filepath)) {
+    return MakeUnexpected(
+        MakeError(ErrorCode::kInvalidArgument, "Invalid filepath: must not contain whitespace or control characters"));
+  }
+
   // Defense-in-depth: reject ".." components before canonicalization. A name
   // that merely contains two dots, such as "nightly..v2.dmp", is not one.
-  const std::filesystem::path requested(filepath);
-  if (std::any_of(requested.begin(), requested.end(), [](const std::filesystem::path& part) { return part == ".."; })) {
+  if (HasParentComponent(filepath)) {
     return MakeUnexpected(MakeError(ErrorCode::kInvalidArgument, "Invalid filepath: path traversal detected"));
   }
 
@@ -444,13 +462,12 @@ inline Expected<std::string, Error> ValidateDumpPath(const std::string& filepath
   }
 
   // Verify resolved path resides strictly within dump directory
-  auto rel = resolved_canonical.lexically_relative(dump_canonical);
-  if (rel.empty() || *rel.begin() == "..") {
-    return MakeUnexpected(MakeError(ErrorCode::kInvalidArgument, "Invalid filepath: path traversal detected"));
-  }
-  if (rel == ".") {
+  if (resolved_canonical.lexically_relative(dump_canonical) == ".") {
     return MakeUnexpected(
         MakeError(ErrorCode::kInvalidArgument, "Invalid filepath: names the dump directory itself, not a file"));
+  }
+  if (!IsStrictlyInside(resolved_canonical, dump_canonical)) {
+    return MakeUnexpected(MakeError(ErrorCode::kInvalidArgument, "Invalid filepath: path traversal detected"));
   }
 
   const auto target_parent =

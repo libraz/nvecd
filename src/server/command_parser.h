@@ -92,4 +92,16 @@ struct Command {
  */
 utils::Expected<Command, utils::Error> ParseCommand(const std::string& request, uint32_t max_top_k = 0);
 
+/**
+ * @brief Command type a request line names, for accounting a request that is refused or fails to parse
+ *
+ * Only the verb is read: a subcommand verb (CONFIG, DUMP, CACHE, DEBUG, SHOW)
+ * yields one member of its family, so CommandGroupOf() of the result is the
+ * group the request belongs to.
+ *
+ * @param request Raw request line
+ * @return The verb's command type, or kUnknown when the verb is not a command
+ */
+CommandType ClassifyRequest(const std::string& request);
+
 }  // namespace nvecd::server

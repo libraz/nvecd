@@ -1272,5 +1272,31 @@ TEST(SimilarityCacheTest, ReplacingInvalidatedEntryReleasesItsReverseIndex) {
   ExpectAccountingMatchesScan(cache, "replace invalidated registered entry");
 }
 
+TEST(SimilarityCacheTest, WouldAdmitMatchesWhatInsertAdmits) {
+  SimilarityCache cache(1024 * 1024, 5.0, 0);
+  CachePolicy disabled;
+  disabled.enabled = false;
+  cache.SetSearchTypePolicy(SearchType::kVectorSearch, disabled);
+  const std::vector<similarity::SimilarityResult> results = {{"item", 1.0F}};
+
+  struct Case {
+    double cost_ms;
+    SearchType type;
+  };
+  uint64_t id = 1;
+  for (const auto& item : {Case{1.0, SearchType::kItemSearch}, Case{5.0, SearchType::kItemSearch},
+                           Case{50.0, SearchType::kItemSearch}, Case{50.0, SearchType::kVectorSearch}}) {
+    const bool expected = cache.WouldAdmit(item.cost_ms, item.type);
+    EXPECT_EQ(cache.Insert(CacheKey{id, id}, results, item.cost_ms, item.type), expected) << item.cost_ms;
+    ++id;
+  }
+  EXPECT_FALSE(cache.WouldAdmit(1.0, SearchType::kItemSearch));
+  EXPECT_TRUE(cache.WouldAdmit(5.0, SearchType::kItemSearch));
+  EXPECT_FALSE(cache.WouldAdmit(50.0, SearchType::kVectorSearch));
+
+  cache.SetEnabled(false);
+  EXPECT_FALSE(cache.WouldAdmit(50.0, SearchType::kItemSearch));
+}
+
 }  // namespace
 }  // namespace nvecd::cache

@@ -10,8 +10,8 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
-#include <ctime>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -203,8 +203,8 @@ struct CommandGroupStat {
  * Uses std::atomic for thread-safe counter updates without locks.
  */
 struct ServerStats {
-  // Read-mostly (set once at startup)
-  uint64_t start_time = static_cast<uint64_t>(std::time(nullptr));
+  // Read-mostly (set once at startup). Monotonic, so a wall-clock step never moves uptime.
+  std::chrono::steady_clock::time_point started_at = std::chrono::steady_clock::now();
 
   // Hot counters - separate cache lines for frequently updated counters
   alignas(64) std::atomic<uint64_t> total_connections{0};
@@ -237,7 +237,10 @@ struct ServerStats {
    * @brief Get uptime in seconds
    * Reference: ../mygram-db/src/server/server_stats.cpp:GetUptimeSeconds
    */
-  uint64_t GetUptimeSeconds() const { return static_cast<uint64_t>(std::time(nullptr)) - start_time; }
+  uint64_t GetUptimeSeconds() const {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - started_at).count());
+  }
 
   /**
    * @brief Get queries per second
@@ -263,8 +266,9 @@ struct ServerStats {
  *
  * The guard is created after a request has been recognised as a command, so
  * both surfaces count the same population: the TCP dispatcher creates one per
- * Dispatch() call (including a parse failure, as kUnknown), and the HTTP route
- * wrapper creates one per request to a route that mirrors a TCP command.
+ * Dispatch() or Refuse() call (a parse failure under the group its verb names),
+ * and the HTTP server creates one per request to a route that mirrors a TCP
+ * command, including one refused by the ACL or rate limiter before routing.
  */
 class CommandStatsScope {
  public:

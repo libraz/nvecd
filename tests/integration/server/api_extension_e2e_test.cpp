@@ -4,8 +4,10 @@
  */
 
 #include <gtest/gtest.h>
+#include <httplib.h>
 
 #include <algorithm>
+#include <nlohmann/json.hpp>
 #include <string>
 #include <thread>
 #include <vector>
@@ -269,4 +271,67 @@ TEST_F(ApiExtensionE2ETest, BackwardCompatSIMVWithoutParams) {
   // Plain SIMV — no extra params
   auto response = client.SendCommand("SIMV 3 1.0 0.0 0.0");
   EXPECT_TRUE(response.find("OK") != std::string::npos);
+}
+
+// --- HTTP surface through the real NvecdServer wiring ---
+
+/**
+ * @brief Fixture that enables the HTTP listener on an ephemeral port with a password set
+ */
+class HttpWiringE2ETest : public NvecdTestFixture {
+ protected:
+  static constexpr const char* kPassword = "s3cret";
+
+  void SetUp() override {
+    SetUpServer(3);
+    server_->Stop();
+    config_.api.http.enable = true;
+    config_.api.http.bind = "127.0.0.1";
+    config_.api.http.port = 0;
+    config_.security.requirepass = kPassword;
+    server_ = std::make_unique<nvecd::server::NvecdServer>(config_);
+    ASSERT_TRUE(server_->Start().has_value());
+    port_ = server_->GetPort();
+    http_port_ = server_->GetHttpPort();
+    ASSERT_GT(http_port_, 0);
+    client_ = std::make_unique<httplib::Client>("127.0.0.1", http_port_);
+  }
+
+  void TearDown() override {
+    client_.reset();
+    TearDownServer();
+  }
+
+  static std::string VecsetBody(const std::string& id) {
+    nlohmann::json body;
+    body["id"] = id;
+    body["vector"] = {1.0F, 0.0F, 0.0F};
+    return body.dump();
+  }
+
+  uint16_t http_port_ = 0;
+  std::unique_ptr<httplib::Client> client_;
+};
+
+TEST_F(HttpWiringE2ETest, WritesRequireCredentialsAndMatchTcpState) {
+  // Without credentials the write is refused and nothing is stored.
+  auto denied = client_->Post("/vecset", VecsetBody("http_item"), "application/json");
+  ASSERT_TRUE(denied);
+  EXPECT_EQ(denied->status, 401);
+
+  const httplib::Headers auth = {{"Authorization", std::string("Bearer ") + kPassword}};
+  auto accepted = client_->Post("/vecset", auth, VecsetBody("http_item"), "application/json");
+  ASSERT_TRUE(accepted);
+  EXPECT_EQ(accepted->status, 200);
+
+  // The same server state is visible through both surfaces.
+  auto info = client_->Get("/info");
+  ASSERT_TRUE(info);
+  ASSERT_EQ(info->status, 200);
+  const auto body = nlohmann::json::parse(info->body);
+  EXPECT_EQ(body["stores"]["vector_store"]["vectors"].get<uint64_t>(), 1U);
+
+  TcpClient tcp("127.0.0.1", port_);
+  EXPECT_EQ(ParseResponseField(tcp.SendCommand("INFO"), "vector_count"), "1");
+  EXPECT_NE(tcp.SendCommand("SIMV 5 1.0 0.0 0.0").find("http_item"), std::string::npos);
 }

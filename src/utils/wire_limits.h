@@ -47,4 +47,24 @@ inline std::optional<std::string> ValidateNoFramingBytes(std::string_view value,
   return std::nullopt;
 }
 
+/**
+ * @brief Whether @p value can be written as one token of a line-framed reply
+ *
+ * Identifiers and snapshot paths are echoed unescaped into replies whose
+ * clients split on spaces and count newlines, so no byte at or below 0x20
+ * (space and every control character) and no DEL may appear. Bytes at or
+ * above 0x80 pass so UTF-8 names keep working.
+ */
+constexpr bool IsSingleToken(std::string_view value) {
+  constexpr unsigned char kSpace = 0x20;
+  constexpr unsigned char kDelete = 0x7F;
+  for (const char raw : value) {
+    const auto byte = static_cast<unsigned char>(raw);
+    if (byte <= kSpace || byte == kDelete) {
+      return false;
+    }
+  }
+  return true;
+}
+
 }  // namespace nvecd::utils

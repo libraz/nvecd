@@ -8,8 +8,12 @@
  */
 
 #include <gtest/gtest.h>
+#include <unistd.h>
 
+#include <chrono>
+#include <filesystem>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "../test_server_fixture.h"
@@ -348,4 +352,114 @@ TEST_F(SimilarityE2ETest, SingleItemStore) {
 
   int count = GetResultCount(resp);
   EXPECT_EQ(count, 0) << "Single item store should return 0 results (no other items to compare)";
+}
+
+// ---------------------------------------------------------------------------
+// Test 17: ANN index covers snapshot and WAL-tail vectors after a restart
+// ---------------------------------------------------------------------------
+
+namespace {
+
+bool ReplyListsAll(const std::string& reply, const std::vector<std::string>& ids) {
+  for (const auto& id : ids) {
+    if (reply.find(id) == std::string::npos) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/// Restart the server over its snapshot and WAL and expect SIMV to see every vector.
+void ExpectAnnCoversRecoveredVectors(const std::string& index_type) {
+  const auto root = fs::temp_directory_path() /
+                    ("nvecd_ann_restart_" + index_type + "_" + std::to_string(static_cast<unsigned>(::getpid())));
+  fs::remove_all(root);
+  fs::create_directories(root / "snapshots");
+  fs::create_directories(root / "wal");
+
+  nvecd::config::Config config;
+  config.api.tcp.bind = "127.0.0.1";
+  config.api.tcp.port = 0;
+  config.network.allow_cidrs = {"127.0.0.1/32"};
+  config.perf.max_connections = 10;
+  config.perf.thread_pool_size = 2;
+  config.snapshot.dir = (root / "snapshots").string();
+  config.snapshot.mode = "lock";
+  config.snapshot.interval_sec = 0;
+  config.wal.enabled = true;
+  config.wal.dir = (root / "wal").string();
+  config.wal.sync_on_write = true;
+  config.vectors.default_dimension = 3;
+  config.events.ctx_buffer_size = 100;
+  config.similarity.default_top_k = 10;
+  config.similarity.max_top_k = 100;
+  config.similarity.index_type = index_type;
+  // Small IVF geometry so a handful of vectors trains and seals; probing every
+  // cell makes the result exact.
+  config.similarity.ivf_nlist = 2;
+  config.similarity.ivf_nprobe = 2;
+  config.similarity.ivf_train_threshold = 4;
+  config.similarity.ivf_seal_threshold = 4;
+
+  const std::vector<std::string> snapshot_ids = {"snap_a", "snap_b", "snap_c", "snap_d"};
+  const std::vector<std::string> tail_ids = {"tail_a", "tail_b"};
+
+  {
+    nvecd::server::NvecdServer server(config);
+    ASSERT_TRUE(server.Start().has_value());
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    TcpClient client("127.0.0.1", server.GetPort());
+    ASSERT_TRUE(ContainsOK(client.SendCommand("VECSET snap_a 1.0 0.0 0.0")));
+    ASSERT_TRUE(ContainsOK(client.SendCommand("VECSET snap_b 0.9 0.1 0.0")));
+    ASSERT_TRUE(ContainsOK(client.SendCommand("VECSET snap_c 0.8 0.2 0.0")));
+    ASSERT_TRUE(ContainsOK(client.SendCommand("VECSET snap_d 0.0 1.0 0.0")));
+    ASSERT_NE(client.SendCommand("DUMP SAVE").find("OK"), std::string::npos);
+    ASSERT_TRUE(ContainsOK(client.SendCommand("VECSET tail_a 0.95 0.05 0.0")));
+    ASSERT_TRUE(ContainsOK(client.SendCommand("VECSET tail_b 0.0 0.0 1.0")));
+    client.Close();
+    server.Stop();
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+
+  {
+    nvecd::server::NvecdServer server(config);
+    ASSERT_TRUE(server.Start().has_value());
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    TcpClient client("127.0.0.1", server.GetPort());
+
+    // IVF trains and seals in the background after the rebuild, so allow it time.
+    std::string reply;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    do {
+      reply = client.SendCommand("SIMV 10 1.0 0.0 0.0");
+      if (ReplyListsAll(reply, snapshot_ids) && ReplyListsAll(reply, tail_ids)) {
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    } while (std::chrono::steady_clock::now() < deadline);
+    EXPECT_TRUE(ReplyListsAll(reply, snapshot_ids)) << index_type << " lost snapshot vectors: " << reply;
+    EXPECT_TRUE(ReplyListsAll(reply, tail_ids)) << index_type << " lost WAL-tail vectors: " << reply;
+
+    // A write after recovery goes through the incremental path onto the rebuilt index.
+    ASSERT_TRUE(ContainsOK(client.SendCommand("VECSET post_restart 0.99 0.01 0.0")));
+    reply = client.SendCommand("SIMV 10 1.0 0.0 0.0");
+    EXPECT_TRUE(ReplyListsAll(reply, snapshot_ids)) << index_type << ": " << reply;
+    EXPECT_TRUE(ReplyListsAll(reply, tail_ids)) << index_type << ": " << reply;
+    EXPECT_NE(reply.find("post_restart"), std::string::npos) << index_type << ": " << reply;
+
+    client.Close();
+    server.Stop();
+  }
+
+  fs::remove_all(root);
+}
+
+}  // namespace
+
+TEST(AnnRestartRecoveryE2ETest, HnswIndexCoversSnapshotAndWalTailAfterRestart) {
+  ExpectAnnCoversRecoveredVectors("hnsw");
+}
+
+TEST(AnnRestartRecoveryE2ETest, IvfIndexCoversSnapshotAndWalTailAfterRestart) {
+  ExpectAnnCoversRecoveredVectors("ivf");
 }

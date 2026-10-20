@@ -143,13 +143,26 @@ class RequestDispatcher {
   std::string Dispatch(const std::string& request, ConnectionContext& conn_ctx);
 
   /**
+   * @brief Answer a request the server refuses before dispatch (rate limit)
+   *
+   * The request is accounted as one failed command under the group its verb
+   * names, exactly as a dispatched failure would be.
+   *
+   * @param request Request line as received
+   * @param message Error text sent in the ERROR reply
+   * @return ERROR response
+   */
+  std::string Refuse(const std::string& request, const std::string& message);
+
+  /**
    * @brief Re-apply a single WAL record during crash recovery
    *
    * Decodes @p record into a Command and applies it through ApplyWrite so the
    * in-memory state is reconstructed by the same code path live traffic uses.
    * This must never re-append to the WAL: callers perform replay while
    * HandlerContext::wal is still null, so the append inside ApplyWrite is
-   * skipped.
+   * skipped. An EVENT record is appended through EventStore::ReplayEvent
+   * instead, because the live run already made its dedup decision.
    *
    * Recovery is fail-closed. A decode failure, a CRC mismatch, a torn record
    * or any apply error other than the cases below is corruption: it is

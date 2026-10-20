@@ -444,6 +444,33 @@ TEST_F(HandlerTest, Info_WithCache_ShowsCacheStats) {
   EXPECT_THAT(*result, HasSubstr("cache_misses: 0"));
 }
 
+TEST_F(HandlerTest, Info_DisabledCacheReportsTheFiguresCacheStatsReports) {
+  ASSERT_TRUE(cache_->Insert(nvecd::cache::CacheKey{1, 2}, {{"item1", 1.0F}}, 1.0));
+  ASSERT_TRUE(cache_->Lookup(nvecd::cache::CacheKey{1, 2}).has_value());
+  ASSERT_FALSE(cache_->Lookup(nvecd::cache::CacheKey{3, 4}).has_value());
+  ASSERT_TRUE(HandleCacheDisable(*ctx_).has_value());
+
+  auto info = HandleInfo(*ctx_);
+  auto cache_stats = HandleCacheStats(*ctx_);
+  ASSERT_TRUE(info.has_value());
+  ASSERT_TRUE(cache_stats.has_value());
+  for (const char* line : {"cache_entries: 1\n", "cache_hits: 1\n", "cache_misses: 1\n"}) {
+    EXPECT_THAT(*info, HasSubstr(line));
+    EXPECT_THAT(*cache_stats, HasSubstr(line));
+  }
+}
+
+TEST_F(HandlerTest, Info_UsedMemoryIsTheVectorMatrixFigure) {
+  ASSERT_TRUE(vector_store_->SetVector("item1", {1.0F, 0.0F, 0.0F}).has_value());
+  const uint64_t expected = vector_store_->GetVectorCount() * vector_store_->GetDimension() * sizeof(float);
+  ASSERT_GT(expected, 0U);
+  EXPECT_EQ(VectorMatrixBytes(*ctx_), expected);
+  EXPECT_EQ(GatherMemoryFigures(*ctx_).vector_matrix_bytes, expected);
+  auto info = HandleInfo(*ctx_);
+  ASSERT_TRUE(info.has_value());
+  EXPECT_THAT(*info, HasSubstr("used_memory_bytes: " + std::to_string(expected) + "\n"));
+}
+
 TEST_F(HandlerTest, Info_ContainsDynamicMemoryHealth) {
   auto result = HandleInfo(*ctx_);
   ASSERT_TRUE(result.has_value());
@@ -564,6 +591,54 @@ TEST_F(HandlerTest, ConfigVerify_FileInsideAllowedRootIsAccepted) {
   auto result = HandleConfigVerify(*ctx_, inside.string());
   ASSERT_TRUE(result.has_value()) << result.error().message();
   EXPECT_THAT(*result, HasSubstr("Configuration is valid"));
+}
+
+TEST_F(HandlerTest, ConfigVerify_UnopenablePathsInsideTheRootGiveTheSharedMessage) {
+  std::filesystem::create_directories(dump_dir_ / "subdir");
+  const std::filesystem::path unreadable = dump_dir_ / "unreadable.yaml";
+  {
+    std::ofstream out(unreadable);
+    out << "vectors:\n  default_dimension: 3\n";
+  }
+  std::filesystem::permissions(unreadable, std::filesystem::perms::none);
+
+  std::vector<std::string> paths = {".", "./", dump_dir_.string(), "subdir"};
+  if (::geteuid() != 0) {
+    paths.push_back(unreadable.string());
+  }
+  for (const auto& path : paths) {
+    auto result = HandleConfigVerify(*ctx_, path);
+    ASSERT_FALSE(result.has_value()) << path;
+    EXPECT_EQ(result.error().code(), nvecd::utils::ErrorCode::kPermissionDenied) << path;
+    EXPECT_EQ(result.error().message(), "Configuration file is not accessible") << path;
+  }
+  std::filesystem::permissions(unreadable, std::filesystem::perms::owner_all);
+}
+
+TEST_F(HandlerTest, ConfigVerify_ANameContainingTwoDotsIsNotTraversal) {
+  const std::filesystem::path inside = dump_dir_ / "nightly..v2.yaml";
+  {
+    std::ofstream out(inside);
+    ASSERT_TRUE(out.is_open());
+    out << "vectors:\n  default_dimension: 3\n";
+  }
+  auto result = HandleConfigVerify(*ctx_, "nightly..v2.yaml");
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+}
+
+TEST_F(HandlerTest, ConfigVerify_SchemaViolationCarriesThePrefixOnce) {
+  const std::filesystem::path inside = dump_dir_ / "schema_invalid.yaml";
+  {
+    std::ofstream out(inside);
+    ASSERT_TRUE(out.is_open());
+    out << "vectors:\n  default_dimension: 999999\n";
+  }
+  auto result = HandleConfigVerify(*ctx_, inside.string());
+  ASSERT_FALSE(result.has_value());
+  const std::string& message = result.error().message();
+  EXPECT_EQ(message.rfind("Configuration validation failed: ", 0), 0U) << message;
+  EXPECT_EQ(message.find("Configuration validation failed", 1), std::string::npos) << message;
+  EXPECT_EQ(message.find_first_of("\r\n"), std::string::npos) << message;
 }
 
 // ============================================================================

@@ -8,6 +8,7 @@
 #include <string_view>
 
 #include "server/argument_validation.h"
+#include "utils/wire_limits.h"
 
 namespace nvecd::server {
 
@@ -122,14 +123,29 @@ utils::Expected<vectors::MetadataFilter, utils::Error> ParseSimpleFilter(const s
   return filter;
 }
 
+utils::Expected<void, utils::Error> ValidateMetadata(const vectors::Metadata& metadata) {
+  if (metadata.empty()) {
+    return utils::MakeUnexpected(
+        utils::MakeError(utils::ErrorCode::kCommandInvalidArgument, "METASET requires at least one key:value pair"));
+  }
+  constexpr std::string_view kFilterSyntax = ",:=<>!";
+  for (const auto& entry : metadata) {
+    const std::string& key = entry.first;
+    const bool addressable =
+        !key.empty() && utils::IsSingleToken(key) && key.find_first_of(kFilterSyntax) == std::string::npos;
+    if (!addressable) {
+      return utils::MakeUnexpected(utils::MakeError(
+          utils::ErrorCode::kCommandInvalidArgument,
+          "Metadata keys must be non-empty with no whitespace, control character, ',' or filter operator (: = < > !)"));
+    }
+  }
+  return {};
+}
+
 utils::Expected<vectors::Metadata, utils::Error> ParseMetadataPairs(const std::string& expr) {
   auto parsed = ParseSimpleFilter(expr);
   if (!parsed) {
     return utils::MakeUnexpected(parsed.error());
-  }
-  if (parsed->conditions.empty()) {
-    return utils::MakeUnexpected(
-        utils::MakeError(utils::ErrorCode::kCommandInvalidArgument, "METASET requires at least one key:value pair"));
   }
   vectors::Metadata metadata;
   for (auto& condition : parsed->conditions) {
@@ -141,6 +157,9 @@ utils::Expected<vectors::Metadata, utils::Error> ParseMetadataPairs(const std::s
           "METASET accepts only key:value pairs, got '" + condition.field + "' with a comparison or in(...) value"));
     }
     metadata[condition.field] = std::move(condition.value);
+  }
+  if (auto valid = ValidateMetadata(metadata); !valid) {
+    return utils::MakeUnexpected(valid.error());
   }
   return metadata;
 }

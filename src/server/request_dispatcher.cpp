@@ -104,6 +104,28 @@ utils::Expected<void, utils::Error> AppendToWal(HandlerContext& ctx, const Comma
   return {};
 }
 
+/// Co-occurrence delta and cache invalidation for an event the store appended,
+/// shared by live ingestion and WAL replay.
+void IndexStoredEvent(HandlerContext& ctx, const Command& cmd, const events::EventStore::IngestResult& stored) {
+  // Update co-occurrence index incrementally (only new pairs, once each).
+  if (ctx.co_index != nullptr) {
+    events::CoOccurrenceIndex::IngestOptions options;
+    if (ctx.config != nullptr) {
+      options.temporal_enabled = ctx.config->events.temporal_cooccurrence;
+      options.half_life_sec = ctx.config->events.temporal_half_life_sec;
+      options.negative_signals = ctx.config->events.negative_signals;
+      options.negative_weight = ctx.config->events.negative_weight;
+    }
+    ctx.co_index->ApplyIngestedEvent(cmd.ctx, stored.prior_events, stored.stored_event, options);
+  }
+
+  // Selective cache invalidation for mutated item
+  auto* cache_ptr = ctx.cache.load(std::memory_order_acquire);
+  if (cache_ptr != nullptr) {
+    cache_ptr->InvalidateByItemId(cmd.id);
+  }
+}
+
 utils::Expected<WriteOutcome, utils::Error> ApplyEvent(HandlerContext& ctx, const Command& cmd) {
   if (ctx.event_store == nullptr) {
     return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kInternalError, "EventStore not initialized"));
@@ -146,25 +168,27 @@ utils::Expected<WriteOutcome, utils::Error> ApplyEvent(HandlerContext& ctx, cons
         utils::MakeError(utils::ErrorCode::kInternalError, "Event apply diverged after WAL acceptance"));
   }
 
-  // Update co-occurrence index incrementally (only new pairs, once each).
-  if (ctx.co_index != nullptr) {
-    events::CoOccurrenceIndex::IngestOptions options;
-    if (ctx.config != nullptr) {
-      options.temporal_enabled = ctx.config->events.temporal_cooccurrence;
-      options.half_life_sec = ctx.config->events.temporal_half_life_sec;
-      options.negative_signals = ctx.config->events.negative_signals;
-      options.negative_weight = ctx.config->events.negative_weight;
-    }
-    ctx.co_index->ApplyIngestedEvent(cmd.ctx, result->prior_events, result->stored_event, options);
-  }
-
-  // Selective cache invalidation for mutated item
-  auto* cache_ptr = ctx.cache.load(std::memory_order_acquire);
-  if (cache_ptr != nullptr) {
-    cache_ptr->InvalidateByItemId(cmd.id);
-  }
-
+  IndexStoredEvent(ctx, cmd, *result);
   return WriteOutcome{CommandType::kEvent, /*dimension=*/0};
+}
+
+/// Apply a WAL EVENT record: appended unconditionally, since the live run
+/// already judged it against the dedup and state caches when it was logged.
+utils::Expected<void, utils::Error> ReplayEventRecord(HandlerContext& ctx, const Command& cmd) {
+  if (ctx.event_store == nullptr) {
+    return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kInternalError, "EventStore not initialized"));
+  }
+  std::unique_lock<std::mutex> write_serialization_guard;
+  if (ctx.write_serialization_gate != nullptr) {
+    write_serialization_guard = std::unique_lock(*ctx.write_serialization_gate);
+  }
+  auto result = ctx.event_store->ReplayEvent(
+      cmd.ctx, events::Event(cmd.id, cmd.score, cmd.timestamp.value_or(0), cmd.event_type));
+  if (!result) {
+    return utils::MakeUnexpected(result.error());
+  }
+  IndexStoredEvent(ctx, cmd, *result);
+  return {};
 }
 
 utils::Expected<WriteOutcome, utils::Error> ApplyVecset(HandlerContext& ctx, const Command& cmd) {
@@ -472,7 +496,8 @@ utils::Expected<SearchOutcome, utils::Error> ExecuteSearch(HandlerContext& ctx, 
   // Measured before the gate below, so lock waits never count as query cost.
   const double elapsed_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 
-  if (cache_enabled) {
+  // A result the cache would refuse anyway takes no write-path lock.
+  if (cache_enabled && cache_ptr->WouldAdmit(elapsed_ms, search_type)) {
     std::unique_lock<std::mutex> generation_guard;
     if (ctx.write_serialization_gate != nullptr) {
       generation_guard = std::unique_lock(*ctx.write_serialization_gate);
@@ -506,9 +531,9 @@ std::string RequestDispatcher::Dispatch(const std::string& request, ConnectionCo
   const uint32_t max_top_k = ctx_.config != nullptr ? ctx_.config->similarity.max_top_k : 0;
   auto cmd = ParseCommand(request, max_top_k);
   if (!cmd) {
-    // A rejected request is still a command the client sent: account it so the
-    // failure ratio an operator alerts on cannot exceed one.
-    CommandStatsScope parse_failure_scope(ctx_.stats, CommandType::kUnknown);
+    // A rejected request is still a command the client sent: account it under
+    // the group its verb names so the failure ratio cannot exceed one.
+    CommandStatsScope parse_failure_scope(ctx_.stats, ClassifyRequest(request));
     utils::LogCommandParseError(request, cmd.error().message(), 0);
     return FormatError(cmd.error().message());
   }
@@ -672,6 +697,11 @@ std::string RequestDispatcher::Dispatch(const std::string& request, ConnectionCo
   return *result;
 }
 
+std::string RequestDispatcher::Refuse(const std::string& request, const std::string& message) {
+  CommandStatsScope refused_scope(ctx_.stats, ClassifyRequest(request));
+  return FormatError(message);
+}
+
 utils::Expected<std::string, utils::Error> RequestDispatcher::HandleWrite(const Command& cmd) const {
   auto outcome = ApplyWrite(ctx_, cmd);
   if (!outcome) {
@@ -738,8 +768,8 @@ utils::Expected<std::string, utils::Error> RequestDispatcher::HandleConfigShow(c
       ctx_.vector_store != nullptr ? static_cast<uint32_t>(ctx_.vector_store->GetDimension()) : 0;
   server_ctx.contexts_total = ctx_.event_store != nullptr ? ctx_.event_store->GetContextCount() : 0;
   server_ctx.events_total = ctx_.event_store != nullptr ? ctx_.event_store->GetTotalEventCount() : 0;
-  auto* cache_ptr = ctx_.cache.load(std::memory_order_acquire);
-  server_ctx.cache_enabled = (cache_ptr != nullptr);
+  const auto* cache_ptr = handlers::ReportedCache(ctx_);
+  server_ctx.cache_enabled = cache_ptr != nullptr && cache_ptr->IsEnabled();
   if (cache_ptr != nullptr) {
     auto cache_stats = cache_ptr->GetStatistics();
     server_ctx.cache_hits = cache_stats.cache_hits;
@@ -885,8 +915,14 @@ utils::Expected<void, utils::Error> RequestDispatcher::ReplayRecord(const storag
 
   // Re-apply through the same write choke point live traffic uses, so recovery
   // reconstructs exactly the state the original command produced. ctx_.wal is
-  // null during replay, so the record is not appended a second time.
-  if (applied) {
+  // null during replay, so the record is not appended a second time. EVENT
+  // records skip the dedup decision the live run already made.
+  if (applied && decoded->type == CommandType::kEvent) {
+    auto replayed = ReplayEventRecord(ctx_, *decoded);
+    if (!replayed) {
+      applied = utils::MakeUnexpected(replayed.error());
+    }
+  } else if (applied) {
     applied = ApplyWrite(ctx_, *decoded);
   }
 

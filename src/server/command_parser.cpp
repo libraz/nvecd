@@ -9,6 +9,7 @@
 #include "server/command_parser.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cmath>
 #include <string_view>
@@ -104,6 +105,11 @@ utils::Expected<uint64_t, utils::Error> ParseTimestampOption(const std::string& 
                                                   "Invalid option: " + str + " (expected timestamp=<value>)"));
   }
   return ParseTimestamp(std::string_view(str).substr(kTimestampPrefixLength));
+}
+
+/// Name of a "name=value" option token; the whole token when it has no '='.
+std::string_view OptionName(std::string_view token) {
+  return token.substr(0, token.find('='));
 }
 
 /**
@@ -307,6 +313,9 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request, 
     }
     cmd.type = CommandType::kVecdel;
     cmd.id = tokens[1];
+    if (auto id_check = ValidateItemId(cmd.id); !id_check) {
+      return utils::MakeUnexpected(id_check.error());
+    }
 
   } else if (cmd_name == "METASET") {
     // METASET <id> <key:value[,key:value...]>
@@ -316,6 +325,9 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request, 
     }
     cmd.type = CommandType::kMetaset;
     cmd.id = tokens[1];
+    if (auto id_check = ValidateItemId(cmd.id); !id_check) {
+      return utils::MakeUnexpected(id_check.error());
+    }
     auto metadata = ParseMetadataPairs(tokens[2]);
     if (!metadata) {
       return utils::MakeUnexpected(metadata.error());
@@ -330,6 +342,9 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request, 
     }
     cmd.type = CommandType::kSim;
     cmd.id = tokens[1];
+    if (auto id_check = ValidateItemId(cmd.id); !id_check) {
+      return utils::MakeUnexpected(id_check.error());
+    }
 
     auto top_k_result = ParseTopK(tokens[2], max_top_k);
     if (!top_k_result) {
@@ -367,15 +382,8 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request, 
           return utils::MakeUnexpected(val.error());
         }
         cmd.min_score = *val;
-      } else if (tokens[i].rfind("candidate_limit=", 0) == 0) {
-        return utils::MakeUnexpected(
-            utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "candidate_limit option is not supported"));
-      } else if (tokens[i].rfind("explain=", 0) == 0) {
-        return utils::MakeUnexpected(
-            utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "explain option is not supported"));
       } else {
-        return utils::MakeUnexpected(
-            utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "Invalid SIM option: " + tokens[i]));
+        return utils::MakeUnexpected(UnsupportedSearchOption("SIM", OptionName(tokens[i]), tokens[i]));
       }
     }
 
@@ -411,15 +419,8 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request, 
           return utils::MakeUnexpected(val.error());
         }
         cmd.min_score = *val;
-      } else if (tokens[i].rfind("candidate_limit=", 0) == 0) {
-        return utils::MakeUnexpected(
-            utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "candidate_limit option is not supported"));
-      } else if (tokens[i].rfind("explain=", 0) == 0) {
-        return utils::MakeUnexpected(
-            utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "explain option is not supported"));
       } else {
-        return utils::MakeUnexpected(
-            utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "Invalid SIMV option: " + tokens[i]));
+        return utils::MakeUnexpected(UnsupportedSearchOption("SIMV", OptionName(tokens[i]), tokens[i]));
       }
       vec_start = i + 1;
     }
@@ -444,6 +445,9 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request, 
     cmd.vector = std::move(vec);
 
   } else if (cmd_name == "INFO") {
+    if (tokens.size() != 1) {
+      return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "INFO takes no arguments"));
+    }
     cmd.type = CommandType::kInfo;
 
   } else if (cmd_name == "CONFIG") {
@@ -463,7 +467,11 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request, 
       return utils::MakeUnexpected(
           utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "Unknown CONFIG subcommand: " + subcmd));
     }
-    if (tokens.size() >= 3) {
+    if (tokens.size() > 3) {
+      return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandSyntaxError,
+                                                    "CONFIG " + subcmd + " takes at most 1 argument: [path]"));
+    }
+    if (tokens.size() == 3) {
       cmd.path = tokens[2];
     }
 
@@ -488,7 +496,15 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request, 
       return utils::MakeUnexpected(
           utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "Unknown DUMP subcommand: " + subcmd));
     }
-    if (tokens.size() >= 3) {
+    if (cmd.type == CommandType::kDumpStatus && tokens.size() != 2) {
+      return utils::MakeUnexpected(
+          utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "DUMP STATUS takes no arguments"));
+    }
+    if (tokens.size() > 3) {
+      return utils::MakeUnexpected(utils::MakeError(utils::ErrorCode::kCommandSyntaxError,
+                                                    "DUMP " + subcmd + " takes at most 1 argument: <filepath>"));
+    }
+    if (tokens.size() == 3) {
       cmd.path = tokens[2];
     }
 
@@ -527,6 +543,10 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request, 
       return utils::MakeUnexpected(
           utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "Unknown CACHE subcommand: " + subcommand));
     }
+    if (tokens.size() != 2) {
+      return utils::MakeUnexpected(
+          utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "CACHE " + subcommand + " takes no arguments"));
+    }
 
   } else if (cmd_name == "SET") {
     // SET <variable_name> <value>
@@ -548,7 +568,7 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request, 
 
   } else if (cmd_name == "GET") {
     // GET <variable_name>
-    if (tokens.size() < 2) {
+    if (tokens.size() != 2) {
       return utils::MakeUnexpected(
           utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "GET requires 1 argument: <variable_name>"));
     }
@@ -565,8 +585,11 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request, 
     if (subcmd == "VARIABLES") {
       cmd.type = CommandType::kShowVariables;
       // Parse optional LIKE pattern
-      if (tokens.size() >= 4 && ToUpper(tokens[2]) == "LIKE") {
+      if (tokens.size() == 4 && ToUpper(tokens[2]) == "LIKE") {
         cmd.pattern = tokens[3];
+      } else if (tokens.size() != 2) {
+        return utils::MakeUnexpected(
+            utils::MakeError(utils::ErrorCode::kCommandSyntaxError, "SHOW VARIABLES accepts only: [LIKE <pattern>]"));
       }
     } else {
       return utils::MakeUnexpected(
@@ -579,6 +602,42 @@ utils::Expected<Command, utils::Error> ParseCommand(const std::string& request, 
   }
 
   return cmd;
+}
+
+CommandType ClassifyRequest(const std::string& request) {
+  const auto tokens = Split(Trim(request), ' ');
+  if (tokens.empty()) {
+    return CommandType::kUnknown;
+  }
+  const std::string verb = ToUpper(tokens[0]);
+  struct VerbType {
+    std::string_view verb;
+    CommandType type;
+  };
+  // Subcommand verbs map to one member of their family; only the group is used.
+  static constexpr std::array<VerbType, 15> kVerbs = {{
+      {"EVENT", CommandType::kEvent},
+      {"VECSET", CommandType::kVecset},
+      {"VECDEL", CommandType::kVecdel},
+      {"METASET", CommandType::kMetaset},
+      {"SIM", CommandType::kSim},
+      {"SIMV", CommandType::kSimv},
+      {"INFO", CommandType::kInfo},
+      {"CONFIG", CommandType::kConfigShow},
+      {"DUMP", CommandType::kDumpStatus},
+      {"CACHE", CommandType::kCacheStats},
+      {"DEBUG", CommandType::kDebugOn},
+      {"SET", CommandType::kSet},
+      {"GET", CommandType::kGet},
+      {"SHOW", CommandType::kShowVariables},
+      {"AUTH", CommandType::kAuth},
+  }};
+  for (const auto& entry : kVerbs) {
+    if (entry.verb == verb) {
+      return entry.type;
+    }
+  }
+  return CommandType::kUnknown;
 }
 
 }  // namespace nvecd::server

@@ -575,3 +575,43 @@ TEST(CommandParserTest, AuthPasswordIsEverythingAfterTheSeparator) {
     EXPECT_EQ(result.error().code(), ErrorCode::kCommandSyntaxError) << request;
   }
 }
+
+TEST(CommandParserTest, AdminCommandsRejectExtraAndMissingTokens) {
+  for (const char* request :
+       {"INFO now", "DUMP INFO my snap.nvec", "DUMP STATUS now", "DUMP SAVE a b", "CONFIG SHOW a b", "CACHE STATS now",
+        "GET a b", "SHOW VARIABLES cache.%", "SHOW VARIABLES LIKE", "SHOW VARIABLES LIKE a b"}) {
+    auto result = ParseCommand(request);
+    ASSERT_FALSE(result.has_value()) << request;
+    EXPECT_EQ(result.error().code(), ErrorCode::kCommandSyntaxError) << request;
+  }
+  for (const char* request : {"INFO", "DUMP INFO snap.nvec", "DUMP STATUS", "DUMP SAVE", "CONFIG SHOW", "CACHE STATS",
+                              "GET a", "SHOW VARIABLES", "SHOW VARIABLES LIKE cache.%"}) {
+    EXPECT_TRUE(ParseCommand(request).has_value()) << request;
+  }
+  EXPECT_EQ(ParseCommand("SHOW VARIABLES like cache.%")->pattern, "cache.%");
+}
+
+TEST(CommandParserTest, LookupIdsFollowTheStoredIdentifierRule) {
+  for (const char* request : {"SIM a\x01 5", "METASET a\x7F k:v", "VECDEL a\x02"}) {
+    auto result = ParseCommand(request);
+    ASSERT_FALSE(result.has_value()) << request;
+    EXPECT_EQ(result.error().code(), ErrorCode::kInvalidArgument) << request;
+    EXPECT_EQ(result.error().message(), "ID must not contain whitespace or control characters");
+  }
+}
+
+TEST(CommandParserTest, ClassifyRequestNamesTheVerbsCommandFamily) {
+  EXPECT_EQ(ClassifyRequest("SIM only_id\r\n"), CommandType::kSim);
+  EXPECT_EQ(ClassifyRequest("  simv 3 x"), CommandType::kSimv);
+  EXPECT_EQ(ClassifyRequest("CONFIG BOGUS"), CommandType::kConfigShow);
+  EXPECT_EQ(ClassifyRequest("VECSET"), CommandType::kVecset);
+  EXPECT_EQ(ClassifyRequest("NOPE 1"), CommandType::kUnknown);
+  EXPECT_EQ(ClassifyRequest(""), CommandType::kUnknown);
+}
+
+TEST(CommandParserTest, UnsupportedSearchOptionsKeepTheirMessages) {
+  EXPECT_EQ(ParseCommand("SIM a 5 candidate_limit=10").error().message(), "candidate_limit option is not supported");
+  EXPECT_EQ(ParseCommand("SIMV 5 explain=on 1 0").error().message(), "explain option is not supported");
+  EXPECT_EQ(ParseCommand("SIM a 5 bogus=1").error().message(), "Invalid SIM option: bogus=1");
+  EXPECT_EQ(ParseCommand("SIMV 5 using=events 1 0").error().message(), "Invalid SIMV option: using=events");
+}

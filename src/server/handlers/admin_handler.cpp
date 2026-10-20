@@ -10,11 +10,13 @@
 #include "server/handlers/admin_handler.h"
 
 #include <filesystem>
+#include <fstream>
 #include <sstream>
 #include <system_error>
 
 #include "config/config.h"
 #include "config/config_help.h"
+#include "utils/path_utils.h"
 #include "utils/structured_log.h"
 #include "version.h"
 
@@ -81,7 +83,7 @@ constexpr const char* kConfigPathNotAllowed = "Configuration file is not accessi
  *
  * @param filepath Raw path from the client (absolute, or relative to the root)
  * @param allowed_root Directory the resolved path must reside in
- * @return Canonical path inside @p allowed_root, or a non-identifying error
+ * @return Canonical path of a readable regular file inside @p allowed_root, or a non-identifying error
  */
 utils::Expected<std::string, utils::Error> ResolveConfigPath(const std::string& filepath,
                                                              const std::string& allowed_root) {
@@ -92,8 +94,8 @@ utils::Expected<std::string, utils::Error> ResolveConfigPath(const std::string& 
   if (allowed_root.empty()) {
     return denied();
   }
-  // Defense-in-depth: reject traversal segments before canonicalization.
-  if (filepath.find("..") != std::string::npos) {
+  // Defense-in-depth: reject traversal components before canonicalization.
+  if (utils::HasParentComponent(filepath)) {
     return denied();
   }
 
@@ -111,8 +113,8 @@ utils::Expected<std::string, utils::Error> ResolveConfigPath(const std::string& 
   if (ec) {
     return denied();
   }
-  const auto relative = resolved_canonical.lexically_relative(root_canonical);
-  if (relative.empty() || relative.string().substr(0, 2) == "..") {
+  if (!utils::IsStrictlyInside(resolved_canonical, root_canonical) ||
+      !std::filesystem::is_regular_file(resolved_canonical, ec) || !std::ifstream(resolved_canonical).is_open()) {
     return denied();
   }
   return resolved_canonical.string();
@@ -148,6 +150,10 @@ utils::Expected<std::string, utils::Error> HandleConfigVerify(const HandlerConte
         .Field("filepath", *resolved)
         .Field("error", config_result.error().to_string())
         .Error();
+    // A schema violation already carries the prefix.
+    if (config_result.error().code() == utils::ErrorCode::kConfigValidationError) {
+      return utils::MakeUnexpected(config_result.error());
+    }
     return utils::MakeUnexpected(
         utils::MakeError(utils::ErrorCode::kConfigValidationError,
                          "Configuration validation failed: " + config_result.error().message()));

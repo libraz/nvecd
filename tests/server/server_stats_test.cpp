@@ -8,6 +8,8 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
+#include <memory>
 #include <thread>
 #include <vector>
 
@@ -43,12 +45,13 @@ TEST_F(ServerStatsTest, InitializedToZero) {
 }
 
 /**
- * @brief Test start time is reasonable
+ * @brief Uptime is measured on the monotonic clock, so a wall-clock step cannot wrap it
  */
-TEST_F(ServerStatsTest, StartTimeReasonable) {
-  uint64_t now = static_cast<uint64_t>(std::time(nullptr));
-  EXPECT_LE(stats_->start_time, now);
-  EXPECT_GT(stats_->start_time, now - 10);  // Should be within last 10 seconds
+TEST_F(ServerStatsTest, UptimeIsMeasuredOnTheSteadyClock) {
+  stats_->started_at = std::chrono::steady_clock::now() - std::chrono::seconds(5);
+  const uint64_t uptime = stats_->GetUptimeSeconds();
+  EXPECT_GE(uptime, 5U);
+  EXPECT_LE(uptime, 6U);
 }
 
 /**

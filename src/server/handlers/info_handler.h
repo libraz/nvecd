@@ -37,6 +37,17 @@ struct MemoryFigures {
 /// Read the memory figures from the stores in @p ctx; absent stores count as zero.
 MemoryFigures GatherMemoryFigures(const HandlerContext& ctx);
 
+/// MemoryFigures::vector_matrix_bytes alone, without walking any store.
+uint64_t VectorMatrixBytes(const HandlerContext& ctx);
+
+/**
+ * @brief Cache whose figures INFO, /info and /metrics report
+ *
+ * The controller's cache whether or not it is enabled, since disabling keeps
+ * its entries; otherwise the published cache. Null when there is neither.
+ */
+const cache::SimilarityCache* ReportedCache(const HandlerContext& ctx);
+
 /**
  * @brief Handle INFO command
  *

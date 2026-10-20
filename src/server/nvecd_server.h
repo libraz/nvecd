@@ -112,6 +112,11 @@ class NvecdServer {
   uint16_t GetPort() const { return acceptor_ ? acceptor_->GetPort() : 0; }
 
   /**
+   * @brief Get HTTP server port (0 when HTTP is disabled)
+   */
+  uint16_t GetHttpPort() const { return http_server_ ? static_cast<uint16_t>(http_server_->GetPort()) : 0; }
+
+  /**
    * @brief Get active connection count
    */
   size_t GetConnectionCount() const { return stats_.active_connections.load(); }

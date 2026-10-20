@@ -13,6 +13,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <string_view>
 
 #include "events/event_store.h"
@@ -28,6 +29,29 @@ inline constexpr std::string_view kSearchModeFusion = "fusion";
 
 /// True for exactly the spellings above (case-sensitive).
 bool IsValidSearchMode(std::string_view mode);
+
+/**
+ * @brief Check the item id of SIM, METASET or VECDEL
+ *
+ * The identifier rule VECSET and EVENT enforce in their stores, applied by the
+ * surfaces to the commands that only look an id up, so an id no store could
+ * hold is a client error rather than a lookup miss.
+ *
+ * @return Success or kInvalidArgument
+ */
+utils::Expected<void, utils::Error> ValidateItemId(const std::string& id);
+
+/**
+ * @brief Error for a SIM/SIMV option or body field the command does not take
+ *
+ * candidate_limit and explain have their own messages; anything else is
+ * "Invalid <command> option: <spelling>".
+ *
+ * @param command "SIM" or "SIMV"
+ * @param name Option name (the TCP token before '=', or the JSON field)
+ * @param spelling What the client sent, echoed in the message
+ */
+utils::Error UnsupportedSearchOption(std::string_view command, std::string_view name, std::string_view spelling);
 
 /**
  * @brief Parse an EVENT type word (ADD, SET or DEL), case-insensitive

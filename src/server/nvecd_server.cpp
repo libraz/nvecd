@@ -14,12 +14,14 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "cache/similarity_cache.h"
+#include "server/connection_budget.h"
 #include "server/handlers/dump_handler.h"
 #include "server/http_server.h"
 #include "server/request_dispatcher.h"
@@ -134,8 +136,13 @@ utils::Expected<void, utils::Error> NvecdServer::Start() {
   server_config.allow_cidrs = config_.network.allow_cidrs;
   server_config.parsed_allow_cidrs = utils::ParseCidrList(config_.network.allow_cidrs);
 
+  // TCP and Unix socket listeners admit against one connection budget.
+  auto connection_budget =
+      std::make_shared<ConnectionBudget>(static_cast<size_t>(std::max(0, config_.perf.max_connections)));
+
   // Create connection acceptor
   acceptor_ = std::make_unique<ConnectionAcceptor>(server_config, thread_pool_.get());
+  acceptor_->SetConnectionBudget(connection_budget);
 
   // Set connection handler
   acceptor_->SetReactorHandler(register_connection);
@@ -161,6 +168,7 @@ utils::Expected<void, utils::Error> NvecdServer::Start() {
     uds_config.send_buffer_size = config_.perf.send_buffer_size;
 
     unix_acceptor_ = std::make_unique<ConnectionAcceptor>(uds_config, thread_pool_.get());
+    unix_acceptor_->SetConnectionBudget(connection_budget);
     unix_acceptor_->SetReactorHandler(register_connection);
 
     auto uds_result = unix_acceptor_->Start();
@@ -637,7 +645,7 @@ std::string NvecdServer::ProcessRequest(const std::string& request, ConnectionCo
   // Rate limit check
   if (rate_limiter_ && !conn_ctx.client_ip.empty() && conn_ctx.client_ip != "unix") {
     if (!rate_limiter_->Allow(conn_ctx.client_ip)) {
-      return "ERROR Rate limit exceeded\r\n";
+      return dispatcher_->Refuse(request, "Rate limit exceeded");
     }
   }
 

@@ -543,6 +543,86 @@ TEST_F(HttpServerTest, SimAndSimvRejectWrongOptionalFieldTypesWithBadRequest) {
   EXPECT_EQ(invalid_top_k_response->status, 400);
 }
 
+TEST_F(HttpServerTest, SimAndSimvRefuseFieldsTheyDoNotTakeWithTheTcpMessages) {
+  const json vector = json::array({1.0, 0.0, 0.0, 0.0});
+  const std::vector<std::pair<std::string, json>> cases = {
+      {"/sim", json{{"id", "item"}, {"bogus", 1}}},
+      {"/sim", json{{"id", "item"}, {"candidate_limit", 10}}},
+      {"/sim", json{{"id", "item"}, {"explain", true}}},
+      {"/simv", json{{"vector", vector}, {"mode", "events"}}},
+      {"/simv", json{{"vector", vector}, {"adaptive", true}}},
+  };
+  const std::vector<std::string> messages = {"Invalid SIM option: bogus", "candidate_limit option is not supported",
+                                             "explain option is not supported", "Invalid SIMV option: mode",
+                                             "Invalid SIMV option: adaptive"};
+  for (size_t i = 0; i < cases.size(); ++i) {
+    auto res = client_->Post(cases[i].first, cases[i].second.dump(), "application/json");
+    ASSERT_TRUE(res);
+    EXPECT_EQ(res->status, 400) << cases[i].second.dump();
+    EXPECT_EQ(json::parse(res->body)["error"], messages[i]);
+  }
+}
+
+TEST_F(HttpServerTest, WriteRoutesRefuseUnknownFieldsWithoutTouchingTheStore) {
+  auto res = client_->Post("/vecset", R"({"id":"item","vector":[1,0,0,0],"dimension":4})", "application/json");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(res->status, 400);
+  EXPECT_EQ(json::parse(res->body)["error"], "Unknown field: dimension");
+  EXPECT_FALSE(vector_store_->HasVector("item"));
+}
+
+TEST_F(HttpServerTest, MetadataFollowsTheMetasetPairRulesOnHttp) {
+  ASSERT_TRUE(vector_store_->SetVector("item", {1.0F, 0.0F, 0.0F, 0.0F}).has_value());
+  metadata_store_->Set("item", {{"k", std::string("original")}});
+
+  for (const char* metadata : {"{}", R"({"a:b":"v"})", R"({"a,b":"v"})", R"({"a b":"v"})"}) {
+    const std::string body = std::string(R"({"id":"item","metadata":)") + metadata + "}";
+    auto res = client_->Post("/metaset", body, "application/json");
+    ASSERT_TRUE(res);
+    EXPECT_EQ(res->status, 400) << metadata;
+  }
+  auto vecset = client_->Post("/vecset", R"({"id":"item2","vector":[1,0,0,0],"metadata":{}})", "application/json");
+  ASSERT_TRUE(vecset);
+  EXPECT_EQ(vecset->status, 400);
+
+  ASSERT_TRUE(metadata_store_->Get("item").has_value());
+  EXPECT_EQ(std::get<std::string>(metadata_store_->Get("item")->at("k")), "original");
+  EXPECT_FALSE(vector_store_->HasVector("item2"));
+}
+
+TEST_F(HttpServerTest, LookupRoutesRejectAnInvalidIdWithBadRequest) {
+  for (const char* id : {"", " item", "a\tb"}) {
+    for (const char* mode : {"events", "vectors", "fusion"}) {
+      json sim = {{"id", id}, {"mode", mode}};
+      auto res = client_->Post("/sim", sim.dump(), "application/json");
+      ASSERT_TRUE(res);
+      EXPECT_EQ(res->status, 400) << mode << " '" << id << "'";
+    }
+    json metaset = {{"id", id}, {"metadata", {{"k", "v"}}}};
+    auto meta_res = client_->Post("/metaset", metaset.dump(), "application/json");
+    ASSERT_TRUE(meta_res);
+    EXPECT_EQ(meta_res->status, 400) << id;
+    json vecdel = {{"id", id}};
+    auto del_res = client_->Delete("/vecset", vecdel.dump(), "application/json");
+    ASSERT_TRUE(del_res);
+    EXPECT_EQ(del_res->status, 400) << id;
+  }
+}
+
+TEST_F(HttpServerTest, SearchRendersAStoredIdThatIsNotValidUtf8) {
+  const std::string bad_id = "item\xC3\x28";
+  ASSERT_TRUE(vector_store_->SetVector(bad_id, {1.0F, 0.0F, 0.0F, 0.0F}).has_value());
+  ASSERT_TRUE(vector_store_->SetVector("query", {1.0F, 0.0F, 0.0F, 0.0F}).has_value());
+
+  auto simv = client_->Post("/simv", R"({"vector":[1,0,0,0],"top_k":5})", "application/json");
+  ASSERT_TRUE(simv);
+  EXPECT_EQ(simv->status, 200) << simv->body;
+  auto sim = client_->Post("/sim", R"({"id":"query","top_k":5,"mode":"vectors"})", "application/json");
+  ASSERT_TRUE(sim);
+  EXPECT_EQ(sim->status, 200) << sim->body;
+  EXPECT_EQ(json::parse(sim->body)["count"], 1);
+}
+
 TEST_F(HttpServerTest, BindFailureIsReportedSynchronouslyAndStopStillJoinsSafely) {
   server::HttpServerConfig duplicate_config;
   duplicate_config.bind = "invalid-bind-address";
@@ -946,6 +1026,8 @@ TEST_F(HttpServerTest, FullWorkflow) {
   ASSERT_EQ(res7->status, 200);
   EXPECT_TRUE(res7->body.find("nvecd_vectors_total 2") != std::string::npos);
   EXPECT_TRUE(res7->body.find("nvecd_events_total 2") != std::string::npos);
+  EXPECT_NE(res7->body.find("# TYPE nvecd_events_total counter\n"), std::string::npos);
+  EXPECT_EQ(event_store_->GetTotalEventCount(), 2U);
 
   // 6. Check info
   auto res8 = client_->Get("/info");
@@ -1121,14 +1203,38 @@ TEST_F(HttpServerTest, DumpResponsesReportPathsContainingWhitespaceWhole) {
   config_->snapshot.mode = "lock";
   vector_store_->SetVector("item", {1.0F, 0.0F, 0.0F, 0.0F});
 
-  const std::string expected = fs::weakly_canonical(dir / "with space.nvec").string();
-  json body = {{"filepath", "with space.nvec"}};
+  // The operator's directory may contain a space; a requested name may not.
+  const std::string expected = fs::weakly_canonical(dir / "snap.nvec").string();
+  json body = {{"filepath", "snap.nvec"}};
   for (const char* route : {"/dump/save", "/dump/verify", "/dump/load"}) {
     auto res = client_->Post(route, body.dump(), "application/json");
     ASSERT_TRUE(res) << route;
     ASSERT_EQ(res->status, 200) << route << " -> " << res->body;
     EXPECT_EQ(json::parse(res->body)["filepath"], expected) << route;
   }
+  handler_ctx_.dump_dir = "";
+  fs::remove_all(dir);
+}
+
+TEST_F(HttpServerTest, DumpPathsThatCannotBeOneProtocolTokenAreRejected) {
+  namespace fs = std::filesystem;
+  const fs::path dir = fs::temp_directory_path() / ("nvecd_http_token_" + std::to_string(::getpid()));
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+  fs::permissions(dir, fs::perms::owner_all, fs::perm_options::replace);
+  handler_ctx_.dump_dir = dir.string();
+  config_->snapshot.mode = "lock";
+
+  for (const char* name : {"a\r\nEND.nvec", "with space.nvec", "tab\there.nvec", "bell\a.nvec"}) {
+    json body = {{"filepath", name}};
+    for (const char* route : {"/dump/save", "/dump/verify", "/dump/load", "/dump/info"}) {
+      auto res = client_->Post(route, body.dump(), "application/json");
+      ASSERT_TRUE(res) << route;
+      EXPECT_EQ(res->status, 400) << route << " -> " << res->body;
+      EXPECT_EQ(json::parse(res->body)["error"], "Invalid filepath: must not contain whitespace or control characters");
+    }
+  }
+  EXPECT_TRUE(fs::is_empty(dir));
   handler_ctx_.dump_dir = "";
   fs::remove_all(dir);
 }
@@ -1754,6 +1860,33 @@ TEST_F(HttpServerRateLimitTest, AppliesConfiguredLimitToHttpRequests) {
   }
 }
 
+TEST_F(HttpServerRateLimitTest, RateLimitedCommandRouteIsAccountedUnderItsGroup) {
+  const size_t info = server::GroupIndex(server::CommandGroup::kInfo);
+  const uint64_t total_before = stats_.total_commands.load();
+  const uint64_t failed_before = stats_.failed_commands.load();
+  const uint64_t info_calls_before = stats_.calls_by_group[info].load();
+  const uint64_t info_failed_before = stats_.failed_by_group[info].load();
+
+  uint64_t sent = 0;
+  uint64_t limited = 0;
+  for (int i = 0; i < 50 && limited == 0; ++i) {
+    auto res = client_->Get("/info");
+    ASSERT_TRUE(res);
+    ++sent;
+    if (res->status == 429) {
+      ++limited;
+    } else {
+      ASSERT_EQ(res->status, 200);
+    }
+  }
+  ASSERT_GT(limited, 0U);
+
+  EXPECT_EQ(stats_.total_commands.load(), total_before + sent);
+  EXPECT_EQ(stats_.failed_commands.load(), failed_before + limited);
+  EXPECT_EQ(stats_.calls_by_group[info].load(), info_calls_before + sent);
+  EXPECT_EQ(stats_.failed_by_group[info].load(), info_failed_before + limited);
+}
+
 class HttpServerAdmissionTest : public HttpServerTest {
  protected:
   void ConfigureHttpServer(server::HttpServerConfig* config) override {
@@ -1796,6 +1929,28 @@ TEST_F(HttpServerAdmissionTest, RejectsSecondSlowConnectionFromSameIpBeforeParsi
 
   ::close(second);
   ::close(first);
+}
+
+class HttpServerPayloadLimitTest : public HttpServerTest {
+ protected:
+  void ConfigureHttpServer(server::HttpServerConfig* config) override { config->max_payload_bytes = 64; }
+};
+
+TEST_F(HttpServerPayloadLimitTest, ResponsesGeneratedByTheHttpLayerCarryAJsonError) {
+  auto unknown_route = client_->Get("/no/such/route");
+  ASSERT_TRUE(unknown_route);
+  auto unknown_method = client_->Put("/sim", "{}", "application/json");
+  ASSERT_TRUE(unknown_method);
+  auto oversized = client_->Post("/sim", std::string(1024, ' '), "application/json");
+  ASSERT_TRUE(oversized);
+  EXPECT_EQ(unknown_route->status, 404);
+  EXPECT_EQ(oversized->status, 413);
+  for (const auto* res : {&unknown_route, &unknown_method, &oversized}) {
+    EXPECT_GE((*res)->status, 400);
+    auto body = json::parse((*res)->body, nullptr, false);
+    ASSERT_TRUE(body.is_object()) << (*res)->status << " " << (*res)->body;
+    EXPECT_TRUE(body.contains("error")) << (*res)->body;
+  }
 }
 
 // CORS behavior: when enabled but no origin is configured, the

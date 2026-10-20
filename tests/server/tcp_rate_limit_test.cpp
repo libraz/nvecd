@@ -60,6 +60,14 @@ TEST(TcpRateLimit, RequestOverCapacityIsRefusedWithoutSideEffects) {
   const std::string refused = SendTcpCommand(port, "VECSET refused 0 1");
   EXPECT_NE(refused.find("ERROR Rate limit exceeded"), std::string::npos) << refused;
 
+  // The refused line is one failed VECSET, like any other rejected command.
+  const auto& stats = server.GetStats();
+  const size_t vecset = nvecd::server::GroupIndex(nvecd::server::CommandGroup::kVecset);
+  EXPECT_EQ(stats.total_commands.load(), 2U);
+  EXPECT_EQ(stats.failed_commands.load(), 1U);
+  EXPECT_EQ(stats.calls_by_group[vecset].load(), 2U);
+  EXPECT_EQ(stats.failed_by_group[vecset].load(), 1U);
+
   // One token refills per second; spend it on reading back the store.
   std::this_thread::sleep_for(std::chrono::milliseconds(1200));
   const std::string info = SendTcpCommand(port, "INFO");

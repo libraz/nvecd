@@ -194,3 +194,31 @@ TEST_F(PathUtilsTest, DirectoryDescriptorPreventsAncestorRenameRedirection) {
   EXPECT_TRUE(std::filesystem::exists(moved / "snapshot.dmp"));
   EXPECT_FALSE(std::filesystem::exists(original / "snapshot.dmp"));
 }
+
+TEST(PathTokenRulesTest, IsSingleTokenRejectsWhitespaceControlAndDelete) {
+  EXPECT_TRUE(IsSingleToken("nightly..v2.dmp"));
+  EXPECT_TRUE(IsSingleToken("caf\xC3\xA9.dmp"));
+  for (const char* value : {"a b", "a\tb", "a\r\nb", "a\x01", "a\x7F"}) {
+    EXPECT_FALSE(IsSingleToken(value)) << value;
+  }
+  EXPECT_FALSE(IsSingleToken(std::string("a\0b", 3)));
+}
+
+TEST(PathTokenRulesTest, HasParentComponentMatchesOnlyAWholeComponent) {
+  EXPECT_TRUE(HasParentComponent(".."));
+  EXPECT_TRUE(HasParentComponent("../x"));
+  EXPECT_TRUE(HasParentComponent("a/../b"));
+  EXPECT_FALSE(HasParentComponent("nightly..v2.dmp"));
+  EXPECT_FALSE(HasParentComponent("..hidden/x"));
+  EXPECT_FALSE(HasParentComponent("./x"));
+}
+
+TEST(PathTokenRulesTest, IsStrictlyInsideExcludesTheRootAndEscapes) {
+  const std::filesystem::path root = "/data/dumps";
+  EXPECT_TRUE(IsStrictlyInside("/data/dumps/a.dmp", root));
+  EXPECT_TRUE(IsStrictlyInside("/data/dumps/sub/a.dmp", root));
+  EXPECT_FALSE(IsStrictlyInside("/data/dumps", root));
+  EXPECT_FALSE(IsStrictlyInside("/data/dumps/", root));
+  EXPECT_FALSE(IsStrictlyInside("/data/other/a.dmp", root));
+  EXPECT_FALSE(IsStrictlyInside("/data", root));
+}

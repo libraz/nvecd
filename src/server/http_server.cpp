@@ -20,6 +20,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <initializer_list>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -272,6 +273,27 @@ utils::Expected<json, utils::Error> ParseObjectBody(const std::string& body, boo
   return parsed;
 }
 
+/**
+ * @brief Reject a body field the route does not take
+ *
+ * @param search_command "SIM" or "SIMV" to report the field as TCP reports an
+ *        unknown option; empty for "Unknown field: <name>"
+ */
+utils::Expected<void, utils::Error> CheckFields(const json& body, std::initializer_list<std::string_view> allowed,
+                                                std::string_view search_command = {}) {
+  for (const auto& item : body.items()) {
+    const std::string& key = item.key();
+    if (std::find(allowed.begin(), allowed.end(), key) != allowed.end()) {
+      continue;
+    }
+    if (!search_command.empty()) {
+      return utils::MakeUnexpected(UnsupportedSearchOption(search_command, key, key));
+    }
+    return utils::MakeUnexpected(FieldError("Unknown field: " + key));
+  }
+  return {};
+}
+
 /// Read an optional string field; absent yields nullopt, any other type is an error.
 utils::Expected<std::optional<std::string>, utils::Error> OptionalString(const json& body, const char* field) {
   const auto it = body.find(field);
@@ -416,9 +438,6 @@ utils::Expected<vectors::Metadata, utils::Error> ParseMetadataJson(const json& v
 
   vectors::Metadata metadata;
   for (const auto& [key, item] : value.items()) {
-    if (key.empty()) {
-      return utils::MakeUnexpected(FieldError("Metadata keys must not be empty"));
-    }
     if (item.is_string()) {
       metadata[key] = item.get<std::string>();
     } else if (item.is_boolean()) {
@@ -439,7 +458,9 @@ utils::Expected<vectors::Metadata, utils::Error> ParseMetadataJson(const json& v
       return utils::MakeUnexpected(FieldError("Metadata values must be string, integer, float, or bool"));
     }
   }
-
+  if (auto valid = ValidateMetadata(metadata); !valid) {
+    return utils::MakeUnexpected(valid.error());
+  }
   return metadata;
 }
 
@@ -512,6 +533,16 @@ HttpServer::HttpServer(HttpServerConfig config, HandlerContext* handler_context,
   // Setup routes
   SetupRoutes();
 
+  // httplib answers unknown routes, unsupported methods and oversized bodies
+  // itself; give those the {"error": ...} body every other failure carries.
+  server_->set_error_handler([](const httplib::Request& /*req*/, httplib::Response& res) {
+    if (!res.body.empty()) {
+      return httplib::Server::HandlerResponse::Unhandled;
+    }
+    SendError(res, res.status, httplib::status_message(res.status));
+    return httplib::Server::HandlerResponse::Handled;
+  });
+
   // Setup CORS if enabled
   if (config_.enable_cors) {
     SetupCors();
@@ -536,6 +567,18 @@ const ServerStats& HttpServer::EffectiveStats() const {
   return const_cast<HttpServer*>(this)->EffectiveStats();
 }
 
+std::string_view HttpServer::RouteMethodName(RouteMethod method) {
+  switch (method) {
+    case RouteMethod::kGet:
+      return "GET";
+    case RouteMethod::kPost:
+      return "POST";
+    case RouteMethod::kDelete:
+      return "DELETE";
+  }
+  return "";
+}
+
 void HttpServer::RegisterHandler(RouteMethod method, const std::string& path, httplib::Server::Handler handler) {
   switch (method) {
     case RouteMethod::kGet:
@@ -550,7 +593,23 @@ void HttpServer::RegisterHandler(RouteMethod method, const std::string& path, ht
   }
 }
 
+std::string HttpServer::RouteKey(std::string_view method, std::string_view path) {
+  std::string key(method);
+  key += ' ';
+  key += path;
+  return key;
+}
+
+std::optional<CommandType> HttpServer::RouteCommand(const httplib::Request& req) const {
+  auto found = route_commands_.find(RouteKey(req.method, req.path));
+  if (found == route_commands_.end()) {
+    return std::nullopt;
+  }
+  return found->second;
+}
+
 void HttpServer::RegisterRoute(RouteMethod method, const std::string& path, CommandType command, RouteHandler handler) {
+  route_commands_.emplace(RouteKey(RouteMethodName(method), path), command);
   auto invoke = [this, command, handler](const httplib::Request& req, httplib::Response& res) {
     // Accounted on every exit path, including the rejection below.
     CommandStatsScope stats_scope(EffectiveStats(), command);
@@ -626,14 +685,23 @@ void HttpServer::SetupRoutes() {
 void HttpServer::SetupAccessControl() {
   server_->set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
     const std::string remote = req.remote_addr.empty() ? std::string("<unknown>") : req.remote_addr;
+    // A refused request to a command route is one failed command of that
+    // route's group, as a refused TCP line is; other paths are not commands.
+    auto refuse = [&](int status, const std::string& message) {
+      std::optional<CommandStatsScope> refused_scope;
+      if (const auto command = RouteCommand(req)) {
+        refused_scope.emplace(EffectiveStats(), *command);
+      }
+      SendError(res, status, message);
+      return httplib::Server::HandlerResponse::Handled;
+    };
     if (!utils::IsIPAllowed(req.remote_addr, parsed_allow_cidrs_)) {
       nvecd::utils::StructuredLog()
           .Event("server_warning")
           .Field("type", "http_request_rejected_acl")
           .Field("remote_addr", remote)
           .Warn();
-      SendError(res, kHttpForbidden, "Access denied by network.allow_cidrs");
-      return httplib::Server::HandlerResponse::Handled;
+      return refuse(kHttpForbidden, "Access denied by network.allow_cidrs");
     }
 
     if (rate_limiter_ != nullptr && !rate_limiter_->Allow(remote)) {
@@ -642,8 +710,7 @@ void HttpServer::SetupAccessControl() {
           .Field("type", "http_request_rate_limited")
           .Field("remote_addr", remote)
           .Warn();
-      SendError(res, kHttpTooManyRequests, "Rate limit exceeded");
-      return httplib::Server::HandlerResponse::Handled;
+      return refuse(kHttpTooManyRequests, "Rate limit exceeded");
     }
     return httplib::Server::HandlerResponse::Unhandled;
   });
@@ -774,7 +841,8 @@ void HttpServer::Stop() {
 
 void HttpServer::SendJson(httplib::Response& res, int status_code, const nlohmann::json& body) {
   res.status = status_code;
-  res.set_content(body.dump(), "application/json");
+  // Stored ids may predate UTF-8 validation; replace invalid bytes instead of throwing.
+  res.set_content(body.dump(-1, ' ', false, json::error_handler_t::replace), "application/json");
 }
 
 void HttpServer::SendError(httplib::Response& res, int status_code, const std::string& message) {
@@ -1029,8 +1097,7 @@ void HttpServer::HandleInfo(const httplib::Request& /*req*/, httplib::Response& 
     response["stores"] = stores_obj;
 
     // Cache statistics (matches the field names used by /cache/stats).
-    auto* info_cache =
-        (handler_context_ != nullptr) ? handler_context_->cache.load(std::memory_order_acquire) : nullptr;
+    const auto* info_cache = (handler_context_ != nullptr) ? handlers::ReportedCache(*handler_context_) : nullptr;
     json cache_obj;
     if (info_cache != nullptr) {
       auto cache_stats = info_cache->GetStatistics();
@@ -1121,6 +1188,10 @@ void HttpServer::HandleEvent(const httplib::Request& req, httplib::Response& res
     auto body = ParseObjectBody(req.body);
     if (!body) {
       SendError(res, kHttpBadRequest, body.error().message());
+      return;
+    }
+    if (auto fields = CheckFields(*body, {"ctx", "id", "type", "score", "timestamp"}); !fields) {
+      SendError(res, kHttpBadRequest, fields.error().message());
       return;
     }
     auto ctx = RequiredString(*body, "ctx");
@@ -1218,6 +1289,10 @@ void HttpServer::HandleVecset(const httplib::Request& req, httplib::Response& re
       SendError(res, kHttpBadRequest, body.error().message());
       return;
     }
+    if (auto fields = CheckFields(*body, {"id", "vector", "metadata"}); !fields) {
+      SendError(res, kHttpBadRequest, fields.error().message());
+      return;
+    }
     auto id = RequiredString(*body, "id");
     if (!id) {
       SendError(res, kHttpBadRequest, id.error().message());
@@ -1286,19 +1361,24 @@ void HttpServer::HandleVecdel(const httplib::Request& req, httplib::Response& re
       SendError(res, kHttpBadRequest, body.error().message());
       return;
     }
+    if (auto fields = CheckFields(*body, {"id"}); !fields) {
+      SendError(res, kHttpBadRequest, fields.error().message());
+      return;
+    }
     auto id = RequiredString(*body, "id");
     if (!id) {
       SendError(res, kHttpBadRequest, id.error().message());
       return;
     }
 
+    if (auto id_check = ValidateItemId(*id); !id_check) {
+      SendError(res, kHttpBadRequest, id_check.error().message());
+      return;
+    }
+
     Command command;
     command.type = CommandType::kVecdel;
     command.id = std::move(*id);
-    if (command.id.empty()) {
-      SendError(res, kHttpBadRequest, "Field 'id' must not be empty");
-      return;
-    }
 
     // Taken after parsing so a slow or malformed body never holds up a snapshot.
     SnapshotCoordinator::AccessGuard snapshot_access;
@@ -1336,9 +1416,17 @@ void HttpServer::HandleMetaset(const httplib::Request& req, httplib::Response& r
       SendError(res, kHttpBadRequest, body.error().message());
       return;
     }
+    if (auto fields = CheckFields(*body, {"id", "metadata"}); !fields) {
+      SendError(res, kHttpBadRequest, fields.error().message());
+      return;
+    }
     auto id = RequiredString(*body, "id");
     if (!id) {
       SendError(res, kHttpBadRequest, id.error().message());
+      return;
+    }
+    if (auto id_check = ValidateItemId(*id); !id_check) {
+      SendError(res, kHttpBadRequest, id_check.error().message());
       return;
     }
     const auto metadata_field = body->find("metadata");
@@ -1413,12 +1501,20 @@ void HttpServer::HandleSim(const httplib::Request& req, httplib::Response& res) 
       SendError(res, kHttpBadRequest, body.error().message());
       return;
     }
+    if (auto fields = CheckFields(*body, {"id", "top_k", "mode", "filter", "min_score", "adaptive"}, "SIM"); !fields) {
+      SendError(res, kHttpBadRequest, fields.error().message());
+      return;
+    }
 
     Command command;
     command.type = CommandType::kSim;
     auto id = RequiredString(*body, "id");
     if (!id) {
       SendError(res, kHttpBadRequest, id.error().message());
+      return;
+    }
+    if (auto id_check = ValidateItemId(*id); !id_check) {
+      SendError(res, kHttpBadRequest, id_check.error().message());
       return;
     }
     command.id = std::move(*id);
@@ -1498,6 +1594,10 @@ void HttpServer::HandleSimv(const httplib::Request& req, httplib::Response& res)
     auto body = ParseObjectBody(req.body);
     if (!body) {
       SendError(res, kHttpBadRequest, body.error().message());
+      return;
+    }
+    if (auto fields = CheckFields(*body, {"vector", "top_k", "filter", "min_score"}, "SIMV"); !fields) {
+      SendError(res, kHttpBadRequest, fields.error().message());
       return;
     }
 
@@ -1613,6 +1713,10 @@ void HttpServer::HandleDumpSave(const httplib::Request& req, httplib::Response& 
       SendError(res, kHttpBadRequest, body.error().message());
       return;
     }
+    if (auto fields = CheckFields(*body, {"filepath"}); !fields) {
+      SendError(res, kHttpBadRequest, fields.error().message());
+      return;
+    }
     auto filepath = OptionalString(*body, "filepath");
     if (!filepath) {
       SendError(res, kHttpBadRequest, filepath.error().message());
@@ -1645,6 +1749,10 @@ void HttpServer::HandleDumpLoad(const httplib::Request& req, httplib::Response& 
       SendError(res, kHttpBadRequest, body.error().message());
       return;
     }
+    if (auto fields = CheckFields(*body, {"filepath"}); !fields) {
+      SendError(res, kHttpBadRequest, fields.error().message());
+      return;
+    }
     auto filepath = RequiredString(*body, "filepath");
     if (!filepath) {
       SendError(res, kHttpBadRequest, filepath.error().message());
@@ -1674,6 +1782,10 @@ void HttpServer::HandleDumpVerify(const httplib::Request& req, httplib::Response
     auto body = ParseObjectBody(req.body);
     if (!body) {
       SendError(res, kHttpBadRequest, body.error().message());
+      return;
+    }
+    if (auto fields = CheckFields(*body, {"filepath"}); !fields) {
+      SendError(res, kHttpBadRequest, fields.error().message());
       return;
     }
     auto filepath = RequiredString(*body, "filepath");
@@ -1712,6 +1824,10 @@ void HttpServer::HandleDumpInfo(const httplib::Request& req, httplib::Response& 
     auto body = ParseObjectBody(req.body);
     if (!body) {
       SendError(res, kHttpBadRequest, body.error().message());
+      return;
+    }
+    if (auto fields = CheckFields(*body, {"filepath"}); !fields) {
+      SendError(res, kHttpBadRequest, fields.error().message());
       return;
     }
     auto filepath = RequiredString(*body, "filepath");
@@ -1809,8 +1925,9 @@ void HttpServer::HandleMetrics(const httplib::Request& /*req*/, httplib::Respons
     // Event count
     if (handler_context_ != nullptr && handler_context_->event_store) {
       auto event_stats = handler_context_->event_store->GetStatistics();
-      metrics << "# HELP nvecd_events_total Total events stored\n";
-      metrics << "# TYPE nvecd_events_total gauge\n";
+      // Same counter as INFO event_count: events accepted since start, not events stored.
+      metrics << "# HELP nvecd_events_total Events accepted since start\n";
+      metrics << "# TYPE nvecd_events_total counter\n";
       metrics << "nvecd_events_total " << event_stats.total_events << "\n\n";
 
       metrics << "# HELP nvecd_contexts_total Total contexts stored\n";
@@ -1819,8 +1936,7 @@ void HttpServer::HandleMetrics(const httplib::Request& /*req*/, httplib::Respons
     }
 
     // Cache metrics
-    auto* metrics_cache =
-        (handler_context_ != nullptr) ? handler_context_->cache.load(std::memory_order_acquire) : nullptr;
+    const auto* metrics_cache = (handler_context_ != nullptr) ? handlers::ReportedCache(*handler_context_) : nullptr;
     if (metrics_cache != nullptr) {
       auto cache_stats = metrics_cache->GetStatistics();
 

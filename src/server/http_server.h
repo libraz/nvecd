@@ -21,8 +21,11 @@
 #include <memory>
 #include <mutex>
 #include <nlohmann/json.hpp>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "config/config.h"
@@ -120,16 +123,6 @@ class HttpServer {
    */
   int GetPort() const { return bound_port_.load(std::memory_order_acquire); }
 
-  /**
-   * @brief Get total requests handled
-   */
-  uint64_t GetTotalRequests() const { return stats_.total_commands.load(); }
-
-  /**
-   * @brief Get server statistics
-   */
-  const ServerStats& GetStats() const { return stats_; }
-
  private:
   HttpServerConfig config_;
   HandlerContext* handler_context_;
@@ -139,7 +132,7 @@ class HttpServer {
   /// Port reported by the listening socket; equals config_.port while unbound.
   std::atomic<int> bound_port_;
 
-  // Statistics
+  /// Statistics of a standalone server; unused when wired to a HandlerContext or TCP stats.
   ServerStats stats_;
 
   std::unique_ptr<httplib::Server> server_;
@@ -161,6 +154,15 @@ class HttpServer {
 
   /// Member handler invoked once a route has been admitted.
   using RouteHandler = void (HttpServer::*)(const httplib::Request&, httplib::Response&);
+
+  /// Command each RegisterRoute() route mirrors, keyed by RouteKey(); filled before Start().
+  std::unordered_map<std::string, CommandType> route_commands_;
+
+  static std::string_view RouteMethodName(RouteMethod method);
+  static std::string RouteKey(std::string_view method, std::string_view path);
+
+  /// Command the request's route mirrors, or nullopt for an uncounted or unknown path.
+  std::optional<CommandType> RouteCommand(const httplib::Request& req) const;
 
   /**
    * @brief Setup routes

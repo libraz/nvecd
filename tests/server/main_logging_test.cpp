@@ -147,3 +147,13 @@ TEST_F(MainLoggingTest, StartupAppendsToTheExistingLog) {
   EXPECT_EQ(contents.rfind(kPreviousLog, 0), 0U) << contents;
   EXPECT_NE(contents.find("Server is running"), std::string::npos) << contents;
 }
+
+TEST_F(MainLoggingTest, RepeatedConfigPathIsAnError) {
+  const auto config = WriteConfig(root_ / "nvecd.log").string();
+  for (const auto& args : {std::vector<std::string>{"-t", config, "-c", config},
+                           std::vector<std::string>{"-t", "-c", config, "-c", config}}) {
+    const int status = Run(args);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 1);
+  }
+}

@@ -153,5 +153,15 @@ TEST(FilterParserTest, MetadataPairsRejectComparisonsInListsAndEmptyLists) {
   }
 }
 
+TEST(FilterParserTest, MetadataValidatorAcceptsOnlyFilterAddressableKeys) {
+  EXPECT_TRUE(ValidateMetadata({{"category", std::string("books")}, {"price.usd", int64_t{12}}}).has_value());
+  EXPECT_FALSE(ValidateMetadata({}).has_value());
+  for (const char* key : {"", "a,b", "a:b", "a=b", "a<b", "a>b", "a!b", "a b", "a\tb", "a\x7F"}) {
+    auto valid = ValidateMetadata({{key, std::string("v")}});
+    ASSERT_FALSE(valid.has_value()) << key;
+    EXPECT_EQ(valid.error().code(), utils::ErrorCode::kCommandInvalidArgument) << key;
+  }
+}
+
 }  // namespace
 }  // namespace nvecd::server

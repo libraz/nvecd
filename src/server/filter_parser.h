@@ -49,4 +49,15 @@ utils::Expected<vectors::MetadataFilter, utils::Error> ParseSimpleFilter(const s
  */
 utils::Expected<vectors::Metadata, utils::Error> ParseMetadataPairs(const std::string& expr);
 
+/**
+ * @brief Check metadata about to be stored, whichever surface typed it
+ *
+ * At least one pair, and every key one the filter grammar can address: non-empty,
+ * with no whitespace or control character, ',' or operator character.
+ *
+ * @param metadata Typed pairs
+ * @return Success or kCommandInvalidArgument
+ */
+utils::Expected<void, utils::Error> ValidateMetadata(const vectors::Metadata& metadata);
+
 }  // namespace nvecd::server
