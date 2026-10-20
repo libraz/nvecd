@@ -51,7 +51,7 @@ All request bodies are JSON. The server does not require a `Content-Type` header
 
 A path that is not in this table, or a registered path reached with the wrong method, is answered `404`.
 
-Each route declares the TCP command it is the HTTP form of, and that single declaration decides both its privilege and which per-command counter the request lands in, so the two surfaces cannot drift apart on either.
+Each route declares the TCP command it is the HTTP form of, and that single declaration decides both its privilege and which per-command counter the request lands in, so the two surfaces cannot drift apart on either. A request to a command route that is refused with `403` or `429` before routing still counts as one failed command of that route's group. A path outside the table, and the health and metrics endpoints, are not commands and are not counted.
 
 ## Authentication
 
@@ -85,7 +85,7 @@ with status `401`. The check runs before the handler reads any state or assemble
 |---|---|
 | `200` | success |
 | `204` | CORS preflight (`OPTIONS`) |
-| `400` | malformed JSON, a body that is not a JSON object, missing or mistyped field, `top_k` outside 1–`similarity.max_top_k` (however large), `min_score` or a vector component beyond the float range, dimension mismatch, invalid filter, invalid event score, an item or context ID that is empty or carries whitespace or a control character, snapshot path traversal, unsupported cache scope |
+| `400` | malformed JSON, a body that is not a JSON object, an unknown field, missing or mistyped field, `top_k` outside 1–`similarity.max_top_k` (however large), `min_score` or a vector component beyond the float range, dimension mismatch, invalid filter, invalid event score, an item or context ID that is empty or carries whitespace or a control character, snapshot path traversal, unsupported cache scope |
 | `401` | credentials missing or wrong on a gated route |
 | `403` | source address outside `network.allow_cidrs`, or a permission-denied error from a handler |
 | `404` | unknown route or method; unknown item ID; snapshot or configuration file not found |
@@ -98,6 +98,8 @@ with status `401`. The check runs before the handler reads any state or assemble
 | `503` | server is loading; a write route while a lock-mode snapshot holds the stores or after the persistence fail-stop latched (the `error` text is the TCP `READONLY` message); a write the WAL could not accept |
 
 Handler errors are mapped from the typed error code rather than sniffed from a message, so the same failure produces the same status on every route. Domain errors map as follows: item and file not-found conditions to `404`; argument, parsing, dimension, `top_k` and event-score errors to `400`; permission-denied to `403`; a concurrent snapshot operation to `409`; an unusable snapshot file to `422`; WAL write, rotation and not-open errors to `503`; everything else to `500`.
+
+A body field the route does not take is rejected with `400` rather than ignored: `Unknown field: <name>`, or on `/sim` and `/simv` the same `Invalid SIM option: <name>` / `Invalid SIMV option: <name>` message TCP gives for an unknown option. `POST /cache/clear` is the exception and ignores every field but `scope`.
 
 Every error body is a single-field object:
 
@@ -157,7 +159,7 @@ A float `score` is rejected rather than truncated, so the integer contract match
 {"status":"ok"}
 ```
 
-The ID is read from a JSON body, not from the path or query string, so a client library that drops bodies on `DELETE` has to be configured to send one. An empty or missing `id` is `400`; an unknown ID is `404` with `Vector not found: <id>`.
+The ID is read from a JSON body, not from the path or query string, so a client library that drops bodies on `DELETE` has to be configured to send one. A missing `id`, or one that is empty or carries whitespace or a control character, is `400`; an unknown ID is `404` with `Vector not found: <id>`.
 
 ### `POST /metaset`
 
@@ -169,7 +171,7 @@ The ID is read from a JSON body, not from the path or query string, so a client 
 {"status":"ok"}
 ```
 
-`metadata` is a structured JSON object here, not the `key:value,key:value` string that TCP `METASET` and the client library take. The item must already have a vector; otherwise the response is `404` with `Vector not found for metadata: <id>`.
+`metadata` is a structured JSON object here, not the `key:value,key:value` string that TCP `METASET` and the client library take. An `id` that is empty or carries whitespace or a control character is `400`. The item must already have a vector; otherwise the response is `404` with `Vector not found for metadata: <id>`.
 
 ## Search routes
 
@@ -194,7 +196,7 @@ The ID is read from a JSON body, not from the path or query string, so a client 
 
 `count` is the number of entries in `results` after `min_score` has been applied. Scores are rounded to four decimal places, the same precision the TCP surface renders.
 
-`top_k` must be positive and must not exceed `similarity.max_top_k`; both violations are `400` with the message TCP gives for the same value, and a value outside the integer range is rejected rather than wrapped. A `min_score` beyond the float range is `400`. `filter` uses the same grammar as the TCP `filter=` option — `=`, `:`, `!=`, `>`, `<`, `>=`, `<=` and `in(a|b|c)` — documented in [protocol.md](./protocol.md). An `id` with no vector is `404` with `Query vector not found: <id>`.
+`top_k` must be positive and must not exceed `similarity.max_top_k`; both violations are `400` with the message TCP gives for the same value, and a value outside the integer range is rejected rather than wrapped. A `min_score` beyond the float range is `400`. `filter` uses the same grammar as the TCP `filter=` option — `=`, `:`, `!=`, `>`, `<`, `>=`, `<=` and `in(a|b|c)` — documented in [protocol.md](./protocol.md). An `id` that is empty or carries whitespace or a control character is `400`, and an `id` with no vector is `404` with `Query vector not found: <id>`.
 
 ### `POST /simv`
 
@@ -329,7 +331,7 @@ This is a deliberately narrow summary: bind addresses, ports, the password and t
 
 `ttl_seconds` and `min_query_cost_ms` reflect the live values, which the `cache.ttl_seconds` and `cache.min_query_cost_ms` runtime variables can change. When no cache controller is wired the route answers `500`.
 
-The field set is close to TCP `CACHE STATS` but not identical: it names two fields differently (`cache_enabled` and `cache_entries` here are `enabled` and `current_entries`).
+The field set is the same as TCP `CACHE STATS`, but five fields are named differently. TCP `cache_enabled` is `enabled` here, `cache_entries` is `current_entries`, `cache_memory_bytes` is `current_memory_bytes`, `cache_hit_rate` is `hit_rate`, and `total_time_saved_ms` is `time_saved_ms`.
 
 ## Cache management
 
@@ -441,7 +443,7 @@ The status is the mapped error status: `404` for a missing file, `422` for an un
 }
 ```
 
-Every value under `info` is a string, because the block is parsed out of the shared handler's text output. `filepath` here echoes the request rather than the resolved path.
+Every value under `info` is a string, because the block is parsed out of the shared handler's text output. `filepath` is the resolved absolute path the handler read, as on `/dump/save`, `/dump/load` and `/dump/verify`.
 
 ### `GET /dump/status`
 
@@ -462,7 +464,7 @@ Takes no body. `snapshot` carries the fields of the TCP `DUMP STATUS` block, wit
 {"snapshot":{"status":"idle"},"status":"ok"}
 ```
 
-A server configured with `snapshot.mode: lock` has no background writer and always answers `idle`. The top-level `status` is `ok` whenever the request itself succeeded.
+`snapshot` describes the background writer, which every fork snapshot goes through: a `/dump/save` under `snapshot.mode: fork`, the snapshot scheduler's and the decay maintenance snapshot. A lock-mode save runs in the request thread and never appears here, but with `snapshot.mode: lock` the scheduler and maintenance snapshots still do, so the status is not always `idle`. The top-level `status` is `ok` whenever the request itself succeeded.
 
 ## Debug routes
 
@@ -563,8 +565,8 @@ nvecd_memory_bytes 7060
 # TYPE nvecd_vectors_total gauge
 nvecd_vectors_total 1
 
-# HELP nvecd_events_total Total events stored
-# TYPE nvecd_events_total gauge
+# HELP nvecd_events_total Events accepted since start
+# TYPE nvecd_events_total counter
 nvecd_events_total 6
 
 # HELP nvecd_contexts_total Total contexts stored
@@ -579,7 +581,7 @@ nvecd_contexts_total 2
 | `nvecd_commands_failed_total` | counter | commands that did not succeed, with the same `command` labels |
 | `nvecd_memory_bytes` | gauge | event store, vector store and co-occurrence index combined |
 | `nvecd_vectors_total` | gauge | vectors stored |
-| `nvecd_events_total` | gauge | events stored |
+| `nvecd_events_total` | counter | events accepted since start (`INFO` `event_count`) |
 | `nvecd_contexts_total` | gauge | active contexts |
 | `nvecd_cache_queries_total` | counter | cache lookups |
 | `nvecd_cache_hits_total` | counter | cache hits |

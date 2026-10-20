@@ -31,7 +31,7 @@ Loading happens in three stages, and the first failure aborts startup.
 2. The JSON is checked against the embedded schema: types, enumerations and per-key numeric ranges.
 3. The parsed structure is checked semantically, which is where the cross-key rules listed under each section live.
 
-The schema sets `additionalProperties: false` at the root and in every section, so a misspelled key is rejected rather than silently ignored. Sections are optional; an absent section takes its defaults in full. A value that is well-formed YAML but does not fit the type it is read into is reported against its key, for example `Invalid value for events.ctx_buffer_size: '...' is out of range for this setting`.
+The schema sets `additionalProperties: false` at the root and in every section, so a misspelled key is rejected rather than silently ignored. Sections are optional; an absent section takes its defaults in full, and an empty file, or one holding only comments, loads as all defaults. A boolean key accepts `true`/`false`, `yes`/`no` and `on`/`off`, each in lower, Capitalised or UPPER case; `1` and `0` are integers here and fail the type check, although the runtime `SET` command accepts them for a boolean variable. A value that is well-formed YAML but does not fit the type it is read into is reported against its key, for example `Invalid value for events.ctx_buffer_size: '...' is out of range for this setting`.
 
 ## `events`
 
@@ -80,7 +80,7 @@ Search behaviour, fusion weights and the ANN index. See [vector-search.md](./vec
 | `max_top_k` | int | 1000 | Maximum number of results allowed in similarity searches (1-10000) |
 | `fusion_alpha` | float | 0.6 | Weight for the vector-similarity component in fusion mode (0.0-1.0) |
 | `fusion_beta` | float | 0.4 | Weight for the co-occurrence component in fusion mode (0.0-1.0) |
-| `sample_size` | int | 10000 | Random sampling size for approximate search; sampling engages only once the corpus exceeds twice this value (0 = exact search), and the maximum is the largest value whose doubling stays inside the 32-bit counter that comparison uses (0-2147483647) |
+| `sample_size` | int | 10000 | Random sampling size for approximate search; sampling engages only when the live vectors exceed twice this value and the query has no filter (0 = exact search), and the maximum is the largest value whose doubling stays inside the 32-bit counter that comparison uses (0-2147483647) |
 | `ivf_enabled` | bool | false | Enable IVF (Inverted File) approximate nearest neighbor search |
 | `ivf_nlist` | int | 256 | Number of Voronoi cells/clusters for IVF index (0 = auto sqrt(n)) (0-65536) |
 | `ivf_nprobe` | int | 8 | Number of clusters to probe at query time (1-65536) |
@@ -105,6 +105,8 @@ Cross-key rules:
 - The HNSW keys are validated only when `index_type: hnsw`. `hnsw_m` must be at least 2, and both `ef` values greater than zero.
 - `ivf_enabled` is the older spelling of `index_type: ivf`. It is applied only when `index_type` is still `flat`; with `index_type` set to `hnsw` or `ivf`, the flag has no effect even though the IVF keys are still range-checked.
 - `fusion_alpha` and `fusion_beta` are independent numbers, not two halves of one budget; they are not required to sum to 1. They must not both be 0, which validation rejects because fusion would have nothing to rank by.
+
+`sample_size` engages sampling only for an unfiltered scan, and only once the live vectors, deleted rows not counted, exceed twice its value. A query with `filter=` always scans every row. See [vector-search.md](./vector-search.md).
 
 `hnsw_max_elements` is reserved at startup. Its maximum, 10,000,000, is a plain capacity bound: the index is rebuilt from the vector store on load rather than read from the snapshot, so no loader constrains it.
 
@@ -197,7 +199,7 @@ The Unix socket serves the same protocol as the TCP port, but bypasses `network.
 | `max_clients` | int | 10000 | Maximum number of tracked clients (for memory management) (10-100000) |
 <!-- END GENERATED: options api.rate_limiting -->
 
-The three numeric keys are checked for positivity only when `enable` is true. Rate limiting keys on the client address, so it does not apply to Unix-socket connections. An HTTP request over the limit is answered `429`.
+The three numeric keys are checked for positivity only when `enable` is true. Rate limiting keys on the client address, so it does not apply to Unix-socket connections. An HTTP request over the limit is answered `429`, and a TCP request `ERROR Rate limit exceeded` on a connection that stays open.
 
 ## `network`
 
@@ -207,7 +209,7 @@ The three numeric keys are checked for positivity only when `enable` is true. Ra
 | `allow_cidrs` | list | [] | Allow CIDR list (empty = deny all) |
 <!-- END GENERATED: options network -->
 
-The list is fail-closed: an empty list denies every address, so a deployment that omits it accepts no TCP or HTTP traffic at all. An entry that does not parse as a CIDR is logged and skipped, leaving the remaining entries in force. The check applies to the TCP listener and to every HTTP route, and does not apply to the Unix socket.
+The list is fail-closed: an empty list denies every address, so a deployment that omits it accepts no TCP or HTTP traffic at all. Every entry must parse as a CIDR; one that does not fails the load rather than being skipped. The check applies to the TCP listener and to every HTTP route, and does not apply to the Unix socket.
 
 ```yaml
 network:
@@ -257,7 +259,7 @@ The query cache. See [caching.md](./caching.md).
 | `requirepass` | string | "" | Required password for write/admin commands (empty = no auth) |
 <!-- END GENERATED: options security -->
 
-Setting `requirepass` closes both surfaces at once: TCP connections must issue `AUTH` before a write or admin command, and gated HTTP routes require `Authorization: Bearer <password>` or a `Basic` credential whose password matches. Read commands and the health probes stay open on both. The value is redacted to `***` by `CONFIG SHOW` and by the `security.requirepass` runtime variable.
+Setting `requirepass` closes both surfaces at once: TCP connections must issue `AUTH` before a write or admin command, and gated HTTP routes require `Authorization: Bearer <password>` or a `Basic` credential whose password matches. Read commands and the health probes stay open on both. The value is redacted to `***` by `CONFIG SHOW` and by the `security.requirepass` runtime variable. It may be at most 4096 bytes and must not contain CR, LF or NUL, the same rules `nvecd-cli` applies to a password file; a value that breaks either fails the load.
 
 Because the password sits in a plain YAML file, the file's permissions are what protects it.
 

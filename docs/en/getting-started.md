@@ -126,12 +126,12 @@ An item with no events at all shows the other half of the behaviour:
 
 ```text
 (3 results)
-1) widget (score: 1)
-2) gasket (score: 0.9942)
-3) flange (score: 0)
+1) widget (score: 0.9994)
+2) gasket (score: 0.9953)
+3) flange (score: 0.2901)
 ```
 
-`bolt` has no co-occurrence neighbours, so the event source contributes no candidates, its weight is dropped, and the vector weight is renormalized to one. The scores are not scaled down by the missing signal.
+`bolt` has no co-occurrence neighbours, so the event source contributes no candidates and the vector source is taken alone at weight one. With nothing to weigh it against, it is not normalized either: the scores are the plain cosine similarities `using=vectors` would return, so a `min_score=` cuts the same items in both modes.
 
 Adding `adaptive=on` makes the weight follow the query item's own data density instead of the fixed 0.6 / 0.4:
 
@@ -200,7 +200,7 @@ Metadata is attached per item and is only accepted for an item that already has 
 2) gasket (score: 0.9954)
 ```
 
-A threshold means different things in different modes: it is a cosine similarity in `using=vectors`, a normalized blend in `using=fusion`, and a raw co-occurrence sum in `using=events`.
+A threshold means different things in different modes: it is a cosine similarity in `using=vectors`, a normalized blend in `using=fusion` (or the lone side's own scale when only one side has candidates), and a raw co-occurrence sum in `using=events`.
 
 ## Look at the server state
 
@@ -230,11 +230,11 @@ cmdstat_event: calls=6,failed=0
 cmdstat_sim: calls=9,failed=0
 cmdstat_vecset: calls=4,failed=0
 cmdstat_vecdel: calls=0,failed=0
-cmdstat_metaset: calls=1,failed=0
+cmdstat_metaset: calls=4,failed=0
 cmdstat_info: calls=1,failed=0
-cmdstat_config: calls=1,failed=0
-cmdstat_dump: calls=1,failed=0
-cmdstat_cache: calls=1,failed=0
+cmdstat_config: calls=0,failed=0
+cmdstat_dump: calls=0,failed=0
+cmdstat_cache: calls=0,failed=0
 cmdstat_other: calls=0,failed=0
 
 # Memory
@@ -253,6 +253,7 @@ id_count: 3
 ctx_count: 3
 vector_count: 4
 event_count: 6
+END
 ```
 
 `id_count` is 3, not 4: it counts items known to the co-occurrence index, and `bolt` has only a vector. `used_memory_bytes` covers the vector matrix alone — four vectors of four floats.
@@ -283,6 +284,7 @@ status: completed
 filepath: /tmp/nvecd-data/nvecd.dmp
 start_time: 1788427835
 end_time: 1788427836
+END
 ```
 
 Restarting the server with the same configuration loads it — the log reports `Recovery loaded snapshot: /tmp/nvecd-data/nvecd.dmp`, and `SIM widget 10 using=events` answers as it did before the restart. Automatic snapshots (`snapshot.interval_sec`), the write-ahead log and what a restart replays are covered in [Persistence](./persistence.md).

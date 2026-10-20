@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 724" width="900" height="724" role="img" aria-labelledby="ttl dsc">
   <title id="ttl">EVENT コマンド 1 件の書き込み経路と順序</title>
-  <desc id="dsc">EVENT コマンド 1 件が、受信から応答までにたどる経路を 5 つの帯で示しています。コマンドは解析され、認証とスナップショットのゲートを通過したうえで排他の書き込みゲートを取得します。イベントストアはタイムスタンプを解決し、DEL のスコアを 0 に固定して検証したのち、動詞に応じた重複キャッシュを照会します。ADD は時間窓、SET は最終値、DEL は削除フラグです。重複ならここで終了します。そうでなければ、どのストアに触れるよりも先に WAL レコードを追記し、そのあとでコンテキスト別リングバッファと共起インデックスに反映します。最後の帯で該当項目の類似度キャッシュを無効化し、応答を返します。</desc>
+  <desc id="dsc">EVENT コマンド 1 件が、受信から応答までにたどる経路を 5 つの帯で示しています。コマンドは解析され、認証とスナップショットのゲートを通過し、書き込みゲートを共有で、書き込み直列化ミューテックスを排他で取得します。イベントストアはタイムスタンプを解決し、DEL のスコアを 0 に固定して検証したのち、動詞に応じた重複キャッシュを照会します。ADD は時間窓、SET は最終値、DEL は受理された ADD か SET で解除される削除フラグです。重複ならここで終了します。そうでなければ、どのストアに触れるよりも先に WAL レコードを追記し、そのあとでコンテキスト別リングバッファと共起インデックスに反映します。最後の帯で該当項目の類似度キャッシュを無効化し、応答を返します。</desc>
 
   <style>
     .bg    { fill:#f7f5f1 }
@@ -43,7 +43,7 @@
   <text class="s" x="579" y="98" text-anchor="middle">AUTH とスナップショット判定</text>
   <path class="ln2" d="M 670 94 H 688" marker-end="url(#b)"/>
   <rect class="chip" x="688" y="78" width="154" height="32" rx="5"/>
-  <text class="s" x="765" y="98" text-anchor="middle">書き込みゲート（排他）</text>
+  <text class="s" x="765" y="98" text-anchor="middle">書き込み直列化</text>
 
   <path class="ln2" d="M 170 124 V 148" marker-end="url(#b)"/>
 
@@ -66,7 +66,7 @@
   <text class="s" x="428" y="258" text-anchor="middle">同じ id への同じ最終値</text>
   <rect class="alt" x="566" y="224" width="252" height="46" rx="5"/>
   <text class="s" x="692" y="243" text-anchor="middle">DEL — StateCache</text>
-  <text class="s" x="692" y="258" text-anchor="middle">すでに削除済み</text>
+  <text class="s" x="692" y="258" text-anchor="middle">前回の DEL 以降 ADD/SET なし</text>
   <text class="s" x="38" y="288">重複ならここで終了。WAL 記録もリングバッファ追加も共起更新も行わないが、応答は OK</text>
 
   <path class="ln2" d="M 170 300 V 324" marker-end="url(#b)"/>

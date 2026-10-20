@@ -9,7 +9,7 @@ nvecd keeps its data in memory. Two mechanisms put that data on disk: a snapshot
 | Mode | How it works | Cost |
 |---|---|---|
 | `fork` (default) | The process forks; the child serializes the copy-on-write image while the parent keeps serving | Write traffic during the child's run dirties pages, and each dirtied page is copied |
-| `lock` | The server publishes a read-only flag, drains in-flight writes, and serializes in the calling thread | Every write is refused for the whole serialization |
+| `lock` | The server publishes a read-only flag, drains in-flight writes, and serializes in the calling thread | Every write is refused for the whole serialization; searches keep being served |
 
 Fork is the default because the parent excludes writers only across the sequence capture and the `fork()` call, not across the serialization. Lock mode has no copy-on-write memory cost, but a client that sends `EVENT`, `VECSET`, `VECDEL` or `METASET` during a lock-mode save receives `ERROR READONLY Snapshot in progress`.
 
@@ -21,13 +21,13 @@ Fork is the default because the parent excludes writers only across the sequence
 
 A fork-mode save runs in this order. `DUMP SAVE`, the snapshot scheduler and decay maintenance all start their snapshots through the same routine, so the order is identical for each.
 
-1. The capture takes the snapshot gate shared and the write serialization mutex — the mutex every write holds across appending its WAL record and applying it to the stores — and is refused while a `DUMP LOAD` is in flight. No write can then sit between its append and its apply.
+1. The capture is admitted as a snapshot session, which is refused while a `DUMP LOAD` or a lock-mode save is in flight and once shutdown has begun, and it takes the write serialization mutex — the mutex every write holds across appending its WAL record and applying it to the stores. No write can then sit between its append and its apply.
 2. The writer publishes `in_progress`, so a second save is refused rather than racing. With a WAL configured, a checkpointed snapshot already at the target path is preserved first, as described under the durability handshake.
 3. A shared read lock is acquired on all four stores at once — event store, co-occurrence index, vector store, metadata store — so no store is mid-mutation when the image is frozen.
-4. **The WAL sequence is read while the gate and the locks are held.** Because no write can be in progress, the captured value is exactly the highest operation the about-to-be-frozen image contains. Everything downstream depends on this: the sidecar records it and the truncation uses it, so the log can never drop a record the snapshot does not carry.
+4. **The WAL sequence is read while the session, the mutex and the locks are held.** Because no write can be in progress, the captured value is exactly the highest operation the about-to-be-frozen image contains. Everything downstream depends on this: the sidecar records it and the truncation uses it, so the log can never drop a record the snapshot does not carry.
 5. The logger is quiesced **in the parent**, by a `pthread_atfork` prepare handler and a flush immediately before the call, and the process forks. The child never touches the logger at all — a sibling thread may have held its registry mutex at fork time, and that mutex would be permanently locked in the child.
 6. The child re-initializes the four inherited locks, closes every descriptor above standard error, resets `SIGCHLD`, `SIGPIPE` and `SIGTERM` to their defaults, and serializes the stores with logging suppressed. It exits `0` on a complete write and `1` otherwise, reporting failure through an async-signal-safe `write(2)`, which is its only diagnostic.
-7. The parent releases the locks and the gate and resumes serving. It hands the child to a session object and returns.
+7. The parent releases the locks, the mutex and the session, and resumes serving; from here the running child counts as the snapshot session. It hands the child to a session object and returns.
 
 The session owns the child from that point. The parent's request threads never reap it: a completion thread inside the session performs the single `waitpid()` for that pid and then runs the durability handshake — the sidecar write and the WAL truncate — on that same thread, without waiting for a client request, a scheduler tick or shutdown.
 
@@ -111,7 +111,7 @@ The mutation and its append run together under a serialization mutex shared by t
 
 With `wal.sync_on_write: true`, every append is fsynced before the handler returns, so an acknowledged write is on the platter. Otherwise a background thread fsyncs at most every `wal.sync_interval_ms` milliseconds — cheaper, but up to one interval's worth of acknowledged writes is lost to a power failure. Setting `sync_interval_ms: 0` with `sync_on_write: false` would leave nobody to perform the fsync at all, so the server promotes that combination to per-append fsync when it opens the log.
 
-A short or failed write closes the current segment and refuses further appends to it. Replay stops at a corrupt tail, so continuing to append past one would silently lose every later record in the same file.
+A short or failed write closes the current segment and refuses further appends to it. Recovery repairs only a torn tail: a record header or body cut short by the end of the newest segment is cut off, the cut is fsynced, and replay continues. A torn record in any other segment, a length prefix outside the valid range, or a CRC mismatch anywhere stops startup, so a record appended after a short write would either be cut with the torn one or make the server fail to start.
 
 ### Rotation and truncation
 
@@ -125,7 +125,7 @@ Truncation is the only thing that reclaims WAL space, and it runs solely as part
 
 `wal.include_vectors: false` omits the vector payload: a `VECSET` writes no record, unless it carries metadata (the HTTP `/vecset` form), in which case that metadata is logged as the equivalent `METASET` record. Operators choose it when snapshots are their intended durability boundary for vector data and the log only needs to carry events and metadata.
 
-The consequence is direct: **a vector written while that setting was off cannot be recovered from the WAL.** Only a snapshot taken after the write holds it. Replay tolerates the resulting gap narrowly — a `VECDEL` or `METASET` whose subject vector is missing is a deliberate absence rather than corruption, so it is skipped and counted. `INFO` reports the running total as `wal_replay_records_skipped`, so the size of the gap survives log rotation. Replay likewise skips and counts a record that validation added after it was logged now rejects: a `VECSET` whose item ID would break the line protocol (empty, or carrying whitespace or a control byte) or whose components the store refuses, and a legacy text `METASET` record whose pairs used a comparison or `in(...)`, which the `METASET` grammar now rejects instead of storing one value. Every other operation and every other failure, including a CRC mismatch, a truncation, a decode failure or a dimension mismatch, stops recovery.
+The consequence is direct: **a vector written while that setting was off cannot be recovered from the WAL.** Only a snapshot taken after the write holds it. Replay tolerates the resulting gap narrowly — a `VECDEL` or `METASET` whose subject vector is missing is a deliberate absence rather than corruption, so it is skipped and counted. `INFO` reports the running total as `wal_replay_records_skipped`, so the size of the gap survives log rotation. Replay likewise skips and counts a record that validation added after it was logged now rejects: a `VECSET` whose item ID would break the line protocol (empty, or carrying whitespace or a control byte) or whose components the store refuses, and a legacy text `METASET` record whose pairs used a comparison or `in(...)`, which the `METASET` grammar now rejects instead of storing one value. Every other operation and every other failure, including a CRC mismatch, a truncation anywhere but the end of the newest segment, a decode failure or a dimension mismatch, stops recovery.
 
 ## Restart recovery
 
@@ -161,6 +161,8 @@ OK DUMP_SAVE_STARTED /var/lib/nvecd/snapshots/backup.nvec
 ```
 
 In lock mode the response comes back after the whole handshake has completed, as `OK DUMP_SAVED /var/lib/nvecd/snapshots/backup.nvec`.
+
+One snapshot session runs at a time: a lock-mode save, a load, or a background save from its capture until its child has been reaped. A `DUMP SAVE` or `DUMP LOAD` that arrives while another session is running is refused rather than queued, and once shutdown has begun both are refused with `ERROR Server is shutting down; snapshot operations are refused`.
 
 **`DUMP LOAD <path>`** replaces the live state with a snapshot. The file is deserialized into staged stores first, so a corrupt or semantically invalid snapshot can only damage those; the live stores are swapped in under exclusive gates, the ANN index is rebuilt and the query cache is cleared. With a WAL configured, a load is treated as a deliberate rollback: the loaded snapshot becomes the newest recovery base and the pre-load WAL tail is discarded, so a later restart does not replay the mutations the operator just rolled back. Because the loaded file becomes the recovery base, its name must end in `.nvec` or `.dmp` when a WAL is configured; without a WAL any name loads. A load is refused while a background fork save is still writing, since that save would finish later and outrank the loaded snapshot. If any durability step of a load fails after publication, the server latches the same fail-stop state, keeps refusing commands as loading, and needs a restart — it will not resume serving on a state whose recovery base is uncertain.
 

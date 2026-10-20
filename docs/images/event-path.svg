@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 724" width="900" height="724" role="img" aria-labelledby="ttl dsc">
   <title id="ttl">The ordered write path of a single EVENT command</title>
-  <desc id="dsc">Five stacked bands follow one EVENT command from the wire to the reply. The command is parsed and passes the auth and snapshot gates before an exclusive write gate is taken. The event store then resolves the timestamp, forces a DEL score to zero, validates, and probes a dedup cache chosen by verb: a time window for ADD, the last value for SET, a deletion flag for DEL. A duplicate stops there. Otherwise the WAL record is appended before any store is touched, and only then does the event reach the per-context ring buffer and the co-occurrence index. The last band invalidates the similarity cache for the item and replies.</desc>
+  <desc id="dsc">Five stacked bands follow one EVENT command from the wire to the reply. The command is parsed and passes the auth and snapshot gates, holding the write gate shared and the write serialization mutex exclusively. The event store then resolves the timestamp, forces a DEL score to zero, validates, and probes a dedup cache chosen by verb: a time window for ADD, the last value for SET, a deletion flag for DEL that an accepted ADD or SET clears. A duplicate stops there. Otherwise the WAL record is appended before any store is touched, and only then does the event reach the per-context ring buffer and the co-occurrence index. The last band invalidates the similarity cache for the item and replies.</desc>
 
   <style>
     .bg    { fill:#f7f5f1 }
@@ -43,7 +43,7 @@
   <text class="s" x="586" y="98" text-anchor="middle">AUTH + snapshot gates</text>
   <path class="ln2" d="M 684 94 H 702" marker-end="url(#b)"/>
   <rect class="chip" x="702" y="78" width="152" height="32" rx="5"/>
-  <text class="s" x="778" y="98" text-anchor="middle">write gate (exclusive)</text>
+  <text class="s" x="778" y="98" text-anchor="middle">serialized write</text>
 
   <path class="ln2" d="M 170 124 V 148" marker-end="url(#b)"/>
 
@@ -66,7 +66,7 @@
   <text class="s" x="428" y="258" text-anchor="middle">same last value for the id</text>
   <rect class="alt" x="566" y="224" width="252" height="46" rx="5"/>
   <text class="s" x="692" y="243" text-anchor="middle">DEL — StateCache</text>
-  <text class="s" x="692" y="258" text-anchor="middle">already marked deleted</text>
+  <text class="s" x="692" y="258" text-anchor="middle">deleted, no ADD/SET accepted since</text>
   <text class="s" x="38" y="288">a duplicate stops here: no WAL record, no ring-buffer push, no co-occurrence update — the reply is still OK</text>
 
   <path class="ln2" d="M 170 300 V 324" marker-end="url(#b)"/>

@@ -44,7 +44,7 @@ $ printf 'INFO\n' | nc -U /var/run/nvecd.sock
 
 応答は CRLF で終端された行の並びで、末尾の CRLF はちょうど 1 個です。ハンドラ本体が素の `\n` で組み立てたテキストもソケットに出る前に正規化されるため、クライアントは常に `\r\n` で分割できます。
 
-`performance.max_query_length`（既定値 1 MiB）を超えるリクエストには `ERROR Request too large` を返し、上限に達するまで改行が届かなかった場合は `ERROR Request too large (no newline detected)` を返します。同じ `ERROR Request too large` は、リアクタのプロセス全体のバッファ予算 `performance.reactor_max_total_buffered_bytes` を使い切った接続にも返されます。ワーカープールがリクエストを受け付けられない場合の応答は `ERROR Server busy` です。どちらの条件でも、応答を送り出したあとに接続を閉じます。
+`performance.max_query_length`（既定値 1 MiB）を超えるリクエストには `ERROR Request too large` を返します。改行で終わらない行は、その上限を超えた時点で改行を待たずに `ERROR Request too large (no newline detected)` で応答します。同じ `ERROR Request too large` は、リアクタのプロセス全体のバッファ予算 `performance.reactor_max_total_buffered_bytes` を使い切った接続にも返されます。ワーカープールがリクエストを受け付けられない場合の応答は `ERROR Server busy` です。どちらの条件でも、応答を送り出したあとに接続を閉じます。いずれもコマンドが成立する前に起きるため、コマンド統計には計上されません。
 
 応答の形は 5 種類です。
 
@@ -418,7 +418,7 @@ OK DUMP_SAVE_STARTED /var/lib/nvecd/snapshots/nvecd.nvec
 OK DUMP_SAVED /var/lib/nvecd/snapshots/nvecd.nvec
 ```
 
-`DUMP STATUS` はバックグラウンドの書き込みプロセスを報告します。まだ何も動いていないときのフィールドは `status: idle` だけで、他の 3 状態はパスと時刻を、失敗はさらにメッセージを運びます。
+`DUMP STATUS` はバックグラウンドの書き込みプロセスを報告します。fork によるスナップショットはすべてここを通ります。`fork` モードの `DUMP SAVE`、スナップショットスケジューラ、減衰保守のスナップショットがそれで、`snapshot.mode: lock` でも自動スナップショットや保守スナップショットが表示されることがあります。`lock` モードの `DUMP SAVE` が表示されることはありません。まだ何も動いていないときのフィールドは `status: idle` だけで、他の 3 状態はパスと時刻を、失敗はさらにメッセージを運びます。
 
 ```text
 > DUMP STATUS
@@ -432,7 +432,7 @@ END
 
 `in_progress` 状態は `pid` を、`failed` 状態は `error` を追加します。
 
-`DUMP LOAD` は稼働中のストアをスナップショットの内容で置き換え、ANN 索引を再構築し、キャッシュを消去し、そのスナップショットを復旧の基点にします。`DUMP VERIFY` は読み込まずに整合性を検査します。`DUMP INFO` はヘッダを読みます。
+`DUMP LOAD` は稼働中のストアをスナップショットの内容で置き換え、ANN 索引を再構築し、キャッシュを消去します。WAL を設定している場合は、そのスナップショットを復旧の基点にし、読み込み前の WAL の末尾を破棄します。WAL がない場合、再起動時の復旧は通常どおり更新時刻が最も新しいスナップショットを選びます。`DUMP VERIFY` は読み込まずに整合性を検査します。`DUMP INFO` はヘッダを読みます。
 
 ```text
 > DUMP INFO nvecd.nvec
@@ -554,9 +554,9 @@ ERROR Variable 'vectors.default_dimension' is immutable (requires restart)
 ERROR Unknown variable: nosuch
 ```
 
-真偽値は `true`／`false`、`on`／`off`、`1`／`0`、`yes`／`no` を受け付け、`true` または `false` の正規形で保存されます。
+真偽値は `true`／`false`、`on`／`off`、`yes`／`no` を小文字、先頭大文字、全大文字のいずれでも受け付け、加えて `1`／`0` も受け付けます。保存されるのは `true` または `false` の正規形です。
 
-`SHOW VARIABLES` は `<name>=<value> (mutable|immutable)` 行の RESP 配列を返します。`LIKE` は前方一致のパターンを取り、末尾の `%` は取り除かれて残りが接頭辞になります。
+`SHOW VARIABLES` は `<name>=<value> (mutable|immutable)` 行の RESP 配列を返します。`LIKE` は前方一致のパターンを取ります。最初の `%` から後ろはすべて捨てられ、残りがそのまま接頭辞として照合されるため、`cache.%` は `cache.` の変数を、`%cache` はすべての変数を列挙します。
 
 ```text
 > SHOW VARIABLES LIKE cache.%
@@ -575,11 +575,11 @@ $31
 cache.ttl_seconds=600 (mutable)
 ```
 
-入力では `performance.` の接頭辞を `perf.` と綴ることもできますが、内省は常に `performance.` の綴りで報告します。変数の一覧と可変性は [configuration.md](./configuration.md) にあります。
+入力では `performance.` の接頭辞を `perf.` と綴ることもでき、`GET`、`SET`、`LIKE` のいずれでも通じますが、内省は常に `performance.` の綴りで報告します。変数の一覧と可変性は [configuration.md](./configuration.md) にあります。
 
 ## エラー応答
 
-すべての失敗は `ERROR <message>` の 1 行です。拒否されたコマンドも `total_commands_processed` と `failed_commands` の両方に計上されるため、運用者がアラートを設定する失敗率が 1 を超えることはありません。
+すべての失敗は `ERROR <message>` の 1 行です。レート制限で拒否されたものを含め、拒否されたコマンドもその動詞のグループで `total_commands_processed` と `failed_commands` の両方に計上されるため、運用者がアラートを設定する失敗率が 1 を超えることはありません。例外はフレーミングによる拒否（`Request too large`、`Request too large (no newline detected)`）と `Server busy` で、これらはコマンドが成立する前に起きるため計上されません。
 
 | メッセージ | 原因 |
 |---|---|
@@ -590,6 +590,8 @@ cache.ttl_seconds=600 (mutable)
 | `Request too large` | `performance.max_query_length` 超過、またはリアクタの共有バッファ予算の枯渇 |
 | `Request too large (no newline detected)` | 改行が届く前に上限に達した |
 | `Server busy` | ワーカープールがリクエストを受け付けられなかった |
+| `Rate limit exceeded` | TCP クライアントのアドレスが `api.rate_limiting` の上限を超えた。Unix ソケット接続は対象外 |
+| `Internal server error` | 処理中のリクエストが予期しない例外を送出した |
 | `NOAUTH Authentication required` | 未認証接続での書き込み／管理コマンド |
 | `ERR invalid password` | `AUTH` のパスワード誤り |
 | `LOADING Snapshot load in progress` | `DUMP LOAD` が反映中 |
@@ -608,7 +610,7 @@ cache.ttl_seconds=600 (mutable)
 | `Invalid option: <t> (expected timestamp=<value>)` | スコアの後（`DEL` では ID の後）のトークンが `timestamp=` でない |
 | `Context cannot be empty` ／ `ID cannot be empty` | `EVENT` のコンテキストまたはアイテム ID が空 |
 | `Context must not contain whitespace or control characters` | `EVENT` のコンテキストに `0x20` 以下または `0x7F` のバイトがある |
-| `ID must not contain whitespace or control characters` | `EVENT` のアイテム ID または `VECSET` の ID に対する同じ規則 |
+| `ID must not contain whitespace or control characters` | `EVENT` のアイテム ID と、`VECSET`、`VECDEL`、`METASET`、`SIM` の ID に対する同じ規則 |
 | `VECSET requires at least 2 arguments: <id> <floats>` | `VECSET` の引数個数 |
 | `Invalid float: <t>` | 末尾に余分な文字が付いた浮動小数点トークン（16 進表記を含む）、`nan` や `inf` などの非有限の綴り、または浮動小数点の範囲を超える大きさ |
 | `Failed to parse float: <t>` | そもそも数値でない浮動小数点トークン |
@@ -616,6 +618,7 @@ cache.ttl_seconds=600 (mutable)
 | `Vector cannot be empty` | 成分のない `VECSET` |
 | `Vector dimension exceeds maximum of <n>` | ストアの上限を超える `VECSET` |
 | `Vector dimension mismatch: expected <n>, got <m>` | `VECSET` の次元 |
+| `Vector norm must be finite` | 成分は有限だがノルムが浮動小数点の範囲を超える `VECSET` |
 | `Query vector cannot be empty` | 成分のない `SIMV` |
 | `Query vector components must be finite` | `SIMV` のクエリベクトルに非有限の成分がある |
 | `Query vector norm must be finite and non-zero` | `SIMV` のクエリベクトルのノルムが使えない |
@@ -626,6 +629,7 @@ cache.ttl_seconds=600 (mutable)
 | `METASET requires 2 arguments: <id> <key:value[,key:value...]>` | `METASET` の引数個数 |
 | `METASET requires at least one key:value pair` | 組の並びが空の `METASET` |
 | `METASET accepts only key:value pairs, got '<key>' with a comparison or in(...) value` | `>`、`<`、`>=`、`<=`、`!=`、`in(...)` を使った `METASET` の組 |
+| `Metadata keys must be non-empty with no whitespace, control character, ',' or filter operator (: = < > !)` | `filter=` の条件で指定できない `METASET` のキー |
 | `SIM requires at least 2 arguments: <id> <top_k>` | `SIM` の引数個数 |
 | `SIMV requires at least 2 arguments: <top_k> <floats>` | `SIMV` の引数個数 |
 | `SIMV requires at least one vector float` | トークンがすべてオプションだった `SIMV` |
@@ -638,24 +642,41 @@ cache.ttl_seconds=600 (mutable)
 | `explain option is not supported` | `explain=` |
 | `Invalid filter condition: '<pair>'` | `filter=` の条件が不正 |
 | `Query vector not found: <id>` | ベクトルのない ID への `SIM` |
+| `INFO takes no arguments` | 後ろにトークンが続く `INFO` |
 | `CONFIG requires subcommand: HELP\|SHOW\|VERIFY` | `CONFIG` の引数個数 |
 | `Unknown CONFIG subcommand: <S>` | `CONFIG` のサブコマンドが未知 |
-| `Configuration file is not accessible` | `CONFIG VERIFY` のパスが許可ルート外 |
+| `CONFIG <S> takes at most 1 argument: [path]` | パスが 2 つ以上続く `CONFIG` サブコマンド |
+| `Configuration path not found: <path>` | スキーマが定義していないパスへの `CONFIG HELP` |
+| `CONFIG VERIFY requires a filepath` | 引数のない `CONFIG VERIFY` |
+| `Configuration file is not accessible` | `CONFIG VERIFY` のパスが許可ルート外、存在しない、または読めない |
+| `Configuration validation failed: <reason>` | 読み込めないファイルへの `CONFIG VERIFY` |
 | `DUMP requires subcommand: SAVE\|LOAD\|VERIFY\|INFO\|STATUS` | `DUMP` の引数個数 |
 | `Unknown DUMP subcommand: <S>` | `DUMP` のサブコマンドが未知 |
+| `DUMP <S> takes at most 1 argument: <filepath>` | パスが 2 つ以上続く `DUMP` サブコマンド |
+| `DUMP STATUS takes no arguments` | 後ろにトークンが続く `DUMP STATUS` |
 | `DUMP LOAD requires a filepath` | 引数のない `DUMP LOAD` |
 | `DUMP VERIFY requires a filepath` | 引数のない `DUMP VERIFY` |
 | `DUMP INFO requires a filepath` | 引数のない `DUMP INFO` |
-| `Invalid filepath: path traversal detected` | スナップショットパスが `snapshot.dir` から逃げている |
+| `Invalid filepath: must not contain whitespace or control characters` | `0x20` 以下または `0x7F` のバイトを含むスナップショットパス |
+| `Invalid filepath: path traversal detected` | `..` の要素を含む、または解決すると `snapshot.dir` の外に出るスナップショットパス |
+| `Invalid filepath: names the dump directory itself, not a file` | 解決すると `snapshot.dir` そのものになるスナップショットパス |
+| `Invalid filepath: snapshot name must end in .nvec or .dmp` | `DUMP SAVE`、または WAL を設定した状態の `DUMP LOAD` で、起動時の復旧が走査しない名前 |
+| `Invalid filepath: <reason>` | ファイルシステムが解決できないスナップショットパス |
+| `Invalid dump directory: <reason>` | `snapshot.dir` を解決できない |
 | `Failed to load snapshot from <path>: <reason>` | `DUMP LOAD` のすべての失敗。整合性の詳細がある場合は括弧で追記される |
 | `Snapshot verification failed for <path>: <reason>` | `DUMP VERIFY` のすべての失敗。同じ詳細が付くことがある |
 | `Failed to read snapshot info from <path>: <reason>` | `DUMP INFO` がヘッダを読めなかった |
 | `Another snapshot load is already in progress` | 2 つ目の `DUMP LOAD` が同時に来た |
-| `Another snapshot save is already in progress` | 2 つ目の `lock` モード `DUMP SAVE` が同時に来た |
-| `A snapshot save is already in progress` | 保存がストアを掴んでいる間の `DUMP LOAD` |
+| `Another snapshot save is already in progress` | 別の `lock` モード保存かバックグラウンド保存の実行中に来た `lock` モードの `DUMP SAVE` |
+| `A snapshot save is already in progress` | `lock` モードの保存がストアを掴んでいる間の `DUMP LOAD` |
+| `Cannot load snapshot while a background save is in progress` | バックグラウンド保存の実行中の `DUMP LOAD` |
+| `Background snapshot already in progress (pid: <n>)` | バックグラウンド保存の実行中に来た `fork` モードの `DUMP SAVE` |
 | `Cannot save snapshot while a snapshot load is in progress` | 読み込み中の `DUMP SAVE` |
+| `Failed to save snapshot to <path>: <reason>` | ファイルを書き込めなかった、または公開できなかった `lock` モードの `DUMP SAVE` |
+| `Server is shutting down; snapshot operations are refused` | シャットダウン開始後の `DUMP SAVE` または `DUMP LOAD` |
 | `CACHE requires subcommand: STATS\|CLEAR\|ENABLE\|DISABLE` | `CACHE` の引数個数 |
 | `Unknown CACHE subcommand: <S>` | `CACHE` のサブコマンドが未知 |
+| `CACHE <S> takes no arguments` | 後ろにトークンが続く `CACHE` サブコマンド |
 | `Cache controller is not initialized` | キャッシュコントローラのないサーバーでの `CACHE STATS` または `CACHE CLEAR` |
 | `Runtime variable manager is not initialized` | 変数マネージャがない状態での `CACHE ENABLE` または `CACHE DISABLE` |
 | `DEBUG requires exactly one argument: ON\|OFF` | `DEBUG` の引数個数 |
@@ -664,8 +685,14 @@ cache.ttl_seconds=600 (mutable)
 | `GET requires 1 argument: <variable_name>` | `GET` の引数個数 |
 | `SHOW requires subcommand: VARIABLES` | `SHOW` の引数個数 |
 | `Unknown SHOW subcommand: <S>` | `SHOW` の後が `VARIABLES` でない |
+| `SHOW VARIABLES accepts only: [LIKE <pattern>]` | 後ろが 1 つの `LIKE <pattern>` でない `SHOW VARIABLES` |
 | `Unknown variable: <name>` | 実行時変数が未知 |
 | `Variable '<name>' is immutable (requires restart)` | 変更不可の変数への書き込み |
+| `Invalid boolean value (use true/false, on/off, yes/no, 1/0): <v>` | 真偽値の変数への、それ以外の綴りでの `SET` |
+| `Invalid integer value: <v>` | 整数でない値での `SET cache.ttl_seconds` |
+| `Invalid double value: <v>` | 有限の数値でない値での `SET cache.min_query_cost_ms` |
+| `cache.ttl_seconds must be >= 0` ／ `cache.min_query_cost_ms must be >= 0` | どちらかへの負の値 |
+| `Invalid logging level (must be trace/debug/info/warn/error): <v>` | 未知のレベルでの `SET logging.level` |
 
 エラーコードはモジュールごとに区切られています。1000〜1999 は設定、2000〜2999 はイベント処理、3000〜3999 はコマンド解析、4000〜4999 はベクトルと類似度、5000〜5999 はストレージとスナップショット、6000〜6999 はネットワークとサーバー、7000〜7999 はクライアント、8000〜8999 はキャッシュです。TCP 面が報告するのはメッセージだけで、[HTTP 面](./http-api.md)はコードをステータスに対応付けます。
 

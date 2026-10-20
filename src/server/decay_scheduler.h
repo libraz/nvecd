@@ -39,7 +39,7 @@ class DecayScheduler {
    * @brief Construct a DecayScheduler
    * @param co_index Co-occurrence index to decay (non-owning, must outlive this)
    * @param interval_sec Decay interval in seconds (<= 0 disables the scheduler)
-   * @param alpha Decay factor passed to ApplyDecay (0.0 < alpha <= 1.0)
+   * @param alpha Decay factor passed to ApplyDecay (0.0 <= alpha <= 1.0; 0 clears the index)
    */
   DecayScheduler(events::CoOccurrenceIndex* co_index, int interval_sec, double alpha,
                  MaintenanceCallback maintenance_callback = {});

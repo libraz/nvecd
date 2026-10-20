@@ -57,7 +57,7 @@ End-to-end through `SimilarityEngine`, dimension 128, `top_k` 10, cosine:
 | 50,000 | 0.62 ms | 0.57 ms |
 | 100,000 | 0.87 ms | 0.90 ms |
 
-These run at the default `sample_size` of 10,000, and sampling engages once the corpus exceeds twice that value. The two smallest rows are therefore exhaustive scans; the 50,000 and 100,000 rows score a sample of 10,000 rows instead. Drawing the sample costs work proportional to its size, but the sampled rows are scattered across the whole matrix, so the scan loses the sequential memory access the exhaustive rows get and its cost still rises with corpus size. The two entry points agree to within run-to-run noise, which is expected: they differ only in whether the query vector is looked up or supplied.
+These run at the default `sample_size` of 10,000, and sampling engages for an unfiltered query once the live vectors exceed twice that value. The two smallest rows are therefore exhaustive scans; the 50,000 and 100,000 rows score a sample of 10,000 rows instead. Drawing the sample costs work proportional to its size, but the sampled rows are scattered across the whole matrix, so the scan loses the sequential memory access the exhaustive rows get and its cost still rises with corpus size. The two entry points agree to within run-to-run noise, which is expected: they differ only in whether the query vector is looked up or supplied.
 
 Dividing through, the 100,000-vector figure is roughly 1,100 queries per second per thread.
 

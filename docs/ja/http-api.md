@@ -51,7 +51,7 @@ network:
 
 この表にないパス、および登録済みのパスに誤ったメソッドで到達した場合は `404` を返します。
 
-各ルートは自分がどの TCP コマンドの HTTP 形であるかを宣言し、その 1 つの宣言が権限とリクエストの計上先カウンタの両方を決めます。そのため 2 つの面がどちらの点でも食い違うことはありません。
+各ルートは自分がどの TCP コマンドの HTTP 形であるかを宣言し、その 1 つの宣言が権限とリクエストの計上先カウンタの両方を決めます。そのため 2 つの面がどちらの点でも食い違うことはありません。コマンドのルートへのリクエストがルーティング前に `403` や `429` で拒否された場合も、そのルートのグループで失敗したコマンド 1 件として計上されます。表にないパスと、ヘルスチェックおよびメトリクスのエンドポイントはコマンドではないので計上されません。
 
 ## 認証
 
@@ -85,7 +85,7 @@ curl -X POST http://127.0.0.1:8080/vecset \
 |---|---|
 | `200` | 成功 |
 | `204` | CORS プリフライト（`OPTIONS`） |
-| `400` | JSON の不正、JSON オブジェクトでないボディ、フィールドの欠落や型違い、1〜`similarity.max_top_k` の外にある `top_k`（値の大きさを問わない）、浮動小数点の範囲を超える `min_score` やベクトル成分、次元不一致、フィルタの不正、イベントスコアの不正、空または空白や制御文字を含むアイテム ID やコンテキスト ID、スナップショットパスのトラバーサル、未対応のキャッシュスコープ |
+| `400` | JSON の不正、JSON オブジェクトでないボディ、未知のフィールド、フィールドの欠落や型違い、1〜`similarity.max_top_k` の外にある `top_k`（値の大きさを問わない）、浮動小数点の範囲を超える `min_score` やベクトル成分、次元不一致、フィルタの不正、イベントスコアの不正、空または空白や制御文字を含むアイテム ID やコンテキスト ID、スナップショットパスのトラバーサル、未対応のキャッシュスコープ |
 | `401` | 対象ルートで資格情報がない、または誤っている |
 | `403` | 送信元アドレスが `network.allow_cidrs` の外側、またはハンドラからの権限エラー |
 | `404` | 未知のルートまたはメソッド、未知のアイテム ID、スナップショットや設定ファイルが見つからない |
@@ -98,6 +98,8 @@ curl -X POST http://127.0.0.1:8080/vecset \
 | `503` | サーバーが読み込み中、lock モードのスナップショットがストアを掴んでいる間またはパーシステンスのフェイルストップ後の書き込みルート（`error` の文字列は TCP の `READONLY` メッセージと同じ）、あるいは WAL が受け付けられなかった書き込み |
 
 ハンドラのエラーはメッセージ文字列を見るのではなく型付きのエラーコードから対応付けられるため、同じ失敗はどのルートでも同じステータスになります。対応は、アイテムやファイルが見つからない条件が `404`、引数・解析・次元・`top_k`・イベントスコアのエラーが `400`、権限拒否が `403`、並行するスナップショット操作が `409`、使えないスナップショットファイルが `422`、WAL の書き込み・ローテーション・未オープンのエラーが `503`、それ以外が `500` です。
+
+ルートが受け取らないボディのフィールドは無視されず、`400` で拒否されます。メッセージは `Unknown field: <name>` で、`/sim` と `/simv` では未知のオプションに対して TCP が返すのと同じ `Invalid SIM option: <name>` ／ `Invalid SIMV option: <name>` です。例外は `POST /cache/clear` で、`scope` 以外のフィールドはすべて無視します。
 
 エラー本文はすべて 1 フィールドのオブジェクトです。
 
@@ -157,7 +159,7 @@ curl -X POST http://127.0.0.1:8080/vecset \
 {"status":"ok"}
 ```
 
-ID はパスやクエリ文字列ではなく JSON ボディから読むため、`DELETE` でボディを送らないクライアントライブラリは送るように設定する必要があります。`id` が空または欠落している場合は `400`、未知の ID の場合は `404` で `Vector not found: <id>` を返します。
+ID はパスやクエリ文字列ではなく JSON ボディから読むため、`DELETE` でボディを送らないクライアントライブラリは送るように設定する必要があります。`id` が欠落している場合、または空や空白・制御文字を含む場合は `400`、未知の ID の場合は `404` で `Vector not found: <id>` を返します。
 
 ### `POST /metaset`
 
@@ -169,7 +171,7 @@ ID はパスやクエリ文字列ではなく JSON ボディから読むため�
 {"status":"ok"}
 ```
 
-ここでの `metadata` は構造化された JSON オブジェクトであり、TCP の `METASET` やクライアントライブラリが取る `key:value,key:value` 文字列ではありません。対象のアイテムはすでにベクトルを持っている必要があり、そうでない場合は `404` で `Vector not found for metadata: <id>` を返します。
+ここでの `metadata` は構造化された JSON オブジェクトであり、TCP の `METASET` やクライアントライブラリが取る `key:value,key:value` 文字列ではありません。`id` が空または空白や制御文字を含む場合は `400` です。対象のアイテムはすでにベクトルを持っている必要があり、そうでない場合は `404` で `Vector not found for metadata: <id>` を返します。
 
 ## 検索ルート
 
@@ -194,7 +196,7 @@ ID はパスやクエリ文字列ではなく JSON ボディから読むため�
 
 `count` は `min_score` 適用後の `results` の要素数です。スコアは小数点以下 4 桁に丸められ、これは TCP 面が描画する精度と同じです。
 
-`top_k` は正で、かつ `similarity.max_top_k` 以下でなければなりません。どちらの違反も、同じ値に対して TCP が返すのと同じメッセージで `400` になり、整数の範囲を超える値は折り返されずに拒否されます。浮動小数点の範囲を超える `min_score` も `400` です。`filter` は TCP の `filter=` と同じ文法（`=`、`:`、`!=`、`>`、`<`、`>=`、`<=`、`in(a|b|c)`）を使い、[protocol.md](./protocol.md) に記載しています。ベクトルを持たない `id` は `404` で `Query vector not found: <id>` を返します。
+`top_k` は正で、かつ `similarity.max_top_k` 以下でなければなりません。どちらの違反も、同じ値に対して TCP が返すのと同じメッセージで `400` になり、整数の範囲を超える値は折り返されずに拒否されます。浮動小数点の範囲を超える `min_score` も `400` です。`filter` は TCP の `filter=` と同じ文法（`=`、`:`、`!=`、`>`、`<`、`>=`、`<=`、`in(a|b|c)`）を使い、[protocol.md](./protocol.md) に記載しています。空または空白や制御文字を含む `id` は `400`、ベクトルを持たない `id` は `404` で `Query vector not found: <id>` を返します。
 
 ### `POST /simv`
 
@@ -329,7 +331,7 @@ ID はパスやクエリ文字列ではなく JSON ボディから読むため�
 
 `ttl_seconds` と `min_query_cost_ms` は現在値を反映し、実行時変数 `cache.ttl_seconds` と `cache.min_query_cost_ms` で変更できます。キャッシュコントローラが接続されていない場合、このルートは `500` を返します。
 
-フィールドの集合は TCP の `CACHE STATS` に近いものの同一ではありません。2 つのフィールドの名前が異なります（ここでの `enabled` と `current_entries` が `cache_enabled` と `cache_entries` にあたります）。
+フィールドの集合は TCP の `CACHE STATS` と同じですが、5 つのフィールドの名前が異なります。TCP の `cache_enabled` はここでは `enabled`、`cache_entries` は `current_entries`、`cache_memory_bytes` は `current_memory_bytes`、`cache_hit_rate` は `hit_rate`、`total_time_saved_ms` は `time_saved_ms` です。
 
 ## キャッシュ管理
 
@@ -441,7 +443,7 @@ JSON オブジェクトでないボディも `400` です。
 }
 ```
 
-`info` の下の値はすべて文字列です。このブロックは共通ハンドラのテキスト出力を解析して作られるためです。ここでの `filepath` は解決済みのパスではなくリクエストの値をそのまま返します。
+`info` の下の値はすべて文字列です。このブロックは共通ハンドラのテキスト出力を解析して作られるためです。`filepath` は、`/dump/save`、`/dump/load`、`/dump/verify` と同じく、ハンドラが読んだ解決済みの絶対パスです。
 
 ### `GET /dump/status`
 
@@ -462,7 +464,7 @@ JSON オブジェクトでないボディも `400` です。
 {"snapshot":{"status":"idle"},"status":"ok"}
 ```
 
-`snapshot.mode: lock` で設定されたサーバーにはバックグラウンドの書き込みプロセスがないため、常に `idle` を返します。最上位の `status` は、リクエスト自体が成功していれば常に `ok` です。
+`snapshot` はバックグラウンドの書き込みプロセスを表し、fork によるスナップショットはすべてここを通ります。`snapshot.mode: fork` での `/dump/save`、スナップショットスケジューラ、減衰保守のスナップショットがそれです。lock モードの保存はリクエストのスレッドで実行されるため表示されませんが、`snapshot.mode: lock` でもスケジューラと保守のスナップショットは表示されるので、常に `idle` になるわけではありません。最上位の `status` は、リクエスト自体が成功していれば常に `ok` です。
 
 ## デバッグルート
 
@@ -563,8 +565,8 @@ nvecd_memory_bytes 7060
 # TYPE nvecd_vectors_total gauge
 nvecd_vectors_total 1
 
-# HELP nvecd_events_total Total events stored
-# TYPE nvecd_events_total gauge
+# HELP nvecd_events_total Events accepted since start
+# TYPE nvecd_events_total counter
 nvecd_events_total 6
 
 # HELP nvecd_contexts_total Total contexts stored
@@ -579,7 +581,7 @@ nvecd_contexts_total 2
 | `nvecd_commands_failed_total` | counter | 成功しなかったコマンド数。`command` ラベルは同じ |
 | `nvecd_memory_bytes` | gauge | イベントストア、ベクトルストア、共起索引の合計 |
 | `nvecd_vectors_total` | gauge | 保持しているベクトル数 |
-| `nvecd_events_total` | gauge | 保持しているイベント数 |
+| `nvecd_events_total` | counter | 起動以降に受け付けたイベント数（`INFO` の `event_count`） |
 | `nvecd_contexts_total` | gauge | アクティブなコンテキスト数 |
 | `nvecd_cache_queries_total` | counter | キャッシュ参照回数 |
 | `nvecd_cache_hits_total` | counter | キャッシュヒット数 |

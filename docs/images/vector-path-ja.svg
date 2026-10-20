@@ -43,7 +43,7 @@
   <text class="s" x="511" y="98" text-anchor="middle">AUTH とスナップショット判定</text>
   <path class="ln" d="M 602 94 H 620" marker-end="url(#a)"/>
   <rect class="chip" x="620" y="78" width="154" height="32" rx="5"/>
-  <text class="s" x="697" y="98" text-anchor="middle">書き込みゲート（排他）</text>
+  <text class="s" x="697" y="98" text-anchor="middle">書き込み直列化</text>
 
   <path class="ln" d="M 136 124 V 148" marker-end="url(#a)"/>
 

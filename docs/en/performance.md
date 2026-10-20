@@ -50,7 +50,7 @@ similarity:
   sample_size: 10000
 ```
 
-`flat` scans vectors and returns the exact top-k as long as `sample_size` is 0 or the corpus is at most twice `sample_size`; above that it scores a random sample (see `sample_size` below). It is the default, it needs no build step and no training, and it is the right answer for a corpus small enough that a scan fits the latency budget. Its cost is linear in both corpus size and dimension.
+`flat` scans vectors and returns the exact top-k as long as `sample_size` is 0, the query carries a `filter=`, or the live vectors number at most twice `sample_size`; above that an unfiltered query scores a random sample (see `sample_size` below). It is the default, it needs no build step and no training, and it is the right answer for a corpus small enough that a scan fits the latency budget. Its cost is linear in both corpus size and dimension.
 
 `hnsw` builds a navigable graph. Recall is tuned by `hnsw_ef_search`, the search width at query time: higher means more of the graph explored, higher recall and more latency. `hnsw_m` and `hnsw_ef_construction` govern the graph itself and take effect at build time, so changing them means rebuilding. `hnsw_max_elements` reserves capacity at startup; left at 0 the graph grows on demand.
 
@@ -58,7 +58,7 @@ similarity:
 
 Choose the knob value from the recall you need rather than the latency you want. The [recall floors in Benchmarks](./benchmarks.md#approximate-index-recall) give the shape of both curves on clustered data: recall rises steeply at first and then flattens, so the last few points of recall cost disproportionately more latency than the first. Verify the setting on your own vectors — recall depends on how clustered the corpus is, and a corpus of near-orthogonal vectors is one where no approximate index pays for itself.
 
-`sample_size` is an independent approximation that applies to the scanning path. Above twice its value, a query scores a random sample instead of the whole corpus. Floyd sampling draws the rows without walking the whole corpus, so both selection and distance work scale with the sample size. The sampled rows are scattered across the matrix, though, so query cost still rises with corpus size rather than staying constant. Set it to 0 for exact answers.
+`sample_size` is an independent approximation that applies to the scanning path. Once the live vectors, deleted rows not counted, exceed twice its value, an unfiltered query scores a random sample of about that many live rows instead of the whole corpus; a query with `filter=` always scans every row. Floyd sampling draws the rows without walking the whole corpus, so both selection and distance work scale with the sample size. The sampled rows are scattered across the matrix, though, so query cost still rises with corpus size rather than staying constant. Set it to 0 for exact answers.
 
 ## Tuning the query cache
 
@@ -97,8 +97,8 @@ eviction_batch_size: 10
 total_queries: 10000
 cache_hits: 8500
 cache_misses: 1500
-cache_misses_invalidated: 320
-cache_misses_not_found: 1180
+cache_misses_invalidated: 0
+cache_misses_not_found: 1500
 cache_hit_rate: 0.8500
 evictions: 320
 ttl_expirations: 12
@@ -114,7 +114,7 @@ Four readings decide whether the cache earns its memory.
 
 `cache_hit_rate` alone can mislead. A low rate with `total_queries` barely above `cache_hits + cache_misses` means the workload has little repetition and nothing will fix that; a low rate with `evictions` climbing means the budget is too small for the working set.
 
-`cache_misses_invalidated` against `cache_misses_not_found` separates the two kinds of miss. Not-found misses are queries never seen before. Invalidated misses are queries whose answer was cached and then thrown away because the underlying item changed — a high proportion of these means writes are outrunning reads on the same items, and more cache memory will not help.
+`cache_misses_not_found` counts every miss in practice. A write erases the cached entries it affects rather than flagging them, and the store generations in the cache key turn a repeat after a write into a new key, so `cache_misses_invalidated` stays at 0. A high not-found count with a low hit rate means the query mix has little repetition, or that writes advance a generation faster than queries repeat; more cache memory fixes neither. [Caching](./caching.md) defines both counters.
 
 `avg_hit_latency_ms` against `avg_miss_latency_ms` is the ratio the cache is buying. When they are close, queries are already fast enough that `min_query_cost_ms` is the setting to look at rather than the budget.
 
@@ -203,7 +203,7 @@ The response carries `status`, `uptime_seconds` and a `components` object, whose
 Work through the settings in the order they affect cost.
 
 1. Check the startup log for the SIMD selection. `Scalar` where AVX2 or NEON was expected costs more than any configuration change will recover.
-2. Turn on debug output with `DEBUG ON` and re-run the query in the same session — the setting is per-connection, so a separate one-shot invocation does not inherit it. Each `SIM` and `SIMV` response then carries an appended block giving the mode that answered, the query time in microseconds, the number of candidates considered and the number of results returned. Candidates far above results means the query is scoring far more than it needs to.
+2. Turn on debug output with `DEBUG ON` and re-run the query in the same session — the setting is per-connection, so a separate one-shot invocation does not inherit it. Each `SIM` and `SIMV` response then carries an appended block giving the mode that answered, the query time in microseconds, the result count before `min_score=` was applied (`candidates`) and the count after it (`results`). Candidates far above results means `min_score=` is discarding most of what the search returned, so a smaller `top_k` would answer the same question for less work.
 3. Read `CACHE STATS`. A hit rate near zero with `total_queries` climbing usually means `min_query_cost_ms` is above the query's actual cost, so nothing is being stored.
 4. Check whether the mode is doing more work than the question needs — a fusion query where `using=vectors` would answer pays for both signals.
 5. Check the corpus size against the index type. A `flat` index scans everything; if the corpus has outgrown the latency budget, that is a structural answer, not a tuning one.
@@ -218,9 +218,13 @@ The one pattern that works is to derive a read replica from a snapshot:
 
 ```bash
 nvecd-cli DUMP SAVE replica-sync.dmp
+until nvecd-cli DUMP STATUS | grep -A1 'status: completed' | grep -q replica-sync.dmp; do sleep 1; done
 scp /var/lib/nvecd/snapshots/replica-sync.dmp replica:/var/lib/nvecd/snapshots/
+ssh replica nvecd-cli DUMP VERIFY replica-sync.dmp
 ssh replica nvecd-cli DUMP LOAD replica-sync.dmp
 ```
+
+Under the default `snapshot.mode: fork`, `DUMP SAVE` returns before the file is complete, so the copy waits until `DUMP STATUS` reports `completed` for that path, and the replica verifies the file before loading it, as [Persistence](./persistence.md) describes for any copy between machines.
 
 What this gives, stated exactly: the replica holds the state as of the moment the snapshot was taken. Every write accepted by the primary since then is missing, and stays missing until the next copy. The staleness window is the interval between copies, and it is on the operator to decide whether the workload tolerates it.
 

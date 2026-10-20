@@ -57,7 +57,9 @@ after a restart.
 `DEL` is the removal verb — an unlike, a removed bookmark, a dismissed
 recommendation. It carries no score: the server stores it with a score of exactly
 0, and the protocol has no score slot for it. It is deduplicated by a deletion
-flag, so a second `DEL` for an item already deleted in that context is dropped.
+flag: a second `DEL` for the same item in that context is dropped only when no
+`ADD` or `SET` for that item was accepted since the first one. An accepted `ADD`
+or `SET` makes the item present again, so the next `DEL` is a new removal.
 Because its stored score is 0, a `DEL` never adds a positive pairwise
 contribution. With `negative_signals` enabled it does the opposite — see
 [Negative signals](#negative-signals).
@@ -173,8 +175,9 @@ Setting `decay_interval_sec` to 0 disables the scheduler. Scores then accumulate
 without bound, nothing ages out, and `min_support` is applied only to items
 touched by a write.
 
-A `decay_alpha` of exactly 0 clears the entire index on the next cycle. Values
-outside 0–1 are ignored and the cycle does nothing.
+`decay_alpha` must be finite and within 0–1 inclusive; any other value is
+rejected at config load, so the server does not start with it. A `decay_alpha`
+of exactly 0 clears the entire index on the next cycle.
 
 ## Negative signals
 
@@ -214,9 +217,15 @@ number of events.
 
 `min_support` erases any edge whose absolute score is below the threshold, in
 both directions. It removes weak associations — a pair seen once, at a low score
-— which is what makes it a noise filter rather than only a memory bound. Set it
-too high and legitimate long-tail associations never accumulate enough to
-survive, because each decay cycle applies the threshold again.
+— which is what makes it a noise filter rather than only a memory bound. Every
+write prunes the items it touched, so a contribution that leaves a pair below
+the threshold is erased in the same write and cannot accumulate: a pair is
+retained only if one contribution clears `min_support` on its own, or lands on an
+existing edge that the sum lifts above it. A pair whose every contribution falls
+short, `5 × 5 = 25` against a `min_support` of 30 for example, never forms
+however often it co-occurs. Set it too high and legitimate long-tail
+associations never appear at all; decay then lowers surviving edges until they
+too drop below it.
 
 `max_contexts` caps how many contexts keep a ring buffer. When a new context
 arrives and the cap is reached, the least recently written context's buffer is

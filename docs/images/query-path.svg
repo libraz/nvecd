@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 900" width="960" height="900" role="img" aria-labelledby="ttl dsc">
   <title id="ttl">How a fusion SIM query is answered</title>
-  <desc id="dsc">A top-to-bottom read path for a SIM query in fusion mode. The request is turned into a cache key that carries the query parameters and four generation counters; a lookup either hits, decompressing the stored top-k result, or misses. On a miss two retrieval arms run: a co-occurrence lookup and a vector search, each oversampled to three times top_k. Each source is min-max normalized to zero-to-one, the two are combined by a weighted sum, the metadata filter is re-applied and the list is cut to top_k. The result is written back to the cache only when the query cost exceeded a threshold, and the min_score cutoff is applied last, on both the hit and miss paths.</desc>
+  <desc id="dsc">A top-to-bottom read path for a SIM query in fusion mode. The request is turned into a cache key that carries the query parameters and four generation counters; a lookup either hits, decompressing the stored top-k result, or misses. On a miss two retrieval arms run: a co-occurrence lookup and a vector search, each oversampled to three times top_k and each applying the metadata filter as it gathers candidates. When both return candidates each source is min-max normalized to zero-to-one, the two are combined by a weighted sum, and the list is cut to top_k; there is no second filter pass. The result is written back to the cache only when the query cost exceeded a threshold, and the min_score cutoff is applied last, on both the hit and miss paths.</desc>
 
   <style>
     .bg    { fill:#f7f5f1 }
@@ -87,14 +87,14 @@
   <rect class="card" x="488" y="332" width="196" height="84" rx="6"/>
   <text class="lbl" x="502" y="353">VECTOR SEARCH</text>
   <text class="mono" x="502" y="372">AnnIndex::Search</text>
-  <text class="s" x="502" y="390">HNSW or IVF; a full scan</text>
-  <text class="s" x="502" y="405">when the index is flat</text>
+  <text class="s" x="502" y="390">HNSW, IVF or a flat scan,</text>
+  <text class="s" x="502" y="405">metadata-filtered</text>
 
   <path class="ln2" d="M 374 416 V 436" marker-end="url(#b)"/>
   <path class="ln" d="M 586 416 V 436" marker-end="url(#a)"/>
 
   <rect class="chip" x="276" y="436" width="408" height="34" rx="5"/>
-  <text class="s" x="480" y="457" text-anchor="middle">each source min–max normalized to [0, 1]</text>
+  <text class="s" x="480" y="457" text-anchor="middle">each source min–max normalized to [0, 1] when both have candidates</text>
 
   <path class="lnn" d="M 480 486 V 506" marker-end="url(#c)"/>
 
@@ -107,9 +107,9 @@
   <path class="lnn" d="M 480 598 V 618" marker-end="url(#c)"/>
 
   <rect class="chip" x="260" y="618" width="440" height="72" rx="6"/>
-  <text class="lbl" x="276" y="640">FILTER AND TOP-K</text>
-  <text class="s" x="276" y="659">metadata filter re-applied over the merged candidates,</text>
-  <text class="s" x="276" y="675">then partial-sort and cut to top_k</text>
+  <text class="lbl" x="276" y="640">TOP-K</text>
+  <text class="s" x="276" y="659">both lists already passed the filter, so the merge</text>
+  <text class="s" x="276" y="675">is only partial-sorted and cut to top_k</text>
 
   <rect class="chip" x="56" y="618" width="184" height="92" rx="6"/>
   <text class="lbl" x="72" y="640">CACHE INSERT</text>

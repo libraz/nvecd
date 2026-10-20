@@ -104,7 +104,7 @@ gasket 8000.0000
 
 Scores in `using=events` are the raw accumulated products. They are unbounded, they grow as the same pair keeps appearing, and they are comparable only within one result set — `9500` says nothing on its own.
 
-Omitting `using=` selects fusion, which is the default mode. With no vectors in the store, fusion falls back to the event signal alone and scales each result set to `[0, 1]` by min-max normalisation:
+Omitting `using=` selects fusion, which is the default mode. With no vectors in the store, fusion falls back to the event signal alone. A lone source is taken at weight one and is not normalised, so the answer is the events-mode answer, raw sums included:
 
 ```bash
 nvecd-cli -p 11017 SIM widget 10
@@ -112,11 +112,11 @@ nvecd-cli -p 11017 SIM widget 10
 
 ```text
 (2 results)
-1) flange (score: 1)
-2) gasket (score: 0)
+1) flange (score: 9500)
+2) gasket (score: 8000)
 ```
 
-The ranking is identical; only the scale changed. Note that the lowest-ranked result normalises to exactly zero and is still returned, because `min_score` defaults to `0` and the comparison is inclusive. An events-mode query with a raw cutoff is the more predictable filter for this shape of data:
+Min-max normalisation applies only when both sides return candidates, so adding vectors to the store changes the scale of this query from raw sums to `[0, 1]`. A cutoff tuned against these numbers stops meaning anything at that point; an events-mode query with a raw cutoff stays predictable either way:
 
 ```bash
 nvecd-cli -p 11017 SIM widget 10 using=events min_score=9000

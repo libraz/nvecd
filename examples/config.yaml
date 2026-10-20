@@ -50,7 +50,7 @@ similarity:
   fusion_alpha: 0.6
   # Weight for the co-occurrence component in fusion mode [0.0-1.0]
   fusion_beta: 0.4
-  # Random sampling size for approximate search; sampling engages only once the corpus exceeds twice this value (0 = exact search), and the maximum is the largest value whose doubling stays inside the 32-bit counter that comparison uses [0-2147483647]
+  # Random sampling size for approximate search; sampling engages only when the live vectors exceed twice this value and the query has no filter (0 = exact search), and the maximum is the largest value whose doubling stays inside the 32-bit counter that comparison uses [0-2147483647]
   sample_size: 10000
   # Enable IVF (Inverted File) approximate nearest neighbor search
   ivf_enabled: false

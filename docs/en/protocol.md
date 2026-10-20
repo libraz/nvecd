@@ -44,7 +44,7 @@ A request is one line terminated by `\n` or `\r\n`. A command cannot span lines:
 
 A response is a sequence of CRLF-terminated lines with exactly one trailing CRLF. Handler bodies that build their text with bare `\n` are normalised before the bytes leave the socket, so a client may split on `\r\n` unconditionally.
 
-A request longer than `performance.max_query_length` (default 1 MiB) is answered with `ERROR Request too large` and, when no newline has arrived within the limit, `ERROR Request too large (no newline detected)`. The same `ERROR Request too large` also covers a connection that exhausts the reactor's process-wide buffer budget, `performance.reactor_max_total_buffered_bytes`. When the worker pool cannot accept a request for processing, the reply is `ERROR Server busy`. Both conditions close the connection once the reply has been flushed.
+A request longer than `performance.max_query_length` (default 1 MiB) is answered with `ERROR Request too large`. An unterminated line is answered with `ERROR Request too large (no newline detected)` as soon as it grows past that limit, without waiting for a newline. The same `ERROR Request too large` also covers a connection that exhausts the reactor's process-wide buffer budget, `performance.reactor_max_total_buffered_bytes`. When the worker pool cannot accept a request for processing, the reply is `ERROR Server busy`. Both conditions close the connection once the reply has been flushed. They are raised before a command exists, so neither is counted in the command statistics.
 
 Responses take five shapes:
 
@@ -418,7 +418,7 @@ In `lock` mode the file is complete when the reply arrives:
 OK DUMP_SAVED /var/lib/nvecd/snapshots/nvecd.nvec
 ```
 
-`DUMP STATUS` reports the background writer. `status: idle` is the only field when nothing has run; the other three states carry the path and timings, and a failure carries its message.
+`DUMP STATUS` reports the background writer. Every fork snapshot passes through it — a fork-mode `DUMP SAVE`, the snapshot scheduler's and the decay maintenance snapshot — so even with `snapshot.mode: lock` the status can show an automatic or maintenance snapshot; a lock-mode `DUMP SAVE` never appears in it. `status: idle` is the only field when nothing has run; the other three states carry the path and timings, and a failure carries its message.
 
 ```text
 > DUMP STATUS
@@ -432,7 +432,7 @@ END
 
 The `in_progress` state adds `pid`, and the `failed` state adds `error`.
 
-`DUMP LOAD` replaces the live stores with the snapshot's contents, rebuilds the ANN index, clears the cache and makes that snapshot the recovery base. `DUMP VERIFY` checks integrity without loading. `DUMP INFO` reads the header:
+`DUMP LOAD` replaces the live stores with the snapshot's contents, rebuilds the ANN index and clears the cache. With a WAL configured it also makes that snapshot the recovery base and discards the pre-load WAL tail; without one, restart recovery picks the newest snapshot by modification time as usual. `DUMP VERIFY` checks integrity without loading. `DUMP INFO` reads the header:
 
 ```text
 > DUMP INFO nvecd.nvec
@@ -554,9 +554,9 @@ ERROR Variable 'vectors.default_dimension' is immutable (requires restart)
 ERROR Unknown variable: nosuch
 ```
 
-Boolean values accept `true`/`false`, `on`/`off`, `1`/`0` and `yes`/`no`, and are stored canonically as `true` or `false`.
+Boolean values accept `true`/`false`, `on`/`off` and `yes`/`no` in lower, Capitalised or UPPER case, plus `1`/`0`, and are stored canonically as `true` or `false`.
 
-`SHOW VARIABLES` returns a RESP array of `<name>=<value> (mutable|immutable)` lines. `LIKE` takes a prefix; a trailing `%` is stripped and the rest is used as the prefix.
+`SHOW VARIABLES` returns a RESP array of `<name>=<value> (mutable|immutable)` lines. `LIKE` takes a prefix: everything from the first `%` on is discarded and the rest is matched as a literal prefix, so `cache.%` lists the `cache.` variables and `%cache` lists every variable.
 
 ```text
 > SHOW VARIABLES LIKE cache.%
@@ -575,11 +575,11 @@ $31
 cache.ttl_seconds=600 (mutable)
 ```
 
-The `performance.` prefix is also accepted as `perf.` on input, but introspection always reports the `performance.` spelling. The full variable list and its mutability is in [configuration.md](./configuration.md).
+The `performance.` prefix is also accepted as `perf.` on input, by `GET`, `SET` and `LIKE` alike, but introspection always reports the `performance.` spelling. The full variable list and its mutability is in [configuration.md](./configuration.md).
 
 ## Error responses
 
-Every failure is a single `ERROR <message>` line. A rejected command still counts towards the `total_commands_processed` and `failed_commands` counters, so the failure ratio an operator alerts on cannot exceed one.
+Every failure is a single `ERROR <message>` line. A rejected command, including one refused by the rate limiter, still counts towards the `total_commands_processed` and `failed_commands` counters under the group its verb names, so the failure ratio an operator alerts on cannot exceed one. The framing rejections (`Request too large`, `Request too large (no newline detected)`) and `Server busy` are the exception: they happen before a command exists and are not counted.
 
 | Message | Cause |
 |---|---|
@@ -590,6 +590,8 @@ Every failure is a single `ERROR <message>` line. A rejected command still count
 | `Request too large` | request exceeds `performance.max_query_length`, or the reactor's shared buffer budget is exhausted |
 | `Request too large (no newline detected)` | limit reached before any newline arrived |
 | `Server busy` | the worker pool could not accept the request |
+| `Rate limit exceeded` | a TCP client address over the `api.rate_limiting` budget; Unix-socket connections are exempt |
+| `Internal server error` | the request raised an unexpected exception while it was processed |
 | `NOAUTH Authentication required` | write or admin command on an unauthenticated connection |
 | `ERR invalid password` | `AUTH` with the wrong password |
 | `LOADING Snapshot load in progress` | `DUMP LOAD` is publishing |
@@ -608,7 +610,7 @@ Every failure is a single `ERROR <message>` line. A rejected command still count
 | `Invalid option: <t> (expected timestamp=<value>)` | the token after the score (or after the ID for `DEL`) is not `timestamp=` |
 | `Context cannot be empty` / `ID cannot be empty` | empty `EVENT` context or item ID |
 | `Context must not contain whitespace or control characters` | `EVENT` context carrying a byte at or below `0x20`, or `0x7F` |
-| `ID must not contain whitespace or control characters` | the same rule for an `EVENT` item ID or a `VECSET` ID |
+| `ID must not contain whitespace or control characters` | the same rule for an `EVENT` item ID and for the ID of `VECSET`, `VECDEL`, `METASET` or `SIM` |
 | `VECSET requires at least 2 arguments: <id> <floats>` | `VECSET` arity |
 | `Invalid float: <t>` | float token with trailing characters (a hex spelling included), a non-finite spelling such as `nan` or `inf`, or a magnitude beyond the float range |
 | `Failed to parse float: <t>` | float token that is not a number at all |
@@ -616,6 +618,7 @@ Every failure is a single `ERROR <message>` line. A rejected command still count
 | `Vector cannot be empty` | `VECSET` with no components |
 | `Vector dimension exceeds maximum of <n>` | `VECSET` above the store's hard ceiling |
 | `Vector dimension mismatch: expected <n>, got <m>` | `VECSET` dimension |
+| `Vector norm must be finite` | `VECSET` whose components are finite but whose norm overflows the float range |
 | `Query vector cannot be empty` | `SIMV` with no components |
 | `Query vector components must be finite` | non-finite component in a `SIMV` query vector |
 | `Query vector norm must be finite and non-zero` | `SIMV` query vector whose norm cannot be used |
@@ -626,6 +629,7 @@ Every failure is a single `ERROR <message>` line. A rejected command still count
 | `METASET requires 2 arguments: <id> <key:value[,key:value...]>` | `METASET` arity |
 | `METASET requires at least one key:value pair` | `METASET` whose pair list is empty |
 | `METASET accepts only key:value pairs, got '<key>' with a comparison or in(...) value` | `METASET` pair using `>`, `<`, `>=`, `<=`, `!=` or `in(...)` |
+| `Metadata keys must be non-empty with no whitespace, control character, ',' or filter operator (: = < > !)` | `METASET` key that a `filter=` condition could not address |
 | `SIM requires at least 2 arguments: <id> <top_k>` | `SIM` arity |
 | `SIMV requires at least 2 arguments: <top_k> <floats>` | `SIMV` arity |
 | `SIMV requires at least one vector float` | `SIMV` whose tokens were all options |
@@ -638,24 +642,41 @@ Every failure is a single `ERROR <message>` line. A rejected command still count
 | `explain option is not supported` | `explain=` |
 | `Invalid filter condition: '<pair>'` | malformed `filter=` condition |
 | `Query vector not found: <id>` | `SIM` on an ID with no vector |
+| `INFO takes no arguments` | `INFO` followed by any token |
 | `CONFIG requires subcommand: HELP\|SHOW\|VERIFY` | `CONFIG` arity |
 | `Unknown CONFIG subcommand: <S>` | unknown `CONFIG` subcommand |
-| `Configuration file is not accessible` | `CONFIG VERIFY` path outside the allowed root |
+| `CONFIG <S> takes at most 1 argument: [path]` | `CONFIG` subcommand followed by more than one path |
+| `Configuration path not found: <path>` | `CONFIG HELP` on a path the schema does not define |
+| `CONFIG VERIFY requires a filepath` | `CONFIG VERIFY` with no argument |
+| `Configuration file is not accessible` | `CONFIG VERIFY` path outside the allowed root, missing or unreadable |
+| `Configuration validation failed: <reason>` | `CONFIG VERIFY` on a file that does not load |
 | `DUMP requires subcommand: SAVE\|LOAD\|VERIFY\|INFO\|STATUS` | `DUMP` arity |
 | `Unknown DUMP subcommand: <S>` | unknown `DUMP` subcommand |
+| `DUMP <S> takes at most 1 argument: <filepath>` | `DUMP` subcommand followed by more than one path |
+| `DUMP STATUS takes no arguments` | `DUMP STATUS` followed by any token |
 | `DUMP LOAD requires a filepath` | `DUMP LOAD` with no argument |
 | `DUMP VERIFY requires a filepath` | `DUMP VERIFY` with no argument |
 | `DUMP INFO requires a filepath` | `DUMP INFO` with no argument |
-| `Invalid filepath: path traversal detected` | snapshot path escapes `snapshot.dir` |
+| `Invalid filepath: must not contain whitespace or control characters` | snapshot path carrying a byte at or below `0x20`, or `0x7F` |
+| `Invalid filepath: path traversal detected` | snapshot path with a `..` component, or one that resolves outside `snapshot.dir` |
+| `Invalid filepath: names the dump directory itself, not a file` | snapshot path that resolves to `snapshot.dir` |
+| `Invalid filepath: snapshot name must end in .nvec or .dmp` | `DUMP SAVE`, or `DUMP LOAD` with a WAL configured, on a name startup recovery would not scan |
+| `Invalid filepath: <reason>` | snapshot path the filesystem cannot resolve |
+| `Invalid dump directory: <reason>` | `snapshot.dir` cannot be resolved |
 | `Failed to load snapshot from <path>: <reason>` | every `DUMP LOAD` failure, with an integrity detail appended in parentheses when there is one |
 | `Snapshot verification failed for <path>: <reason>` | every `DUMP VERIFY` failure, with the same optional detail |
 | `Failed to read snapshot info from <path>: <reason>` | `DUMP INFO` could not read the header |
 | `Another snapshot load is already in progress` | a second concurrent `DUMP LOAD` |
-| `Another snapshot save is already in progress` | a second concurrent lock-mode `DUMP SAVE` |
-| `A snapshot save is already in progress` | `DUMP LOAD` while a save holds the store |
+| `Another snapshot save is already in progress` | a lock-mode `DUMP SAVE` while another lock-mode save or a background save is running |
+| `A snapshot save is already in progress` | `DUMP LOAD` while a lock-mode save holds the store |
+| `Cannot load snapshot while a background save is in progress` | `DUMP LOAD` while a background save is running |
+| `Background snapshot already in progress (pid: <n>)` | a fork-mode `DUMP SAVE` while a background save is running |
 | `Cannot save snapshot while a snapshot load is in progress` | `DUMP SAVE` during a load |
+| `Failed to save snapshot to <path>: <reason>` | a lock-mode `DUMP SAVE` that could not write or publish the file |
+| `Server is shutting down; snapshot operations are refused` | `DUMP SAVE` or `DUMP LOAD` after shutdown has begun |
 | `CACHE requires subcommand: STATS\|CLEAR\|ENABLE\|DISABLE` | `CACHE` arity |
 | `Unknown CACHE subcommand: <S>` | unknown `CACHE` subcommand |
+| `CACHE <S> takes no arguments` | `CACHE` subcommand followed by any token |
 | `Cache controller is not initialized` | `CACHE STATS` or `CACHE CLEAR` on a server with no cache controller |
 | `Runtime variable manager is not initialized` | `CACHE ENABLE` or `CACHE DISABLE` with no variable manager |
 | `DEBUG requires exactly one argument: ON\|OFF` | `DEBUG` arity |
@@ -664,8 +685,14 @@ Every failure is a single `ERROR <message>` line. A rejected command still count
 | `GET requires 1 argument: <variable_name>` | `GET` arity |
 | `SHOW requires subcommand: VARIABLES` | `SHOW` arity |
 | `Unknown SHOW subcommand: <S>` | `SHOW` followed by anything but `VARIABLES` |
+| `SHOW VARIABLES accepts only: [LIKE <pattern>]` | `SHOW VARIABLES` followed by anything but one `LIKE <pattern>` |
 | `Unknown variable: <name>` | unknown runtime variable |
 | `Variable '<name>' is immutable (requires restart)` | write to an immutable variable |
+| `Invalid boolean value (use true/false, on/off, yes/no, 1/0): <v>` | `SET` of a boolean variable to another spelling |
+| `Invalid integer value: <v>` | `SET cache.ttl_seconds` to a value that is not an integer |
+| `Invalid double value: <v>` | `SET cache.min_query_cost_ms` to a value that is not a finite number |
+| `cache.ttl_seconds must be >= 0` / `cache.min_query_cost_ms must be >= 0` | negative value for either |
+| `Invalid logging level (must be trace/debug/info/warn/error): <v>` | `SET logging.level` to an unknown level |
 
 Error codes are partitioned by module: 1000–1999 configuration, 2000–2999 event processing, 3000–3999 command parsing, 4000–4999 vector and similarity, 5000–5999 storage and snapshot, 6000–6999 network and server, 7000–7999 client, 8000–8999 cache. The TCP surface reports the message only; the [HTTP surface](./http-api.md) maps the code to a status.
 

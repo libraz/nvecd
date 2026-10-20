@@ -39,16 +39,16 @@ The HTTP surface runs its own listener and its own worker threads and does not g
 
 ## Read path
 
-![A fusion query checking the cache, running both signals, normalizing and blending, then filtering and storing the result](../images/query-path.svg)
+![A fusion query checking the cache, running both filtered signals, normalizing and blending, then cutting to top_k and storing the result](../images/query-path.svg)
 
 A fusion `SIM` takes this path.
 
 1. **Parse the filter.** A `filter=` argument becomes a `MetadataFilter`. Its presence changes the cache's search-type classification, since filtered and unfiltered results are not interchangeable.
 2. **Check the cache.** The key is derived from the query ID, `top_k`, the mode, the adaptive flag, the filter expression, and four generation counters: the co-occurrence generation, the vector generation, the metadata generation and the dataset generation. Because a generation is part of the key, a mutation that bumps one makes every affected key unreachable rather than requiring the old entries to be found and deleted. On a hit the result is returned directly, with `min_score` applied on the way out.
-3. **Run both signals.** The engine oversamples — three times the requested `top_k`, clamped to `similarity.max_top_k` — and runs the co-occurrence search and the vector search independently over the full store. They are additive, not an intersection: an item that is content-similar but has never co-occurred still surfaces.
+3. **Run both signals.** The engine oversamples — three times the requested `top_k`, clamped to `similarity.max_top_k` — and runs the co-occurrence search and the vector search independently over the full store. They are additive, not an intersection: an item that is content-similar but has never co-occurred still surfaces. The metadata filter is applied inside each search as candidates are gathered, and nowhere after it.
 4. **Weight.** With adaptive fusion the blend weight comes from the query item's true neighbor count in the co-occurrence index, not from the truncated result list, so a small `top_k` cannot make a mature item look new. Otherwise the configured `fusion_alpha` and `fusion_beta` apply.
-5. **Normalize and blend.** Each source's scores are normalized before the weighted sum, so the two scales do not have to be comparable. If one source has no candidates, its weight does not shrink the other's contribution. If one source fails, the query still answers on the surviving signal and the failure is logged.
-6. **Filter and store.** The metadata filter is applied, the result is measured, and it is inserted into the cache — but only if the cache is still the published instance and all four generation counters still hold the values captured at step 2. A result computed against state that has since changed is discarded rather than cached.
+5. **Normalize and blend.** When both sources have candidates, each source's scores are normalized before the weighted sum, so the two scales do not have to be comparable. If one source has no candidates, the other is used alone, at its own scale and at weight one. If one source fails, the query still answers on the surviving signal and the failure is logged.
+6. **Cut and store.** The merged list is cut to `top_k`, the result is measured, and it is inserted into the cache — but only if the cache is still the published instance and all four generation counters still hold the values captured at step 2. A result computed against state that has since changed is discarded rather than cached.
 
 The scoring itself is covered by [Fusion](./fusion.md).
 
@@ -59,21 +59,23 @@ The scoring itself is covered by [Fusion](./fusion.md).
 | Lock | Protects |
 |---|---|
 | One `shared_mutex` per store | The contents of `EventStore`, `CoOccurrenceIndex`, `VectorStore`, `MetadataStore` — one each |
-| `snapshot_write_gate` (`shared_mutex`) | The point-in-time boundary of a snapshot |
+| `SnapshotCoordinator` write gate (`shared_mutex`) | Store writes hold it shared; a lock-mode save holds it exclusively, so writes drain while searches keep running |
+| `SnapshotCoordinator` search gate (`shared_mutex`) | `SIM` and `SIMV` hold it shared; `DUMP LOAD` publication holds it exclusively after the write gate |
+| `SnapshotCoordinator` admission mutex (`mutex`) | Snapshot sessions — a lock-mode save, a load, a fork capture until its child exists, retention cleanup — admitted one at a time, a running fork child counting as one, none after shutdown begins |
 | `write_serialization_gate` (`mutex`) | A mutation together with its WAL append, and the generation counters |
 | `SimilarityCache::mutex_` (`shared_mutex`) | The LRU list, the entry map and the reverse index |
 | `SimilarityEngine::ann_publication_mutex_` (`shared_mutex`) | The ANN label mapping published alongside a vector-store generation |
 | `IoReactor::connections_mutex_` | The reactor's descriptor tables |
 
-**Lock order.** A request that mutates state takes `snapshot_write_gate` shared, then `write_serialization_gate`, then a store's own lock. A snapshot or a `DUMP LOAD` takes `snapshot_write_gate` exclusively and then `write_serialization_gate`. The order is the same in both directions, which is what makes them safe against each other. Within the stores the order is fixed as event store, co-occurrence index, vector store, metadata store, and both snapshot modes acquire all four at once in that order.
+**Lock order.** The order is write gate, search gate, `write_serialization_gate`, then the stores' own locks. A request that mutates state takes the write gate shared, then `write_serialization_gate`, then a store's lock; a search takes the search gate shared and then the store locks it reads. A lock-mode save takes the write gate exclusively. `DUMP LOAD` publication takes the write gate and then the search gate exclusively, and then `write_serialization_gate`. A fork capture holds an admitted session and `write_serialization_gate` across the WAL sequence capture and `fork()`. Every path takes the locks it needs in that one order, which is what makes them safe against each other. Within the stores the order is fixed as event store, co-occurrence index, vector store, metadata store, and both snapshot modes acquire all four at once in that order.
 
-**What `shared_mutex` buys.** A store's own lock is what makes concurrent reads possible: any number of `SIM` queries read the vector store at the same time, and a `VECSET` excludes them for the duration of the insert. The two server-wide gates are not about the stores' internal consistency — they exist so that a snapshot's point-in-time boundary is real, and so that WAL order matches dependency order across both protocol surfaces.
+**What `shared_mutex` buys.** A store's own lock is what makes concurrent reads possible: any number of `SIM` queries read the vector store at the same time, and a `VECSET` excludes them for the duration of the insert. The server-wide gates are not about the stores' internal consistency — they exist so that a snapshot's point-in-time boundary is real, and so that WAL order matches dependency order across both protocol surfaces.
 
 **Where atomics replace a lock.** Counters that only need to be monotonic use atomics with relaxed ordering: the per-command statistics, the connection counts, the cache's hit and miss counters. The four generation counters and the lifecycle flags (`loading`, `read_only`, `durability_failed`) are atomics with acquire/release ordering, because a reader must see the state the writer published before bumping them. The published cache pointer is an atomic so that enabling or disabling the cache never requires a lock on the query path. A cache entry's invalidation flag is an atomic so it can be set without taking the cache's write lock.
 
 **What a reader is promised during a concurrent write.** Each store gives a reader a consistent view of *that store*. A query that touches the co-occurrence index and the vector store takes their locks separately, so it can observe a write that landed in one but not yet in the other. Fusion is defined so that this is harmless: the two signals are independent, normalized separately, and a source with no candidate contributes nothing rather than a wrong value.
 
-Consistency across all four stores at once exists only under the snapshot gate. That is what a snapshot needs and what a query does not.
+Consistency across all four stores at once exists only inside a snapshot, which holds all four store locks together while writes are excluded. That is what a snapshot needs and what a query does not.
 
 ## Ownership and lifetime
 

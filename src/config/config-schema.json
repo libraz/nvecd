@@ -171,8 +171,8 @@
         },
         "sample_size": {
           "type": "integer",
-          "description": "Random sampling size for approximate search; sampling engages only once the corpus exceeds twice this value (0 = exact search), and the maximum is the largest value whose doubling stays inside the 32-bit counter that comparison uses",
-          "description_ja": "近似検索のランダムサンプリング件数。サンプリングはコーパスがこの値の 2 倍を超えたときにのみ有効になる（0 = 全探索）。上限は、その比較に使う 32 ビットカウンタ内に 2 倍した値が収まる最大値",
+          "description": "Random sampling size for approximate search; sampling engages only when the live vectors exceed twice this value and the query has no filter (0 = exact search), and the maximum is the largest value whose doubling stays inside the 32-bit counter that comparison uses",
+          "description_ja": "近似検索のランダムサンプリング件数。サンプリングは生存しているベクトルがこの値の 2 倍を超え、かつクエリに filter が無い場合にのみ有効になる（0 = 全探索）。上限は、その比較に使う 32 ビットカウンタ内に 2 倍した値が収まる最大値",
           "default": 10000,
           "minimum": 0,
           "maximum": 2147483647

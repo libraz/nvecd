@@ -50,7 +50,7 @@ nvecd-cli -p 11017 METASET lamp category:lighting,in_stock:true
 
 ## Fusion
 
-`using=fusion` runs both searches and merges them. Each side is min-max normalised to `[0, 1]` within its own result set, then combined as `alpha × vector_score + beta × event_score`. The two weights come from `similarity.fusion_alpha` and `similarity.fusion_beta`.
+`using=fusion` runs both searches and merges them. Each side is min-max normalised to `[0, 1]` within its own result set, then combined as `alpha × vector_score + beta × event_score`, where `alpha` and `beta` are `similarity.fusion_alpha` and `similarity.fusion_beta` rescaled to sum to 1. When only one side returns candidates, that side is used alone, unnormalised and at weight 1.
 
 The union matters: the vector search runs over the whole store rather than over the event neighbours, so a content-similar product that has never been co-purchased can still surface, and a co-purchased product with no vector can too.
 
@@ -172,12 +172,12 @@ nvecd-cli -p 11017 SIM shade 5 using=fusion
 
 ```text
 (3 results)
-1) bulb (score: 1)
-2) lamp (score: 0.9786)
-3) desk (score: 0)
+1) bulb (score: 0.9865)
+2) lamp (score: 0.975)
+3) desk (score: 0.4486)
 ```
 
-`shade` has no events at all. When only one side has candidates, the contributing weight is renormalised to one, so the surviving signal is not shrunk by the weight of the missing one.
+`shade` has no events at all. When only one side has candidates, that side is taken alone at weight one and keeps its own scale: these are the cosine similarities `using=vectors` returns, not min-max normalised values, so the surviving signal is neither shrunk by the weight of the missing one nor stretched to `[0, 1]`.
 
 ## Filtering the catalogue
 

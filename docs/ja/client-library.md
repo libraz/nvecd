@@ -69,7 +69,7 @@ config.recv_buffer_size = 65536;
 
 `timeout_ms` と `recv_buffer_size` が 0 の場合は「未設定」として扱われ、C++ クライアントでも C API でも既定値に置き換えられます。
 
-`timeout_ms` は `Save`、`Load`、`Verify` を含むすべてのコマンドに適用されます。大きなストアのスナップショットは書き込みや読み込みに既定値より長くかかることがあるため、これらに使うハンドルでは `timeout_ms` を引き上げてください。`nvecd-cli` は `DUMP SAVE`、`DUMP LOAD`、`DUMP VERIFY` については独自に最大 1 時間待ちます。
+`timeout_ms` は `Save`、`Load`、`Verify` を除くすべてのコマンドの期限です。大きなストアのスナップショットは書き込みや読み込みにクエリよりはるかに長くかかることがあるため、この 3 つは少なくとも 1 時間、`timeout_ms` のほうが長ければその時間だけ応答を待ちます。`nvecd-cli` も `DUMP SAVE`、`DUMP LOAD`、`DUMP VERIFY` に同じ 1 時間の待ちを適用します。
 
 `unix_socket_path` を設定すると転送方式が切り替わり、クライアントはそのソケットに接続して `host` と `port` を無視します。
 
@@ -214,11 +214,11 @@ for (const auto& item : result->results) {
 
 `Error::to_string()` は両方をまとめて `[Connection failed (7001)] Connection failed: Connection refused` の形で描画します。
 
-エラーの発生源はコードで 3 つに区別できます。
+エラーの発生源はコードで 4 つに区別できます。
 
 | 範囲 | 発生源 |
 |---|---|
-| `kClientInvalidArgument`（7009） | クライアントが何も送らずに引数を拒否した |
+| `kClientInvalidArgument`（7009）、`kClientAlreadyConnected`（7006） | クライアントが何も送らずに呼び出しを拒否した。7006 は接続済みのハンドルへの `Connect` |
 | `kClientNotConnected`（7000）、`kClientConnectionFailed`（7001）、`kClientSendFailed`（7002）、`kClientReceiveFailed`（7003）、`kClientTimeout`（7005）、`kClientConnectionClosed`（7008） | 転送層 |
 | `kClientServerError`（7010） | サーバーが `ERROR` を返した。メッセージはサーバーのテキスト |
 | `kClientProtocolError`（7011） | 応答が期待した形でなかった |

@@ -126,12 +126,12 @@ gasket 8000.0000\r\n
 
 ```text
 (3 results)
-1) widget (score: 1)
-2) gasket (score: 0.9942)
-3) flange (score: 0)
+1) widget (score: 0.9994)
+2) gasket (score: 0.9953)
+3) flange (score: 0.2901)
 ```
 
-`bolt` には共起の隣接がないため、イベント側は候補を出さず、その配分は外され、ベクトル側の重みが 1 に再正規化されます。欠けた信号のぶんスコアが目減りすることはありません。
+`bolt` には共起の隣接がないため、イベント側は候補を出さず、ベクトル側だけが重み 1 で使われます。比べる相手がないので正規化もされず、スコアは `using=vectors` が返すのと同じコサイン類似度そのものです。そのため `min_score=` はどちらのモードでも同じアイテムを切ります。
 
 `adaptive=on` を付けると、配分は固定の 0.6 / 0.4 ではなくクエリアイテム自身のデータ密度に従います。
 
@@ -200,7 +200,7 @@ gasket 8000.0000\r\n
 2) gasket (score: 0.9954)
 ```
 
-閾値が指す尺度はモードごとに違います。`using=vectors` ではコサイン類似度、`using=fusion` では正規化した統合値、`using=events` では生の共起の累積和です。
+閾値が指す尺度はモードごとに違います。`using=vectors` ではコサイン類似度、`using=fusion` では正規化した統合値（片側にしか候補がないときはその側の尺度そのまま）、`using=events` では生の共起の累積和です。
 
 ## サーバーの状態を見る
 
@@ -230,11 +230,11 @@ cmdstat_event: calls=6,failed=0
 cmdstat_sim: calls=9,failed=0
 cmdstat_vecset: calls=4,failed=0
 cmdstat_vecdel: calls=0,failed=0
-cmdstat_metaset: calls=1,failed=0
+cmdstat_metaset: calls=4,failed=0
 cmdstat_info: calls=1,failed=0
-cmdstat_config: calls=1,failed=0
-cmdstat_dump: calls=1,failed=0
-cmdstat_cache: calls=1,failed=0
+cmdstat_config: calls=0,failed=0
+cmdstat_dump: calls=0,failed=0
+cmdstat_cache: calls=0,failed=0
 cmdstat_other: calls=0,failed=0
 
 # Memory
@@ -253,6 +253,7 @@ id_count: 3
 ctx_count: 3
 vector_count: 4
 event_count: 6
+END
 ```
 
 `id_count` が 4 ではなく 3 なのは、これが共起索引の知っているアイテムを数えていて、`bolt` はベクトルしか持たないからです。`used_memory_bytes` はベクトル行列だけを対象にした値で、4 次元のベクトル 4 本ぶんです。
@@ -283,6 +284,7 @@ status: completed
 filepath: /tmp/nvecd-data/nvecd.dmp
 start_time: 1788427835
 end_time: 1788427836
+END
 ```
 
 同じ設定でサーバーを起動し直すと、これが読み込まれます。ログに `Recovery loaded snapshot: /tmp/nvecd-data/nvecd.dmp` が出て、`SIM widget 10 using=events` は再起動前と同じ答えを返します。自動スナップショット（`snapshot.interval_sec`）、先行書き込みログ、再起動時に何が再生されるかは [永続化](./persistence.md) で扱います。

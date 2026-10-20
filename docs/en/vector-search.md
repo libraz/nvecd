@@ -51,7 +51,7 @@ out, so it makes no difference.
 ## Distance metrics
 
 `vectors.distance_metric` selects the metric. It accepts `cosine` (the default),
-`dot` and `l2`; an unrecognised value falls back to cosine. There is no
+`dot` and `l2`; any other value is rejected at config load. There is no
 `similarity.metric` key — the metric lives under `vectors`, while
 `similarity.index_type` selects the index that applies it.
 
@@ -105,8 +105,8 @@ build options.
 
 ## Index types
 
-`similarity.index_type` selects one of `flat`, `hnsw` and `ivf`. An unrecognised
-name behaves as `flat`. Setting `similarity.ivf_enabled` to true promotes a
+`similarity.index_type` selects one of `flat`, `hnsw` and `ivf`; any other name
+is rejected at config load. Setting `similarity.ivf_enabled` to true promotes a
 `flat` configuration to `ivf`.
 
 ### flat
@@ -114,9 +114,11 @@ name behaves as `flat`. Setting `similarity.ivf_enabled` to true promotes a
 The default. No index object is built; every query scans the whole matrix. Build
 cost is zero, query cost is linear in the corpus, and the result is exact — with
 one exception. `similarity.sample_size` (default 10000) engages uniform random
-sampling once the corpus exceeds twice that value: the scan then visits a random
-sample of that many rows instead of all of them, which makes even `flat`
-approximate on a large corpus, with a different sample per query. Setting
+sampling once the live vectors (deleted rows not counted) exceed twice that
+value: the scan then visits a random sample of about that many live rows instead
+of all of them, which makes even `flat` approximate on a large corpus, with a
+different sample per query. A query with `filter=` never samples and always scans
+every row, so a sparse filter is not left with too few survivors. Setting
 `sample_size` to 0 disables sampling and keeps the scan exact at any size.
 
 ### hnsw
@@ -145,9 +147,9 @@ corpus, so query cost falls roughly in proportion to `nprobe / nlist`.
 
 IVF has to be trained before it can partition anything. Training starts once the
 store holds `ivf_train_threshold` vectors (default 10000) and runs in a
-background thread, so ingestion is not blocked by it. Up to 50000 vectors are
-copied for the run and k-means trains on a random sample of at most 10000 of
-them. `ivf_nlist` (default 256) sets the number of cells; 0 derives
+background thread, so ingestion is not blocked by it. The run copies a random
+sample of at most 10000 live vectors and k-means trains on exactly that sample.
+`ivf_nlist` (default 256) sets the number of cells; 0 derives
 `sqrt(n)`, capped at 1024.
 
 Until training finishes, and for every vector written after it, new vectors land
@@ -242,11 +244,9 @@ which items any filtered query returns. See [caching.md](./caching.md).
 The order these are applied in decides how many results a caller gets back.
 
 The metadata filter is not a post-processing stage. It is applied as candidates
-are gathered, inside each retrieval arm: a candidate that fails the filter is
-never admitted to the top-k heap in the first place. A fusion query applies it a
-second time over the merged candidate map, and the dispatcher applies a final
-pass for every mode except `events`, so a result that reached the response by any
-other route is held to the same filter.
+are gathered, inside each retrieval arm, and nowhere else: a candidate that fails
+the filter is never admitted to the top-k heap in the first place, so a fusion
+query merges two lists that already satisfy it.
 
 Filtering during collection is what keeps a filtered query from simply returning
 fewer results. The engine over-fetches — three times `top_k` for vector search,

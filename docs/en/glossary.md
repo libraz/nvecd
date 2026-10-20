@@ -28,7 +28,7 @@ Terms as nvecd uses them. Where general machine-learning usage is broader, the d
 
 **dot** — The dot-product metric. The score is the raw dot product, so it is unbounded and sensitive to vector magnitude. See [Vector search](./vector-search.md).
 
-**event** — One reported interaction: `EVENT <context> <ADD|SET|DEL> <item> [<score>]`. All three forms append to the context's ring buffer and differ in how they are deduplicated: `ADD` against the dedup window, `SET` against the last score recorded for that context and item, `DEL` against whether the pair is already marked deleted. A `DEL` is stored with score 0, so it forms no new co-occurrence contribution. See [Events and co-occurrence](./events-and-co-occurrence.md).
+**event** — One reported interaction: `EVENT <context> <ADD|SET|DEL> <item> [<score>]`. All three forms append to the context's ring buffer and differ in how they are deduplicated: `ADD` against the dedup window, `SET` against the last score recorded for that context and item, `DEL` against a deletion mark that an accepted `ADD` or `SET` for the same pair clears. A `DEL` is stored with score 0, so it forms no new co-occurrence contribution. See [Events and co-occurrence](./events-and-co-occurrence.md).
 
 **flat index** — The default `similarity.index_type`. No index structure exists; a query scans the stored vectors directly, which is exact unless sampling engages. See [Vector search](./vector-search.md).
 
@@ -58,7 +58,7 @@ Terms as nvecd uses them. Where general machine-learning usage is broader, the d
 
 **ring buffer** — The fixed-size per-context event buffer, sized by `events.ctx_buffer_size`. A new event overwrites the oldest one, and only the events still in the buffer take part in the co-occurrence pairs a later event forms. See [Events and co-occurrence](./events-and-co-occurrence.md).
 
-**sampling** — Approximate scanning controlled by `similarity.sample_size`: once the corpus exceeds twice that value, a vector search scores a random sample rather than every vector. Setting it to 0 makes every search exact. See [Vector search](./vector-search.md).
+**sampling** — Approximate scanning controlled by `similarity.sample_size`: once the live vectors exceed twice that value, an unfiltered vector search scores a random sample rather than every vector; a query with `filter=` always scans every row. Setting it to 0 makes every search exact. See [Vector search](./vector-search.md).
 
 **score** — Two distinct things. On an `EVENT`, an integer weight in the range 0 to 100 that a client assigns to an interaction. In a `SIM` or `SIMV` result, the ranking value the search produced, rendered on the wire with four decimal places. See [TCP protocol](./protocol.md).
 

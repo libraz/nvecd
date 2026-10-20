@@ -113,7 +113,7 @@ Filtering happens after the metric ranks the candidates, so a highly selective f
 
 `similarity.index_type` selects how a query finds its candidates.
 
-**`flat`** (the default) scans the corpus and is exact — with one caveat that matters at scale. `similarity.sample_size` defaults to `10000`, and once the corpus holds more than twice that many vectors, the scan covers a random sample of that size instead of everything. That is a recall loss inside the supposedly exact path. Set `similarity.sample_size: 0` to keep `flat` genuinely exhaustive, and accept that the scan then grows linearly with the corpus.
+**`flat`** (the default) scans the corpus and is exact — with one caveat that matters at scale. `similarity.sample_size` defaults to `10000`, and once the corpus holds more than twice that many live vectors, an unfiltered scan covers a random sample of that size instead of everything. That is a recall loss inside the supposedly exact path; a query with `filter=` is exempt and always scans every row. Set `similarity.sample_size: 0` to keep `flat` genuinely exhaustive, and accept that the scan then grows linearly with the corpus.
 
 **`hnsw`** builds a navigable graph and answers from it. `similarity.hnsw_ef_search` is the query-time knob: a larger search width explores more of the graph and recovers more of the true neighbours, at proportionally more work per query. `similarity.hnsw_m` and `similarity.hnsw_ef_construction` govern the graph itself and are build-time costs — raising them makes insertion slower and the graph better connected. The index accepts insertions incrementally, so a corpus can grow without a rebuild.
 

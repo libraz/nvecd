@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 900" width="960" height="900" role="img" aria-labelledby="ttl dsc">
   <title id="ttl">fusion モードの SIM クエリが返るまで</title>
-  <desc id="dsc">fusion モードの SIM クエリを上から下へたどった読み取り経路です。リクエストはクエリ引数と 4 つの世代番号からなるキャッシュキーに変換され、参照はヒットして保存済みの上位 k 件を展開するか、ミスします。ミスした場合は共起検索とベクトル検索の 2 系統が top_k の 3 倍まで候補を取得し、各ソースを min–max で 0 から 1 に正規化してから重み付きで統合します。統合後にメタデータフィルタを再適用して top_k 件に切り詰め、クエリコストが閾値を超えたときだけキャッシュへ書き戻します。min_score の下限はヒット経路とミス経路の両方で最後に適用されます。</desc>
+  <desc id="dsc">fusion モードの SIM クエリを上から下へたどった読み取り経路です。リクエストはクエリ引数と 4 つの世代番号からなるキャッシュキーに変換され、参照はヒットして保存済みの上位 k 件を展開するか、ミスします。ミスした場合は共起検索とベクトル検索の 2 系統が、メタデータフィルタを適用しながら top_k の 3 倍まで候補を取得します。両方に候補があれば各ソースを min–max で 0 から 1 に正規化してから重み付きで統合し、top_k 件に切り詰めます。フィルタを統合後に再適用することはありません。そのうえでクエリコストが閾値を超えたときだけキャッシュへ書き戻します。min_score の下限はヒット経路とミス経路の両方で最後に適用されます。</desc>
 
   <style>
     .bg    { fill:#f7f5f1 }
@@ -87,14 +87,14 @@
   <rect class="card" x="488" y="332" width="196" height="84" rx="6"/>
   <text class="lbl" x="502" y="353">ベクトル検索</text>
   <text class="mono" x="502" y="372">AnnIndex::Search</text>
-  <text class="s" x="502" y="390">HNSW / IVF による近似探索</text>
-  <text class="s" x="502" y="405">flat なら全件走査</text>
+  <text class="s" x="502" y="390">HNSW / IVF / flat 走査</text>
+  <text class="s" x="502" y="405">メタデータで絞り込み</text>
 
   <path class="ln2" d="M 374 416 V 436" marker-end="url(#b)"/>
   <path class="ln" d="M 586 416 V 436" marker-end="url(#a)"/>
 
   <rect class="chip" x="276" y="436" width="408" height="34" rx="5"/>
-  <text class="s" x="480" y="457" text-anchor="middle">各ソースを min–max で [0, 1] に正規化</text>
+  <text class="s" x="480" y="457" text-anchor="middle">両ソースに候補があれば各ソースを min–max で [0, 1] に正規化</text>
 
   <path class="lnn" d="M 480 486 V 506" marker-end="url(#c)"/>
 
@@ -107,9 +107,9 @@
   <path class="lnn" d="M 480 598 V 618" marker-end="url(#c)"/>
 
   <rect class="chip" x="260" y="618" width="440" height="72" rx="6"/>
-  <text class="lbl" x="276" y="640">絞り込みと上位抽出</text>
-  <text class="s" x="276" y="659">統合後の候補にメタデータフィルタを再適用し、</text>
-  <text class="s" x="276" y="675">部分ソートして top_k 件に切り詰める</text>
+  <text class="lbl" x="276" y="640">上位抽出</text>
+  <text class="s" x="276" y="659">両リストはフィルタ適用済みのため、統合結果を</text>
+  <text class="s" x="276" y="675">部分ソートして top_k 件に切り詰めるだけ</text>
 
   <rect class="chip" x="56" y="618" width="184" height="92" rx="6"/>
   <text class="lbl" x="72" y="640">キャッシュ書き込み</text>

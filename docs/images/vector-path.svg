@@ -43,7 +43,7 @@
   <text class="s" x="518" y="98" text-anchor="middle">AUTH + snapshot gates</text>
   <path class="ln" d="M 616 94 H 634" marker-end="url(#a)"/>
   <rect class="chip" x="634" y="78" width="152" height="32" rx="5"/>
-  <text class="s" x="710" y="98" text-anchor="middle">write gate (exclusive)</text>
+  <text class="s" x="710" y="98" text-anchor="middle">serialized write</text>
 
   <path class="ln" d="M 136 124 V 148" marker-end="url(#a)"/>
 

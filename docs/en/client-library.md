@@ -69,7 +69,7 @@ config.recv_buffer_size = 65536;
 
 A zero `timeout_ms` or `recv_buffer_size` means "unset" and is replaced by the default, in the C++ client and the C API alike.
 
-`timeout_ms` applies to every command, including `Save`, `Load` and `Verify`. A snapshot of a large store can take longer than the default to write or read, so raise `timeout_ms` on a handle used for them. `nvecd-cli` waits up to an hour for `DUMP SAVE`, `DUMP LOAD` and `DUMP VERIFY` on its own.
+`timeout_ms` is the deadline for every command except `Save`, `Load` and `Verify`. A snapshot of a large store can take far longer than a query to write or read, so those three wait for their reply for at least one hour, or for `timeout_ms` when it is longer. `nvecd-cli` applies the same one-hour wait to `DUMP SAVE`, `DUMP LOAD` and `DUMP VERIFY`.
 
 Setting `unix_socket_path` switches the transport: the client connects to that socket and ignores `host` and `port`.
 
@@ -214,11 +214,11 @@ for (const auto& item : result->results) {
 
 `Error::to_string()` renders both together, in the form `[Connection failed (7001)] Connection failed: Connection refused`.
 
-Three error sources are distinguishable by code:
+Four error sources are distinguishable by code:
 
 | Range | Source |
 |---|---|
-| `kClientInvalidArgument` (7009) | the client rejected the arguments without sending anything |
+| `kClientInvalidArgument` (7009), `kClientAlreadyConnected` (7006) | the client rejected the call without sending anything; 7006 is `Connect` on a handle that is already connected |
 | `kClientNotConnected` (7000), `kClientConnectionFailed` (7001), `kClientSendFailed` (7002), `kClientReceiveFailed` (7003), `kClientTimeout` (7005), `kClientConnectionClosed` (7008) | transport |
 | `kClientServerError` (7010) | the server answered `ERROR`; the message is the server's text |
 | `kClientProtocolError` (7011) | the response did not have the expected shape |
