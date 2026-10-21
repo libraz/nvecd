@@ -212,7 +212,7 @@ gasket 8000.0000\r\n
 INFO
 
 # Server
-version: 0.3.0
+version: 0.4.0
 uptime_seconds: 15
 
 # Stats

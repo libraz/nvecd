@@ -212,7 +212,7 @@ A threshold means different things in different modes: it is a cosine similarity
 INFO
 
 # Server
-version: 0.3.0
+version: 0.4.0
 uptime_seconds: 15
 
 # Stats

@@ -16,7 +16,7 @@ class Version {
  public:
   /**
    * @brief Get version string
-   * @return Version string (e.g., "0.3.0")
+   * @return Version string (e.g., "0.4.0")
    */
   static std::string String() { return "@PROJECT_VERSION@"; }
 

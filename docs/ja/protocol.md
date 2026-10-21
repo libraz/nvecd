@@ -298,7 +298,7 @@ INFO
 OK INFO
 
 # Server
-version: 0.3.0
+version: 0.4.0
 uptime_seconds: 29
 
 # Stats
@@ -721,7 +721,7 @@ $ nvecd-cli -p 11017 INFO
 INFO
 
 # Server
-version: 0.3.0
+version: 0.4.0
 ...
 
 $ nvecd-cli -p 11017 BOGUS; echo "exit=$?"
