@@ -223,6 +223,8 @@ int ErrorCodeToHttpStatus(utils::ErrorCode code) {
     case utils::ErrorCode::kWalWriteError:
     case utils::ErrorCode::kWalNotOpen:
     case utils::ErrorCode::kWalRotationFailed:
+    // Snapshot admission refused because the server is shutting down.
+    case utils::ErrorCode::kCancelled:
       return kHttpServiceUnavailable;
     default:
       return kHttpInternalServerError;

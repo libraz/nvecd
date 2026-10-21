@@ -95,9 +95,9 @@ with status `401`. The check runs before the handler reads any state or assemble
 | `422` | a snapshot file that exists but cannot be loaded, verified or inspected (unreadable, corrupt or an unsupported version) |
 | `429` | rate limit exceeded |
 | `500` | any other handler error |
-| `503` | server is loading; a write route while a lock-mode snapshot holds the stores or after the persistence fail-stop latched (the `error` text is the TCP `READONLY` message); a write the WAL could not accept |
+| `503` | server is loading; a write route while a lock-mode snapshot holds the stores or after the persistence fail-stop latched (the `error` text is the TCP `READONLY` message); a write the WAL could not accept; a snapshot save or load refused because the server is shutting down |
 
-Handler errors are mapped from the typed error code rather than sniffed from a message, so the same failure produces the same status on every route. Domain errors map as follows: item and file not-found conditions to `404`; argument, parsing, dimension, `top_k` and event-score errors to `400`; permission-denied to `403`; a concurrent snapshot operation to `409`; an unusable snapshot file to `422`; WAL write, rotation and not-open errors to `503`; everything else to `500`.
+Handler errors are mapped from the typed error code rather than sniffed from a message, so the same failure produces the same status on every route. Domain errors map as follows: item and file not-found conditions to `404`; argument, parsing, dimension, `top_k` and event-score errors to `400`; permission-denied to `403`; a concurrent snapshot operation to `409`; an unusable snapshot file to `422`; WAL write, rotation and not-open errors and a snapshot operation refused during shutdown to `503`; everything else to `500`.
 
 A body field the route does not take is rejected with `400` rather than ignored: `Unknown field: <name>`, or on `/sim` and `/simv` the same `Invalid SIM option: <name>` / `Invalid SIMV option: <name>` message TCP gives for an unknown option. `POST /cache/clear` is the exception and ignores every field but `scope`.
 

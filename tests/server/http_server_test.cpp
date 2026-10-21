@@ -2102,6 +2102,25 @@ TEST_F(HttpServerTest, SnapshotLoadWhileAnotherIsRunningReturns409) {
   fs::remove_all(dir);
 }
 
+TEST_F(HttpServerTest, SnapshotRoutesDuringShutdownReturn503) {
+  const fs::path dir = MakeHttpDumpDir("shutdown");
+  handler_ctx_.dump_dir = dir.string();
+  config_->snapshot.mode = "lock";
+  std::ofstream(dir / "any.nvec", std::ios::binary) << "placeholder";
+  handler_ctx_.snapshot_coordinator.BeginShutdown();
+
+  json body = {{"filepath", "any.nvec"}};
+  for (const char* route : {"/dump/save", "/dump/load"}) {
+    auto res = client_->Post(route, body.dump(), "application/json");
+    ASSERT_TRUE(res) << route;
+    EXPECT_EQ(res->status, 503) << route << " -> " << res->body;
+    EXPECT_EQ(json::parse(res->body)["error"], "Server is shutting down; snapshot operations are refused") << route;
+  }
+
+  handler_ctx_.dump_dir = "";
+  fs::remove_all(dir);
+}
+
 TEST_F(HttpServerTest, DumpInfoReportsTheResolvedPath) {
   const fs::path dir = MakeHttpDumpDir("info");
   handler_ctx_.dump_dir = dir.string();
